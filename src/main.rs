@@ -182,6 +182,37 @@ fn run_thin_client(session: &str, url: &str, title: &str) -> Result<()> {
     Ok(())
 }
 
+/// Detect a yggterm-owned PTY. Primary signal is YGGTERM_SESSION_ID (the
+/// daemon exports it into every PTY it owns). Fallback: the ssh bridge also
+/// exports YGGTERM_TERM_PROGRAM=yggterm, and older remote daemons predate the
+/// session-id handshake — the GUI keys surfaces by the STREAM the OSC arrives
+/// on (the payload session field is diagnostic only), so a placeholder id
+/// still yields a working surface.
+fn yggterm_thin_client_session() -> Option<String> {
+    if let Ok(session) = std::env::var("YGGTERM_SESSION_ID")
+        && !session.is_empty()
+    {
+        return Some(session);
+    }
+    if std::env::var("YGGTERM_TERM_PROGRAM").is_ok_and(|value| value == "yggterm") {
+        return Some("env-unknown".to_string());
+    }
+    None
+}
+
+/// Standalone mode opens a GTK window; without a display GTK aborts the
+/// process with CRITICAL assertions instead of failing politely — check
+/// first and produce a real error.
+#[cfg(target_os = "linux")]
+fn display_available() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty())
+        || std::env::var_os("DISPLAY").is_some_and(|value| !value.is_empty())
+}
+#[cfg(not(target_os = "linux"))]
+fn display_available() -> bool {
+    true
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -192,12 +223,11 @@ fn main() -> Result<()> {
         format!("http://{raw_url}")
     };
 
-    // Inside yggterm (the daemon exports YGGTERM_SESSION_ID into every PTY
-    // it owns): thin-client mode — the yggterm GUI renders; locality comes
-    // from where this command runs. `--via` is standalone-only by design.
-    if let Ok(session) = std::env::var("YGGTERM_SESSION_ID")
-        && !session.is_empty()
-        && args.via.is_none()
+    // Inside yggterm: thin-client mode — the yggterm GUI renders; locality
+    // comes from where this command runs. `--via` is standalone-only by
+    // design.
+    if args.via.is_none()
+        && let Some(session) = yggterm_thin_client_session()
     {
         let title = args.title.clone().unwrap_or_else(|| {
             Url::parse(&raw_url)
@@ -207,6 +237,16 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| "ychrome".to_string())
         });
         return run_thin_client(&session, &raw_url, &title);
+    }
+
+    if !display_available() {
+        bail!(
+            "no display (DISPLAY/WAYLAND_DISPLAY unset) — standalone mode needs a desktop.\n\
+             Inside a yggterm terminal ychrome drives the session viewport instead; that mode\n\
+             activates automatically via YGGTERM_SESSION_ID / YGGTERM_TERM_PROGRAM. If this IS\n\
+             a yggterm session, the host daemon predates the env handshake — update yggterm on\n\
+             this machine or run: export YGGTERM_TERM_PROGRAM=yggterm"
+        );
     }
 
     // Resolve --via: rewrite the URL to a local tunnel endpoint. The
