@@ -41,14 +41,17 @@ ychrome https://chat.example.com --profile personal
 so multiple accounts on the same site coexist — each profile is its own
 session jar under `~/.local/share/ychrome/profiles/<name>`.
 
-`--via <ssh-host>` exists only in standalone mode, for reaching a remote
-machine's localhost without a yggterm anywhere in the loop:
+`--via <ssh-host>` exists only in standalone mode: browse with that machine's
+network identity (its localhost, its internal DNS, its routes) when no yggterm
+is in the loop:
 
 ```
 ychrome --via dev http://localhost:8000
 ```
 
-Inside yggterm this flag is unnecessary by design.
+Inside yggterm this flag is unnecessary by design — running `ychrome` in a
+session already connects directly on that session's machine (the egress rule
+in [docs/architecture.md](docs/architecture.md)).
 
 ## Status
 

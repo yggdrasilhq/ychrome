@@ -26,22 +26,41 @@ Participants:
   tagged with the session id. Owns lifecycle truth: if the CLI dies, the
   surface closes; if the surface is closed in the GUI, the CLI is told.
 - **yggterm GUI** — swaps that session's viewport from the terminal to a
-  webview surface. For loopback URLs (`localhost`, `127.0.0.1`, `::1`) on a
-  remote session, the GUI establishes a port forward to the session's machine
-  over the existing ssh substrate and rewrites the URL to the local end.
-  Non-loopback URLs load directly. The right sidebar shows ychrome's panels
-  while the surface is foreground.
+  webview surface. The right sidebar shows ychrome's panels while the surface
+  is foreground.
 
-Key property: **the tunnel is yggterm's job, not the user's.** The user never
-names a machine; the session already knows it.
+## The egress rule
+
+**A surface's network egress is the invoking host's network — for all URLs,
+always.** The connection to the target service is made *on the session's
+machine, by the session's side* (CLI or daemon); the GUI only renders.
+
+Mechanism: a per-surface SOCKS proxy relayed over the existing substrate. The
+session-side component is the proxy egress; the GUI configures the surface's
+web context (each surface has its own context already, for profile isolation)
+to route all requests — including DNS resolution — through it. Loopback
+services, internal DNS names, docker networks, VPN-only routes, and
+source-IP-checked services all behave exactly as they would in a browser
+running on that machine.
+
+A GUI-side `ssh -L` port forward was considered and rejected: it originates
+the connection on the GUI host and only special-cases loopback, silently
+breaking every other only-reachable-from-there case.
+
+Key property: **the network plumbing is yggterm's job, not the user's.** The
+user never names a machine; where they typed the command is where the URL
+resolves.
 
 ## Standalone mode
 
 `src/main.rs` today: tao event loop + wry WebViewBuilder on a WebContext whose
-data directory is `~/.local/share/ychrome/profiles/<profile>`. `--via` spawns
-`ssh -N -L` with a free local port and rewrites the URL — the manual escape
-hatch for when no yggterm daemon exists on either end. The tunnel dies with
-the window.
+data directory is `~/.local/share/ychrome/profiles/<profile>`. `--via <host>`
+is the same egress rule with plain ssh as the carrier: borrow that host's
+entire network identity for the window via a dynamic SOCKS forward
+(`ssh -N -D`), with the web context's proxy pointed at the local end. (The
+current implementation still uses a single-port `-L` rewrite; migrating it to
+`-D` + per-context proxy is the open v0 task, tracked below.) The forward dies
+with the window.
 
 Standalone mode is also the degradation story required of every libyggterm
 app: in a bare xterm the command still does something sensible.
