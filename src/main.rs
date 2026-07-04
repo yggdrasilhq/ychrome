@@ -22,7 +22,7 @@ use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop};
 use tao::window::WindowBuilder;
 use url::Url;
-use wry::{WebContext, WebViewBuilder};
+use wry::{ProxyConfig, ProxyEndpoint, WebContext, WebViewBuilder};
 
 #[derive(Parser, Debug)]
 #[command(name = "ychrome", version, about)]
@@ -61,11 +61,14 @@ fn free_local_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-/// Spawn `ssh -N -L <local>:<host>:<port> <via>` and wait until the local
-/// side accepts connections.
-fn open_tunnel(via: &str, remote_host: &str, remote_port: u16) -> Result<Tunnel> {
+/// Spawn `ssh -N -D <local> <via>` (a dynamic SOCKS proxy) and wait until the
+/// local side accepts connections. The webview points at the SOCKS proxy, so
+/// the *remote* sshd resolves DNS and originates every connection on the
+/// session's machine — the egress rule, for ALL URLs (not just one loopback
+/// port). `-L` was the old carrier and only forwarded a single host:port; it
+/// broke internal DNS, docker networks, and cross-origin navigation.
+fn open_tunnel(via: &str) -> Result<Tunnel> {
     let local_port = free_local_port()?;
-    let forward = format!("{local_port}:{remote_host}:{remote_port}");
     let child = Command::new("ssh")
         .args([
             "-N",
@@ -73,13 +76,13 @@ fn open_tunnel(via: &str, remote_host: &str, remote_port: u16) -> Result<Tunnel>
             "ExitOnForwardFailure=yes",
             "-o",
             "ConnectTimeout=10",
-            "-L",
-            &forward,
+            "-D",
+            &format!("127.0.0.1:{local_port}"),
             via,
         ])
         .stdin(Stdio::null())
         .spawn()
-        .context("spawning ssh for the tunnel")?;
+        .context("spawning ssh for the SOCKS tunnel")?;
     let mut tunnel = Tunnel { child, local_port };
 
     let deadline = Instant::now() + Duration::from_secs(12);
@@ -93,10 +96,10 @@ fn open_tunnel(via: &str, remote_host: &str, remote_port: u16) -> Result<Tunnel>
             return Ok(tunnel);
         }
         if let Some(status) = tunnel.child.try_wait()? {
-            bail!("ssh tunnel to {via} exited early ({status}) — check `ssh {via}` works and the remote port {remote_port} is listening");
+            bail!("ssh SOCKS tunnel to {via} exited early ({status}) — check `ssh {via}` works");
         }
         if Instant::now() > deadline {
-            bail!("ssh tunnel to {via} did not come up within 12s");
+            bail!("ssh SOCKS tunnel to {via} did not come up within 12s");
         }
         std::thread::sleep(Duration::from_millis(150));
     }
@@ -249,33 +252,28 @@ fn main() -> Result<()> {
         );
     }
 
-    // Resolve --via: rewrite the URL to a local tunnel endpoint. The
-    // tunnel handle must outlive the event loop, so it is held below.
+    // Resolve --via: open a SOCKS tunnel and route the webview through it.
+    // The URL is UNCHANGED (the remote sshd resolves the host); only the
+    // network path is rewritten, so https certs match and cross-origin
+    // navigation stays on the session's network. The tunnel handle must
+    // outlive the event loop, so it is held below.
     let mut tunnel: Option<Tunnel> = None;
-    let final_url = if let Some(via) = &args.via {
-        let parsed = Url::parse(&raw_url).context("parsing URL for --via")?;
-        if parsed.scheme() == "https" {
-            eprintln!(
-                "ychrome: warning: --via rewrites the host to 127.0.0.1; \
-                 https certificates will not match. Use plain http dev servers."
-            );
-        }
-        let remote_host = parsed.host_str().unwrap_or("127.0.0.1").to_string();
-        let remote_port = parsed
-            .port_or_known_default()
-            .context("URL has no port and no default")?;
-        eprintln!("ychrome: opening ssh tunnel via {via} → {remote_host}:{remote_port} …");
-        let t = open_tunnel(via, &remote_host, remote_port)?;
-        let mut rewritten = parsed.clone();
-        rewritten.set_host(Some("127.0.0.1"))?;
-        rewritten.set_port(Some(t.local_port)).ok();
-        let s = rewritten.to_string();
-        eprintln!("ychrome: tunnel up on {s}");
+    let proxy_config = if let Some(via) = &args.via {
+        // Parse only to fail early on a nonsense URL; the value is untouched.
+        Url::parse(&raw_url).context("parsing URL for --via")?;
+        eprintln!("ychrome: opening ssh SOCKS tunnel via {via} …");
+        let t = open_tunnel(via)?;
+        let local_port = t.local_port;
+        eprintln!("ychrome: tunnel up — egress on {via}'s network (socks5://127.0.0.1:{local_port})");
         tunnel = Some(t);
-        s
+        Some(ProxyConfig::Socks5(ProxyEndpoint {
+            host: "127.0.0.1".to_string(),
+            port: local_port.to_string(),
+        }))
     } else {
-        raw_url
+        None
     };
+    let final_url = raw_url;
 
     let title = args.title.clone().unwrap_or_else(|| {
         let host = Url::parse(&final_url)
@@ -299,7 +297,10 @@ fn main() -> Result<()> {
         .build(&event_loop)
         .context("creating window")?;
 
-    let builder = WebViewBuilder::new_with_web_context(&mut web_context).with_url(&final_url);
+    let mut builder = WebViewBuilder::new_with_web_context(&mut web_context).with_url(&final_url);
+    if let Some(proxy_config) = proxy_config {
+        builder = builder.with_proxy_config(proxy_config);
+    }
 
     #[cfg(not(target_os = "linux"))]
     let _webview = builder.build(&window).context("creating webview")?;
