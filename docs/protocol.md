@@ -40,11 +40,17 @@ model.
 ## GUI responsibilities
 
 - Swap the session viewport terminal → webview; restore on close.
-- Loopback URL on a remote session ⇒ establish a port forward to the
-  session's host over the existing ssh machinery, rewrite the URL to the
-  local end, tear the forward down with the surface.
+- Configure the surface's web context to route all traffic (including DNS)
+  through the surface's session-side SOCKS egress (see the egress rule in
+  architecture.md) — never originate target connections from the GUI host.
 - Expose the app's sidebar panels while the surface is foreground.
 - Report close back through the daemon so the CLI unblocks.
+
+## Session-side responsibilities (daemon or CLI)
+
+- Act as the SOCKS egress for the surface: resolve names and open target
+  connections on the session's machine, relaying streams over the substrate.
+- Tear the egress down with the surface.
 
 ## Open questions (to be answered by the pilot)
 
@@ -55,3 +61,7 @@ model.
    socket. ytop-class apps need live updates; v0 ychrome does not.
 3. Where the ALT+/KeyTips command registry hooks in, so app surfaces are
    keyboard- and agent-drivable like native ones.
+4. SOCKS relay transport: multiplex over the daemon's existing channel vs a
+   dedicated `ssh -D` alongside it. Also verify WebKitGTK/libsoup passes
+   hostnames to the SOCKS proxy (socks5h behavior) so remote DNS actually
+   resolves session-side.
