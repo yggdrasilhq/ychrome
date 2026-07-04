@@ -55,9 +55,12 @@ in [docs/architecture.md](docs/architecture.md)).
 
 ## Status
 
-Early pilot. The standalone window mode works today; the yggterm viewport
-takeover (the actual point) is being built against the daemon-relay protocol
-described in [docs/protocol.md](docs/protocol.md).
+**Working end-to-end as of yggterm 2.9.53.** Live-verified: `ychrome
+http://localhost:8377` in a yggterm session on a remote machine rendered that
+machine's loopback-only dev server in the viewport, with egress on that
+machine, and Ctrl+C handed the terminal back. Standalone window mode also
+works. Contract: [docs/protocol.md](docs/protocol.md) (authoritative copy in
+yggterm's `docs/web-surfaces.md`).
 
 ## Docs
 

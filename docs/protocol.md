@@ -1,67 +1,65 @@
-# Surface Protocol (draft)
+# Surface Protocol (v0 — as shipped in yggterm 2.9.53)
 
-Draft of the daemon-relay contract ychrome pilots for libyggterm. Everything
-here is subject to what the yggterm integration actually teaches; this file is
-the current best guess, not a spec.
+This is the contract ychrome pilots for libyggterm, as actually implemented.
+The authoritative copy lives in the yggterm repo at `docs/web-surfaces.md`;
+this file summarizes the app-side view. An earlier draft proposed a daemon
+socket RPC lane — that was replaced: the terminal byte stream itself is the
+transport.
 
-## Session identity handoff
+## Session identity handshake
 
 The yggterm host daemon exports into every PTY it owns:
 
 ```
-YGGTERM_SESSION_ID=<session uuid>
-YGGTERM_DAEMON_SOCK=<path to the host daemon control socket>
+YGGTERM_SESSION_ID=<the daemon's session key>
+YGGTERM_BIN=<path to the yggterm binary that owns the PTY>
 ```
 
-A libyggterm app treats the presence of both as "I am inside yggterm."
-Absence of either → standalone/degraded mode. (Same detection contract tmux
-established with `$TMUX`; survives ssh because the *remote* daemon is the one
-that owns the PTY and sets the vars.)
+Presence of `YGGTERM_SESSION_ID` ⇒ thin-client mode. Absence ⇒ standalone
+window. (The `$TMUX` detection pattern; survives ssh because the *remote*
+daemon owns the PTY.)
 
-## Requests (CLI → daemon)
+## Control channel: OSC 7717 on stdout
 
 ```
-web-surface open   { session_id, url, title?, profile? }   → { surface_id }
-web-surface close  { surface_id }
-web-surface status { surface_id }                          → { state }
+ESC ] 7717 ; web-surface ; <action> ; <base64 json> BEL
 ```
 
-The CLI holds the socket open for the surface lifetime; socket drop = implicit
-close (crash-safe: a killed CLI never leaks a surface).
+- actions: `open`, `heartbeat` (~4s cadence, full payload), `close`
+- payload: `{"session": $YGGTERM_SESSION_ID, "url": "...", "title": "..."}`
 
-## Relay (daemon → GUI)
+Why OSC instead of a socket RPC: the PTY relay already reaches the GUI from
+every machine (remote daemon → ssh bridge → local daemon → xterm.js), so the
+control channel needs no discovery, no version negotiation, and no new
+transport — and unknown OSCs are invisible in plain terminals, which is the
+degradation story. The GUI keys surface state by the *stream* the OSC arrived
+on; the payload `session` field is diagnostic.
 
-The daemon forwards surface events to attached GUI clients tagged with the
-session id, exactly like session output. The GUI that has the session focused
-(or any GUI showing it) performs the viewport swap. Multiple attached GUIs see
-the same surface state — consistent with the ssh-as-keycard collaboration
-model.
+## Lifecycle rules the app must follow
 
-## GUI responsibilities
+- Emit `open` once, then `heartbeat` every ~4s while alive. The GUI expires
+  surfaces after 15s without a heartbeat — a SIGKILLed app never leaks an
+  overlay, and heartbeats re-heal the surface across GUI-side terminal
+  remounts.
+- Emit `close` on exit (Ctrl+C). The GUI's overlay ✕ sends a real Ctrl+C to
+  the PTY, so handling SIGINT is the whole close protocol.
+- Block in the foreground while the surface is open — a web surface is a
+  foreground program, not a session.
 
-- Swap the session viewport terminal → webview; restore on close.
-- Configure the surface's web context to route all traffic (including DNS)
-  through the surface's session-side SOCKS egress (see the egress rule in
-  architecture.md) — never originate target connections from the GUI host.
-- Expose the app's sidebar panels while the surface is foreground.
-- Report close back through the daemon so the CLI unblocks.
+## Egress (yggterm-side)
 
-## Session-side responsibilities (daemon or CLI)
+Remote session + loopback URL ⇒ the GUI opens `ssh -N -L` to the session's
+machine; the remote sshd originates the target connection there (the egress
+rule). Non-loopback URLs currently load directly from the GUI host — v0 gap;
+the general fix is a per-surface SOCKS egress carried over the substrate,
+still open.
 
-- Act as the SOCKS egress for the surface: resolve names and open target
-  connections on the session's machine, relaying streams over the substrate.
-- Tear the egress down with the surface.
+## Open questions (for the next libyggterm apps)
 
-## Open questions (to be answered by the pilot)
-
-1. Does the surface follow the *session* (survives GUI restart, like the
-   terminal does) or the *CLI process*? Leaning: the CLI process — a web
-   surface is a foreground program, not a session.
-2. Sidebar panel schema: static manifest at open vs live updates over the
-   socket. ytop-class apps need live updates; v0 ychrome does not.
+1. Sidebar panel contributions (ytop-class apps): schema + live updates —
+   probably additional OSC 7717 verbs.
+2. Per-surface SOCKS egress (full network-identity borrowing) and verifying
+   WebKit sends hostnames to the proxy (socks5h) so remote DNS resolves
+   session-side.
 3. Where the ALT+/KeyTips command registry hooks in, so app surfaces are
    keyboard- and agent-drivable like native ones.
-4. SOCKS relay transport: multiplex over the daemon's existing channel vs a
-   dedicated `ssh -D` alongside it. Also verify WebKitGTK/libsoup passes
-   hostnames to the SOCKS proxy (socks5h behavior) so remote DNS actually
-   resolves session-side.
