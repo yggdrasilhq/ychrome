@@ -8,7 +8,9 @@ repository = "https://github.com/yggdrasilhq/ychrome"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
 dirs = "5"
 tao = "0.35"
 url = "2"
