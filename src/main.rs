@@ -1,14 +1,15 @@
-//! ychrome — a minimal profile-aware web viewport.
+//! ychrome — a web viewport for the Yggdrasil ecosystem.
 //!
-//! v0 scope (standalone):
-//!   - open a URL in a real WebKit webview window
-//!   - `--profile <name>` gives each profile its own persistent storage
-//!     (cookies, localStorage), so two accounts on the same site coexist
-//!   - `--via <ssh-host>` opens a localhost URL that lives on a remote
-//!     machine by spawning an ssh -L tunnel for the window's lifetime
-//!
-//! The libyggterm integration (viewport takeover inside yggterm) comes
-//! later; see docs/architecture.md.
+//! Two modes (docs/architecture.md):
+//!   - **thin-client** (inside yggterm, detected via YGGTERM_SESSION_ID):
+//!     emit the libyggterm web-surface OSC (7717) on stdout so the yggterm
+//!     GUI swaps this session's viewport to a web view, heartbeat every few
+//!     seconds, block until Ctrl+C, then emit the close OSC. The PTY byte
+//!     relay is the transport, so this works identically over ssh.
+//!   - **standalone** (no yggterm): open an own WebKit window.
+//!     `--profile <name>` gives each profile its own persistent storage;
+//!     `--via <ssh-host>` reaches that machine's network through an ssh
+//!     forward.
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -114,6 +115,73 @@ fn profile_dir(profile: &str) -> Result<PathBuf> {
     Ok(base)
 }
 
+/// The libyggterm web-surface control sequence (OSC 7717). Consumed by the
+/// yggterm GUI's terminal parser; invisible junk-free in plain terminals
+/// (unknown OSCs are ignored) — the degradation story is the channel itself.
+fn emit_web_surface_osc(action: &str, session: &str, url: &str, title: &str) {
+    use base64::Engine as _;
+    use std::io::Write as _;
+    let payload = format!(
+        "{{\"session\":{},\"url\":{},\"title\":{}}}",
+        serde_json_string(session),
+        serde_json_string(url),
+        serde_json_string(title),
+    );
+    let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+    let mut stdout = std::io::stdout().lock();
+    let _ = write!(stdout, "\u{1b}]7717;web-surface;{action};{encoded}\u{7}");
+    let _ = stdout.flush();
+}
+
+/// Minimal JSON string escaping (avoid a serde dependency for one payload).
+fn serde_json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Thin-client mode: drive the yggterm viewport via OSC and block in the
+/// foreground like a proper CLI program. The heartbeat keeps the surface
+/// alive (the GUI expires surfaces after ~15s without one, so a SIGKILLed
+/// ychrome never leaks a full-screen overlay) and re-heals the surface
+/// after a GUI-side terminal remount.
+fn run_thin_client(session: &str, url: &str, title: &str) -> Result<()> {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        ctrlc::set_handler(move || {
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .context("installing Ctrl+C handler")?;
+    }
+    emit_web_surface_osc("open", session, url, title);
+    eprintln!("ychrome: web surface open — {url}  (Ctrl+C to close)");
+    let mut ticks: u32 = 0;
+    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(200));
+        ticks += 1;
+        // Heartbeat every ~4s (20 × 200ms) — the GUI's liveness truth.
+        if ticks.is_multiple_of(20) {
+            emit_web_surface_osc("heartbeat", session, url, title);
+        }
+    }
+    emit_web_surface_osc("close", session, url, title);
+    eprintln!("ychrome: web surface closed");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -123,6 +191,23 @@ fn main() -> Result<()> {
     } else {
         format!("http://{raw_url}")
     };
+
+    // Inside yggterm (the daemon exports YGGTERM_SESSION_ID into every PTY
+    // it owns): thin-client mode — the yggterm GUI renders; locality comes
+    // from where this command runs. `--via` is standalone-only by design.
+    if let Ok(session) = std::env::var("YGGTERM_SESSION_ID")
+        && !session.is_empty()
+        && args.via.is_none()
+    {
+        let title = args.title.clone().unwrap_or_else(|| {
+            Url::parse(&raw_url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .map(|h| format!("ychrome — {h}"))
+                .unwrap_or_else(|| "ychrome".to_string())
+        });
+        return run_thin_client(&session, &raw_url, &title);
+    }
 
     // Resolve --via: rewrite the URL to a local tunnel endpoint. The
     // tunnel handle must outlive the event loop, so it is held below.
