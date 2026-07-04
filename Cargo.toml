@@ -1,0 +1,19 @@
+[package]
+name = "ychrome"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A minimal profile-aware web viewport for the Yggdrasil ecosystem — multi-account browsing and ssh-tunneled localhost views, and the libyggterm pilot app"
+repository = "https://github.com/yggdrasilhq/ychrome"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+tao = "0.35"
+url = "2"
+wry = "0.55"
+
+[profile.release]
+strip = true
+lto = "thin"
