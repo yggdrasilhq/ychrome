@@ -39,7 +39,9 @@ ychrome https://chat.example.com --profile personal
 
 `--profile` gives each name an isolated persistent storage (cookies, logins),
 so multiple accounts on the same site coexist — each profile is its own
-session jar under `~/.local/share/ychrome/profiles/<name>`.
+host-owned session jar under `~/.yggterm/web-profiles/<name>` (the same jar the
+yggterm viewport uses, so a profile means one identity whether ychrome renders
+it standalone or hands it to yggterm).
 
 `--via <ssh-host>` exists only in standalone mode: browse with that machine's
 network identity (its localhost, its internal DNS, its routes) when no yggterm
@@ -52,6 +54,24 @@ ychrome --via dev http://localhost:8000
 Inside yggterm this flag is unnecessary by design — running `ychrome` in a
 session already connects directly on that session's machine (the egress rule
 in [docs/architecture.md](docs/architecture.md)).
+
+## Profile picker (no arguments)
+
+Run `ychrome` with no URL and it shows a **profile picker** instead of a blank
+page:
+
+```
+# in a yggterm session
+ychrome
+```
+
+It serves a small picker page on a loopback port and points the yggterm
+viewport at it — a card per existing profile plus a URL/search field. Pick a
+profile and type a URL (or leave it blank to start on search); ychrome then
+opens that URL under that profile in the viewport. This is the natural entry
+point for the multi-account use case: one command, choose which identity to
+browse as. (The picker is thin-client only; standalone `ychrome` with no URL
+still opens a blank window.)
 
 ## Status
 
