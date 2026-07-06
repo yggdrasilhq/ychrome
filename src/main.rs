@@ -105,14 +105,18 @@ fn open_tunnel(via: &str) -> Result<Tunnel> {
     }
 }
 
+/// Host-owned profile jars live under `~/.yggterm/web-profiles/<name>/` on the
+/// INVOKING host — the same location the yggterm GUI uses for a session's
+/// surface, so a profile means the same identity whether ychrome renders it
+/// itself (standalone) or hands it to the yggterm viewport (thin-client).
 fn profile_dir(profile: &str) -> Result<PathBuf> {
-    if profile.contains('/') || profile.contains("..") {
-        bail!("profile name must be a plain name, not a path: {profile}");
+    if profile.contains('/') || profile.contains("..") || profile.is_empty() {
+        bail!("profile name must be a plain name, not a path: {profile:?}");
     }
-    let base = dirs::data_dir()
-        .context("no XDG data dir")?
-        .join("ychrome")
-        .join("profiles")
+    let base = dirs::home_dir()
+        .context("no home dir")?
+        .join(".yggterm")
+        .join("web-profiles")
         .join(profile);
     std::fs::create_dir_all(&base)?;
     Ok(base)
@@ -121,14 +125,15 @@ fn profile_dir(profile: &str) -> Result<PathBuf> {
 /// The libyggterm web-surface control sequence (OSC 7717). Consumed by the
 /// yggterm GUI's terminal parser; invisible junk-free in plain terminals
 /// (unknown OSCs are ignored) — the degradation story is the channel itself.
-fn emit_web_surface_osc(action: &str, session: &str, url: &str, title: &str) {
+fn emit_web_surface_osc(action: &str, session: &str, url: &str, title: &str, profile: &str) {
     use base64::Engine as _;
     use std::io::Write as _;
     let payload = format!(
-        "{{\"session\":{},\"url\":{},\"title\":{}}}",
+        "{{\"session\":{},\"url\":{},\"title\":{},\"profile\":{}}}",
         serde_json_string(session),
         serde_json_string(url),
         serde_json_string(title),
+        serde_json_string(profile),
     );
     let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
     let mut stdout = std::io::stdout().lock();
@@ -160,7 +165,7 @@ fn serde_json_string(value: &str) -> String {
 /// alive (the GUI expires surfaces after ~15s without one, so a SIGKILLed
 /// ychrome never leaks a full-screen overlay) and re-heals the surface
 /// after a GUI-side terminal remount.
-fn run_thin_client(session: &str, url: &str, title: &str) -> Result<()> {
+fn run_thin_client(session: &str, url: &str, title: &str, profile: &str) -> Result<()> {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let stop = stop.clone();
@@ -169,18 +174,18 @@ fn run_thin_client(session: &str, url: &str, title: &str) -> Result<()> {
         })
         .context("installing Ctrl+C handler")?;
     }
-    emit_web_surface_osc("open", session, url, title);
-    eprintln!("ychrome: web surface open — {url}  (Ctrl+C to close)");
+    emit_web_surface_osc("open", session, url, title, profile);
+    eprintln!("ychrome: web surface open — {url} [{profile}]  (Ctrl+C to close)");
     let mut ticks: u32 = 0;
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(200));
         ticks += 1;
         // Heartbeat every ~4s (20 × 200ms) — the GUI's liveness truth.
         if ticks.is_multiple_of(20) {
-            emit_web_surface_osc("heartbeat", session, url, title);
+            emit_web_surface_osc("heartbeat", session, url, title, profile);
         }
     }
-    emit_web_surface_osc("close", session, url, title);
+    emit_web_surface_osc("close", session, url, title, profile);
     eprintln!("ychrome: web surface closed");
     Ok(())
 }
@@ -239,7 +244,7 @@ fn main() -> Result<()> {
                 .map(|h| format!("ychrome — {h}"))
                 .unwrap_or_else(|| "ychrome".to_string())
         });
-        return run_thin_client(&session, &raw_url, &title);
+        return run_thin_client(&session, &raw_url, &title, &args.profile);
     }
 
     if !display_available() {
