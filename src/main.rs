@@ -116,6 +116,16 @@ fn profile_dir(profile: &str) -> Result<PathBuf> {
     if profile.contains('/') || profile.contains("..") || profile.is_empty() {
         bail!("profile name must be a plain name, not a path: {profile:?}");
     }
+    if profile == TEMP_PROFILE {
+        // Reserved ephemeral profile: a throwaway jar under the OS temp dir,
+        // unique per process, best-effort deleted on exit (see main). Never
+        // touches ~/.yggterm/web-profiles/. Thin-client mode doesn't come
+        // here at all — the yggterm GUI maps "temp" to a true in-memory
+        // ephemeral WebContext.
+        let dir = std::env::temp_dir().join(format!("ychrome-temp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        return Ok(dir);
+    }
     let base = dirs::home_dir()
         .context("no home dir")?
         .join(".yggterm")
@@ -124,6 +134,11 @@ fn profile_dir(profile: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(&base)?;
     Ok(base)
 }
+
+/// Reserved profile name for an ephemeral session: no persistent jar, nothing
+/// kept after close. Mirrored by yggterm's `web_surface_profile_dir` (which
+/// maps it to an in-memory ephemeral WebContext on the GUI side).
+const TEMP_PROFILE: &str = "temp";
 
 /// The libyggterm web-surface control sequence (OSC 7717). Consumed by the
 /// yggterm GUI's terminal parser; invisible junk-free in plain terminals
@@ -214,6 +229,9 @@ fn enumerate_profiles() -> Vec<String> {
                 && let Some(name) = entry.file_name().to_str()
                 && !name.is_empty()
                 && !name.starts_with('.')
+                // "temp" is reserved for the ephemeral profile; a stray dir
+                // with that name is never a real jar (both sides ignore it).
+                && name != TEMP_PROFILE
             {
                 names.push(name.to_string());
             }
@@ -352,6 +370,7 @@ button:hover {{ background: #3d59f0; }}
   font-size: 20px; font-weight: 600; color: #fff;
   background: linear-gradient(135deg, #6c8cff, #9a6bff); }}
 .card.newcard .avatar {{ background: none; color: #7a7a86; border: 2px dashed #b6b6c0; }}
+.card.tempcard .avatar {{ background: linear-gradient(135deg, #5f6672, #3a3f4a); }}
 .pname {{ font-size: 13px; max-width: 100%; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; }}
 #newprofile {{ margin-top: 12px; width: 100%; max-width: 240px; padding: 9px 12px;
@@ -367,6 +386,9 @@ button:hover {{ background: #3d59f0; }}
   </div>
   <div class="grid">
     {cards}
+    <label class="card tempcard" title="No history, cookies or storage kept — everything vanishes on close">
+      <input type="radio" name="profile" value="temp">
+      <span class="avatar">&#9202;</span><span class="pname">Temporary</span></label>
     <label class="card newcard"><input type="radio" name="profile" value="" id="newradio">
       <span class="avatar">+</span><span class="pname">New profile</span></label>
   </div>
@@ -644,6 +666,9 @@ fn main() -> Result<()> {
     });
 
     let data_dir = profile_dir(&args.profile)?;
+    // The temp profile's throwaway jar is deleted on window close (below);
+    // remember where it is.
+    let temp_jar = (args.profile == TEMP_PROFILE).then(|| data_dir.clone());
     let mut web_context = WebContext::new(Some(data_dir));
 
     let event_loop = EventLoop::new();
@@ -677,6 +702,10 @@ fn main() -> Result<()> {
         {
             // Dropping the tunnel kills the ssh child.
             tunnel.take();
+            // Best-effort: a temp-profile jar leaves nothing behind.
+            if let Some(jar) = &temp_jar {
+                let _ = std::fs::remove_dir_all(jar);
+            }
             *control_flow = ControlFlow::Exit;
         }
     });
