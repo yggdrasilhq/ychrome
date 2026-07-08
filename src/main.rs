@@ -268,10 +268,33 @@ fn sanitize_profile(name: &str) -> String {
     }
 }
 
-/// Default start page when the picker's URL field is left empty — a frameless,
-/// framing-friendly search page (matches yggterm's address-bar search fallback)
-/// so "pick a profile, press Open" lands somewhere usable with the omnibox live.
-const DEFAULT_START_URL: &str = "https://html.duckduckgo.com/html/";
+/// Read a string key from `~/.yggterm/web-surface.json` — the ONE config file
+/// the yggterm GUI also reads (`web_surface_config_string` there), so ychrome's
+/// omnibox and the GUI address bar share a single source of truth for the search
+/// engine and start page.
+fn web_surface_config_string(key: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(dirs::home_dir()?.join(".yggterm").join("web-surface.json"))
+        .ok()?;
+    let config: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    config.get(key).and_then(|value| value.as_str()).map(str::to_string)
+}
+
+/// Default start page when the picker's URL field is left empty — the configured
+/// engine's home (default Brave). Native child webviews aren't iframes, so
+/// X-Frame-Options no longer constrains the choice (the historical reason
+/// DuckDuckGo's html/ endpoint was hard-coded).
+fn default_start_url() -> String {
+    web_surface_config_string("default_start_url")
+        .unwrap_or_else(|| "https://search.brave.com/".to_string())
+}
+
+/// Search-engine URL template with a `{q}` placeholder for the URL-encoded
+/// query (default Brave). Same key/default the yggterm GUI uses.
+fn search_url_template() -> String {
+    web_surface_config_string("search_url_template")
+        .filter(|template| template.contains("{q}"))
+        .unwrap_or_else(|| "https://search.brave.com/search?q={q}".to_string())
+}
 
 /// Turn a picker URL field into an http(s) URL the yggterm surface will accept
 /// (`web_surface_url_scheme_allowed` only permits http/https). Mirrors the
@@ -280,7 +303,7 @@ const DEFAULT_START_URL: &str = "https://html.duckduckgo.com/html/";
 fn normalize_target_url(raw: &str) -> String {
     let raw = raw.trim();
     if raw.is_empty() {
-        return DEFAULT_START_URL.to_string();
+        return default_start_url();
     }
     if raw.contains("://") {
         return raw.to_string();
@@ -296,7 +319,7 @@ fn normalize_target_url(raw: &str) -> String {
         format!("{scheme}://{raw}")
     } else {
         let q: String = url::form_urlencoded::byte_serialize(raw.as_bytes()).collect();
-        format!("https://html.duckduckgo.com/html/?q={q}")
+        search_url_template().replace("{q}", &q)
     }
 }
 
