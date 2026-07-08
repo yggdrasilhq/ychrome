@@ -208,12 +208,17 @@ fn run_thin_client(session: &str, url: &str, title: &str, profile: &str) -> Resu
 }
 
 /// The surface the picker's heartbeat currently points at. Starts as the
-/// loopback picker page; the picker server retargets it (url+profile) when the
-/// user submits, and the heartbeat carries the new value from then on.
+/// loopback control endpoint (action "pick" — the yggterm GUI renders a
+/// NATIVE profile picker and GETs /open on this server); the /open handler
+/// retargets it (url+profile, action "open") and the heartbeat carries the
+/// new value from then on.
 struct SurfaceTarget {
     url: String,
     title: String,
     profile: String,
+    /// OSC action for the current target: "pick" until the user chooses,
+    /// "open" after.
+    action: &'static str,
 }
 
 /// Existing host-owned profiles, for the picker to list. Reads directory names
@@ -491,6 +496,7 @@ fn handle_picker_conn(stream: TcpStream, session: &str, target: &Arc<Mutex<Surfa
                     url: url.clone(),
                     title: title.clone(),
                     profile: profile.clone(),
+                    action: "open",
                 };
             }
             emit_web_surface_osc("open", session, &url, &title, &profile);
@@ -515,6 +521,7 @@ fn run_thin_client_picker(session: &str) -> Result<()> {
         url: picker_url.clone(),
         title: "ychrome — choose a profile".to_string(),
         profile: "default".to_string(),
+        action: "pick",
     }));
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -536,11 +543,14 @@ fn run_thin_client_picker(session: &str) -> Result<()> {
         });
     }
 
-    // Open the picker surface, then heartbeat the CURRENT target — which the
-    // server thread swaps to the chosen url+profile on submit.
+    // Announce the picker (action "pick": the GUI renders a NATIVE profile
+    // picker; the OSC url is this loopback CONTROL endpoint the GUI GETs
+    // /open on), then heartbeat the CURRENT target — which the server thread
+    // swaps to the chosen url+profile (action "open") on submit. A "pick"
+    // heartbeat keeps the picker alive; an "open" one the page.
     {
         let t = target.lock().unwrap();
-        emit_web_surface_osc("open", session, &t.url, &t.title, &t.profile);
+        emit_web_surface_osc(t.action, session, &t.url, &t.title, &t.profile);
         eprintln!("ychrome: profile picker open — {picker_url}  (Ctrl+C to close)");
     }
     let mut ticks: u32 = 0;
@@ -549,7 +559,11 @@ fn run_thin_client_picker(session: &str) -> Result<()> {
         ticks += 1;
         if ticks.is_multiple_of(20) {
             let t = target.lock().unwrap();
-            emit_web_surface_osc("heartbeat", session, &t.url, &t.title, &t.profile);
+            if t.action == "pick" {
+                emit_web_surface_osc("pick", session, &t.url, &t.title, &t.profile);
+            } else {
+                emit_web_surface_osc("heartbeat", session, &t.url, &t.title, &t.profile);
+            }
         }
     }
     let t = target.lock().unwrap();
