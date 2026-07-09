@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+
+mod sidebar;
 use clap::Parser;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop};
@@ -192,6 +194,19 @@ fn run_thin_client(session: &str, url: &str, title: &str, profile: &str) -> Resu
         .context("installing Ctrl+C handler")?;
     }
     emit_web_surface_osc("open", session, url, title, profile);
+    // ychrome CONTRIBUTES its vault pane rather than yggterm hardcoding one.
+    // A failure here must never take the browser down: the surface is the
+    // product, the sidebar is an extra.
+    let sidebar = match sidebar::spawn() {
+        Ok(sidebar) => {
+            sidebar::emit_declare(session, &sidebar.control_url);
+            Some(sidebar)
+        }
+        Err(error) => {
+            eprintln!("ychrome: sidebar unavailable ({error})");
+            None
+        }
+    };
     eprintln!("ychrome: web surface open — {url} [{profile}]  (Ctrl+C to close, Ctrl+Z / yggterm Zzz to suspend)");
     let mut ticks: u32 = 0;
     let mut last_tick = std::time::Instant::now();
@@ -204,13 +219,26 @@ fn run_thin_client(session: &str, url: &str, title: &str, profile: &str) -> Resu
         // "open" with an unchanged URL is liveness-idempotent GUI-side.
         if last_tick.elapsed() > Duration::from_secs(3) {
             emit_web_surface_osc("open", session, url, title, profile);
+            if let Some(sidebar) = &sidebar {
+                sidebar::emit_declare(session, &sidebar.control_url);
+            }
         }
         last_tick = std::time::Instant::now();
         ticks += 1;
         // Heartbeat every ~4s (20 × 200ms) — the GUI's liveness truth.
         if ticks.is_multiple_of(20) {
             emit_web_surface_osc("heartbeat", session, url, title, profile);
+            // Re-declaring IS the sidebar's heartbeat: it is idempotent, and
+            // the GUI expires a contribution whose declares stop, so a SIGKILLed
+            // ychrome never leaves phantom buttons in the rail.
+            if let Some(sidebar) = &sidebar {
+                sidebar::emit_declare(session, &sidebar.control_url);
+            }
         }
+    }
+    if let Some(sidebar) = &sidebar {
+        sidebar::emit_close(session);
+        sidebar.stop();
     }
     emit_web_surface_osc("close", session, url, title, profile);
     eprintln!("ychrome: web surface closed");
