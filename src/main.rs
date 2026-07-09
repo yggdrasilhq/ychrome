@@ -192,10 +192,20 @@ fn run_thin_client(session: &str, url: &str, title: &str, profile: &str) -> Resu
         .context("installing Ctrl+C handler")?;
     }
     emit_web_surface_osc("open", session, url, title, profile);
-    eprintln!("ychrome: web surface open — {url} [{profile}]  (Ctrl+C to close)");
+    eprintln!("ychrome: web surface open — {url} [{profile}]  (Ctrl+C to close, Ctrl+Z / yggterm Zzz to suspend)");
     let mut ticks: u32 = 0;
+    let mut last_tick = std::time::Instant::now();
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(200));
+        // A large gap between ticks means we were suspended (Ctrl+Z /
+        // SIGSTOP — yggterm's Zzz button) or the machine slept, and the GUI
+        // may have closed or swept the surface meanwhile. Re-emit "open" on
+        // resume: heartbeats deliberately cannot re-CREATE a surface, and an
+        // "open" with an unchanged URL is liveness-idempotent GUI-side.
+        if last_tick.elapsed() > Duration::from_secs(3) {
+            emit_web_surface_osc("open", session, url, title, profile);
+        }
+        last_tick = std::time::Instant::now();
         ticks += 1;
         // Heartbeat every ~4s (20 × 200ms) — the GUI's liveness truth.
         if ticks.is_multiple_of(20) {
@@ -577,8 +587,18 @@ fn run_thin_client_picker(session: &str) -> Result<()> {
         eprintln!("ychrome: profile picker open — {picker_url}  (Ctrl+C to close)");
     }
     let mut ticks: u32 = 0;
+    let mut last_tick = std::time::Instant::now();
     while !stop.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(200));
+        // Suspend/resume gap (Ctrl+Z / yggterm Zzz / machine sleep): the GUI
+        // may have closed the surface, and heartbeats can't re-create one —
+        // re-announce the current target ("pick" re-announces itself; "open"
+        // is liveness-idempotent when nothing changed).
+        if last_tick.elapsed() > Duration::from_secs(3) {
+            let t = target.lock().unwrap();
+            emit_web_surface_osc(t.action, session, &t.url, &t.title, &t.profile);
+        }
+        last_tick = std::time::Instant::now();
         ticks += 1;
         if ticks.is_multiple_of(20) {
             let t = target.lock().unwrap();
