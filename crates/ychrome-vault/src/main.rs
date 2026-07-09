@@ -1,90 +1,255 @@
-//! `ychrome-vault` — host-resident vault access for agents and for validating
-//! the native Bitwarden client against a real server. The vault sidebar (in the
-//! yggterm GUI) will drive this same crate; this binary is the headless face.
+//! `ychrome-vault` — host-resident vault access for ychrome, its sidebar, and
+//! any agent or script on this machine. The native replacement for `rbw`.
 //!
-//! `status` — report configuration/lock state.
-//! `configure --server <url> --email <e>` — run prelogin, persist secret-free config.
-//! `check` (alias `unlock`) — read the master password from STDIN (use `read -rs`,
-//! never a flag or env var), unlock, sync, print an item summary, exit.
+//! Unlock once; the agent (a unix-socket daemon, auto-started on first need)
+//! caches the decrypted vault so `list`/`get`/`totp` are instant and keyless
+//! until an idle timeout drops it:
 //!
-//! Config lives on THIS host at `~/.yggterm/vault/config.json` (host-resident
-//! state — a libyggterm app owns its state where it runs).
+//! ```text
+//! read -rs PW; echo "$PW" | ychrome-vault unlock
+//! ychrome-vault get github.com          # password on stdout, rbw-compatible
+//! ychrome-vault totp github.com         # 6-digit code
+//! ychrome-vault list                    # name<TAB>user<TAB>folder
+//! ```
+//!
+//! Config and socket live on THIS host at `~/.yggterm/vault/` — host-resident
+//! state, as a libyggterm app owns its state where it runs. The master password
+//! is read from stdin only (never a flag, never an environment variable) and is
+//! dropped the moment the keys are derived.
 
-use anyhow::{Context, Result};
-use ychrome_vault::{VaultManager, VaultStatus};
+use std::io::{IsTerminal, Read};
+use std::path::PathBuf;
 
-fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let vault_dir = dirs::home_dir()
-        .context("no home directory")?
-        .join(".yggterm")
-        .join("vault");
-    let flag = |name: &str| -> Option<String> {
-        args.iter()
-            .position(|a| a == name)
-            .and_then(|i| args.get(i + 1))
-            .cloned()
-    };
-    let action = args.first().map(String::as_str).unwrap_or("status");
-    let mut manager = VaultManager::load(&vault_dir);
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+use serde_json::{Value, json};
+use ychrome_vault::VaultManager;
+use ychrome_vault::agent;
 
-    match action {
-        "status" => println!("{}", serde_json::to_string_pretty(&status_json(&manager))?),
-        "configure" => {
-            let server = flag("--server")
-                .context("usage: ychrome-vault configure --server <url> --email <email>")?;
-            let email = flag("--email")
-                .context("usage: ychrome-vault configure --server <url> --email <email>")?;
-            manager
-                .configure(&server, &email)
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            println!("{}", serde_json::to_string_pretty(&status_json(&manager))?);
-        }
-        "check" | "unlock" => {
-            if !manager.is_configured() {
-                anyhow::bail!(
-                    "not configured; run `ychrome-vault configure --server <url> --email <email>` first"
-                );
-            }
-            let mut password = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut password)
-                .context("reading master password from stdin")?;
-            let password = password.trim_end_matches(['\n', '\r']);
-            if password.is_empty() {
-                anyhow::bail!(
-                    "no master password on stdin (pipe it: `read -rs PW; echo \"$PW\" | ychrome-vault check`)"
-                );
-            }
-            let count = manager
-                .unlock(password)
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            let vault = manager.vault().expect("unlocked");
-            let items = vault.items();
-            let with_totp = items.iter().filter(|i| i.has_totp).count();
-            let sample: Vec<&str> = items.iter().take(8).map(|i| i.name.as_str()).collect();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "unlocked": true,
-                    "item_count": count,
-                    "items_with_totp": with_totp,
-                    "sample_names": sample,
-                }))?
-            );
-        }
-        other => anyhow::bail!("unknown action {other:?} (status | configure | check)"),
-    }
-    Ok(())
+#[derive(Parser)]
+#[command(name = "ychrome-vault", version, about = "ychrome's native Bitwarden/Vaultwarden client")]
+struct Cli {
+    /// Vault directory (config + agent socket). Default `~/.yggterm/vault`.
+    #[arg(long, global = true)]
+    dir: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
-fn status_json(manager: &VaultManager) -> serde_json::Value {
-    match manager.status() {
-        VaultStatus::NotConfigured => serde_json::json!({ "state": "not_configured" }),
-        VaultStatus::Locked { email, server_url } => {
-            serde_json::json!({ "state": "locked", "email": email, "server_url": server_url })
+#[derive(Subcommand)]
+enum Command {
+    /// Report configuration and lock state.
+    Status,
+    /// Fetch the account's KDF parameters and persist a secret-free config.
+    Configure {
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        email: String,
+        /// Idle seconds before the agent re-locks (0 = never).
+        #[arg(long)]
+        lock_timeout: Option<u64>,
+    },
+    /// Unlock the vault in the agent, reading the master password from stdin.
+    Unlock,
+    /// Drop the agent's decrypted vault.
+    Lock,
+    /// Re-pull the ciphers into the unlocked agent (no password needed).
+    Sync,
+    /// List items as `name<TAB>user<TAB>folder`, optionally filtered.
+    List {
+        query: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print an item's password (or another field) — `rbw get` parity.
+    Get {
+        name: String,
+        user: Option<String>,
+        /// One of: password, username, totp.
+        #[arg(long, default_value = "password")]
+        field: String,
+    },
+    /// Print an item's current TOTP code — `rbw code` parity.
+    #[command(alias = "code")]
+    Totp { name: String, user: Option<String> },
+    /// Resolve a page host to the ONE entry an auto-fill may use (strict rule).
+    Match { host: String },
+    /// Items the sidebar would float to the top for a host (loose rule, secret-free).
+    Suggest { host: String },
+    /// Ensure the agent is running (starting it if needed) and report state.
+    /// Touches no secrets and no network — the sidebar calls this on open.
+    Ping,
+    /// Run the agent in the foreground (normally auto-started on demand).
+    Agent,
+    /// Unlock in-process and print a summary — validates the client end to end.
+    Check,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let dir = match cli.dir {
+        Some(dir) => dir,
+        None => dirs::home_dir()
+            .context("no home directory")?
+            .join(".yggterm")
+            .join("vault"),
+    };
+
+    match cli.command.unwrap_or(Command::Status) {
+        Command::Agent => agent::serve(&dir),
+        Command::Ping => {
+            agent::request_autostart(&dir, &json!({"op": "ping"}))?;
+            print_json(&agent::request(&dir, &json!({"op": "status"}))?)
         }
-        VaultStatus::Unlocked { email, item_count } => {
-            serde_json::json!({ "state": "unlocked", "email": email, "item_count": item_count })
+        Command::Status => {
+            // The agent is the source of truth when it is running (only it
+            // knows whether the vault is unlocked); otherwise read the config.
+            let status = if agent::is_running(&dir) {
+                let mut response = agent::request(&dir, &json!({"op": "status"}))?;
+                response["agent"] = json!(true);
+                response
+            } else {
+                let mut status = agent::status_json(&VaultManager::load(&dir));
+                status["agent"] = json!(false);
+                status
+            };
+            print_json(&status)
+        }
+        Command::Configure {
+            server,
+            email,
+            lock_timeout,
+        } => {
+            let mut manager = VaultManager::load(&dir);
+            manager
+                .configure(&server, &email)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if let Some(seconds) = lock_timeout {
+                manager
+                    .set_lock_timeout(seconds)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            }
+            // A running agent still holds the OLD account's keys.
+            if agent::is_running(&dir) {
+                agent::request(&dir, &json!({"op": "lock"})).ok();
+            }
+            print_json(&agent::status_json(&manager))
+        }
+        Command::Unlock => {
+            if !VaultManager::load(&dir).is_configured() {
+                bail!(
+                    "not configured — run `ychrome-vault configure --server <url> --email <email>` first"
+                );
+            }
+            let password = read_master_password()?;
+            let response =
+                agent::request_autostart(&dir, &json!({"op": "unlock", "password": password}))?;
+            print_json(&json!({
+                "unlocked": true,
+                "item_count": response["item_count"],
+            }))
+        }
+        Command::Lock => print_json(&agent::request(&dir, &json!({"op": "lock"}))?),
+        Command::Sync => print_json(&agent::request(&dir, &json!({"op": "sync"}))?),
+        Command::List { query, json } => {
+            let response = agent::request(&dir, &json!({"op": "list", "query": query}))?;
+            let items = response["items"].as_array().cloned().unwrap_or_default();
+            if json {
+                return print_json(&response["items"]);
+            }
+            // `name<TAB>user<TAB>folder` — the shape `rbw list --fields
+            // name,user,folder` printed, so existing scripts keep parsing.
+            for item in items {
+                println!(
+                    "{}\t{}\t{}",
+                    item["name"].as_str().unwrap_or(""),
+                    item["username"].as_str().unwrap_or(""),
+                    item["folder"].as_str().unwrap_or(""),
+                );
+            }
+            Ok(())
+        }
+        Command::Get { name, user, field } => {
+            let entry = match field.as_str() {
+                "totp" => {
+                    let response =
+                        agent::request(&dir, &json!({"op": "totp", "name": name, "user": user}))?;
+                    println!("{}", string_field(&response, "code"));
+                    return Ok(());
+                }
+                "password" | "username" => {
+                    agent::request(&dir, &json!({"op": "get", "name": name, "user": user}))?
+                }
+                other => bail!("unknown --field {other:?} (password | username | totp)"),
+            };
+            println!("{}", string_field(&entry["entry"], &field));
+            Ok(())
+        }
+        Command::Totp { name, user } => {
+            let response = agent::request(&dir, &json!({"op": "totp", "name": name, "user": user}))?;
+            println!("{}", string_field(&response, "code"));
+            Ok(())
+        }
+        Command::Match { host } => {
+            print_json(&agent::request(&dir, &json!({"op": "match", "host": host}))?["entry"])
+        }
+        Command::Suggest { host } => {
+            print_json(&agent::request(&dir, &json!({"op": "suggest", "host": host}))?["items"])
+        }
+        Command::Check => {
+            let mut manager = VaultManager::load(&dir);
+            if !manager.is_configured() {
+                bail!("not configured; run `ychrome-vault configure --server <url> --email <email>`");
+            }
+            let password = read_master_password()?;
+            let count = manager
+                .unlock(&password)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let vault = manager.vault().expect("unlocked");
+            let items = vault.items();
+            let with_totp = items.iter().filter(|item| item.has_totp).count();
+            let sample: Vec<&str> = items.iter().take(8).map(|item| item.name.as_str()).collect();
+            // Prove the URI index is live too — this is what `rbw list` never had.
+            let with_uris = items.iter().filter(|item| !item.uris.is_empty()).count();
+            print_json(&json!({
+                "unlocked": true,
+                "item_count": count,
+                "items_with_totp": with_totp,
+                "items_with_uris": with_uris,
+                "sample_names": sample,
+            }))
         }
     }
+}
+
+/// The master password comes from stdin and nowhere else. A terminal on stdin
+/// means the user typed `ychrome-vault unlock` with no pipe — reading it there
+/// would echo the password into their scrollback, so refuse and show the
+/// no-echo incantation instead.
+fn read_master_password() -> Result<String> {
+    if std::io::stdin().is_terminal() {
+        bail!(
+            "pipe the master password in without echoing it:\n    \
+             read -rs PW; echo \"$PW\" | ychrome-vault unlock"
+        );
+    }
+    let mut password = String::new();
+    std::io::stdin()
+        .read_to_string(&mut password)
+        .context("reading the master password from stdin")?;
+    let password = password.trim_end_matches(['\n', '\r']).to_string();
+    if password.is_empty() {
+        bail!("no master password on stdin");
+    }
+    Ok(password)
+}
+
+fn string_field(value: &Value, key: &str) -> String {
+    value[key].as_str().unwrap_or_default().to_string()
+}
+
+fn print_json(value: &Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
 }

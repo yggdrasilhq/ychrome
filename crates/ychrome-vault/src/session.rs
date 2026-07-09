@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::api::{ApiError, Client};
 use crate::crypto::{Kdf, MasterKey};
@@ -18,12 +19,22 @@ use crate::model::Vault;
 pub enum VaultError {
     #[error("the vault is not configured yet")]
     NotConfigured,
+    #[error("the vault is locked")]
+    Locked,
     #[error(transparent)]
     Api(#[from] ApiError),
     #[error(transparent)]
     Crypto(#[from] crate::crypto::CryptoError),
     #[error("config storage: {0}")]
     Io(String),
+}
+
+/// How long an idle unlocked vault stays unlocked in the agent, when the
+/// config does not say otherwise. Zero means "never auto-lock".
+pub const DEFAULT_LOCK_TIMEOUT_SECS: u64 = 3_600;
+
+fn default_lock_timeout_secs() -> u64 {
+    DEFAULT_LOCK_TIMEOUT_SECS
 }
 
 /// Persisted, secret-free configuration.
@@ -38,6 +49,9 @@ pub struct VaultConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kdf_parallelism: Option<u32>,
     pub device_id: String,
+    /// Idle seconds before the agent drops the unlocked vault. 0 = never.
+    #[serde(default = "default_lock_timeout_secs")]
+    pub lock_timeout_secs: u64,
 }
 
 impl VaultConfig {
@@ -59,11 +73,15 @@ pub enum VaultStatus {
     Unlocked { email: String, item_count: usize },
 }
 
-/// Owns the vault config and the unlocked session. One per GUI process.
+/// Owns the vault config and the unlocked session. One per agent process.
 pub struct VaultManager {
     dir: PathBuf,
     config: Option<VaultConfig>,
     vault: Option<Vault>,
+    /// Bearer token from the last successful unlock, held so `resync` (and
+    /// cipher writes) never need the master password a second time. Dropped
+    /// by `lock` together with the vault.
+    access_token: Option<Zeroizing<String>>,
 }
 
 impl VaultManager {
@@ -78,6 +96,7 @@ impl VaultManager {
             dir,
             config,
             vault: None,
+            access_token: None,
         }
     }
 
@@ -105,6 +124,23 @@ impl VaultManager {
 
     pub fn vault(&self) -> Option<&Vault> {
         self.vault.as_ref()
+    }
+
+    pub fn config(&self) -> Option<&VaultConfig> {
+        self.config.as_ref()
+    }
+
+    /// Idle-lock timeout from the config (0 = never auto-lock).
+    pub fn lock_timeout_secs(&self) -> u64 {
+        self.config
+            .as_ref()
+            .map(|config| config.lock_timeout_secs)
+            .unwrap_or(DEFAULT_LOCK_TIMEOUT_SECS)
+    }
+
+    /// The bearer token of the current session, for cipher writes.
+    pub fn access_token(&self) -> Option<&str> {
+        self.access_token.as_deref().map(String::as_str)
     }
 
     /// Contact the server for the account's KDF parameters and persist the
@@ -140,10 +176,24 @@ impl VaultManager {
                 _ => None,
             },
             device_id,
+            lock_timeout_secs: self
+                .config
+                .as_ref()
+                .map(|config| config.lock_timeout_secs)
+                .unwrap_or(DEFAULT_LOCK_TIMEOUT_SECS),
         };
         self.persist(&config)?;
         self.config = Some(config);
-        self.vault = None;
+        self.lock();
+        Ok(())
+    }
+
+    /// Persist a new idle-lock timeout (0 = never).
+    pub fn set_lock_timeout(&mut self, seconds: u64) -> Result<(), VaultError> {
+        let mut config = self.config.clone().ok_or(VaultError::NotConfigured)?;
+        config.lock_timeout_secs = seconds;
+        self.persist(&config)?;
+        self.config = Some(config);
         Ok(())
     }
 
@@ -168,18 +218,35 @@ impl VaultManager {
         let vault = Vault::new(user_key, ciphers, folders);
         let count = vault.len();
         self.vault = Some(vault);
+        self.access_token = Some(Zeroizing::new(token.access_token));
         Ok(count)
     }
 
-    /// Drop the in-memory vault (keys zeroize). Config is kept.
-    pub fn lock(&mut self) {
-        self.vault = None;
+    /// Test-only: install an already-decrypted vault, so the agent's op layer
+    /// can be exercised without a server or a master password.
+    #[cfg(test)]
+    pub(crate) fn install_vault_for_test(&mut self, vault: Vault) {
+        self.vault = Some(vault);
     }
 
-    /// Re-sync an already-unlocked vault by re-deriving from the master
-    /// password. (Refresh-token reuse is a later optimization.)
-    pub fn resync(&mut self, master_password: &str) -> Result<usize, VaultError> {
-        self.unlock(master_password)
+    /// Drop the in-memory vault and its bearer token (keys zeroize). Config
+    /// is kept.
+    pub fn lock(&mut self) {
+        self.vault = None;
+        self.access_token = None;
+    }
+
+    /// Re-pull the ciphers with the session's bearer token, keeping the same
+    /// user key. The master password is NOT needed — that is the whole point
+    /// of holding the token: an agent can refresh a long-lived unlock.
+    pub fn resync(&mut self) -> Result<usize, VaultError> {
+        let config = self.config.clone().ok_or(VaultError::NotConfigured)?;
+        let token = self.access_token.clone().ok_or(VaultError::Locked)?;
+        let vault = self.vault.as_mut().ok_or(VaultError::Locked)?;
+        let client = Client::new(&config.server_url)?;
+        let (ciphers, folders) = client.sync(&token)?;
+        vault.replace_contents(ciphers, folders);
+        Ok(vault.len())
     }
 
     fn persist(&self, config: &VaultConfig) -> Result<(), VaultError> {
@@ -242,6 +309,7 @@ mod tests {
             kdf_memory: None,
             kdf_parallelism: None,
             device_id: new_device_id(),
+            lock_timeout_secs: DEFAULT_LOCK_TIMEOUT_SECS,
         };
         mgr.persist(&config).unwrap();
         let reloaded = VaultManager::load(&dir);
