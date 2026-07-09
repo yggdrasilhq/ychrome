@@ -96,6 +96,52 @@ enum Command {
         #[arg(long)]
         no_symbols: bool,
     },
+    /// Change fields on an existing item. Fields you do not name are preserved
+    /// — including the notes, custom fields, favorite flag and password history
+    /// this client does not otherwise model.
+    Edit {
+        name: String,
+        user: Option<String>,
+        /// New item name.
+        #[arg(long)]
+        rename: Option<String>,
+        /// New username.
+        #[arg(long)]
+        set_user: Option<String>,
+        /// Replaces the item's entire uri list with this one uri.
+        #[arg(long)]
+        uri: Option<String>,
+        #[arg(long)]
+        totp: Option<String>,
+        #[arg(long)]
+        notes: Option<String>,
+        /// Move the item to this existing folder.
+        #[arg(long)]
+        folder: Option<String>,
+        /// Read a new password from stdin. The old one is kept in the item's
+        /// password history.
+        #[arg(long)]
+        password: bool,
+        /// Roll a new password instead of reading one (echoed once).
+        #[arg(long, conflicts_with = "password")]
+        generate: bool,
+        #[arg(long, default_value_t = ychrome_vault::DEFAULT_LENGTH)]
+        length: usize,
+        #[arg(long)]
+        no_symbols: bool,
+    },
+    /// Delete an item — `rbw remove` parity, but recoverable by default.
+    ///
+    /// The item moves to the vault's trash, where any Bitwarden client can
+    /// restore it. `--permanent` destroys it instead: no trash copy, no undo.
+    #[command(alias = "remove")]
+    Rm {
+        name: String,
+        user: Option<String>,
+        /// Destroy the item outright instead of trashing it. Irreversible.
+        #[arg(long)]
+        permanent: bool,
+    },
     /// Roll a password without touching the vault.
     Generate {
         #[arg(default_value_t = ychrome_vault::DEFAULT_LENGTH)]
@@ -273,6 +319,55 @@ fn main() -> Result<()> {
                 "added": response["name"],
                 "id": response["id"],
                 "generated_password": response["generated_password"],
+            }))
+        }
+        Command::Edit {
+            name,
+            user,
+            rename,
+            set_user,
+            uri,
+            totp,
+            notes,
+            folder,
+            password,
+            generate,
+            length,
+            no_symbols,
+        } => {
+            let password = password.then(|| read_secret("new password")).transpose()?;
+            let response = agent::request(
+                &dir,
+                &json!({
+                    "op": "edit", "name": name, "user": user,
+                    "rename": rename, "set_user": set_user, "uri": uri,
+                    "totp": totp, "notes": notes, "folder": folder,
+                    "password": password,
+                    "generate": generate, "length": length, "symbols": !no_symbols,
+                }),
+            )?;
+            print_json(&json!({
+                "edited": response["name"],
+                "id": response["id"],
+                "generated_password": response["generated_password"],
+            }))
+        }
+        Command::Rm {
+            name,
+            user,
+            permanent,
+        } => {
+            let response = agent::request(
+                &dir,
+                &json!({"op": "rm", "name": name, "user": user, "permanent": permanent}),
+            )?;
+            print_json(&json!({
+                "removed": response["name"],
+                "id": response["id"],
+                // Which of the two operations actually happened. They are not
+                // interchangeable: only a trashed item can be restored.
+                "trashed": response["trashed"],
+                "permanent": response["permanent"],
             }))
         }
         Command::Match { host } => {

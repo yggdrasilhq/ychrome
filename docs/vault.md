@@ -118,6 +118,8 @@ ychrome-vault list                               # name<TAB>user<TAB>folder
 ychrome-vault match chat.example.com                  # what an auto-fill may use
 ychrome-vault generate 24                        # local dice, no vault touched
 ychrome-vault add example.com alice --generate --uri https://example.com
+ychrome-vault edit example.com alice --generate   # rotate the password
+ychrome-vault rm example.com alice                # to the trash, restorable
 ychrome-vault lock
 ychrome-vault stop-agent                          # after every rebuild
 ```
@@ -137,6 +139,8 @@ terminal on stdin is refused rather than echoed into the user's scrollback.
 | `rbw lock` | `ychrome-vault lock` |
 | `rbw add NAME [USER]` | `ychrome-vault add NAME [USER]` |
 | `rbw generate` | `ychrome-vault generate` |
+| `rbw remove NAME [USER]` | `ychrome-vault rm NAME [USER]` (trash, not destroy) |
+| — (rbw has none) | `ychrome-vault edit NAME [USER]` |
 
 ## Writes
 
@@ -144,12 +148,47 @@ terminal on stdin is refused rather than echoed into the user's scrollback.
 EncStrings to `/api/ciphers`; the server never sees plaintext. `--generate`
 rolls the password here, so it never crosses a shell's argv.
 
-There is deliberately **no `edit`/`update`.** A Bitwarden `PUT` replaces the
-whole cipher, and `sync` only parses the fields this client models — rebuilding
-a cipher from `RawCipher` would silently drop the item's notes, custom fields,
-favorite flag and password history. Doing it safely means retaining each
-cipher's raw JSON from `sync` and patching that. Until then, edit in a Bitwarden
-client. `rbw` has no edit either, so this is not a parity gap.
+### `edit` patches the raw record, it does not rebuild one
+
+A Bitwarden `PUT /api/ciphers/{id}` replaces the **whole** cipher. The server
+assigns unconditionally — `cipher.notes = data.notes` — so a field missing from
+the request is not left alone, it is destroyed. `sync` only parses the fields
+this client models, so a body rebuilt from `RawCipher` would silently drop every
+item's notes, custom fields, favorite flag and password history.
+
+So `RawCipher` keeps the untouched `raw` JSON from `sync`, and `Vault::edit_body`
+patches *that*:
+
+- Server-managed keys (`id`, `revisionDate`, `collectionIds`, …) are stripped by
+  a **denylist**, not an allowlist — a field Bitwarden adds in a future version
+  rides back untouched instead of being dropped by a client written before it.
+- Patched fields are encrypted under the **cipher's** key (its own item key, or
+  its organization's), never blindly under the user key. Getting this wrong is
+  invisible: the MAC check fails and `items()` silently skips the item.
+- The raw `revisionDate` is echoed as `lastKnownRevisionDate`, so a server whose
+  copy moved on since our last sync **refuses** the write ("The client copy of
+  this cipher is out of date") instead of clobbering another client's edit.
+- Replacing a password prepends the OLD ciphertext to `passwordHistory`, reusing
+  it verbatim rather than re-encrypting.
+- Clearing a field is **not** expressible: `--notes ""` is rejected rather than
+  quietly encrypting an empty string. That needs its own verb.
+
+### `rm` trashes by default
+
+The two delete routes are different operations, and the difference is
+unrecoverable. Verified against the deployed vaultwarden commit (`f21a3ada`,
+2025.12.0) rather than from memory — an earlier note in this campaign had them
+backwards, which would have destroyed items while reporting them recoverable:
+
+| call | route | effect |
+| --- | --- | --- |
+| `ychrome-vault rm` | `PUT /api/ciphers/{id}/delete` | `SoftSingle` → trash, restorable from any client |
+| `ychrome-vault rm --permanent` | `DELETE /api/ciphers/{id}` | `HardSingle` → gone, no trash copy, no undo |
+
+Soft is the default at every layer, and the CLI reports which one happened
+(`"trashed": true` vs `"permanent": true`). `rbw remove` hard-deletes; this is
+deliberately safer than parity. `rm` is **not** wired into the sidebar — a
+destructive verb needs its contract confirmed before it gets a button.
 
 ## What is proven, and what is not
 
@@ -165,8 +204,14 @@ client. `rbw` has no edit either, so this is not a parity gap.
 - **Encrypt** — pinned known-answer vector, cross-checked against an
   independently written sealer, plus IV-coverage and wrong-key rejection. A
   round-trip test alone would pass even if encrypt and decrypt drifted together.
-- **`add` against a real server** — NOT yet exercised. The body is proven
-  correct (every field decrypts back, no plaintext in the request), but no item
-  has been created on `vault.example.com`.
+- **`add` against a real server** — proven on `vault.example.com`: an item was created,
+  `cipher_count` went 1107 → 1108, `get` round-tripped the exact generated
+  password, and `match` resolved it by its stored URI.
+- **`edit` / `rm` against a real server** — NOT yet exercised. The bodies and the
+  route selection are covered by `cargo test` (preservation of unmodelled fields,
+  cipher-key vs user-key encryption, org ciphers, PascalCase drift, the password
+  history prepend, the `lastKnownRevisionDate` guard), and the soft-vs-hard
+  routes were read off the deployed server's source — but no cipher on
+  `vault.example.com` has yet been edited or trashed by this client.
 - **Passkeys** (`fido2Credentials`) — not started. Needs a
   `navigator.credentials` shim, because WebKitGTK has no WebAuthn.

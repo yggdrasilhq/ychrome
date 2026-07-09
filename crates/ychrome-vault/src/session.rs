@@ -25,6 +25,8 @@ pub enum VaultError {
     Api(#[from] ApiError),
     #[error(transparent)]
     Crypto(#[from] crate::crypto::CryptoError),
+    #[error(transparent)]
+    Edit(#[from] crate::model::EditError),
     #[error("config storage: {0}")]
     Io(String),
 }
@@ -260,6 +262,47 @@ impl VaultManager {
         let id = client.create_cipher(&token, &body)?;
         self.resync()?;
         Ok(id)
+    }
+
+    /// Patch an existing item and re-sync. Only the fields named in `edit`
+    /// change; everything else on the cipher — including what this client does
+    /// not model — is carried back verbatim by [`Vault::edit_body`].
+    ///
+    /// If the server's copy has moved on since our last sync, the write is
+    /// REFUSED (`lastKnownRevisionDate`) rather than clobbering the other
+    /// client's change. Run `sync` and retry.
+    ///
+    /// [`Vault::edit_body`]: crate::model::Vault::edit_body
+    pub fn edit_item(
+        &mut self,
+        id: &str,
+        edit: &crate::model::CipherEdit,
+    ) -> Result<(), VaultError> {
+        let config = self.config.clone().ok_or(VaultError::NotConfigured)?;
+        let token = self.access_token.clone().ok_or(VaultError::Locked)?;
+        let vault = self.vault.as_ref().ok_or(VaultError::Locked)?;
+        let body = vault.edit_body(id, edit)?;
+        let client = Client::new(&config.server_url)?;
+        client.update_cipher(&token, id, &body)?;
+        self.resync()?;
+        Ok(())
+    }
+
+    /// Delete an item and re-sync.
+    ///
+    /// `permanent == false` (the default everywhere above this) moves it to the
+    /// vault's trash, where any Bitwarden client can restore it. `permanent ==
+    /// true` destroys it outright, with no trash copy and no undo.
+    pub fn remove_item(&mut self, id: &str, permanent: bool) -> Result<(), VaultError> {
+        let config = self.config.clone().ok_or(VaultError::NotConfigured)?;
+        let token = self.access_token.clone().ok_or(VaultError::Locked)?;
+        if self.vault.is_none() {
+            return Err(VaultError::Locked);
+        }
+        let client = Client::new(&config.server_url)?;
+        client.delete_cipher(&token, id, permanent)?;
+        self.resync()?;
+        Ok(())
     }
 
     /// Re-pull the ciphers with the session's bearer token, keeping the same

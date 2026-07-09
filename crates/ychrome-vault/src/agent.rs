@@ -392,6 +392,91 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
                 "generated_password": generate.then_some(password).flatten(),
             }))
         }
+        // Patch an existing item. Every field the caller does not name — notes,
+        // custom fields, favorite, password history — survives verbatim; see
+        // `Vault::edit_body`.
+        "edit" => {
+            // Refuse on the lock before anything else, so a write op fails on
+            // the safety condition rather than on a missing argument.
+            unlocked(&state)?;
+            let name = string("name").ok_or_else(|| anyhow!("edit needs a name"))?;
+            let generate = request
+                .get("generate")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let password = if generate {
+                let length = request
+                    .get("length")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(crate::generator::DEFAULT_LENGTH as u64) as usize;
+                let symbols = request
+                    .get("symbols")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                Some(crate::generator::generate_password(length, symbols).to_string())
+            } else {
+                string("password")
+            };
+            let folder_id = match string("folder") {
+                Some(folder) => Some(
+                    unlocked(&state)?
+                        .folder_id(&folder)
+                        .ok_or_else(|| anyhow!("no vault folder named {folder:?}"))?,
+                ),
+                None => None,
+            };
+            let edit = crate::model::CipherEdit {
+                name: string("rename"),
+                username: string("set_user"),
+                password: password.clone(),
+                totp: string("totp"),
+                uri: string("uri"),
+                notes: string("notes"),
+                folder_id,
+            };
+            if edit.is_empty() {
+                bail!("edit needs at least one field to change");
+            }
+            let vault = unlocked(&state)?;
+            let items = vault.items();
+            let item = resolve(&items, &name, string("user").as_deref())?;
+            let (id, name) = (item.id.clone(), item.name.clone());
+            state
+                .manager
+                .edit_item(&id, &edit)
+                .map_err(|error| anyhow!(error.to_string()))?;
+            state.touch();
+            Ok(json!({
+                "id": id,
+                "name": name,
+                "generated_password": generate.then_some(password).flatten(),
+            }))
+        }
+        // Delete an item. Soft by default: it lands in the vault's trash and any
+        // Bitwarden client can restore it. `permanent` destroys it outright —
+        // the caller must ask for that explicitly, and there is no undo.
+        "rm" => {
+            let name = string("name").ok_or_else(|| anyhow!("rm needs a name"))?;
+            let permanent = request
+                .get("permanent")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let vault = unlocked(&state)?;
+            let items = vault.items();
+            let item = resolve(&items, &name, string("user").as_deref())?;
+            let (id, name) = (item.id.clone(), item.name.clone());
+            state
+                .manager
+                .remove_item(&id, permanent)
+                .map_err(|error| anyhow!(error.to_string()))?;
+            state.touch();
+            Ok(json!({
+                "id": id,
+                "name": name,
+                "permanent": permanent,
+                "trashed": !permanent,
+            }))
+        }
         // Account for every cipher the server sent: how many we can read, and
         // why we cannot read the rest.
         "diagnose" => {
@@ -629,7 +714,9 @@ mod tests {
         let status = dispatch(&json!({"op": "status"}), &state).unwrap();
         assert_eq!(status["state"], "not_configured");
 
-        for op in ["list", "get", "totp", "match", "suggest"] {
+        // The write ops refuse on the LOCK, not on a missing argument — a
+        // destructive verb must never get as far as resolving a target.
+        for op in ["list", "get", "totp", "match", "suggest", "rm", "edit"] {
             let error = dispatch(
                 &json!({"op": op, "name": "x", "host": "example.com"}),
                 &state,
@@ -727,6 +814,32 @@ mod tests {
         assert!(suggested[0].get("password").is_none());
 
         assert!(dispatch(&json!({"op": "get", "name": "nope"}), &state).is_err());
+    }
+
+    // An `edit` that names no field to change must not reach the network. The
+    // guard runs on an UNLOCKED vault, so it cannot be mistaken for a refusal
+    // to open the vault at all.
+    #[test]
+    fn edit_refuses_a_change_that_changes_nothing() {
+        let state = synthetic_state();
+        let error = dispatch(&json!({"op": "edit", "name": "github"}), &state)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at least one field"), "{error}");
+
+        // An ambiguous or unknown target is rejected before any write, with the
+        // same wording the read ops use.
+        let error = dispatch(
+            &json!({"op": "edit", "name": "nope", "rename": "x"}),
+            &state,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no vault entry named"), "{error}");
+        let error = dispatch(&json!({"op": "rm", "name": "nope"}), &state)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no vault entry named"), "{error}");
     }
 
     // `lock` must make the cached vault unreachable immediately.

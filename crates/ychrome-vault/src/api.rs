@@ -207,12 +207,19 @@ impl Client {
 
         let mut ciphers = Vec::new();
         for cipher in get_array(&value, "ciphers") {
-            // Deleted items carry a deletedDate; skip them.
+            // Deleted items carry a deletedDate; skip them. A soft-deleted
+            // (trashed) item therefore leaves the item list on the next sync.
             if get_str(cipher, "deletedDate").is_some() {
                 continue;
             }
             let login = get_ci(cipher, "login");
             ciphers.push(RawCipher {
+                // The whole record, verbatim. An update PUT replaces the entire
+                // cipher, so the fields this client does not model (notes,
+                // custom fields, favorite, password history, and anything
+                // Bitwarden adds later) can only survive an edit by being
+                // carried back from here. See `Vault::edit_body`.
+                raw: (*cipher).clone(),
                 id: get_str(cipher, "id").unwrap_or_default().to_string(),
                 folder_id: get_str(cipher, "folderId").map(str::to_string),
                 organization_id: get_str(cipher, "organizationId").map(str::to_string),
@@ -259,6 +266,74 @@ impl Client {
             .ok_or_else(|| ApiError::Malformed("create response has no id".into()))?
             .to_string())
     }
+
+    /// `PUT /api/ciphers/{id}` — replaces the WHOLE cipher.
+    ///
+    /// The server assigns unconditionally (`cipher.notes = data.notes`), so a
+    /// field missing from `body` is not "left alone", it is DESTROYED. Build
+    /// `body` with [`crate::model::Vault::edit_body`], which patches the raw
+    /// record `sync` returned rather than rebuilding one from the fields this
+    /// client happens to model.
+    pub fn update_cipher(
+        &self,
+        access_token: &str,
+        id: &str,
+        body: &Value,
+    ) -> Result<(), ApiError> {
+        let url = format!("{}/api/ciphers/{id}", self.base);
+        let resp = self
+            .http
+            .put(&url)
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .map_err(|error| ApiError::Network(error.to_string()))?;
+        ok_or_err(resp)
+    }
+
+    /// Delete a cipher. The two routes are NOT the same operation, and the
+    /// difference is unrecoverable — verified against the deployed vaultwarden
+    /// commit (`f21a3ada`, 2025.12.0), not from memory:
+    ///
+    /// * `permanent == false` → `PUT /api/ciphers/{id}/delete` → `SoftSingle`:
+    ///   the item moves to the trash and can be restored from any client.
+    /// * `permanent == true`  → `DELETE /api/ciphers/{id}` → `HardSingle`:
+    ///   the item is gone, with no trash copy.
+    ///
+    /// Soft is the default everywhere above this call.
+    pub fn delete_cipher(
+        &self,
+        access_token: &str,
+        id: &str,
+        permanent: bool,
+    ) -> Result<(), ApiError> {
+        let resp = if permanent {
+            self.http
+                .delete(format!("{}/api/ciphers/{id}", self.base))
+                .bearer_auth(access_token)
+                .send()
+        } else {
+            self.http
+                .put(format!("{}/api/ciphers/{id}/delete", self.base))
+                .bearer_auth(access_token)
+                .send()
+        }
+        .map_err(|error| ApiError::Network(error.to_string()))?;
+        ok_or_err(resp)
+    }
+}
+
+/// A write endpoint that answers with an empty body on success.
+fn ok_or_err(resp: reqwest::blocking::Response) -> Result<(), ApiError> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = resp.text().unwrap_or_default();
+    Err(ApiError::Http {
+        status: status.as_u16(),
+        body: body.chars().take(400).collect(),
+    })
 }
 
 /// `application/x-www-form-urlencoded` body. Percent-encodes every byte outside
