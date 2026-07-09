@@ -665,7 +665,7 @@ mod tests {
         ];
         let dir = temp_dir("synthetic");
         let mut manager = VaultManager::load(&dir);
-        manager.install_vault_for_test(Vault::new(user_key, ciphers, Default::default()));
+        manager.install_vault_for_test(Vault::new(user_key, Default::default(), ciphers, Default::default()));
         test_state(manager, dir)
     }
 

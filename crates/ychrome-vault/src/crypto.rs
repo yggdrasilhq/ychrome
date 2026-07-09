@@ -51,6 +51,14 @@ pub enum CryptoError {
     BadKeyLen(usize),
     #[error("decrypted value is not valid UTF-8")]
     NotUtf8,
+    #[error("not an asymmetric EncString (type {0}, want 3 or 4)")]
+    NotAsymmetric(u8),
+    #[error("RSA private key: {0}")]
+    RsaKey(String),
+    #[error("RSA decrypt failed (wrong key)")]
+    RsaDecrypt,
+    #[error("no key for organization {0} (not unwrapped at unlock)")]
+    MissingOrganizationKey(String),
 }
 
 /// Which key-derivation function protects the account (from `prelogin`).
@@ -326,6 +334,82 @@ impl std::fmt::Display for EncString {
     }
 }
 
+/// An RSA-wrapped EncString: `"4.<b64>"` (OAEP-SHA1) or `"3.<b64>"`
+/// (OAEP-SHA256). Bitwarden seals an **organization's** symmetric key to the
+/// user's public key this way, so an org cipher is unreadable until the org key
+/// has been unwrapped with the user's RSA private key.
+///
+/// Deliberately a separate type from [`EncString`]: it has no IV and no MAC,
+/// and the only things that ever arrive in this shape are key blobs. Types 5
+/// and 6 (RSA + an outer HMAC) are not produced by Vaultwarden and are refused
+/// rather than silently mis-parsed.
+#[derive(Debug, Clone)]
+pub struct AsymEncString {
+    oaep_sha256: bool,
+    ct: Vec<u8>,
+}
+
+impl AsymEncString {
+    pub fn parse(value: &str) -> Result<Self, CryptoError> {
+        let value = value.trim();
+        let (ty, rest) = value
+            .split_once('.')
+            .ok_or_else(|| CryptoError::MalformedEncString("missing type prefix".into()))?;
+        let ty: u8 = ty
+            .parse()
+            .map_err(|_| CryptoError::MalformedEncString(format!("bad type {ty:?}")))?;
+        let oaep_sha256 = match ty {
+            3 => true,
+            4 => false,
+            other => return Err(CryptoError::NotAsymmetric(other)),
+        };
+        if rest.contains('|') {
+            return Err(CryptoError::MalformedEncString(
+                "asymmetric EncString has no | parts".into(),
+            ));
+        }
+        Ok(AsymEncString {
+            oaep_sha256,
+            ct: decode_b64(Some(rest))?,
+        })
+    }
+}
+
+/// The user's RSA private key, as `profile.privateKey` carries it: a PKCS#8 DER
+/// blob, itself an [`EncString`] under the user key. Unwraps organization keys.
+///
+/// The `rsa` crate carries RUSTSEC-2023-0071 (Marvin — a timing side channel in
+/// PKCS#1 v1.5 / OAEP decryption). It is unfixed upstream and there is no pure
+/// Rust alternative; `rbw` and the official Bitwarden Rust SDK use the same
+/// crate. The exposure here is narrow: the only RSA decryptions we perform are
+/// of organization keys, once per unlock, against a server the user controls,
+/// with no attacker-chosen ciphertexts and no timing oracle to observe. Every
+/// per-item secret is symmetric (AES-CBC + HMAC) and never touches RSA.
+pub struct PrivateKey(rsa::RsaPrivateKey);
+
+impl PrivateKey {
+    pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, CryptoError> {
+        use rsa::pkcs8::DecodePrivateKey as _;
+        rsa::RsaPrivateKey::from_pkcs8_der(der)
+            .map(PrivateKey)
+            .map_err(|error| CryptoError::RsaKey(error.to_string()))
+    }
+
+    /// Unwrap an RSA-sealed blob — in practice, an organization's 64-byte
+    /// symmetric key.
+    pub fn decrypt(&self, enc: &AsymEncString) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+        let padding = if enc.oaep_sha256 {
+            rsa::Oaep::new::<Sha256>()
+        } else {
+            rsa::Oaep::new::<sha1::Sha1>()
+        };
+        self.0
+            .decrypt(padding, &enc.ct)
+            .map(Zeroizing::new)
+            .map_err(|_| CryptoError::RsaDecrypt)
+    }
+}
+
 fn decode_b64(part: Option<&str>) -> Result<Vec<u8>, CryptoError> {
     let part = part.ok_or_else(|| CryptoError::MalformedEncString("missing | part".into()))?;
     B64.decode(part.trim())
@@ -341,6 +425,67 @@ mod tests {
     /// the wire format moved.
     const PINNED_ENCRYPT_VECTOR: &str =
         "2.JCQkJCQkJCQkJCQkJCQkJA==|m2JG1xRlopnafzGD7/heTA==|docRQwq1qGqe7hMmsMIwB+Ak6B6joaSFE/AaR2kxDYY=";
+
+    // An organization's symmetric key arrives sealed to the user's PUBLIC key
+    // as a type-4 (RSA-OAEP-SHA1) EncString. Both fixtures were produced by
+    // openssl, not by us, so this is a cross-implementation check rather than a
+    // round-trip against ourselves. Without this path, every organization
+    // cipher fails its MAC check and vanishes from the item list.
+    #[test]
+    fn rsa_unwraps_an_organization_key() {
+        let der = B64
+            .decode(include_str!("../testdata/rsa_pkcs8_private_key.b64").trim())
+            .unwrap();
+        let private_key = PrivateKey::from_pkcs8_der(&der).unwrap();
+
+        let sealed = AsymEncString::parse(&format!(
+            "4.{}",
+            include_str!("../testdata/rsa_oaep_sha1_org_key.b64").trim()
+        ))
+        .unwrap();
+        let raw = private_key.decrypt(&sealed).unwrap();
+
+        assert_eq!(raw.len(), 64, "an org key is 32B enc + 32B mac");
+        assert!(raw.iter().all(|byte| *byte == 0x99));
+        assert!(SymmetricKey::from_bytes(&raw).is_ok());
+    }
+
+    #[test]
+    fn asym_encstring_refuses_symmetric_and_unsupported_types() {
+        assert!(matches!(
+            AsymEncString::parse("2.aXY=|Y3Q=|bWFj"),
+            Err(CryptoError::NotAsymmetric(2))
+        ));
+        // Types 5 and 6 wrap RSA in an outer HMAC; Vaultwarden emits neither,
+        // and guessing would silently mis-parse a key.
+        assert!(matches!(
+            AsymEncString::parse("5.YWJj"),
+            Err(CryptoError::NotAsymmetric(5))
+        ));
+        assert!(AsymEncString::parse("4.YWJj|ZGVm").is_err(), "no | parts");
+        assert!(AsymEncString::parse("3.YWJj").is_ok(), "OAEP-SHA256");
+        assert!(AsymEncString::parse("4.YWJj").is_ok(), "OAEP-SHA1");
+    }
+
+    // A key that did not seal the blob must not unwrap it.
+    #[test]
+    fn rsa_decrypt_is_bound_to_its_key() {
+        let der = B64
+            .decode(include_str!("../testdata/rsa_pkcs8_private_key.b64").trim())
+            .unwrap();
+        let private_key = PrivateKey::from_pkcs8_der(&der).unwrap();
+        // Same ciphertext, but claimed as OAEP-SHA256 — the label differs, so
+        // the unwrap must fail rather than return garbage.
+        let mislabelled = AsymEncString::parse(&format!(
+            "3.{}",
+            include_str!("../testdata/rsa_oaep_sha1_org_key.b64").trim()
+        ))
+        .unwrap();
+        assert!(matches!(
+            private_key.decrypt(&mislabelled),
+            Err(CryptoError::RsaDecrypt)
+        ));
+    }
 
     // Known-answer test for encrypt. The vector is pinned as a literal: a
     // round-trip test alone would still pass if encrypt and decrypt drifted

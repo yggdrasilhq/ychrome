@@ -225,9 +225,10 @@ impl VaultManager {
         let user_key_bytes = stretched.decrypt(&token.protected_user_key)?;
         let user_key = crate::crypto::SymmetricKey::from_bytes(&user_key_bytes)?;
 
-        let (ciphers, folders) = client.sync(&token.access_token)?;
-        let vault = Vault::new(user_key, ciphers, folders);
-        let count = vault.len();
+        let sync = client.sync(&token.access_token)?;
+        let organization_keys = unwrap_organization_keys(&user_key, &sync)?;
+        let vault = Vault::new(user_key, organization_keys, sync.ciphers, sync.folders);
+        let count = vault.items().len();
         self.vault = Some(vault);
         self.access_token = Some(Zeroizing::new(token.access_token));
         Ok(count)
@@ -267,11 +268,18 @@ impl VaultManager {
     pub fn resync(&mut self) -> Result<usize, VaultError> {
         let config = self.config.clone().ok_or(VaultError::NotConfigured)?;
         let token = self.access_token.clone().ok_or(VaultError::Locked)?;
-        let vault = self.vault.as_mut().ok_or(VaultError::Locked)?;
+        if self.vault.is_none() {
+            return Err(VaultError::Locked);
+        }
         let client = Client::new(&config.server_url)?;
-        let (ciphers, folders) = client.sync(&token)?;
-        vault.replace_contents(ciphers, folders);
-        Ok(vault.len())
+        let sync = client.sync(&token)?;
+        // Org membership can change between syncs, so the org keys are
+        // re-unwrapped rather than carried over.
+        let user_key = self.vault.as_ref().expect("checked").user_key().clone();
+        let organization_keys = unwrap_organization_keys(&user_key, &sync)?;
+        let vault = self.vault.as_mut().expect("checked");
+        vault.replace_contents(organization_keys, sync.ciphers, sync.folders);
+        Ok(vault.items().len())
     }
 
     fn persist(&self, config: &VaultConfig) -> Result<(), VaultError> {
@@ -283,6 +291,37 @@ impl VaultManager {
         std::fs::rename(&tmp, &path).map_err(|e| VaultError::Io(e.to_string()))?;
         Ok(())
     }
+}
+
+/// Decrypt the user's RSA private key with the user key, then unwrap each
+/// organization's symmetric key with it.
+///
+/// A failure to unwrap ONE org is not fatal: that org's ciphers stay
+/// undecryptable and `Vault::diagnose` counts them, which is strictly better
+/// than refusing to open the whole vault. An account in no orgs never touches
+/// RSA at all.
+fn unwrap_organization_keys(
+    user_key: &crate::crypto::SymmetricKey,
+    sync: &crate::api::SyncResponse,
+) -> Result<std::collections::HashMap<String, crate::crypto::SymmetricKey>, VaultError> {
+    if sync.organization_keys.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let Some(encrypted_private_key) = &sync.private_key else {
+        return Ok(std::collections::HashMap::new());
+    };
+    let der = user_key.decrypt(encrypted_private_key)?;
+    let private_key = crate::crypto::PrivateKey::from_pkcs8_der(&der)?;
+
+    let mut keys = std::collections::HashMap::new();
+    for (id, sealed) in &sync.organization_keys {
+        if let Ok(raw) = private_key.decrypt(sealed)
+            && let Ok(key) = crate::crypto::SymmetricKey::from_bytes(&raw)
+        {
+            keys.insert(id.clone(), key);
+        }
+    }
+    Ok(keys)
 }
 
 /// A random RFC-4122 v4 device identifier (Bitwarden wants a stable per-device

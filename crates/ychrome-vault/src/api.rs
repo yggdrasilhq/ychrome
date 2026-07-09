@@ -13,7 +13,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use serde_json::Value;
 
-use crate::crypto::{EncString, Kdf};
+use crate::crypto::{AsymEncString, EncString, Kdf};
 use crate::model::RawCipher;
 
 #[derive(Debug, thiserror::Error)]
@@ -44,6 +44,19 @@ pub struct TokenResponse {
     pub refresh_token: Option<String>,
     /// The user's symmetric key, encrypted under the stretched master key.
     pub protected_user_key: EncString,
+}
+
+/// Everything `sync` returns, still encrypted.
+pub struct SyncResponse {
+    pub ciphers: Vec<RawCipher>,
+    /// `folder_id -> encrypted name` (always under the user key).
+    pub folders: HashMap<String, EncString>,
+    /// The user's RSA private key, sealed under the user key. Absent on an
+    /// account that has never had one.
+    pub private_key: Option<EncString>,
+    /// `organization_id -> that org's symmetric key`, sealed to the user's
+    /// public key.
+    pub organization_keys: HashMap<String, AsymEncString>,
 }
 
 /// A thin client bound to one server base URL.
@@ -153,12 +166,8 @@ impl Client {
         })
     }
 
-    /// `GET /api/sync` → the raw ciphers and folder names (still encrypted).
-    /// Returns `(ciphers, folder_id -> encrypted_name)`.
-    pub fn sync(
-        &self,
-        access_token: &str,
-    ) -> Result<(Vec<RawCipher>, HashMap<String, EncString>), ApiError> {
+    /// `GET /api/sync` → everything needed to open the vault, still encrypted.
+    pub fn sync(&self, access_token: &str) -> Result<SyncResponse, ApiError> {
         let url = format!("{}/api/sync?excludeDomains=true", self.base);
         let resp = self
             .http
@@ -167,6 +176,25 @@ impl Client {
             .send()
             .map_err(|error| ApiError::Network(error.to_string()))?;
         let value = json_or_err(resp)?;
+
+        // The user's RSA private key (sealed under the user key) and, per
+        // organization, that org's symmetric key (sealed to the user's public
+        // key). Without these, every organization cipher is undecryptable —
+        // which is exactly how 59 of them silently vanished from the item list.
+        let profile = get_ci(&value, "profile");
+        let private_key = profile
+            .and_then(|profile| EncString::parse_opt(get_str(profile, "privateKey")).ok().flatten());
+        let mut organization_keys = HashMap::new();
+        if let Some(profile) = profile {
+            for organization in get_array(profile, "organizations") {
+                if let (Some(id), Some(key)) =
+                    (get_str(organization, "id"), get_str(organization, "key"))
+                    && let Ok(key) = AsymEncString::parse(key)
+                {
+                    organization_keys.insert(id.to_string(), key);
+                }
+            }
+        }
 
         let mut folders = HashMap::new();
         for folder in get_array(&value, "folders") {
@@ -206,7 +234,12 @@ impl Client {
                     .unwrap_or_default(),
             });
         }
-        Ok((ciphers, folders))
+        Ok(SyncResponse {
+            ciphers,
+            folders,
+            private_key,
+            organization_keys,
+        })
     }
 
     /// `POST /api/ciphers` → the created cipher's id. `body` must already be
