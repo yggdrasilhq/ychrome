@@ -3861,6 +3861,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "libc",
  "pbkdf2",
  "rand 0.8.6",
  "reqwest",

@@ -44,16 +44,55 @@ pub fn socket_path(dir: &Path) -> PathBuf {
     dir.join("agent.sock")
 }
 
+/// The agent's pid, written beside the socket.
+///
+/// `stop` is an op like any other, which means an agent old enough not to know
+/// it cannot be asked to leave — precisely the agent you most want gone after a
+/// rebuild. The pid file is the escape hatch: signal it instead.
+fn pid_path(dir: &Path) -> PathBuf {
+    dir.join("agent.pid")
+}
+
+fn read_pid(dir: &Path) -> Option<i32> {
+    std::fs::read_to_string(pid_path(dir))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 struct AgentState {
     manager: VaultManager,
     /// Bumped by every op that touches secrets; the idle-lock clock reads it.
     last_activity: Instant,
+    dir: PathBuf,
+    /// Set by the `stop` op; the connection handler exits once it has replied.
+    stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AgentState {
     fn touch(&mut self) {
         self.last_activity = Instant::now();
     }
+}
+
+/// Identifies the exact binary an agent is running: path plus mtime.
+///
+/// A vault agent outlives the binary that spawned it, so after a rebuild the
+/// old process keeps answering with old code — a `get` works, a newly added op
+/// comes back "unknown op", and the confusion is total. Clients compare this
+/// stamp against their own and say so.
+pub fn exe_stamp() -> String {
+    let Ok(path) = std::env::current_exe() else {
+        return String::new();
+    };
+    let mtime = std::fs::metadata(&path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    format!("{}@{mtime}", path.display())
 }
 
 /// Run the agent in the foreground, serving `dir/agent.sock` until killed.
@@ -76,10 +115,15 @@ pub fn serve(dir: &Path) -> Result<()> {
     let listener =
         UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::write(pid_path(dir), std::process::id().to_string())
+        .with_context(|| format!("writing {}", pid_path(dir).display()))?;
+    std::fs::set_permissions(pid_path(dir), std::fs::Permissions::from_mode(0o600))?;
 
     let state = Arc::new(Mutex::new(AgentState {
         manager: VaultManager::load(dir),
         last_activity: Instant::now(),
+        dir: dir.to_path_buf(),
+        stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }));
 
     spawn_idle_lock_thread(state.clone());
@@ -145,6 +189,15 @@ fn serve_connection(stream: UnixStream, state: &Arc<Mutex<AgentState>>) {
         if writeln!(writer, "{body}").is_err() || writer.flush().is_err() {
             return;
         }
+        // `stop` replies first, then takes the process down — the client must
+        // see "stopped" rather than a closed socket.
+        let stopping = state
+            .lock()
+            .map(|state| state.stop.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(false);
+        if stopping {
+            std::process::exit(0);
+        }
     }
 }
 
@@ -168,6 +221,16 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
         "lock" => {
             state.manager.lock();
             Ok(status_json(&state.manager))
+        }
+        // Drop the keys, unlink the socket, and exit once the reply is out.
+        // Unlinking here (rather than on the way down) means a client that
+        // immediately re-spawns cannot race a socket we are about to remove.
+        "stop" => {
+            state.manager.lock();
+            let _ = std::fs::remove_file(socket_path(&state.dir));
+            let _ = std::fs::remove_file(pid_path(&state.dir));
+            state.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!({ "stopped": true }))
         }
         "unlock" => {
             let password = request
@@ -271,6 +334,67 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             state.touch();
             Ok(json!({ "items": items }))
         }
+        // Create a login. The plaintext arrives over the 0600 socket, is
+        // encrypted under the user key here, and only EncStrings reach the
+        // server. A `generate` flag rolls the password locally so it never has
+        // to cross a shell's argv.
+        "add" => {
+            // Same refusal wording the read ops give, rather than the raw
+            // VaultError text.
+            unlocked(&state)?;
+            let name = string("name").ok_or_else(|| anyhow!("add needs a name"))?;
+            let generate = request
+                .get("generate")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let password = if generate {
+                let length = request
+                    .get("length")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(crate::generator::DEFAULT_LENGTH as u64) as usize;
+                let symbols = request
+                    .get("symbols")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                Some(crate::generator::generate_password(length, symbols).to_string())
+            } else {
+                string("password")
+            };
+            let login = crate::model::NewLogin {
+                name: name.clone(),
+                username: string("user"),
+                password: password.clone(),
+                totp: string("totp"),
+                uri: string("uri"),
+                notes: string("notes"),
+                folder_id: None,
+            };
+            let id = state
+                .manager
+                .add_login(&login)
+                .map_err(|error| anyhow!(error.to_string()))?;
+            state.touch();
+            // The generated password comes back so the caller can show it once;
+            // a caller-supplied one is never echoed.
+            Ok(json!({
+                "id": id,
+                "name": name,
+                "generated_password": generate.then_some(password).flatten(),
+            }))
+        }
+        // Roll a password without touching the vault (the sidebar's generator).
+        "generate" => {
+            let length = request
+                .get("length")
+                .and_then(Value::as_u64)
+                .unwrap_or(crate::generator::DEFAULT_LENGTH as u64) as usize;
+            let symbols = request
+                .get("symbols")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let password = crate::generator::generate_password(length, symbols);
+            Ok(json!({ "password": password.to_string() }))
+        }
         other => bail!("unknown op {other:?}"),
     }
 }
@@ -312,7 +436,7 @@ fn resolve<'a>(
 }
 
 pub fn status_json(manager: &VaultManager) -> Value {
-    match manager.status() {
+    let mut status = match manager.status() {
         VaultStatus::NotConfigured => json!({ "state": "not_configured" }),
         VaultStatus::Locked { email, server_url } => {
             json!({ "state": "locked", "email": email, "server_url": server_url })
@@ -323,7 +447,10 @@ pub fn status_json(manager: &VaultManager) -> Value {
             "item_count": item_count,
             "lock_timeout_secs": manager.lock_timeout_secs(),
         }),
-    }
+    };
+    status["version"] = json!(env!("CARGO_PKG_VERSION"));
+    status["exe_stamp"] = json!(exe_stamp());
+    status
 }
 
 /// Is an agent answering on this vault dir's socket?
@@ -346,16 +473,75 @@ pub fn request(dir: &Path, request: &Value) -> Result<Value> {
     let response: Value = serde_json::from_str(line.trim())
         .with_context(|| format!("agent sent a malformed response: {line:?}"))?;
     if response.get("ok").and_then(Value::as_bool) == Some(true) {
-        Ok(response)
-    } else {
-        Err(anyhow!(
-            response
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("agent refused the request")
-                .to_string()
-        ))
+        return Ok(response);
     }
+    let error = response
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("agent refused the request");
+    // The agent outlives the binary that spawned it. An op this binary knows
+    // but the agent does not means the running agent predates the rebuild —
+    // say so, instead of leaving the caller staring at "unknown op". `stop` is
+    // exempt: it is the remedy, and `stop()` has its own fallback for an agent
+    // too old to perform it.
+    let stopping = request.get("op").and_then(Value::as_str) == Some("stop");
+    if error.starts_with("unknown op") && !stopping {
+        bail!("{error} — the running agent predates this binary; run `ychrome-vault stop-agent`");
+    }
+    Err(anyhow!(error.to_string()))
+}
+
+/// Ask a running agent to drop its keys and exit. Returns false when none ran.
+///
+/// An agent predating the `stop` op cannot answer the request that would retire
+/// it, so fall back to signalling the pid file. An agent predating *that* is
+/// unreachable by any means we control, and says so rather than pretending.
+pub fn stop(dir: &Path) -> Result<bool> {
+    if !is_running(dir) {
+        clear_agent_files(dir);
+        return Ok(false);
+    }
+    match request(dir, &json!({"op": "stop"})) {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            let Some(pid) = read_pid(dir) else {
+                bail!(
+                    "{error}\nit also predates the agent pid file, so it cannot be \
+                     retired automatically — run: pkill -f 'ychrome-vault agent'"
+                );
+            };
+            terminate(pid, dir)?;
+            clear_agent_files(dir);
+            Ok(true)
+        }
+    }
+}
+
+/// SIGTERM, then SIGKILL if it will not go. An agent holds decrypted keys, so
+/// "still running" is never an acceptable outcome of `stop`.
+fn terminate(pid: i32, dir: &Path) -> Result<()> {
+    // SAFETY: `kill` on a pid we wrote ourselves; a stale pid at worst returns
+    // ESRCH, which the deadline loop below treats as "already gone".
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if !is_running(dir) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    std::thread::sleep(Duration::from_millis(100));
+    if is_running(dir) {
+        bail!("the vault agent (pid {pid}) survived SIGKILL");
+    }
+    Ok(())
+}
+
+/// Socket and pid file left behind by a killed agent.
+fn clear_agent_files(dir: &Path) {
+    let _ = std::fs::remove_file(socket_path(dir));
+    let _ = std::fs::remove_file(pid_path(dir));
 }
 
 /// Send one request, starting an agent first if none is listening.
@@ -418,10 +604,7 @@ mod tests {
     #[test]
     fn agent_answers_status_and_refuses_secrets_while_locked() {
         let dir = temp_dir("locked");
-        let state = Arc::new(Mutex::new(AgentState {
-            manager: VaultManager::load(&dir),
-            last_activity: Instant::now(),
-        }));
+        let state = test_state(VaultManager::load(&dir), dir.clone());
 
         let status = dispatch(&json!({"op": "status"}), &state).unwrap();
         assert_eq!(status["state"], "not_configured");
@@ -473,9 +656,15 @@ mod tests {
         let dir = temp_dir("synthetic");
         let mut manager = VaultManager::load(&dir);
         manager.install_vault_for_test(Vault::new(user_key, ciphers, Default::default()));
+        test_state(manager, dir)
+    }
+
+    fn test_state(manager: VaultManager, dir: PathBuf) -> Arc<Mutex<AgentState>> {
         Arc::new(Mutex::new(AgentState {
             manager,
             last_activity: Instant::now(),
+            dir,
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }))
     }
 

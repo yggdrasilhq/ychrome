@@ -17,7 +17,8 @@ State: `~/.yggterm/vault/` — `config.json` (secret-free) and `agent.sock`.
 | `model` | The unlocked `Vault`: user key + still-encrypted ciphers. Metadata is secret-free; passwords and TOTP secrets decrypt on demand |
 | `totp` | RFC 6238, `otpauth://` URIs |
 | `matching` | Page-host → item rules (below) |
-| `session` | `VaultManager`: config, unlock/lock, and the bearer token held for `resync` |
+| `generator` | Local password generation (no server, no `rbw generate` subprocess) |
+| `session` | `VaultManager`: config, unlock/lock, `add_login`, and the bearer token held for `resync` |
 | `agent` | The unlock cache: a unix-socket daemon holding the decrypted vault |
 
 ## The agent
@@ -41,14 +42,33 @@ Requests and responses are one JSON object per line:
 {"ok":true,"entry":{"name":"github.com","username":"octocat","password":"…"}}
 ```
 
-Ops: `ping`, `status`, `unlock`, `lock`, `sync`, `list`, `get`, `totp`, `match`,
-`suggest`. The agent auto-starts on `unlock` (and on `ping`) and detaches into
-its own process group, so the shell that first needed it can go away. A socket
-left behind by a SIGKILLed agent is detected (nobody answers) and reclaimed.
+Ops: `ping`, `status`, `unlock`, `lock`, `stop`, `sync`, `list`, `get`, `totp`,
+`match`, `suggest`, `add`, `generate`. The agent auto-starts on `unlock` (and on
+`ping`) and detaches into its own process group, so the shell that first needed
+it can go away. A socket left behind by a SIGKILLed agent is detected (nobody
+answers) and reclaimed.
 
 Read ops deliberately do **not** auto-start an agent: a fresh one holds no keys,
 so `get` would fail anyway, and it would leave a pointless daemon behind. They
 say "no agent, run `ychrome-vault unlock`" instead.
+
+### The agent outlives the binary
+
+Rebuild `ychrome-vault` and the *old* process keeps answering. `get` still
+works; a newly added op comes back `unknown op`; the confusion is total. This is
+the same stale-daemon trap yggterm keeps falling into, so the agent is built to
+make it visible:
+
+- `status` reports `version` and `exe_stamp` (path + mtime), and the client sets
+  `agent_stale: true` when they differ from its own.
+- Any `unknown op` error is rewritten to name the cause and the remedy.
+- `ychrome-vault stop-agent` retires it. Because `stop` is *itself* an op that a
+  sufficiently old agent does not know, `stop()` falls back to signalling
+  `agent.pid` (SIGTERM, then SIGKILL — an agent holding decrypted keys must
+  never survive a `stop`). An agent older than the pid file says so plainly
+  rather than pretending to have worked.
+
+**After rebuilding, run `ychrome-vault stop-agent`.**
 
 ## Host matching: two deliberately asymmetric rules
 
@@ -76,7 +96,10 @@ ychrome-vault get github.com                     # password on stdout
 ychrome-vault totp github.com                    # 6-digit code
 ychrome-vault list                               # name<TAB>user<TAB>folder
 ychrome-vault match chat.example.com                  # what an auto-fill may use
+ychrome-vault generate 24                        # local dice, no vault touched
+ychrome-vault add example.com alice --generate --uri https://example.com
 ychrome-vault lock
+ychrome-vault stop-agent                          # after every rebuild
 ```
 
 The master password is read from **stdin only** — never a flag, never an
@@ -92,15 +115,33 @@ terminal on stdin is refused rather than echoed into the user's scrollback.
 | `rbw code NAME [USER]` | `ychrome-vault totp NAME [USER]` |
 | `rbw unlock` | `read -rs PW; echo "$PW" \| ychrome-vault unlock` |
 | `rbw lock` | `ychrome-vault lock` |
+| `rbw add NAME [USER]` | `ychrome-vault add NAME [USER]` |
+| `rbw generate` | `ychrome-vault generate` |
+
+## Writes
+
+`add` encrypts every field under the user key locally and `POST`s the
+EncStrings to `/api/ciphers`; the server never sees plaintext. `--generate`
+rolls the password here, so it never crosses a shell's argv.
+
+There is deliberately **no `edit`/`update`.** A Bitwarden `PUT` replaces the
+whole cipher, and `sync` only parses the fields this client models — rebuilding
+a cipher from `RawCipher` would silently drop the item's notes, custom fields,
+favorite flag and password history. Doing it safely means retaining each
+cipher's raw JSON from `sync` and patching that. Until then, edit in a Bitwarden
+client. `rbw` has no edit either, so this is not a parity gap.
 
 ## What is proven, and what is not
 
-The read path is proven end to end against the real vault at `vault.example.com`
-(1107 items, 34 with TOTP) and, in `cargo test`, against a synthetic vault
-sealed with the real primitives — so `list`/`get`/`totp`/`match`/`suggest` are
-covered without a network or a master password.
-
-**Writes are not implemented.** `crypto` has EncString decrypt only; adding a
-login needs encrypt (AES-256-CBC + HMAC, with known-answer tests) plus
-`POST /api/ciphers`. Passkeys (`fido2Credentials`) come after that, and need a
-`navigator.credentials` shim because WebKitGTK has no WebAuthn.
+- **Read path** — proven end to end against the real vault at `vault.example.com`
+  (1107 items, 34 with TOTP), and in `cargo test` against a synthetic vault
+  sealed with the real primitives, so `list`/`get`/`totp`/`match`/`suggest` are
+  covered with no network and no master password.
+- **Encrypt** — pinned known-answer vector, cross-checked against an
+  independently written sealer, plus IV-coverage and wrong-key rejection. A
+  round-trip test alone would pass even if encrypt and decrypt drifted together.
+- **`add` against a real server** — NOT yet exercised. The body is proven
+  correct (every field decrypts back, no plaintext in the request), but no item
+  has been created on `vault.example.com`.
+- **Passkeys** (`fido2Credentials`) — not started. Needs a
+  `navigator.credentials` shim, because WebKitGTK has no WebAuthn.

@@ -207,6 +207,24 @@ impl Client {
         }
         Ok((ciphers, folders))
     }
+
+    /// `POST /api/ciphers` → the created cipher's id. `body` must already be
+    /// encrypted (every string field an EncString); this call never sees
+    /// plaintext.
+    pub fn create_cipher(&self, access_token: &str, body: &Value) -> Result<String, ApiError> {
+        let url = format!("{}/api/ciphers", self.base);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .map_err(|error| ApiError::Network(error.to_string()))?;
+        let value = json_or_err(resp)?;
+        Ok(get_str(&value, "id")
+            .ok_or_else(|| ApiError::Malformed("create response has no id".into()))?
+            .to_string())
+    }
 }
 
 /// `application/x-www-form-urlencoded` body. Percent-encodes every byte outside

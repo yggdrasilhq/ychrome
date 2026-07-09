@@ -236,6 +236,20 @@ impl VaultManager {
         self.access_token = None;
     }
 
+    /// Create a login in the vault and re-sync so the new item is immediately
+    /// visible. Encryption happens locally under the user key; the server only
+    /// ever sees EncStrings. Returns the new cipher's id.
+    pub fn add_login(&mut self, login: &crate::model::NewLogin) -> Result<String, VaultError> {
+        let config = self.config.clone().ok_or(VaultError::NotConfigured)?;
+        let token = self.access_token.clone().ok_or(VaultError::Locked)?;
+        let vault = self.vault.as_ref().ok_or(VaultError::Locked)?;
+        let body = vault.new_login_body(login)?;
+        let client = Client::new(&config.server_url)?;
+        let id = client.create_cipher(&token, &body)?;
+        self.resync()?;
+        Ok(id)
+    }
+
     /// Re-pull the ciphers with the session's bearer token, keeping the same
     /// user key. The master password is NOT needed — that is the whole point
     /// of holding the token: an agent can refresh a long-lived unlock.

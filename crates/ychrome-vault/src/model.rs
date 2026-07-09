@@ -39,6 +39,20 @@ pub struct VaultItem {
     pub has_totp: bool,
 }
 
+/// A login to create. Plaintext — it is encrypted by [`Vault::new_login_body`]
+/// and never leaves this process in the clear.
+#[derive(Debug, Clone, Default)]
+pub struct NewLogin {
+    pub name: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    /// An authenticator secret (base32) or a full `otpauth://` URI.
+    pub totp: Option<String>,
+    pub uri: Option<String>,
+    pub notes: Option<String>,
+    pub folder_id: Option<String>,
+}
+
 /// The unlocked vault: the user key plus the still-encrypted ciphers. Secrets
 /// are decrypted only when asked for.
 pub struct Vault {
@@ -109,6 +123,48 @@ impl Vault {
                 })
             })
             .collect()
+    }
+
+    /// Build the `POST /api/ciphers` body for a new login, encrypting every
+    /// field under the user key. A newly created cipher carries no item key,
+    /// so the user key is the cipher key — exactly what [`cipher_key`] will
+    /// resolve when the item comes back on the next sync.
+    ///
+    /// Only the fields we model are emitted. That is safe for CREATE (there is
+    /// nothing to lose) and is why there is no `update` counterpart: a PUT
+    /// rebuilt from this struct would silently drop the notes, custom fields,
+    /// favorite flag and password history that `sync` does not parse.
+    ///
+    /// [`cipher_key`]: Vault::cipher_key
+    pub fn new_login_body(&self, login: &NewLogin) -> Result<serde_json::Value, CryptoError> {
+        let enc = |value: &str| -> Result<String, CryptoError> {
+            Ok(self.user_key.encrypt_string(value)?.to_string())
+        };
+        let enc_opt = |value: &Option<String>| -> Result<serde_json::Value, CryptoError> {
+            match value.as_deref().filter(|value| !value.is_empty()) {
+                Some(value) => Ok(serde_json::Value::String(enc(value)?)),
+                None => Ok(serde_json::Value::Null),
+            }
+        };
+        let uris = match login.uri.as_deref().filter(|uri| !uri.is_empty()) {
+            Some(uri) => serde_json::json!([{ "uri": enc(uri)?, "match": serde_json::Value::Null }]),
+            None => serde_json::json!([]),
+        };
+        Ok(serde_json::json!({
+            "type": 1,
+            "name": enc(&login.name)?,
+            "notes": enc_opt(&login.notes)?,
+            "favorite": false,
+            "folderId": login.folder_id,
+            "reprompt": 0,
+            "fields": [],
+            "login": {
+                "username": enc_opt(&login.username)?,
+                "password": enc_opt(&login.password)?,
+                "totp": enc_opt(&login.totp)?,
+                "uris": uris,
+            },
+        }))
     }
 
     /// Swap in a freshly synced cipher set, keeping the same user key. Used by
@@ -193,12 +249,6 @@ pub(crate) fn seal(user_key_bytes: &[u8; 64], plaintext: &[u8]) -> EncString {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes::Aes256;
-    use aes::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD as B64;
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
 
     fn seal(user_key_bytes: &[u8; 64], plaintext: &str) -> EncString {
         super::seal(user_key_bytes, plaintext.as_bytes())
@@ -240,6 +290,62 @@ mod tests {
         assert_eq!(code.len(), 6);
         assert!(remaining >= 1 && remaining <= 30);
         assert!(vault.password("nope").is_none());
+    }
+
+    // What we WRITE must be what we can READ. Every field of a create body is
+    // an EncString under the user key, no plaintext leaks into the JSON, and
+    // an absent field is null rather than an EncString of "".
+    #[test]
+    fn new_login_body_encrypts_every_field_and_reads_back() {
+        let key_bytes = [0x5au8; 64];
+        let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
+        let vault = Vault::new(user_key.clone(), vec![], HashMap::new());
+
+        let body = vault
+            .new_login_body(&NewLogin {
+                name: "example.com".to_string(),
+                username: Some("alice".to_string()),
+                password: Some("hunter2".to_string()),
+                uri: Some("https://example.com".to_string()),
+                totp: None,
+                notes: None,
+                folder_id: None,
+            })
+            .unwrap();
+
+        let decrypt = |value: &serde_json::Value| {
+            let enc = EncString::parse(value.as_str().unwrap()).unwrap();
+            user_key.decrypt_to_string(&enc).unwrap()
+        };
+        assert_eq!(body["type"], 1);
+        assert_eq!(decrypt(&body["name"]), "example.com");
+        assert_eq!(decrypt(&body["login"]["username"]), "alice");
+        assert_eq!(decrypt(&body["login"]["password"]), "hunter2");
+        assert_eq!(decrypt(&body["login"]["uris"][0]["uri"]), "https://example.com");
+        // Fields the user left out are null, not an encrypted empty string.
+        assert!(body["login"]["totp"].is_null());
+        assert!(body["notes"].is_null());
+
+        // No plaintext anywhere in the serialized request.
+        let wire = body.to_string();
+        for secret in ["hunter2", "alice", "example.com"] {
+            assert!(!wire.contains(secret), "{secret} leaked into the request body");
+        }
+    }
+
+    // An empty uri must not produce a uris entry at all.
+    #[test]
+    fn new_login_body_omits_an_empty_uri() {
+        let user_key = SymmetricKey::from_bytes(&[0x11u8; 64]).unwrap();
+        let vault = Vault::new(user_key, vec![], HashMap::new());
+        let body = vault
+            .new_login_body(&NewLogin {
+                name: "bare".to_string(),
+                uri: Some(String::new()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(body["login"]["uris"].as_array().unwrap().len(), 0);
     }
 
     // An item with its OWN key: fields are encrypted under the item key, which
