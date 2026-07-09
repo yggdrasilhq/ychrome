@@ -206,18 +206,34 @@ $Y server app screenshot /tmp/pane.png --crop 1400,0,520,700 --scale 2
 The pane renders `MAX_ROWS = 80` of the item list ("Showing 80 of 1107"), so
 count ⏱ buttons against the first 80 rows, not all of them.
 
+## The sidebar contribution (`src/sidebar.rs`) — SHIPPED, live-proven
+
+ychrome DECLARES its vault pane over `OSC 7717 ; sidebar ; declare` and serves it
+from a loopback control endpoint. yggterm renders generic widgets and knows
+nothing about vaults. See `docs/protocol.md` and the `libyggterm-surfaces` SKILL.
+
+- The schema never leaves the app's host over the PTY — the GUI `GET`s it.
+- **No secret in a schema.** A credential reaches the page only as the `eval`
+  script an action returns, which the GUI injects into the surface.
+- Row ids are `name \x1f username`, not the cipher id: the agent resolves by that
+  pair, so no new agent op (and no forced re-unlock) was needed.
+- The pane shells out to the `ychrome-vault` CLI. The browser deliberately does
+  **not** link the vault crate — the workspace keeps the browser build lean.
+
 ## Still open
 
-- **Phase A / E — the sidebar-contribution surface.** yggterm still hardcodes
-  `RightPanelMode::Vault` and `::AppSidebar`; both must become ychrome
-  contributions declared over `OSC 7717 ; sidebar ; declare`, with the GUI
-  `GET`ing `<control>/pane/<id>` for a schema and `POST`ing `<control>/action`.
-  Then delete both variants (and `vault_password_is_weak`) from `shell.rs` and
-  move `yggterm/docs/ychrome-password-manager.md` here. Contract:
-  `libyggterm-surfaces` SKILL. Known blocker: `RightPanelMode` is `Copy` and must
-  lose it to carry an `AppPane(String)` id.
+- **Finish Phase A.** yggterm still has `RightPanelMode::Vault` and
+  `::AppSidebar`, and they still work. The contributed pane does not yet cover
+  the **password generator** or **watchtower**, so deleting `::Vault` would
+  regress the UI. Port those, move `vault_password_is_weak` out of `shell.rs`,
+  migrate `::AppSidebar` (adblock + userscript settings, per the "app's host owns
+  its config" rule), then delete both variants and move
+  `yggterm/docs/ychrome-password-manager.md` here.
 - **`restore`** (`PUT /api/ciphers/{id}/restore`) — `rm` has no undo, and because
   `sync` filters `deletedDate` items this client cannot even *show* the trash.
+  A `list --trashed` plus `restore` would close the loop and make the
+  soft-vs-hard delete distinction empirically observable, not just read off the
+  server's source.
 - **Passkeys** (`fido2Credentials`) — needs a `navigator.credentials` userscript
   shim (WebKitGTK has no WebAuthn) plus a user-presence dialog. **The agent may
   never auto-consent.**
