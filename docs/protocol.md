@@ -54,12 +54,42 @@ rule). Non-loopback URLs currently load directly from the GUI host — v0 gap;
 the general fix is a per-surface SOCKS egress carried over the substrate,
 still open.
 
+## Sidebar contribution (`sidebar` verb) — SHIPPED
+
+ychrome contributes its vault pane rather than yggterm hardcoding one.
+
+```
+ESC ] 7717 ; sidebar ; declare ; <base64 {"session","control","panes":[{id,icon,title}]}> BEL
+ESC ] 7717 ; sidebar ; close   ; <base64 {"session"}> BEL
+```
+
+`declare` is idempotent and re-emitted on the same ~4s heartbeat cadence as the
+web surface — that IS the contribution's liveness signal, and the GUI expires a
+contribution whose declares stop, so a SIGKILLed ychrome leaves no phantom
+buttons. It carries **no schema and no secret**: only a loopback control
+endpoint and the pane buttons.
+
+The GUI then talks to the control endpoint itself, over a plain socket (through
+an `ssh -L` forward when ychrome runs remotely):
+
+```
+GET  <control>/pane/vault?host=<page host>   -> the schema
+POST <control>/action  {pane, action, values} -> {schema?, toast?, eval?}
+```
+
+`eval` is a script the GUI runs in the surface — the only way a host-resident
+credential reaches a client-rendered page. ychrome computes it; the GUI injects
+it. The vault never crosses the OSC, and a schema never carries a secret.
+
+Implementation: `src/sidebar.rs`. Widget vocabulary and the GUI side:
+`yggterm/.agents/skills/libyggterm-surfaces/SKILL.md`.
+
 ## Open questions (for the next libyggterm apps)
 
-1. Sidebar panel contributions (ytop-class apps): schema + live updates —
-   probably additional OSC 7717 verbs.
-2. Per-surface SOCKS egress (full network-identity borrowing) and verifying
+1. Per-surface SOCKS egress (full network-identity borrowing) and verifying
    WebKit sends hostnames to the proxy (socks5h) so remote DNS resolves
    session-side.
-3. Where the ALT+/KeyTips command registry hooks in, so app surfaces are
+2. Where the ALT+/KeyTips command registry hooks in, so app surfaces are
    keyboard- and agent-drivable like native ones.
+3. Live pane updates (an ytop-class app pushing a new schema without the user
+   acting). Today a schema changes only on open or in an action's reply.
