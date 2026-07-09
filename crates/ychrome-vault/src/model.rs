@@ -25,8 +25,10 @@ pub struct RawCipher {
     pub uris: Vec<EncString>,
 }
 
-/// Decrypted, secret-free metadata for one vault item.
-#[derive(Debug, Clone)]
+/// Decrypted, secret-free metadata for one vault item. Serializable because
+/// the agent hands this list to clients — it carries no password and no TOTP
+/// secret, only the booleans saying one exists.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct VaultItem {
     pub id: String,
     pub name: String,
@@ -109,6 +111,18 @@ impl Vault {
             .collect()
     }
 
+    /// Swap in a freshly synced cipher set, keeping the same user key. Used by
+    /// `VaultManager::resync`, which refreshes an unlocked vault with the
+    /// session's bearer token rather than the master password.
+    pub fn replace_contents(
+        &mut self,
+        ciphers: Vec<RawCipher>,
+        folders: HashMap<String, EncString>,
+    ) {
+        self.ciphers = ciphers;
+        self.folder_names = folders;
+    }
+
     fn find(&self, id: &str) -> Option<&RawCipher> {
         self.ciphers.iter().find(|cipher| cipher.id == id)
     }
@@ -141,6 +155,41 @@ impl Vault {
     }
 }
 
+/// Encrypt bytes into a type-2 EncString under a raw 64-byte key, exactly as a
+/// Bitwarden client would. Test-only: it lets the model — and the agent's whole
+/// op layer — be exercised against a genuinely sealed vault with no network, no
+/// server, and no master password.
+#[cfg(test)]
+pub(crate) fn seal(user_key_bytes: &[u8; 64], plaintext: &[u8]) -> EncString {
+    use aes::Aes256;
+    use aes::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    type Enc = cbc::Encryptor<Aes256>;
+    let enc_key: [u8; 32] = user_key_bytes[..32].try_into().unwrap();
+    let mac_key = &user_key_bytes[32..];
+    let iv = [0x24u8; 16];
+    let mut buf = vec![0u8; plaintext.len() + 16];
+    buf[..plaintext.len()].copy_from_slice(plaintext);
+    let ct = Enc::new(&enc_key.into(), &iv.into())
+        .encrypt_padded_mut::<Pkcs7>(&mut buf, plaintext.len())
+        .unwrap()
+        .to_vec();
+    let mut mac = <Hmac<Sha256>>::new_from_slice(mac_key).unwrap();
+    mac.update(&iv);
+    mac.update(&ct);
+    EncString::parse(&format!(
+        "2.{}|{}|{}",
+        B64.encode(iv),
+        B64.encode(&ct),
+        B64.encode(mac.finalize().into_bytes())
+    ))
+    .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,31 +200,8 @@ mod tests {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
-    // Encrypt a plaintext into a type-2 EncString under a raw 64-byte key,
-    // exactly as a Bitwarden client would, so the model can be tested with no
-    // network and no real vault.
     fn seal(user_key_bytes: &[u8; 64], plaintext: &str) -> EncString {
-        type Enc = cbc::Encryptor<Aes256>;
-        let enc_key: [u8; 32] = user_key_bytes[..32].try_into().unwrap();
-        let mac_key = &user_key_bytes[32..];
-        let iv = [0x24u8; 16];
-        let mut buf = vec![0u8; plaintext.len() + 16];
-        buf[..plaintext.len()].copy_from_slice(plaintext.as_bytes());
-        let ct = Enc::new(&enc_key.into(), &iv.into())
-            .encrypt_padded_mut::<Pkcs7>(&mut buf, plaintext.len())
-            .unwrap()
-            .to_vec();
-        let mut m = <Hmac<Sha256>>::new_from_slice(mac_key).unwrap();
-        m.update(&iv);
-        m.update(&ct);
-        let mac = m.finalize().into_bytes().to_vec();
-        EncString::parse(&format!(
-            "2.{}|{}|{}",
-            B64.encode(iv),
-            B64.encode(&ct),
-            B64.encode(&mac)
-        ))
-        .unwrap()
+        super::seal(user_key_bytes, plaintext.as_bytes())
     }
 
     #[test]
@@ -224,30 +250,8 @@ mod tests {
         let item_bytes = [0x77u8; 64];
         let user_key = SymmetricKey::from_bytes(&user_bytes).unwrap();
 
-        // The item key is 64 raw bytes, sealed under the user key.
-        let sealed_item_key = {
-            // Reuse `seal` by treating the raw key bytes as a latin-1 string is
-            // wrong (non-UTF8); instead encrypt the raw bytes directly.
-            type Enc = cbc::Encryptor<Aes256>;
-            let enc_key: [u8; 32] = user_bytes[..32].try_into().unwrap();
-            let iv = [0x31u8; 16];
-            let mut buf = vec![0u8; item_bytes.len() + 16];
-            buf[..item_bytes.len()].copy_from_slice(&item_bytes);
-            let ct = Enc::new(&enc_key.into(), &iv.into())
-                .encrypt_padded_mut::<Pkcs7>(&mut buf, item_bytes.len())
-                .unwrap()
-                .to_vec();
-            let mut m = <Hmac<Sha256>>::new_from_slice(&user_bytes[32..]).unwrap();
-            m.update(&iv);
-            m.update(&ct);
-            EncString::parse(&format!(
-                "2.{}|{}|{}",
-                B64.encode(iv),
-                B64.encode(&ct),
-                B64.encode(m.finalize().into_bytes())
-            ))
-            .unwrap()
-        };
+        // The item key is 64 raw (non-UTF8) bytes, sealed under the user key.
+        let sealed_item_key = super::seal(&user_bytes, &item_bytes);
 
         let cipher = RawCipher {
             id: "c1".to_string(),
