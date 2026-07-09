@@ -483,6 +483,20 @@ impl Vault {
         key.decrypt_to_string(enc).ok()
     }
 
+    /// A specific item's notes, decrypted on demand.
+    ///
+    /// Read straight off the RAW record, because `sync` does not parse notes
+    /// into [`RawCipher`] at all — which is exactly why [`Vault::edit_body`]
+    /// must patch the raw JSON instead of rebuilding a cipher from the parsed
+    /// fields. `None` if the item is unknown, has no notes, or predates the
+    /// raw-retention change.
+    pub fn notes(&self, id: &str) -> Option<String> {
+        let cipher = self.find(id)?;
+        let encrypted = get_ci(cipher.raw.as_object()?, "notes")?.as_str()?;
+        let key = self.cipher_key(cipher).ok()?;
+        key.decrypt_to_string(&EncString::parse(encrypted).ok()?).ok()
+    }
+
     /// The current TOTP code for a specific item, with the seconds until it
     /// rolls. `None` if the item is unknown or carries no authenticator secret.
     pub fn totp_code(&self, id: &str) -> Option<(String, u64)> {
@@ -1111,6 +1125,36 @@ mod tests {
         let vault = Vault::new(user_key, HashMap::new(), vec![cipher], HashMap::new());
         let result = vault.edit_body("c1", &CipherEdit { name: Some("x".into()), ..Default::default() });
         assert!(matches!(result, Err(EditError::NoRawRecord(_))));
+    }
+
+    // Notes are decrypted off the RAW record under the cipher key, and survive
+    // a round trip through `edit_body` — the property the whole raw-retention
+    // design exists to guarantee.
+    #[test]
+    fn notes_read_off_the_raw_record_and_survive_an_edit() {
+        let key_bytes = [0x5au8; 64];
+        let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
+        let mut raw = raw_login_record();
+        raw["notes"] = serde_json::json!(seal(&key_bytes, "remember me").to_string());
+        let cipher = RawCipher {
+            raw,
+            id: "c1".into(),
+            item_type: 1,
+            name: Some(seal(&key_bytes, "GitHub")),
+            password: Some(seal(&key_bytes, "old-password")),
+            ..Default::default()
+        };
+        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], HashMap::new());
+        assert_eq!(vault.notes("c1").as_deref(), Some("remember me"));
+        assert!(vault.notes("nope").is_none());
+
+        // A password-only edit carries the SAME encrypted notes back.
+        let body = vault
+            .edit_body("c1", &CipherEdit { password: Some("new".into()), ..Default::default() })
+            .unwrap();
+        let carried = EncString::parse(body["notes"].as_str().unwrap()).unwrap();
+        let key = SymmetricKey::from_bytes(&key_bytes).unwrap();
+        assert_eq!(key.decrypt_to_string(&carried).unwrap(), "remember me");
     }
 
     #[test]

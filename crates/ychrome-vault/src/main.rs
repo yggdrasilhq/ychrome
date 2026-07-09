@@ -66,7 +66,7 @@ enum Command {
     Get {
         name: String,
         user: Option<String>,
-        /// One of: password, username, totp.
+        /// One of: password, username, totp, notes.
         #[arg(long, default_value = "password")]
         field: String,
     },
@@ -272,10 +272,18 @@ fn main() -> Result<()> {
                     println!("{}", string_field(&response, "code"));
                     return Ok(());
                 }
+                // Notes are not in the parsed cipher at all — the agent reads
+                // them off the raw record.
+                "notes" => {
+                    let response =
+                        agent::request(&dir, &json!({"op": "notes", "name": name, "user": user}))?;
+                    println!("{}", string_field(&response, "notes"));
+                    return Ok(());
+                }
                 "password" | "username" => {
                     agent::request(&dir, &json!({"op": "get", "name": name, "user": user}))?
                 }
-                other => bail!("unknown --field {other:?} (password | username | totp)"),
+                other => bail!("unknown --field {other:?} (password | username | totp | notes)"),
             };
             println!("{}", string_field(&entry["entry"], &field));
             Ok(())
