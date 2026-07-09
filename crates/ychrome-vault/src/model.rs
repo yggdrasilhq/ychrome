@@ -130,6 +130,16 @@ impl Vault {
         }
     }
 
+    /// The id of the folder with this name (case-insensitive). Folders are
+    /// always sealed under the user key, never an organization key.
+    pub fn folder_id(&self, name: &str) -> Option<String> {
+        let wanted = name.trim().to_ascii_lowercase();
+        self.folder_names.iter().find_map(|(id, enc)| {
+            let decrypted = self.user_key.decrypt_to_string(enc).ok()?;
+            (decrypted.trim().to_ascii_lowercase() == wanted).then(|| id.clone())
+        })
+    }
+
     fn folder_name(&self, cipher: &RawCipher) -> Option<String> {
         let id = cipher.folder_id.as_ref()?;
         let enc = self.folder_names.get(id)?;
