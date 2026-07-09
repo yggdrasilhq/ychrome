@@ -1,3 +1,12 @@
+[workspace]
+# The browser (root package) plus ychrome's own crates. A libyggterm app owns
+# its capabilities: the vault client lives here, not in yggterm.
+members = ["crates/ychrome-vault"]
+# `cargo build` at the root builds only the browser (lean, strip+lto); the vault
+# crate is built explicitly (`-p ychrome-vault`) so its crypto/http deps don't
+# weigh on the browser build.
+default-members = ["."]
+
 [package]
 name = "ychrome"
 version = "0.1.0"

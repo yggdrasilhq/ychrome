@@ -1,0 +1,42 @@
+[package]
+name = "ychrome-vault"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "ychrome's self-reliant Bitwarden/Vaultwarden client — the vault sidebar's backend and the `ychrome-vault` CLI/agent. A libyggterm app owns its own capabilities; this crate lives with ychrome, not yggterm."
+repository = "https://github.com/yggdrasilhq/ychrome"
+
+[lib]
+name = "ychrome_vault"
+path = "src/lib.rs"
+
+# `ychrome-vault <status|configure|check>` — host-resident vault access for
+# agents and for validating the crypto. The unlock-caching agent grows here.
+[[bin]]
+name = "ychrome-vault"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+dirs = "5"
+reqwest = { version = "0.13.3", default-features = false, features = ["blocking", "json", "rustls"] }
+
+# Bitwarden crypto: KDF -> master key -> stretched key -> user key -> ciphers.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+hkdf = "0.12"
+sha2 = "0.10"
+sha1 = "0.10"
+argon2 = "0.5"
+base64 = "0.22"
+rand = "0.8"
+subtle = "2"
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+hex = "0.4"
