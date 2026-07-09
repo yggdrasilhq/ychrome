@@ -104,6 +104,9 @@ enum Command {
     Match { host: String },
     /// Items the sidebar would float to the top for a host (loose rule, secret-free).
     Suggest { host: String },
+    /// Account for every cipher the server sent: how many decrypt, and why the
+    /// rest do not.
+    Diagnose,
     /// Ensure the agent is running (starting it if needed) and report state.
     /// Touches no secrets and no network — the sidebar calls this on open.
     Ping,
@@ -187,6 +190,7 @@ fn main() -> Result<()> {
                 "item_count": response["item_count"],
             }))
         }
+        Command::Diagnose => print_json(&agent::request(&dir, &json!({"op": "diagnose"}))?),
         Command::Lock => print_json(&agent::request(&dir, &json!({"op": "lock"}))?),
         Command::Sync => print_json(&agent::request(&dir, &json!({"op": "sync"}))?),
         Command::List { query, json } => {
@@ -274,7 +278,7 @@ fn main() -> Result<()> {
                 bail!("not configured; run `ychrome-vault configure --server <url> --email <email>`");
             }
             let password = read_master_password()?;
-            let count = manager
+            manager
                 .unlock(&password)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             let vault = manager.vault().expect("unlocked");
@@ -285,10 +289,14 @@ fn main() -> Result<()> {
             let with_uris = items.iter().filter(|item| !item.uris.is_empty()).count();
             print_json(&json!({
                 "unlocked": true,
-                "item_count": count,
+                "item_count": items.len(),
                 "items_with_totp": with_totp,
                 "items_with_uris": with_uris,
                 "sample_names": sample,
+                // Accounts for every cipher the server sent, including the ones
+                // we cannot read. Runs in this process, so a running agent is
+                // left alone.
+                "diagnostic": vault.diagnose(),
             }))
         }
     }
