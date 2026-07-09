@@ -360,6 +360,16 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             } else {
                 string("password")
             };
+            // A folder is named by the caller and identified by id on the wire.
+            // An unknown name is an error, not a silently-unfiled item.
+            let folder_id = match string("folder") {
+                Some(folder) => Some(
+                    unlocked(&state)?
+                        .folder_id(&folder)
+                        .ok_or_else(|| anyhow!("no vault folder named {folder:?}"))?,
+                ),
+                None => None,
+            };
             let login = crate::model::NewLogin {
                 name: name.clone(),
                 username: string("user"),
@@ -367,7 +377,7 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
                 totp: string("totp"),
                 uri: string("uri"),
                 notes: string("notes"),
-                folder_id: None,
+                folder_id,
             };
             let id = state
                 .manager

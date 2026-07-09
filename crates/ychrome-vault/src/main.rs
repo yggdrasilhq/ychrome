@@ -85,6 +85,9 @@ enum Command {
         totp: Option<String>,
         #[arg(long)]
         notes: Option<String>,
+        /// Name of an existing vault folder to file the item under.
+        #[arg(long)]
+        folder: Option<String>,
         /// Roll the password instead of reading it from stdin.
         #[arg(long)]
         generate: bool,
@@ -247,6 +250,7 @@ fn main() -> Result<()> {
             uri,
             totp,
             notes,
+            folder,
             generate,
             length,
             no_symbols,
@@ -261,6 +265,7 @@ fn main() -> Result<()> {
                 &json!({
                     "op": "add", "name": name, "user": user, "uri": uri,
                     "totp": totp, "notes": notes, "password": password,
+                    "folder": folder,
                     "generate": generate, "length": length, "symbols": !no_symbols,
                 }),
             )?;
