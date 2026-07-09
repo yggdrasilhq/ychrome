@@ -289,6 +289,20 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             state.touch();
             Ok(json!({ "entry": entry }))
         }
+        // Notes live only in the raw record, so this is also the read that
+        // proves an edit preserved them.
+        "notes" => {
+            let name = string("name").ok_or_else(|| anyhow!("notes needs a name"))?;
+            let vault = unlocked(&state)?;
+            let items = vault.items();
+            let item = resolve(&items, &name, string("user").as_deref())?;
+            let notes = vault
+                .notes(&item.id)
+                .ok_or_else(|| anyhow!("{} has no notes", item.name))?;
+            let name = item.name.clone();
+            state.touch();
+            Ok(json!({ "notes": notes, "name": name }))
+        }
         "totp" => {
             let name = string("name").ok_or_else(|| anyhow!("totp needs a name"))?;
             let vault = unlocked(&state)?;
