@@ -16,6 +16,9 @@ use crate::totp::Totp;
 pub struct RawCipher {
     pub id: String,
     pub folder_id: Option<String>,
+    /// Set when the cipher belongs to an organization. Its fields are then
+    /// encrypted under that ORG's key, not the user key — see [`Vault::diagnose`].
+    pub organization_id: Option<String>,
     pub item_type: u8,
     pub key: Option<EncString>,
     pub name: Option<EncString>,
@@ -51,6 +54,26 @@ pub struct NewLogin {
     pub uri: Option<String>,
     pub notes: Option<String>,
     pub folder_id: Option<String>,
+}
+
+/// The gap between "ciphers the server sent" and "items we can show".
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct VaultDiagnostic {
+    /// Everything `sync` returned (minus trashed items).
+    pub ciphers: usize,
+    /// Ciphers whose name decrypts — exactly what `items()` yields.
+    pub decrypted: usize,
+    /// The cipher carries its own key and that key will not decrypt. The usual
+    /// cause is an organization cipher: its item key is sealed under the org
+    /// key, which requires the user's RSA private key to unwrap.
+    pub skipped_item_key_undecryptable: usize,
+    /// The name is present but will not decrypt under the resolved key —
+    /// again, typically an org cipher, sealed under a key we never fetched.
+    pub skipped_name_undecryptable: usize,
+    /// No name field at all.
+    pub skipped_no_name: usize,
+    /// How many ciphers belong to an organization, decryptable or not.
+    pub organization_ciphers: usize,
 }
 
 /// The unlocked vault: the user key plus the still-encrypted ciphers. Secrets
@@ -179,6 +202,37 @@ impl Vault {
         self.folder_names = folders;
     }
 
+    /// Why every cipher `sync` returned is, or is not, in [`items`].
+    ///
+    /// `items()` silently skips a cipher it cannot decrypt, which is right for
+    /// robustness and wrong for honesty: the vault reported 1107 items and
+    /// listed 1050. This attributes the gap.
+    ///
+    /// [`items`]: Vault::items
+    pub fn diagnose(&self) -> VaultDiagnostic {
+        let mut diagnostic = VaultDiagnostic {
+            ciphers: self.ciphers.len(),
+            ..Default::default()
+        };
+        for cipher in &self.ciphers {
+            if cipher.organization_id.is_some() {
+                diagnostic.organization_ciphers += 1;
+            }
+            let Ok(key) = self.cipher_key(cipher) else {
+                diagnostic.skipped_item_key_undecryptable += 1;
+                continue;
+            };
+            match &cipher.name {
+                None => diagnostic.skipped_no_name += 1,
+                Some(name) if key.decrypt_to_string(name).is_err() => {
+                    diagnostic.skipped_name_undecryptable += 1
+                }
+                Some(_) => diagnostic.decrypted += 1,
+            }
+        }
+        diagnostic
+    }
+
     fn find(&self, id: &str) -> Option<&RawCipher> {
         self.ciphers.iter().find(|cipher| cipher.id == id)
     }
@@ -272,6 +326,7 @@ mod tests {
             password: Some(seal(&key_bytes, "s3cret!")),
             totp: Some(seal(&key_bytes, "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")),
             uris: vec![seal(&key_bytes, "https://github.com")],
+            organization_id: None,
         };
         let vault = Vault::new(user_key, vec![cipher], folders);
 
@@ -290,6 +345,69 @@ mod tests {
         assert_eq!(code.len(), 6);
         assert!(remaining >= 1 && remaining <= 30);
         assert!(vault.password("nope").is_none());
+    }
+
+    // `items()` skips what it cannot decrypt, so the cipher count and the item
+    // count diverge whenever the vault holds ciphers sealed under a key we do
+    // not have — an organization's. `diagnose` must attribute every one.
+    #[test]
+    fn diagnose_attributes_every_undecryptable_cipher() {
+        let user_bytes = [0x5au8; 64];
+        let org_bytes = [0x99u8; 64]; // a key we were never given
+        let user_key = SymmetricKey::from_bytes(&user_bytes).unwrap();
+
+        let ciphers = vec![
+            // Readable: sealed under the user key.
+            RawCipher {
+                id: "ok".into(),
+                name: Some(seal(&user_bytes, "GitHub")),
+                ..Default::default()
+            },
+            // Org cipher, no item key: the NAME will not decrypt.
+            RawCipher {
+                id: "org-name".into(),
+                organization_id: Some("org1".into()),
+                name: Some(seal(&org_bytes, "Shared Login")),
+                ..Default::default()
+            },
+            // Org cipher WITH an item key sealed under the org key: the item
+            // key itself will not unwrap.
+            RawCipher {
+                id: "org-key".into(),
+                organization_id: Some("org1".into()),
+                key: Some(super::seal(&org_bytes, &[0x77u8; 64])),
+                name: Some(seal(&org_bytes, "Shared Note")),
+                ..Default::default()
+            },
+            // Nameless.
+            RawCipher {
+                id: "nameless".into(),
+                ..Default::default()
+            },
+        ];
+        let vault = Vault::new(user_key, ciphers, HashMap::new());
+
+        assert_eq!(vault.items().len(), 1, "only the user-key cipher is readable");
+        assert_eq!(
+            vault.diagnose(),
+            VaultDiagnostic {
+                ciphers: 4,
+                decrypted: 1,
+                skipped_item_key_undecryptable: 1,
+                skipped_name_undecryptable: 1,
+                skipped_no_name: 1,
+                organization_ciphers: 2,
+            }
+        );
+        // Every cipher is accounted for — no silent third category.
+        let d = vault.diagnose();
+        assert_eq!(
+            d.decrypted
+                + d.skipped_item_key_undecryptable
+                + d.skipped_name_undecryptable
+                + d.skipped_no_name,
+            d.ciphers
+        );
     }
 
     // What we WRITE must be what we can READ. Every field of a create body is

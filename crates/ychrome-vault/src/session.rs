@@ -69,8 +69,18 @@ impl VaultConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VaultStatus {
     NotConfigured,
-    Locked { email: String, server_url: String },
-    Unlocked { email: String, item_count: usize },
+    Locked {
+        email: String,
+        server_url: String,
+    },
+    Unlocked {
+        email: String,
+        /// Items we can actually decrypt and show. NOT the cipher count — the
+        /// two differ whenever the vault holds ciphers sealed under a key we
+        /// do not have, and reporting the larger number was a lie.
+        item_count: usize,
+        cipher_count: usize,
+    },
 }
 
 /// Owns the vault config and the unlocked session. One per agent process.
@@ -104,7 +114,8 @@ impl VaultManager {
         match (&self.config, &self.vault) {
             (Some(config), Some(vault)) => VaultStatus::Unlocked {
                 email: config.email.clone(),
-                item_count: vault.len(),
+                item_count: vault.items().len(),
+                cipher_count: vault.len(),
             },
             (Some(config), None) => VaultStatus::Locked {
                 email: config.email.clone(),

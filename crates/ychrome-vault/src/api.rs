@@ -187,6 +187,7 @@ impl Client {
             ciphers.push(RawCipher {
                 id: get_str(cipher, "id").unwrap_or_default().to_string(),
                 folder_id: get_str(cipher, "folderId").map(str::to_string),
+                organization_id: get_str(cipher, "organizationId").map(str::to_string),
                 item_type: get_u64(cipher, "type").unwrap_or(1) as u8,
                 key: EncString::parse_opt(get_str(cipher, "key")).ok().flatten(),
                 name: EncString::parse_opt(get_str(cipher, "name")).ok().flatten(),

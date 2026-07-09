@@ -382,6 +382,12 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
                 "generated_password": generate.then_some(password).flatten(),
             }))
         }
+        // Account for every cipher the server sent: how many we can read, and
+        // why we cannot read the rest.
+        "diagnose" => {
+            let vault = unlocked(&state)?;
+            Ok(serde_json::to_value(vault.diagnose())?)
+        }
         // Roll a password without touching the vault (the sidebar's generator).
         "generate" => {
             let length = request
@@ -417,18 +423,16 @@ fn resolve<'a>(
         if candidates.is_empty() {
             anyhow!("no vault entry named {name:?}")
         } else {
+            // The username is a POSITIONAL argument (`rbw get NAME USER`
+            // parity). The old wording told the user to type `--user`, which
+            // clap rejects.
             let users: Vec<String> = candidates
                 .iter()
-                .map(|item| {
-                    format!(
-                        "{} ({})",
-                        item.name,
-                        item.username.as_deref().unwrap_or("no user")
-                    )
-                })
+                .map(|item| item.username.as_deref().unwrap_or("<no user>").to_string())
                 .collect();
             anyhow!(
-                "{name:?} is ambiguous — disambiguate with --user: {}",
+                "{name:?} matches {} accounts — name one: {}",
+                candidates.len(),
                 users.join(", ")
             )
         }
@@ -441,10 +445,16 @@ pub fn status_json(manager: &VaultManager) -> Value {
         VaultStatus::Locked { email, server_url } => {
             json!({ "state": "locked", "email": email, "server_url": server_url })
         }
-        VaultStatus::Unlocked { email, item_count } => json!({
+        VaultStatus::Unlocked {
+            email,
+            item_count,
+            cipher_count,
+        } => json!({
             "state": "unlocked",
             "email": email,
             "item_count": item_count,
+            "cipher_count": cipher_count,
+            "undecryptable": cipher_count.saturating_sub(item_count),
             "lock_timeout_secs": manager.lock_timeout_secs(),
         }),
     };
