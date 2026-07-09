@@ -63,12 +63,12 @@ pub struct VaultDiagnostic {
     pub ciphers: usize,
     /// Ciphers whose name decrypts — exactly what `items()` yields.
     pub decrypted: usize,
-    /// The cipher carries its own key and that key will not decrypt. The usual
-    /// cause is an organization cipher: its item key is sealed under the org
-    /// key, which requires the user's RSA private key to unwrap.
+    /// The cipher belongs to an organization whose key we never unwrapped.
+    /// Before org support this showed up as the two buckets below instead.
+    pub skipped_missing_organization_key: usize,
+    /// The cipher carries its own key and that key will not decrypt.
     pub skipped_item_key_undecryptable: usize,
-    /// The name is present but will not decrypt under the resolved key —
-    /// again, typically an org cipher, sealed under a key we never fetched.
+    /// The name is present but will not decrypt under the resolved key.
     pub skipped_name_undecryptable: usize,
     /// No name field at all.
     pub skipped_no_name: usize,
@@ -80,6 +80,9 @@ pub struct VaultDiagnostic {
 /// are decrypted only when asked for.
 pub struct Vault {
     user_key: SymmetricKey,
+    /// `organization_id -> that org's symmetric key`, already unwrapped with
+    /// the user's RSA private key. Empty when the account is in no orgs.
+    organization_keys: HashMap<String, SymmetricKey>,
     ciphers: Vec<RawCipher>,
     folder_names: HashMap<String, EncString>,
 }
@@ -87,25 +90,43 @@ pub struct Vault {
 impl Vault {
     pub fn new(
         user_key: SymmetricKey,
+        organization_keys: HashMap<String, SymmetricKey>,
         ciphers: Vec<RawCipher>,
         folders: HashMap<String, EncString>,
     ) -> Self {
         Vault {
             user_key,
+            organization_keys,
             ciphers,
             folder_names: folders,
         }
     }
 
-    /// The key that decrypts a cipher's fields: its own item key if present,
-    /// else the user key.
+    /// The key a cipher's fields (or its item key) are sealed under: its
+    /// organization's key when it belongs to one, else the user key.
+    ///
+    /// Getting this wrong is invisible — the MAC check fails, `items()` skips
+    /// the cipher, and the item simply is not there.
+    fn base_key(&self, cipher: &RawCipher) -> Result<&SymmetricKey, CryptoError> {
+        match &cipher.organization_id {
+            Some(id) => self
+                .organization_keys
+                .get(id)
+                .ok_or_else(|| CryptoError::MissingOrganizationKey(id.clone())),
+            None => Ok(&self.user_key),
+        }
+    }
+
+    /// The key that decrypts a cipher's fields: its own item key if present
+    /// (itself sealed under the base key), else the base key.
     fn cipher_key(&self, cipher: &RawCipher) -> Result<SymmetricKey, CryptoError> {
+        let base = self.base_key(cipher)?;
         match &cipher.key {
             Some(item_key) => {
-                let raw = self.user_key.decrypt(item_key)?;
+                let raw = base.decrypt(item_key)?;
                 SymmetricKey::from_bytes(&raw)
             }
-            None => Ok(self.user_key.clone()),
+            None => Ok(base.clone()),
         }
     }
 
@@ -190,14 +211,22 @@ impl Vault {
         }))
     }
 
+    /// The user key, so a resync can re-unwrap organization keys without the
+    /// master password.
+    pub(crate) fn user_key(&self) -> &SymmetricKey {
+        &self.user_key
+    }
+
     /// Swap in a freshly synced cipher set, keeping the same user key. Used by
     /// `VaultManager::resync`, which refreshes an unlocked vault with the
     /// session's bearer token rather than the master password.
     pub fn replace_contents(
         &mut self,
+        organization_keys: HashMap<String, SymmetricKey>,
         ciphers: Vec<RawCipher>,
         folders: HashMap<String, EncString>,
     ) {
+        self.organization_keys = organization_keys;
         self.ciphers = ciphers;
         self.folder_names = folders;
     }
@@ -217,6 +246,10 @@ impl Vault {
         for cipher in &self.ciphers {
             if cipher.organization_id.is_some() {
                 diagnostic.organization_ciphers += 1;
+            }
+            if self.base_key(cipher).is_err() {
+                diagnostic.skipped_missing_organization_key += 1;
+                continue;
             }
             let Ok(key) = self.cipher_key(cipher) else {
                 diagnostic.skipped_item_key_undecryptable += 1;
@@ -328,7 +361,7 @@ mod tests {
             uris: vec![seal(&key_bytes, "https://github.com")],
             organization_id: None,
         };
-        let vault = Vault::new(user_key, vec![cipher], folders);
+        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], folders);
 
         let items = vault.items();
         assert_eq!(items.len(), 1);
@@ -353,7 +386,8 @@ mod tests {
     #[test]
     fn diagnose_attributes_every_undecryptable_cipher() {
         let user_bytes = [0x5au8; 64];
-        let org_bytes = [0x99u8; 64]; // a key we were never given
+        let org_bytes = [0x99u8; 64]; // sealed to the user's public key, in reality
+        let item_bytes = [0x77u8; 64]; // an org cipher's own item key
         let user_key = SymmetricKey::from_bytes(&user_bytes).unwrap();
 
         let ciphers = vec![
@@ -370,13 +404,14 @@ mod tests {
                 name: Some(seal(&org_bytes, "Shared Login")),
                 ..Default::default()
             },
-            // Org cipher WITH an item key sealed under the org key: the item
-            // key itself will not unwrap.
+            // Org cipher WITH its own item key: the ITEM key is sealed under
+            // the ORG key, and the fields under the item key. Two hops, and
+            // both need the org key to start.
             RawCipher {
                 id: "org-key".into(),
                 organization_id: Some("org1".into()),
-                key: Some(super::seal(&org_bytes, &[0x77u8; 64])),
-                name: Some(seal(&org_bytes, "Shared Note")),
+                key: Some(super::seal(&org_bytes, &item_bytes)),
+                name: Some(seal(&item_bytes, "Shared Note")),
                 ..Default::default()
             },
             // Nameless.
@@ -385,29 +420,45 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let vault = Vault::new(user_key, ciphers, HashMap::new());
-
-        assert_eq!(vault.items().len(), 1, "only the user-key cipher is readable");
+        // WITHOUT the org key: the two org ciphers are unreadable, and the
+        // diagnostic says exactly why. This is the 59-cipher gap in miniature.
+        let blind = Vault::new(user_key.clone(), HashMap::new(), ciphers.clone(), HashMap::new());
+        assert_eq!(blind.items().len(), 1, "only the user-key cipher is readable");
         assert_eq!(
-            vault.diagnose(),
+            blind.diagnose(),
             VaultDiagnostic {
                 ciphers: 4,
                 decrypted: 1,
-                skipped_item_key_undecryptable: 1,
-                skipped_name_undecryptable: 1,
+                skipped_missing_organization_key: 2,
+                skipped_item_key_undecryptable: 0,
+                skipped_name_undecryptable: 0,
                 skipped_no_name: 1,
                 organization_ciphers: 2,
             }
         );
-        // Every cipher is accounted for — no silent third category.
-        let d = vault.diagnose();
-        assert_eq!(
-            d.decrypted
-                + d.skipped_item_key_undecryptable
-                + d.skipped_name_undecryptable
-                + d.skipped_no_name,
-            d.ciphers
-        );
+
+        // WITH the org key: both org ciphers decrypt, including the one whose
+        // item key is sealed under the org key rather than the user key.
+        let mut org_keys = HashMap::new();
+        org_keys.insert("org1".to_string(), SymmetricKey::from_bytes(&org_bytes).unwrap());
+        let seeing = Vault::new(user_key, org_keys, ciphers, HashMap::new());
+        let names: Vec<String> = seeing.items().into_iter().map(|item| item.name).collect();
+        assert_eq!(names, ["GitHub", "Shared Login", "Shared Note"]);
+        let diagnostic = seeing.diagnose();
+        assert_eq!(diagnostic.decrypted, 3);
+        assert_eq!(diagnostic.skipped_missing_organization_key, 0);
+
+        // Every cipher is accounted for — no silent category.
+        for d in [blind.diagnose(), diagnostic] {
+            assert_eq!(
+                d.decrypted
+                    + d.skipped_missing_organization_key
+                    + d.skipped_item_key_undecryptable
+                    + d.skipped_name_undecryptable
+                    + d.skipped_no_name,
+                d.ciphers
+            );
+        }
     }
 
     // What we WRITE must be what we can READ. Every field of a create body is
@@ -417,7 +468,7 @@ mod tests {
     fn new_login_body_encrypts_every_field_and_reads_back() {
         let key_bytes = [0x5au8; 64];
         let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
-        let vault = Vault::new(user_key.clone(), vec![], HashMap::new());
+        let vault = Vault::new(user_key.clone(), HashMap::new(), vec![], HashMap::new());
 
         let body = vault
             .new_login_body(&NewLogin {
@@ -455,7 +506,7 @@ mod tests {
     #[test]
     fn new_login_body_omits_an_empty_uri() {
         let user_key = SymmetricKey::from_bytes(&[0x11u8; 64]).unwrap();
-        let vault = Vault::new(user_key, vec![], HashMap::new());
+        let vault = Vault::new(user_key, HashMap::new(), vec![], HashMap::new());
         let body = vault
             .new_login_body(&NewLogin {
                 name: "bare".to_string(),
@@ -485,7 +536,7 @@ mod tests {
             password: Some(seal(&item_bytes, "under-item-key")),
             ..Default::default()
         };
-        let vault = Vault::new(user_key, vec![cipher], HashMap::new());
+        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], HashMap::new());
         assert_eq!(vault.items()[0].name, "Sealed Item");
         assert_eq!(vault.password("c1").as_deref(), Some("under-item-key"));
     }

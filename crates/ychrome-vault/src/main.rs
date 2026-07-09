@@ -201,12 +201,16 @@ fn main() -> Result<()> {
             }
             // `name<TAB>user<TAB>folder` — the shape `rbw list --fields
             // name,user,folder` printed, so existing scripts keep parsing.
+            //
+            // Vault names really do contain newlines and tabs (two of this
+            // user's 1048 items do), and an unescaped one turns a single record
+            // into two rows: `list | wc -l` read 1050. One record, one line.
             for item in items {
                 println!(
                     "{}\t{}\t{}",
-                    item["name"].as_str().unwrap_or(""),
-                    item["username"].as_str().unwrap_or(""),
-                    item["folder"].as_str().unwrap_or(""),
+                    tsv_field(&item["name"]),
+                    tsv_field(&item["username"]),
+                    tsv_field(&item["folder"]),
                 );
             }
             Ok(())
@@ -326,6 +330,17 @@ fn read_secret(what: &str) -> Result<String> {
         bail!("no {what} on stdin");
     }
     Ok(secret)
+}
+
+/// One TSV cell: control characters that would break the record boundary are
+/// replaced with a space. Use `--json` when the exact bytes matter.
+fn tsv_field(value: &Value) -> String {
+    value
+        .as_str()
+        .unwrap_or("")
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
 }
 
 fn string_field(value: &Value, key: &str) -> String {

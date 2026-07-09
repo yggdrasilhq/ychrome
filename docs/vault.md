@@ -12,7 +12,7 @@ State: `~/.yggterm/vault/` — `config.json` (secret-free) and `agent.sock`.
 
 | Module | What it owns |
 | --- | --- |
-| `crypto` | KDF → master key → stretched key → user key; EncString type-2 (AES-256-CBC + HMAC-SHA256), MAC checked in constant time before decrypt |
+| `crypto` | KDF → master key → stretched key → user key; EncString type-2 (AES-256-CBC + HMAC-SHA256), MAC checked in constant time before decrypt; type-3/4 (RSA-OAEP) for organization keys |
 | `api` | `prelogin`, the identity token endpoint, `sync`. Responses navigated case-insensitively (Vaultwarden drifts PascalCase↔camelCase) |
 | `model` | The unlocked `Vault`: user key + still-encrypted ciphers. Metadata is secret-free; passwords and TOTP secrets decrypt on demand |
 | `totp` | RFC 6238, `otpauth://` URIs |
@@ -69,6 +69,26 @@ make it visible:
   rather than pretending to have worked.
 
 **After rebuilding, run `ychrome-vault stop-agent`.**
+
+## Organization ciphers
+
+A cipher that belongs to an organization has its fields sealed under **that
+org's** symmetric key, not the user key. The org key arrives from `sync` as
+`profile.organizations[].key` — a **type-4** EncString, RSA-OAEP-SHA1, sealed to
+the user's public key. Unwrapping it needs the user's RSA private key, which
+arrives as `profile.privateKey` (a type-2 EncString under the user key,
+containing PKCS#8 DER).
+
+So: unlock → user key → private key → org keys → org ciphers.
+
+This was missed at first, and the failure was **silent**: `Vault::items()` skips
+any cipher it cannot decrypt, so 59 of a 1107-item vault simply were not there,
+while `status` cheerfully reported 1107. `ychrome-vault diagnose` now accounts
+for every cipher, and `item_count` counts only what we can actually read. An
+account in no organizations never touches RSA at all.
+
+Failing to unwrap ONE org is not fatal — that org's ciphers stay unreadable and
+`diagnose` counts them, which beats refusing to open the whole vault.
 
 ## Host matching: two deliberately asymmetric rules
 
@@ -134,9 +154,14 @@ client. `rbw` has no edit either, so this is not a parity gap.
 ## What is proven, and what is not
 
 - **Read path** — proven end to end against the real vault at `vault.example.com`
-  (1107 items, 34 with TOTP), and in `cargo test` against a synthetic vault
-  sealed with the real primitives, so `list`/`get`/`totp`/`match`/`suggest` are
-  covered with no network and no master password.
+  (1107 ciphers, 35 with TOTP, 936 with URIs), and in `cargo test` against a
+  synthetic vault sealed with the real primitives, so
+  `list`/`get`/`totp`/`match`/`suggest` are covered with no network and no
+  master password.
+- **Organization keys** — the RSA unwrap is cross-checked in `cargo test`
+  against openssl-produced fixtures (`testdata/`), and the cipher-key selection
+  is tested both with and without the org key. Reading the real vault's 59 org
+  ciphers is verified separately (see the campaign memory).
 - **Encrypt** — pinned known-answer vector, cross-checked against an
   independently written sealer, plus IV-coverage and wrong-key rejection. A
   round-trip test alone would pass even if encrypt and decrypt drifted together.
