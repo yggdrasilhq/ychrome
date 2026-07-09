@@ -14,14 +14,16 @@
 pub mod agent;
 pub mod api;
 pub mod crypto;
+pub mod generator;
 pub mod matching;
 pub mod model;
 pub mod session;
 pub mod totp;
 
 pub use crypto::{CryptoError, EncString, Kdf, MasterKey, SymmetricKey};
+pub use generator::{DEFAULT_LENGTH, MIN_LENGTH, generate_password};
 pub use matching::{auto_match_for_host, find_by_name, item_applies_to_host, item_auto_matches_host};
-pub use model::{RawCipher, Vault, VaultItem};
+pub use model::{NewLogin, RawCipher, Vault, VaultItem};
 pub use session::{
     DEFAULT_LOCK_TIMEOUT_SECS, VaultConfig, VaultError, VaultManager, VaultStatus,
 };

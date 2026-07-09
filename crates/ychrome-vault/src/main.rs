@@ -73,6 +73,33 @@ enum Command {
     /// Print an item's current TOTP code — `rbw code` parity.
     #[command(alias = "code")]
     Totp { name: String, user: Option<String> },
+    /// Create a login — `rbw add` parity. The password is read from stdin, or
+    /// rolled locally with `--generate` (and echoed once, so you can save it).
+    Add {
+        name: String,
+        user: Option<String>,
+        #[arg(long)]
+        uri: Option<String>,
+        /// Authenticator secret (base32) or a full `otpauth://` URI.
+        #[arg(long)]
+        totp: Option<String>,
+        #[arg(long)]
+        notes: Option<String>,
+        /// Roll the password instead of reading it from stdin.
+        #[arg(long)]
+        generate: bool,
+        #[arg(long, default_value_t = ychrome_vault::DEFAULT_LENGTH)]
+        length: usize,
+        #[arg(long)]
+        no_symbols: bool,
+    },
+    /// Roll a password without touching the vault.
+    Generate {
+        #[arg(default_value_t = ychrome_vault::DEFAULT_LENGTH)]
+        length: usize,
+        #[arg(long)]
+        no_symbols: bool,
+    },
     /// Resolve a page host to the ONE entry an auto-fill may use (strict rule).
     Match { host: String },
     /// Items the sidebar would float to the top for a host (loose rule, secret-free).
@@ -80,6 +107,9 @@ enum Command {
     /// Ensure the agent is running (starting it if needed) and report state.
     /// Touches no secrets and no network — the sidebar calls this on open.
     Ping,
+    /// Stop the agent (drops its keys and exits). Needed after a rebuild: the
+    /// agent outlives the binary, so it keeps serving the old code.
+    StopAgent,
     /// Run the agent in the foreground (normally auto-started on demand).
     Agent,
     /// Unlock in-process and print a summary — validates the client end to end.
@@ -102,12 +132,19 @@ fn main() -> Result<()> {
             agent::request_autostart(&dir, &json!({"op": "ping"}))?;
             print_json(&agent::request(&dir, &json!({"op": "status"}))?)
         }
+        Command::StopAgent => {
+            let stopped = agent::stop(&dir)?;
+            print_json(&json!({ "stopped": stopped }))
+        }
         Command::Status => {
             // The agent is the source of truth when it is running (only it
             // knows whether the vault is unlocked); otherwise read the config.
             let status = if agent::is_running(&dir) {
                 let mut response = agent::request(&dir, &json!({"op": "status"}))?;
                 response["agent"] = json!(true);
+                // The agent may be running a binary older than this one.
+                let stale = response["exe_stamp"].as_str() != Some(&agent::exe_stamp());
+                response["agent_stale"] = json!(stale);
                 response
             } else {
                 let mut status = agent::status_json(&VaultManager::load(&dir));
@@ -191,6 +228,40 @@ fn main() -> Result<()> {
             println!("{}", string_field(&response, "code"));
             Ok(())
         }
+        Command::Generate { length, no_symbols } => {
+            // Local dice — no agent, no unlock, no network.
+            println!("{}", *ychrome_vault::generate_password(length, !no_symbols));
+            Ok(())
+        }
+        Command::Add {
+            name,
+            user,
+            uri,
+            totp,
+            notes,
+            generate,
+            length,
+            no_symbols,
+        } => {
+            let password = if generate {
+                None
+            } else {
+                Some(read_secret("password")?)
+            };
+            let response = agent::request(
+                &dir,
+                &json!({
+                    "op": "add", "name": name, "user": user, "uri": uri,
+                    "totp": totp, "notes": notes, "password": password,
+                    "generate": generate, "length": length, "symbols": !no_symbols,
+                }),
+            )?;
+            print_json(&json!({
+                "added": response["name"],
+                "id": response["id"],
+                "generated_password": response["generated_password"],
+            }))
+        }
         Command::Match { host } => {
             print_json(&agent::request(&dir, &json!({"op": "match", "host": host}))?["entry"])
         }
@@ -223,26 +294,30 @@ fn main() -> Result<()> {
     }
 }
 
-/// The master password comes from stdin and nowhere else. A terminal on stdin
-/// means the user typed `ychrome-vault unlock` with no pipe — reading it there
-/// would echo the password into their scrollback, so refuse and show the
-/// no-echo incantation instead.
 fn read_master_password() -> Result<String> {
+    read_secret("master password")
+}
+
+/// Secrets come from stdin and nowhere else — never a flag (visible in `ps`),
+/// never an environment variable. A terminal on stdin means the user ran the
+/// command with no pipe; reading it there would echo the secret into their
+/// scrollback, so refuse and show the no-echo incantation instead.
+fn read_secret(what: &str) -> Result<String> {
     if std::io::stdin().is_terminal() {
         bail!(
-            "pipe the master password in without echoing it:\n    \
-             read -rs PW; echo \"$PW\" | ychrome-vault unlock"
+            "pipe the {what} in without echoing it:\n    \
+             read -rs PW; echo \"$PW\" | ychrome-vault …"
         );
     }
-    let mut password = String::new();
+    let mut secret = String::new();
     std::io::stdin()
-        .read_to_string(&mut password)
-        .context("reading the master password from stdin")?;
-    let password = password.trim_end_matches(['\n', '\r']).to_string();
-    if password.is_empty() {
-        bail!("no master password on stdin");
+        .read_to_string(&mut secret)
+        .with_context(|| format!("reading the {what} from stdin"))?;
+    let secret = secret.trim_end_matches(['\n', '\r']).to_string();
+    if secret.is_empty() {
+        bail!("no {what} on stdin");
     }
-    Ok(password)
+    Ok(secret)
 }
 
 fn string_field(value: &Value, key: &str) -> String {

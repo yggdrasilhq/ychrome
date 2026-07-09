@@ -18,7 +18,7 @@ use aes::Aes256;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use cbc::cipher::block_padding::Pkcs7;
-use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -27,6 +27,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 type HmacSha256 = Hmac<Sha256>;
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
+type Aes256CbcEnc = cbc::Encryptor<Aes256>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
@@ -211,6 +212,41 @@ impl SymmetricKey {
         String::from_utf8(bytes.to_vec()).map_err(|_| CryptoError::NotUtf8)
     }
 
+    /// Encrypt bytes into a type-2 [`EncString`] with a fresh random IV.
+    /// Encrypt-then-MAC: the HMAC covers `iv || ct`, exactly as [`decrypt`]
+    /// verifies it.
+    ///
+    /// [`decrypt`]: SymmetricKey::decrypt
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<EncString, CryptoError> {
+        let mut iv = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut iv);
+        self.encrypt_with_iv(plaintext, iv)
+    }
+
+    /// Encrypt with a caller-chosen IV. Only tests should pick the IV — a
+    /// reused IV under the same key leaks plaintext equality.
+    pub(crate) fn encrypt_with_iv(
+        &self,
+        plaintext: &[u8],
+        iv: [u8; 16],
+    ) -> Result<EncString, CryptoError> {
+        let ct = Aes256CbcEnc::new((&self.enc_arr()).into(), (&iv).into())
+            .encrypt_padded_vec_mut::<Pkcs7>(plaintext);
+        let mut mac = HmacSha256::new_from_slice(&self.mac[..]).expect("HMAC accepts any key length");
+        mac.update(&iv);
+        mac.update(&ct);
+        Ok(EncString {
+            iv: iv.to_vec(),
+            ct,
+            mac: mac.finalize().into_bytes().to_vec(),
+        })
+    }
+
+    /// Encrypt a UTF-8 string into a type-2 [`EncString`].
+    pub fn encrypt_string(&self, plaintext: &str) -> Result<EncString, CryptoError> {
+        self.encrypt(plaintext.as_bytes())
+    }
+
     fn enc_arr(&self) -> [u8; 32] {
         *self.enc
     }
@@ -274,6 +310,22 @@ impl EncString {
     }
 }
 
+/// The wire form: `2.<iv_b64>|<ct_b64>|<mac_b64>`. This is what goes back to
+/// the server on a cipher create/update, and it round-trips with [`parse`].
+///
+/// [`parse`]: EncString::parse
+impl std::fmt::Display for EncString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "2.{}|{}|{}",
+            B64.encode(&self.iv),
+            B64.encode(&self.ct),
+            B64.encode(&self.mac)
+        )
+    }
+}
+
 fn decode_b64(part: Option<&str>) -> Result<Vec<u8>, CryptoError> {
     let part = part.ok_or_else(|| CryptoError::MalformedEncString("missing | part".into()))?;
     B64.decode(part.trim())
@@ -283,6 +335,66 @@ fn decode_b64(part: Option<&str>) -> Result<Vec<u8>, CryptoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AES-256-CBC + HMAC-SHA256 over `"s3cret!"`, key = 64 × `0x5a`,
+    /// iv = 16 × `0x24`. Captured once from a verified run; a change here means
+    /// the wire format moved.
+    const PINNED_ENCRYPT_VECTOR: &str =
+        "2.JCQkJCQkJCQkJCQkJCQkJA==|m2JG1xRlopnafzGD7/heTA==|docRQwq1qGqe7hMmsMIwB+Ak6B6joaSFE/AaR2kxDYY=";
+
+    // Known-answer test for encrypt. The vector is pinned as a literal: a
+    // round-trip test alone would still pass if encrypt and decrypt drifted
+    // together (say, if the MAC stopped covering the IV on both sides), and a
+    // wrong ciphertext here means every item we write is silently unreadable by
+    // the official Bitwarden clients.
+    #[test]
+    fn encrypt_matches_a_pinned_vector_and_round_trips() {
+        let key = SymmetricKey::from_bytes(&[0x5au8; 64]).unwrap();
+        let enc = key.encrypt_with_iv(b"s3cret!", [0x24u8; 16]).unwrap();
+        // Cross-check against `model::seal`, which drives the RustCrypto
+        // primitives directly and was written before `encrypt` existed.
+        assert_eq!(
+            enc.to_string(),
+            crate::model::seal(&[0x5au8; 64], b"s3cret!").to_string(),
+            "encrypt must agree with a hand-rolled Bitwarden-style sealer"
+        );
+        assert_eq!(enc.to_string(), PINNED_ENCRYPT_VECTOR);
+        // Parse of our own output must reconstruct the same fields, and decrypt.
+        let reparsed = EncString::parse(&enc.to_string()).unwrap();
+        assert_eq!(key.decrypt_to_string(&reparsed).unwrap(), "s3cret!");
+
+        // A random IV each call: same plaintext, different ciphertext.
+        let a = key.encrypt_string("same").unwrap();
+        let b = key.encrypt_string("same").unwrap();
+        assert_ne!(a.iv, b.iv, "each encrypt draws a fresh IV");
+        assert_ne!(a.ct, b.ct);
+        assert_eq!(key.decrypt_to_string(&a).unwrap(), "same");
+        assert_eq!(key.decrypt_to_string(&b).unwrap(), "same");
+
+        // Empty plaintext is a full block of PKCS7 padding, not an empty ct.
+        let empty = key.encrypt(b"").unwrap();
+        assert_eq!(empty.ct.len(), 16);
+        assert!(key.decrypt(&empty).unwrap().is_empty());
+    }
+
+    // Encrypt-then-MAC must authenticate the IV as well as the ciphertext:
+    // an attacker who can flip IV bits flips the first plaintext block.
+    #[test]
+    fn encrypt_mac_covers_the_iv() {
+        let key = SymmetricKey::from_bytes(&[0x11u8; 64]).unwrap();
+        let mut enc = key.encrypt_string("attack at dawn").unwrap();
+        enc.iv[0] ^= 0x01;
+        assert!(matches!(key.decrypt(&enc), Err(CryptoError::MacMismatch)));
+    }
+
+    // A key that did not seal the value must never decrypt it.
+    #[test]
+    fn encrypt_is_bound_to_its_key() {
+        let mine = SymmetricKey::from_bytes(&[0x01u8; 64]).unwrap();
+        let theirs = SymmetricKey::from_bytes(&[0x02u8; 64]).unwrap();
+        let enc = mine.encrypt_string("mine").unwrap();
+        assert!(matches!(theirs.decrypt(&enc), Err(CryptoError::MacMismatch)));
+    }
 
     // RFC 5869 Appendix A.2 uses HKDF-SHA256 with extract+expand; Bitwarden uses
     // expand-only, so we pin our expand step against a value computed with the
