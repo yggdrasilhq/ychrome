@@ -207,11 +207,19 @@ destructive verb needs its contract confirmed before it gets a button.
 - **`add` against a real server** — proven on `vault.example.com`: an item was created,
   `cipher_count` went 1107 → 1108, `get` round-tripped the exact generated
   password, and `match` resolved it by its stored URI.
-- **`edit` / `rm` against a real server** — NOT yet exercised. The bodies and the
-  route selection are covered by `cargo test` (preservation of unmodelled fields,
-  cipher-key vs user-key encryption, org ciphers, PascalCase drift, the password
-  history prepend, the `lastKnownRevisionDate` guard), and the soft-vs-hard
-  routes were read off the deployed server's source — but no cipher on
-  `vault.example.com` has yet been edited or trashed by this client.
+- **`edit` against a real server** — proven on `vault.example.com`. Notes were written to
+  an item on one host; a **password-only** edit was then issued from a *different*
+  host's client; the notes read back intact, alongside name, username and URI.
+  That is exactly the silent data loss raw-retention exists to prevent. Custom
+  fields, favorite and password history are covered by `cargo test` only.
+- **The `lastKnownRevisionDate` guard** — fired for real, unplanned: the second
+  host's agent had cached the cipher before the first host's edit, and the server
+  refused the write ("The client copy of this cipher is out of date"). Two
+  long-lived agents WILL go stale against each other — `sync` before a write.
+- **`rm` against a real server** — proven: the item was trashed (`"trashed": true`)
+  and left the item list (1108 → 1107). Note that `sync` filters `deletedDate`
+  items, so this client cannot *display* the trash: "restorable" rests on the
+  route, verified in the deployed server's source, not on an observed restore.
+  A `restore` verb would close that loop and give `rm` an undo. Not built.
 - **Passkeys** (`fido2Credentials`) — not started. Needs a
   `navigator.credentials` shim, because WebKitGTK has no WebAuthn.
