@@ -31,6 +31,36 @@ pub struct RawCipher {
     pub password: Option<EncString>,
     pub totp: Option<EncString>,
     pub uris: Vec<EncString>,
+    /// The item's stored passkeys (`login.fido2Credentials[]`), fields still
+    /// encrypted. Empty for the overwhelming majority of logins. The private
+    /// key (`key_value`) is only ever touched by a WebAuthn ceremony, never by
+    /// the metadata listing.
+    pub fido2: Vec<RawFido2Credential>,
+}
+
+/// One stored passkey as it arrives from `sync`, every string field still an
+/// EncString (except `creation_date`, which Bitwarden stores in the clear).
+/// The shape matches Bitwarden's encrypted `Fido2Credential`; unknown/absent
+/// fields are simply `None`.
+#[derive(Debug, Clone, Default)]
+pub struct RawFido2Credential {
+    pub credential_id: Option<EncString>,
+    pub rp_id: Option<EncString>,
+    pub rp_name: Option<EncString>,
+    pub user_name: Option<EncString>,
+    pub user_display_name: Option<EncString>,
+    /// The account handle — needed for a `get` ceremony, not shown in a listing.
+    pub user_handle: Option<EncString>,
+    pub counter: Option<EncString>,
+    pub discoverable: Option<EncString>,
+    pub key_type: Option<EncString>,
+    pub key_algorithm: Option<EncString>,
+    pub key_curve: Option<EncString>,
+    /// The PKCS#8 private key, encrypted. Decrypted ONLY to sign a ceremony
+    /// challenge, and NEVER surfaced in [`PasskeyInfo`] or any list.
+    pub key_value: Option<EncString>,
+    /// Plaintext ISO-8601 in the sync record — Bitwarden does not encrypt it.
+    pub creation_date: Option<String>,
 }
 
 /// The `type` value of a login cipher. The only type this client can edit's
@@ -130,6 +160,23 @@ pub struct VaultItem {
     pub uris: Vec<String>,
     pub has_password: bool,
     pub has_totp: bool,
+    /// The item stores at least one passkey. Like `has_totp`, this is a boolean
+    /// so a listing can badge it without decrypting anything secret.
+    pub has_passkey: bool,
+}
+
+/// Secret-free metadata for one stored passkey. Carries what a picker or a
+/// listing shows — never the private key (`key_value`) and never the raw
+/// account handle. Serializable because the agent hands it to clients.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PasskeyInfo {
+    pub credential_id: Option<String>,
+    pub rp_id: Option<String>,
+    pub rp_name: Option<String>,
+    pub user_name: Option<String>,
+    pub user_display_name: Option<String>,
+    pub discoverable: bool,
+    pub creation_date: Option<String>,
 }
 
 /// A login to create. Plaintext — it is encrypted by [`Vault::new_login_body`]
@@ -286,7 +333,39 @@ impl Vault {
                     uris,
                     has_password: cipher.password.is_some(),
                     has_totp: cipher.totp.is_some(),
+                    has_passkey: !cipher.fido2.is_empty(),
                 })
+            })
+            .collect()
+    }
+
+    /// The secret-free metadata of an item's stored passkeys, decrypted on
+    /// demand. Empty if the item is unknown or holds no passkey. The private
+    /// key is never decrypted here — a listing must not be able to spill it.
+    pub fn passkeys(&self, id: &str) -> Vec<PasskeyInfo> {
+        let Some(cipher) = self.find(id) else {
+            return Vec::new();
+        };
+        let Ok(key) = self.cipher_key(cipher) else {
+            return Vec::new();
+        };
+        let decrypt = |enc: &Option<EncString>| {
+            enc.as_ref()
+                .and_then(|enc| key.decrypt_to_string(enc).ok())
+        };
+        cipher
+            .fido2
+            .iter()
+            .map(|credential| PasskeyInfo {
+                credential_id: decrypt(&credential.credential_id),
+                rp_id: decrypt(&credential.rp_id),
+                rp_name: decrypt(&credential.rp_name),
+                user_name: decrypt(&credential.user_name),
+                user_display_name: decrypt(&credential.user_display_name),
+                // A malformed or absent flag reads as not-discoverable rather
+                // than failing the whole listing.
+                discoverable: decrypt(&credential.discoverable).as_deref() == Some("true"),
+                creation_date: credential.creation_date.clone(),
             })
             .collect()
     }
@@ -704,6 +783,7 @@ mod tests {
             uris: vec![seal(&key_bytes, "https://github.com")],
             organization_id: None,
             raw: serde_json::Value::Null,
+            fido2: vec![],
         };
         let vault = Vault::new(user_key, HashMap::new(), vec![cipher], vec![], folders);
 
@@ -934,6 +1014,60 @@ mod tests {
         // The whole point: a trashed name never leaks into the live list, so an
         // auto-fill or the sidebar cannot surface a deleted credential.
         assert!(!live.iter().any(|name| name == "Trashed Entry"));
+    }
+
+    #[test]
+    fn passkeys_decrypt_metadata_and_never_expose_the_private_key() {
+        let key_bytes = [0x5au8; 64];
+        let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
+        let s = |text: &str| Some(seal(&key_bytes, text));
+        let cipher = RawCipher {
+            id: "pk".into(),
+            item_type: 1,
+            name: Some(seal(&key_bytes, "GitHub")),
+            fido2: vec![RawFido2Credential {
+                credential_id: s("cred-123"),
+                rp_id: s("github.com"),
+                rp_name: s("GitHub"),
+                user_name: s("octocat"),
+                user_display_name: s("Octo Cat"),
+                user_handle: s("dXNlci1oYW5kbGU"),
+                counter: s("0"),
+                discoverable: s("true"),
+                key_type: s("public-key"),
+                key_algorithm: s("ECDSA"),
+                key_curve: s("P-256"),
+                key_value: s("SUPER-SECRET-PKCS8-PRIVATE-KEY"),
+                creation_date: Some("2026-07-10T00:00:00Z".into()),
+            }],
+            ..Default::default()
+        };
+        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], vec![], HashMap::new());
+
+        // The badge is set without decrypting anything secret.
+        assert!(vault.items()[0].has_passkey);
+
+        let passkeys = vault.passkeys("pk");
+        assert_eq!(passkeys.len(), 1);
+        let pk = &passkeys[0];
+        assert_eq!(pk.rp_id.as_deref(), Some("github.com"));
+        assert_eq!(pk.user_name.as_deref(), Some("octocat"));
+        assert_eq!(pk.credential_id.as_deref(), Some("cred-123"));
+        assert!(pk.discoverable);
+        assert_eq!(pk.creation_date.as_deref(), Some("2026-07-10T00:00:00Z"));
+
+        // THE security property: the secret-free view has no field that could
+        // carry the private key. Serialize it and prove the plaintext key and
+        // its field name are both absent — a listing must never spill it.
+        let json = serde_json::to_string(pk).unwrap();
+        assert!(
+            !json.contains("SUPER-SECRET-PKCS8-PRIVATE-KEY"),
+            "private key leaked into the listing: {json}"
+        );
+        assert!(!json.contains("key_value") && !json.contains("user_handle"), "{json}");
+
+        // An unknown item yields no passkeys rather than panicking.
+        assert!(vault.passkeys("nope").is_empty());
     }
 
     // THE contract this whole struct exists for. `PUT /api/ciphers/{id}`

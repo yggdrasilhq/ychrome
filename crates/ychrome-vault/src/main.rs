@@ -81,6 +81,11 @@ enum Command {
     /// Print an item's current TOTP code — `rbw code` parity.
     #[command(alias = "code")]
     Totp { name: String, user: Option<String> },
+    /// List an item's stored passkeys as `rpId<TAB>user<TAB>credentialId<TAB>created`.
+    ///
+    /// Metadata only — the passkey private key is never printed, and a listing
+    /// can never trigger a WebAuthn ceremony.
+    Passkeys { name: String, user: Option<String> },
     /// Create a login — `rbw add` parity. The password is read from stdin, or
     /// rolled locally with `--generate` (and echoed once, so you can save it).
     Add {
@@ -315,6 +320,22 @@ fn main() -> Result<()> {
         Command::Totp { name, user } => {
             let response = agent::request(&dir, &json!({"op": "totp", "name": name, "user": user}))?;
             println!("{}", string_field(&response, "code"));
+            Ok(())
+        }
+        Command::Passkeys { name, user } => {
+            let response =
+                agent::request(&dir, &json!({"op": "passkeys", "name": name, "user": user}))?;
+            // rpId<TAB>user<TAB>credentialId<TAB>created — one passkey per line,
+            // same TSV discipline as `list` (control chars neutralised).
+            for pk in response["passkeys"].as_array().cloned().unwrap_or_default() {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    tsv_field(&pk["rp_id"]),
+                    tsv_field(&pk["user_name"]),
+                    tsv_field(&pk["credential_id"]),
+                    tsv_field(&pk["creation_date"]),
+                );
+            }
             Ok(())
         }
         Command::Generate { length, no_symbols } => {

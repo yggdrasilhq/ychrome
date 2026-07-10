@@ -344,6 +344,18 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             state.touch();
             Ok(json!({ "code": code, "remaining_secs": remaining, "name": name }))
         }
+        // The item's stored passkeys, metadata only. No private key crosses this
+        // socket — that is reserved for a future ceremony op with explicit
+        // user consent, never a listing.
+        "passkeys" => {
+            let name = string("name").ok_or_else(|| anyhow!("passkeys needs a name"))?;
+            let vault = unlocked(&state)?;
+            let items = vault.items();
+            let item = resolve(&items, &name, string("user").as_deref())?;
+            let passkeys = vault.passkeys(&item.id);
+            state.touch();
+            Ok(json!({ "name": item.name, "passkeys": passkeys }))
+        }
         // The strict host rule: what an auto-fill is allowed to use. Returns
         // the credential outright, because every caller wants it next.
         "match" => {
@@ -806,6 +818,7 @@ mod tests {
             "rm",
             "restore",
             "edit",
+            "passkeys",
             "watchtower",
         ] {
             let error = dispatch(
@@ -826,7 +839,7 @@ mod tests {
     /// user key is handed straight in.
     fn synthetic_state() -> Arc<Mutex<AgentState>> {
         use crate::crypto::SymmetricKey;
-        use crate::model::{RawCipher, Vault, seal};
+        use crate::model::{RawCipher, RawFido2Credential, Vault, seal};
 
         let key_bytes = [0x5au8; 64];
         let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
@@ -840,6 +853,14 @@ mod tests {
                 password: enc("s3cret!"),
                 totp: enc("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"),
                 uris: vec![seal(&key_bytes, b"https://github.com/login")],
+                fido2: vec![RawFido2Credential {
+                    credential_id: enc("cred-abc"),
+                    rp_id: enc("github.com"),
+                    user_name: enc("octocat"),
+                    discoverable: enc("true"),
+                    key_value: enc("PRIVATE-KEY-MUST-NOT-LEAK"),
+                    ..Default::default()
+                }],
                 ..Default::default()
             },
             RawCipher {
@@ -921,6 +942,39 @@ mod tests {
         assert!(suggested[0].get("password").is_none());
 
         assert!(dispatch(&json!({"op": "get", "name": "nope"}), &state).is_err());
+    }
+
+    // Passkeys surface as a badge on the list and a metadata-only op. The
+    // private key never crosses the socket, and an item without a passkey
+    // reports none rather than erroring.
+    #[test]
+    fn agent_reports_stored_passkeys_metadata_only() {
+        let state = synthetic_state();
+
+        let list = dispatch(&json!({"op": "list"}), &state).unwrap();
+        let github = list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "GitHub")
+            .unwrap()
+            .clone();
+        assert_eq!(github["has_passkey"], true);
+
+        let response = dispatch(&json!({"op": "passkeys", "name": "github"}), &state).unwrap();
+        let passkeys = response["passkeys"].as_array().unwrap();
+        assert_eq!(passkeys.len(), 1);
+        assert_eq!(passkeys[0]["rp_id"], "github.com");
+        assert_eq!(passkeys[0]["user_name"], "octocat");
+        // The whole response, serialized, must not contain the private key.
+        assert!(
+            !response.to_string().contains("PRIVATE-KEY-MUST-NOT-LEAK"),
+            "{response}"
+        );
+
+        // An item with no passkey answers with an empty list, not an error.
+        let none = dispatch(&json!({"op": "passkeys", "name": "gour.top"}), &state).unwrap();
+        assert!(none["passkeys"].as_array().unwrap().is_empty());
     }
 
     // The trash is a second, opt-in list. `restore` resolves names against it —

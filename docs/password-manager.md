@@ -1,8 +1,14 @@
 # ychrome × Bitwarden/Vaultwarden: autofill + passkeys design
 
-Status: SLICE 1 SHIPPED (2026-07-09) — autofill MVP; TOTP/passkeys still design.
-Companion to the ychrome daily-browser campaign. User setup: Bitwarden clients
-against a self-hosted Vaultwarden, passkeys stored in the vault.
+Status: autofill + TOTP shipped; the vault client is now **native**
+(`crates/ychrome-vault`, `ychrome-vault` CLI/agent), NOT rbw/goldwarden — the
+"Engine reality" and "signer" notes below that name rbw/goldwarden are the
+original design and are superseded by the native client. Passkeys: the READ
+layer is built (`sync` → `RawCipher::fido2`, `list` badges `has_passkey`,
+`passkeys NAME` returns secret-free metadata; see `docs/vault.md`); the WebAuthn
+ceremony (ES256 signer + `navigator.credentials` shim + user-presence dialog)
+is still to build. Companion to the ychrome daily-browser campaign. User setup:
+Bitwarden clients against a self-hosted Vaultwarden, passkeys stored in the vault.
 
 ## Shipped: autofill MVP (slice 1, 2.9.66)
 

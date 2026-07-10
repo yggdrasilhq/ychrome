@@ -168,6 +168,7 @@ mod tests {
             uris: uris.iter().map(|u| u.to_string()).collect(),
             has_password: true,
             has_totp: false,
+            has_passkey: false,
         }
     }
 
