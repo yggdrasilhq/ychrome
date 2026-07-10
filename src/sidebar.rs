@@ -326,6 +326,13 @@ fn handle_conn(stream: TcpStream, state: &ServerState) {
         Some(serde_json::from_slice(&body).unwrap_or(Value::Null))
     };
 
+    // A cross-origin fetch from an RP's page (the passkey shim) preflights with
+    // OPTIONS before the real POST — answer it, whatever the path.
+    if method == "OPTIONS" {
+        respond_preflight(stream);
+        return;
+    }
+
     match (method, path) {
         ("GET", p) if p == format!("/pane/{VAULT_PANE}") => {
             let host = query_value(query, "host");
@@ -438,13 +445,43 @@ fn respond_json(mut stream: TcpStream, status: u16, body: &Value) {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         404 => "Not Found",
         _ => "OK",
     };
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
-         Content-Length: {len}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+         Content-Length: {len}\r\nCache-Control: no-store\r\nConnection: close\r\n\
+         {cors}\r\n{body}",
         len = body.len(),
+        cors = cors_headers(),
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+/// CORS headers on EVERY control response.
+///
+/// The signer's page routes (`/fido2/get`, `/fido2/create`) are fetched by a
+/// userscript running in the RP's page — a cross-origin request (webauthn.io →
+/// `127.0.0.1:<port>`) that WebKit refuses without these. `*` is safe: CORS is
+/// not our security boundary — the bearer token (page routes) and the unguessable
+/// request_id (grant routes) are — and the shim never sends credentials, so a
+/// wildcard origin is allowed. The custom `X-Ychrome-Fido2` header forces a
+/// preflight `OPTIONS`, which [`handle_conn`] answers.
+fn cors_headers() -> &'static str {
+    "Access-Control-Allow-Origin: *\r\n\
+     Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+     Access-Control-Allow-Headers: Content-Type, X-Ychrome-Fido2\r\n\
+     Access-Control-Max-Age: 600\r\n"
+}
+
+/// Answer a CORS preflight: 204, the CORS headers, no body. Without this the
+/// browser never sends the real `/fido2/*` POST.
+fn respond_preflight(mut stream: TcpStream) {
+    let response = format!(
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n{cors}\r\n",
+        cors = cors_headers(),
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
