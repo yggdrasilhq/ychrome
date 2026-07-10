@@ -405,6 +405,30 @@ const MAX_REPORT_ROWS: usize = 30;
 /// so it never rides a schema down. The unlock itself runs `ychrome-vault
 /// unlock` on THIS host, reading the password from stdin — the same path the
 /// user would take at a shell, now without leaving the sidebar.
+/// The agent outlives the binary: install a new `ychrome-vault` and the running
+/// agent keeps serving the OLD code, so ops added since it started answer
+/// `unknown op`. `status` reports this as `agent_stale`.
+///
+/// Retiring the agent DROPS the cached keys, so the vault re-locks and the user
+/// must unlock again. That is why this is a button and not something the pane
+/// does behind their back — and why the button lives right next to the unlock
+/// form, which is where the flow lands.
+fn stale_agent_widgets(status: &Value) -> Vec<Value> {
+    if !status["agent_stale"].as_bool().unwrap_or(false) {
+        return Vec::new();
+    }
+    vec![
+        json!({
+            "kind": "label", "muted": true,
+            "text": "This host's vault agent is older than the installed ychrome-vault, so newer features are unavailable. Restarting it re-locks the vault.",
+        }),
+        json!({
+            "kind": "button", "id": "restart_agent", "action": "restart_agent",
+            "label": "Restart agent (re-locks)",
+        }),
+    ]
+}
+
 fn locked_schema(status: &Value) -> Value {
     let state = status["state"].as_str().unwrap_or("unknown");
     let mut widgets = vec![];
@@ -415,8 +439,11 @@ fn locked_schema(status: &Value) -> Value {
                 widgets.push(json!({"kind": "label", "muted": true, "text": email}));
             }
             widgets.push(json!({
+                // `action` fires on Enter: typing a master password and reaching
+                // for the mouse is not how anyone unlocks a vault.
                 "kind": "text-input", "id": "unlock_password", "label": "Master password",
                 "placeholder": "Master password", "secret": true, "value": "",
+                "action": "unlock",
             }));
             widgets.push(json!({
                 "kind": "button", "id": "unlock", "action": "unlock", "primary": true,
@@ -426,6 +453,7 @@ fn locked_schema(status: &Value) -> Value {
                 "kind": "label", "muted": true,
                 "text": "Your password unlocks the vault on this host and is not stored. It never crosses the terminal or the GUI.",
             }));
+            widgets.extend(stale_agent_widgets(status));
         }
         "not_configured" => {
             widgets.push(json!({"kind": "section", "text": "Vault not set up"}));
@@ -449,9 +477,12 @@ fn locked_schema(status: &Value) -> Value {
 /// The I/O lives here so [`unlocked_schema`] stays pure and testable without an
 /// agent — a test must never touch the user's real vault.
 fn vault_schema(state: &PaneState, host: Option<&str>) -> Value {
+    // ONE `status` call per schema. It is the SSOT for lock state AND agent
+    // staleness, so both branches read the same answer — the Tools tab used to
+    // fetch it a second time and could disagree with the gate above it.
     match vault_cli_json(&["status"]) {
         Ok(status) if status["state"].as_str() == Some("unlocked") => {
-            unlocked_schema(state, host)
+            unlocked_schema(state, host, &status)
         }
         Ok(status) => locked_schema(&status),
         Err(error) => json!({
@@ -468,7 +499,7 @@ fn vault_schema(state: &PaneState, host: Option<&str>) -> Value {
 /// usernames and the booleans saying a password or TOTP secret exists. The Add
 /// tab's password field is declared EMPTY every time: it carries what the user
 /// types up to this process on an action, and nothing ever comes back down.
-fn unlocked_schema(state: &PaneState, host: Option<&str>) -> Value {
+fn unlocked_schema(state: &PaneState, host: Option<&str>, status: &Value) -> Value {
     let mut widgets = vec![json!({
         "kind": "tabs",
         "id": "tab",
@@ -518,19 +549,13 @@ fn unlocked_schema(state: &PaneState, host: Option<&str>) -> Value {
         }
         "tools" => {
             widgets.push(json!({"kind": "section", "text": "Vault"}));
-            match vault_cli_json(&["status"]) {
-                Ok(status) => {
-                    let state_label = status["state"].as_str().unwrap_or("unknown");
-                    let items = status["item_count"].as_u64().unwrap_or(0);
-                    widgets.push(json!({
-                        "kind": "label", "muted": true,
-                        "text": format!("{state_label} · {items} items"),
-                    }));
-                }
-                Err(error) => widgets.push(json!({
-                    "kind": "label", "muted": true, "text": error.to_string(),
-                })),
-            }
+            let state_label = status["state"].as_str().unwrap_or("unknown");
+            let items = status["item_count"].as_u64().unwrap_or(0);
+            widgets.push(json!({
+                "kind": "label", "muted": true,
+                "text": format!("{state_label} · {items} items"),
+            }));
+            widgets.extend(stale_agent_widgets(status));
             widgets.push(json!({"kind": "button", "id": "sync", "action": "sync", "label": "Re-sync from the server"}));
             widgets.push(json!({"kind": "button", "id": "lock", "action": "lock", "label": "Lock the vault"}));
 
@@ -768,6 +793,18 @@ fn run_action(state: &Arc<Mutex<PaneState>>, request: &Value) -> Value {
                 Err(error) => merge(reschema(state, host.as_deref()), json!({ "toast": error.to_string() })),
             }
         }
+        "restart_agent" => match vault_cli_json(&["stop-agent"]) {
+            Ok(_) => {
+                // The agent held the keys, so the vault is locked now and the old
+                // scan is meaningless. Reschema lands on the unlock form.
+                state.lock().unwrap().watchtower = None;
+                merge(
+                    reschema(state, host.as_deref()),
+                    json!({ "toast": "Agent restarted — unlock the vault to continue." }),
+                )
+            }
+            Err(error) => json!({ "toast": error.to_string() }),
+        },
         "lock" => match vault_cli_json(&["lock"]) {
             Ok(_) => {
                 // A locked vault's scan is stale and unrepeatable; do not keep
@@ -1054,7 +1091,7 @@ mod tests {
         state.seed_add_draft(Some("github.com"));
         // `unlocked_schema`, not `vault_schema`: the latter shells out to
         // `ychrome-vault status`, which a test must never do.
-        let schema = unlocked_schema(&state, Some("github.com"));
+        let schema = unlocked_schema(&state, Some("github.com"), &json!({"state": "unlocked"}));
         let widgets = schema["widgets"].as_array().unwrap();
 
         let password = widgets
@@ -1123,6 +1160,8 @@ mod tests {
             .expect("locked pane has a master-password field");
         assert_eq!(field["secret"], true, "the master password must be masked");
         assert_eq!(field["value"], "", "a schema must never carry a secret");
+        // Enter in the field unlocks, without reaching for the button.
+        assert_eq!(field["action"], "unlock");
         assert!(widgets.iter().any(|w| w["action"] == "unlock"));
         // The account is shown for context; the password never is.
         assert!(json!(widgets).to_string().contains("you@example.com"));
@@ -1143,6 +1182,7 @@ mod tests {
         let schema = unlocked_schema(
             &PaneState { tab: "add".to_string(), add: AddDraft { notes: "hi".to_string(), ..AddDraft::default() }, ..PaneState::default() },
             None,
+            &json!({"state": "unlocked"}),
         );
         let notes = schema["widgets"]
             .as_array()
@@ -1151,6 +1191,32 @@ mod tests {
             .find(|w| w["id"] == "add_notes")
             .expect("notes field present");
         assert_eq!(notes["value"], "hi");
+    }
+
+    // The agent outlives the binary. When `status` says so, the pane must SAY so
+    // and offer the remedy — otherwise the user meets `unknown op` in a toast and
+    // has to go to a terminal, which the sidebar-unlock work exists to avoid.
+    #[test]
+    fn a_stale_agent_is_surfaced_with_a_restart_button() {
+        let stale = json!({"state": "locked", "email": "you@example.com", "agent_stale": true});
+        let wire = locked_schema(&stale).to_string();
+        assert!(wire.contains("restart_agent"), "no remedy offered for a stale agent");
+        assert!(wire.contains("re-locks"), "the cost of restarting must be stated");
+        // Still an unlock form: restarting lands the user right back here.
+        assert!(wire.contains("unlock_password"));
+
+        // A healthy agent gets no banner and no button.
+        let fresh = json!({"state": "locked", "email": "you@example.com", "agent_stale": false});
+        assert!(!locked_schema(&fresh).to_string().contains("restart_agent"));
+        // Absent field (an older `status`) is treated as healthy, not stale.
+        assert!(!locked_schema(&json!({"state": "locked"})).to_string().contains("restart_agent"));
+
+        // Tools tab surfaces it too, for a vault that went stale while unlocked.
+        let tools = PaneState { tab: "tools".to_string(), ..PaneState::default() };
+        let unlocked_stale = json!({"state": "unlocked", "item_count": 1107, "agent_stale": true});
+        let wire = unlocked_schema(&tools, None, &unlocked_stale).to_string();
+        assert!(wire.contains("restart_agent"));
+        assert!(wire.contains("1107 items"));
     }
 
     // yggterm posts only the values its CURRENT schema declares. A `tab` action
