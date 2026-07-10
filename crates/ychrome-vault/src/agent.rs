@@ -255,7 +255,17 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
         "list" => {
             let vault = unlocked(&state)?;
             let query = string("query").map(|q| q.to_lowercase());
-            let mut items = vault.items();
+            // `--trashed` lists the recoverable soft-deleted items instead of the
+            // live ones; the two sets never overlap.
+            let trashed = request
+                .get("trashed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut items = if trashed {
+                vault.trashed_items()
+            } else {
+                vault.items()
+            };
             if let Some(query) = &query {
                 items.retain(|item| {
                     item.name.to_lowercase().contains(query)
@@ -510,6 +520,44 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
                 "trashed": !permanent,
             }))
         }
+        // Bring a soft-deleted item back from the trash — the inverse of a soft
+        // `rm`. The name is resolved among the TRASHED items, not the live ones,
+        // so restoring cannot accidentally touch a live entry that shares a name.
+        "restore" => {
+            let name = string("name").ok_or_else(|| anyhow!("restore needs a name"))?;
+            let vault = unlocked(&state)?;
+            let items = vault.trashed_items();
+            let item = find_by_name(&items, &name, string("user").as_deref())
+                .map_err(|candidates| {
+                    if candidates.is_empty() {
+                        anyhow!(
+                            "no trashed entry named {name:?} \
+                             (only a soft-deleted item can be restored)"
+                        )
+                    } else {
+                        let users: Vec<String> = candidates
+                            .iter()
+                            .map(|item| item.username.as_deref().unwrap_or("<no user>").to_string())
+                            .collect();
+                        anyhow!(
+                            "{name:?} matches {} trashed accounts — name one: {}",
+                            candidates.len(),
+                            users.join(", ")
+                        )
+                    }
+                })?;
+            let (id, name) = (item.id.clone(), item.name.clone());
+            state
+                .manager
+                .restore_item(&id)
+                .map_err(|error| anyhow!(error.to_string()))?;
+            state.touch();
+            Ok(json!({
+                "id": id,
+                "name": name,
+                "restored": true,
+            }))
+        }
         // Account for every cipher the server sent: how many we can read, and
         // why we cannot read the rest.
         "diagnose" => {
@@ -756,6 +804,7 @@ mod tests {
             "match",
             "suggest",
             "rm",
+            "restore",
             "edit",
             "watchtower",
         ] {
@@ -802,9 +851,25 @@ mod tests {
                 ..Default::default()
             },
         ];
+        // One soft-deleted item, so `list --trashed` and `restore` have a target.
+        // It stays OUT of the live `ciphers` above — the live list must not see it.
+        let trashed = vec![RawCipher {
+            id: "old".to_string(),
+            item_type: 1,
+            name: enc("deleted-site.example"),
+            username: enc("ghost"),
+            password: enc("was-here"),
+            ..Default::default()
+        }];
         let dir = temp_dir("synthetic");
         let mut manager = VaultManager::load(&dir);
-        manager.install_vault_for_test(Vault::new(user_key, Default::default(), ciphers, Default::default()));
+        manager.install_vault_for_test(Vault::new(
+            user_key,
+            Default::default(),
+            ciphers,
+            trashed,
+            Default::default(),
+        ));
         test_state(manager, dir)
     }
 
@@ -856,6 +921,39 @@ mod tests {
         assert!(suggested[0].get("password").is_none());
 
         assert!(dispatch(&json!({"op": "get", "name": "nope"}), &state).is_err());
+    }
+
+    // The trash is a second, opt-in list. `restore` resolves names against it —
+    // and only it — so a destructive verb's inverse can never touch a live entry.
+    #[test]
+    fn trash_is_listed_only_on_request_and_restore_resolves_the_trash() {
+        let state = synthetic_state();
+
+        // The live list never shows the trashed item...
+        let live = dispatch(&json!({"op": "list"}), &state).unwrap();
+        let live = live["items"].as_array().unwrap();
+        assert_eq!(live.len(), 2);
+        assert!(live.iter().all(|item| item["name"] != "deleted-site.example"));
+
+        // ...but `list --trashed` shows exactly it, secret-free like any list.
+        let trashed = dispatch(&json!({"op": "list", "trashed": true}), &state).unwrap();
+        let trashed = trashed["items"].as_array().unwrap();
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed[0]["name"], "deleted-site.example");
+        assert!(trashed[0].get("password").is_none());
+
+        // Restoring a LIVE item's name refuses before any network — restore's
+        // target space is the trash, never the live list.
+        let error = dispatch(&json!({"op": "restore", "name": "GitHub"}), &state)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no trashed entry named"), "{error}");
+
+        // A name that is in neither list refuses the same way.
+        let error = dispatch(&json!({"op": "restore", "name": "nope"}), &state)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no trashed entry named"), "{error}");
     }
 
     // An `edit` that names no field to change must not reach the network. The

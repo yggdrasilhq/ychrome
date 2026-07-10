@@ -229,7 +229,13 @@ impl VaultManager {
 
         let sync = client.sync(&token.access_token)?;
         let organization_keys = unwrap_organization_keys(&user_key, &sync)?;
-        let vault = Vault::new(user_key, organization_keys, sync.ciphers, sync.folders);
+        let vault = Vault::new(
+            user_key,
+            organization_keys,
+            sync.ciphers,
+            sync.trashed,
+            sync.folders,
+        );
         let count = vault.items().len();
         self.vault = Some(vault);
         self.access_token = Some(Zeroizing::new(token.access_token));
@@ -305,6 +311,24 @@ impl VaultManager {
         Ok(())
     }
 
+    /// Restore a soft-deleted item from the trash and re-sync, so it reappears
+    /// in the live item list. The item must still be in the trash — a
+    /// hard-deleted one is gone and the server refuses. This is the exact
+    /// inverse of a soft [`remove_item`].
+    ///
+    /// [`remove_item`]: VaultManager::remove_item
+    pub fn restore_item(&mut self, id: &str) -> Result<(), VaultError> {
+        let config = self.config.clone().ok_or(VaultError::NotConfigured)?;
+        let token = self.access_token.clone().ok_or(VaultError::Locked)?;
+        if self.vault.is_none() {
+            return Err(VaultError::Locked);
+        }
+        let client = Client::new(&config.server_url)?;
+        client.restore_cipher(&token, id)?;
+        self.resync()?;
+        Ok(())
+    }
+
     /// Re-pull the ciphers with the session's bearer token, keeping the same
     /// user key. The master password is NOT needed — that is the whole point
     /// of holding the token: an agent can refresh a long-lived unlock.
@@ -321,7 +345,7 @@ impl VaultManager {
         let user_key = self.vault.as_ref().expect("checked").user_key().clone();
         let organization_keys = unwrap_organization_keys(&user_key, &sync)?;
         let vault = self.vault.as_mut().expect("checked");
-        vault.replace_contents(organization_keys, sync.ciphers, sync.folders);
+        vault.replace_contents(organization_keys, sync.ciphers, sync.trashed, sync.folders);
         Ok(vault.items().len())
     }
 
