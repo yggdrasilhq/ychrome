@@ -56,7 +56,13 @@ const CEREMONY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// What the GUI dialog delivered for a pending ceremony.
 enum Outcome {
-    Granted { user_verified: bool },
+    Granted {
+        user_verified: bool,
+        /// Which passkey the user chose, when the site offered several accounts.
+        /// `None` for a single-account ceremony or a `create()` — the caller
+        /// falls back to the only/first candidate.
+        credential_id: Option<String>,
+    },
     Denied,
 }
 
@@ -162,26 +168,25 @@ impl Signer {
             })
             .unwrap_or_default();
 
-        // Which stored passkey answers this — secret-free, from the agent.
+        // Which stored passkeys answer this — secret-free, from the agent. ALL
+        // of them: a site where the user has several accounts (github, google)
+        // offers a choice, exactly as the Bitwarden extension does.
         let resolved = agent_request(&json!({
             "op": "fido2-resolve",
             "rp_id": rp_id,
             "allow_credential_ids": allow,
         }))
         .map_err(|error| GetError::Bad(error.to_string()))?;
-        let candidate = resolved["matches"]
+        let matches: Vec<Value> = resolved["matches"]
             .as_array()
-            .and_then(|matches| matches.first())
             .cloned()
-            .ok_or(GetError::NoCredential)?;
-        let item_id = candidate["item_id"].as_str().unwrap_or_default().to_string();
-        let credential_id = candidate["credential_id"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        let user_handle = candidate["user_handle"].as_str().map(str::to_string);
+            .unwrap_or_default();
+        if matches.is_empty() {
+            return Err(GetError::NoCredential);
+        }
 
         // The bytes the RP will re-hash: whatever we sign, we return verbatim.
+        // Independent of which account — computed once.
         let client_data_json = format!(
             r#"{{"type":"webauthn.get","challenge":{},"origin":{},"crossOrigin":false}}"#,
             json_string(challenge),
@@ -189,18 +194,40 @@ impl Signer {
         );
         let client_data_hash = Sha256::digest(client_data_json.as_bytes());
 
-        // Ask the human. Emit the OSC, then park until the GUI answers.
+        // Ask the human, offering every matched account. One entry ⇒ the dialog
+        // is a plain Approve; several ⇒ a picker. Labels only — no key.
+        let accounts: Vec<Value> = matches
+            .iter()
+            .map(|candidate| {
+                json!({
+                    "credential_id": candidate["credential_id"].as_str().unwrap_or_default(),
+                    "label": account_label(candidate),
+                })
+            })
+            .collect();
         let request_id = hex_token(16);
-        let label = account_label(&candidate);
         self.register(&request_id);
-        emit_fido2_request(&self.session, &request_id, rp_id, &label, "get", origin);
+        emit_fido2_request(&self.session, &request_id, rp_id, &accounts, "get", origin);
         let outcome = self.wait_for_outcome(&request_id);
 
-        let user_verified = match outcome {
-            Some(Outcome::Granted { user_verified }) => user_verified,
+        let (user_verified, chosen_id) = match outcome {
+            Some(Outcome::Granted { user_verified, credential_id }) => (user_verified, credential_id),
             Some(Outcome::Denied) => return Err(GetError::Denied),
             None => return Err(GetError::TimedOut),
         };
+
+        // The account the user chose (or the only one). A chosen id the resolver
+        // did not return is refused rather than silently signing another account.
+        let candidate = match &chosen_id {
+            Some(id) => matches
+                .iter()
+                .find(|c| c["credential_id"].as_str() == Some(id.as_str()))
+                .ok_or_else(|| GetError::Bad("chosen passkey is not among the offered accounts".into()))?,
+            None => &matches[0],
+        };
+        let item_id = candidate["item_id"].as_str().unwrap_or_default().to_string();
+        let credential_id = candidate["credential_id"].as_str().unwrap_or_default().to_string();
+        let user_handle = candidate["user_handle"].as_str().map(str::to_string);
 
         // Consent in hand: the agent mints UserPresence and signs.
         let assertion = agent_request(&json!({
@@ -277,13 +304,16 @@ impl Signer {
             json_string(origin),
         );
 
-        // Ask the human — a registration is a presence ceremony too.
+        // Ask the human — a registration is a presence ceremony too. One account
+        // (the one being created), so the dialog is a plain Approve, never a
+        // picker; a chosen credential_id in the grant is ignored here.
         let request_id = hex_token(16);
         let label = if display_name.is_empty() { user_name } else { display_name };
+        let accounts = vec![json!({ "label": label })];
         self.register(&request_id);
-        emit_fido2_request(&self.session, &request_id, rp_id, label, "create", origin);
+        emit_fido2_request(&self.session, &request_id, rp_id, &accounts, "create", origin);
         let user_verified = match self.wait_for_outcome(&request_id) {
-            Some(Outcome::Granted { user_verified }) => user_verified,
+            Some(Outcome::Granted { user_verified, .. }) => user_verified,
             Some(Outcome::Denied) => return Err(GetError::Denied),
             None => return Err(GetError::TimedOut),
         };
@@ -326,7 +356,20 @@ impl Signer {
             .get("user_verified")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        self.resolve_ceremony(body, Outcome::Granted { user_verified })
+        // The account the user picked, when the site offered several. Absent for
+        // a single-account ceremony (the dialog is a plain Approve).
+        let credential_id = body
+            .get("credential_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        self.resolve_ceremony(
+            body,
+            Outcome::Granted {
+                user_verified,
+                credential_id,
+            },
+        )
     }
 
     /// `POST /fido2/deny` — the GUI dialog was declined or dismissed.
@@ -430,15 +473,30 @@ fn origin_host(origin: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
-/// `OSC 7717 ; fido2 ; request ; <base64 json>`. Carries only rpId + a label —
-/// never a challenge secret, never a key. The GUI shows a presence dialog and,
-/// on approval, POSTs `/fido2/grant` back to this control endpoint.
-fn emit_fido2_request(session: &str, request_id: &str, rp_id: &str, account: &str, kind: &str, origin: &str) {
+/// `OSC 7717 ; fido2 ; request ; <base64 json>`. Carries rpId + the matched
+/// accounts (each `{credential_id, label}`) — never a challenge secret, never a
+/// key. The GUI shows a presence dialog (a picker when several accounts match)
+/// and, on the user's choice, POSTs `/fido2/grant {request_id, credential_id}`
+/// back to this control endpoint. `account` is kept as the first label so an
+/// older yggterm that reads only that still names an account.
+fn emit_fido2_request(
+    session: &str,
+    request_id: &str,
+    rp_id: &str,
+    accounts: &[Value],
+    kind: &str,
+    origin: &str,
+) {
+    let first_label = accounts
+        .first()
+        .and_then(|a| a["label"].as_str())
+        .unwrap_or("this account");
     let payload = json!({
         "session": session,
         "request_id": request_id,
         "rp_id": rp_id,
-        "account": account,
+        "account": first_label,
+        "accounts": accounts,
         "kind": kind,
         "origin": origin,
     });
@@ -734,18 +792,21 @@ mod tests {
         let signer = Signer::new(1234, "sess".into());
         signer.register("req-1");
 
-        // Grant for a live ceremony succeeds and is idempotent on repeat.
-        let (status, _) = signer.handle_grant(&json!({ "request_id": "req-1", "user_verified": true }));
+        // Grant for a live ceremony succeeds, carrying the chosen account, and
+        // is idempotent on repeat.
+        let (status, _) = signer.handle_grant(
+            &json!({ "request_id": "req-1", "user_verified": true, "credential_id": "cred-b" }),
+        );
         assert_eq!(status, 200);
         // The outcome is now set; a second grant is a no-op, never a 500.
         let (status, body) = signer.handle_grant(&json!({ "request_id": "req-1" }));
         assert_eq!(status, 200);
         assert_eq!(body["already"], true);
 
-        // The parked side consumes it exactly once.
+        // The parked side consumes it exactly once, with the picked account.
         assert!(matches!(
             signer.wait_for_outcome("req-1"),
-            Some(Outcome::Granted { user_verified: true })
+            Some(Outcome::Granted { user_verified: true, credential_id: Some(id) }) if id == "cred-b"
         ));
         // Consumed: a later look finds nothing.
         assert!(signer.wait_for_outcome("req-1").is_none());
