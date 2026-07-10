@@ -588,10 +588,16 @@ fn json_string(value: &str) -> String {
 /// rebuilds a `PublicKeyCredential` from the response. `PORT`/`TOKEN` are baked
 /// in per surface. Kept as one self-contained IIFE so it needs nothing else.
 fn shim_js(port: u16, token: &str) -> String {
+    // The shim reaches the signer through yggterm's `yggterm-appctl://` bridge,
+    // NOT `http://127.0.0.1:{port}` directly: WebKitGTK blocks an https page from
+    // fetching http-loopback (mixed content). yggterm registers the scheme as
+    // secure and proxies it to this app's control endpoint. The port is unused in
+    // the page (the GUI knows which signer to route to); the token still gates.
+    let _ = port;
     format!(
         r#"(function () {{
   'use strict';
-  var ENDPOINT = 'http://127.0.0.1:{port}';
+  var ENDPOINT = 'yggterm-appctl://signer';
   var TOKEN = '{token}';
 
   function b64urlToBuf(s) {{
@@ -779,10 +785,12 @@ mod tests {
     }
 
     #[test]
-    fn the_shim_bakes_in_the_port_and_token_and_overrides_get() {
+    fn the_shim_uses_the_appctl_bridge_and_the_token_and_overrides_get() {
         let signer = Signer::new(54321, "sess".into());
         let js = signer.shim_userscript();
-        assert!(js.contains("http://127.0.0.1:54321"));
+        // The bridge scheme, NOT a raw http-loopback URL (mixed content).
+        assert!(js.contains("yggterm-appctl://signer"));
+        assert!(!js.contains("http://127.0.0.1"));
         assert!(js.contains(&signer.token));
         assert!(js.contains("shim.get = function"));
         assert!(js.contains("/fido2/get"));
