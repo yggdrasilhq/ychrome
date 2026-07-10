@@ -29,8 +29,11 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-/// The pane id ychrome declares. yggterm only ever echoes it back.
+/// The pane ids ychrome declares. yggterm only ever echoes them back.
 const VAULT_PANE: &str = "vault";
+/// ychrome's own settings: ad blocking and userscripts, both owned by the host
+/// ychrome runs on. yggterm used to hardcode this as `RightPanelMode::AppSidebar`.
+const SETTINGS_PANE: &str = "settings";
 /// Rows the pane shows before the user narrows with the search box. The vault
 /// has ~1100 items; rendering them all would make the panel unusable and the
 /// schema enormous.
@@ -123,6 +126,10 @@ struct AddDraft {
 /// What the pane is currently showing. Host-resident, like everything else the
 /// app owns: yggterm holds no vault state, not even which tab is selected.
 struct PaneState {
+    /// The profile this ychrome is running. The settings pane needs it to show
+    /// the per-profile adblock override, and `/policy` needs it to decide which
+    /// userscripts apply.
+    profile: String,
     tab: String,
     query: String,
     add: AddDraft,
@@ -136,12 +143,22 @@ struct PaneState {
 impl Default for PaneState {
     fn default() -> Self {
         PaneState {
+            profile: "default".to_string(),
             tab: "fill".to_string(),
             query: String::new(),
             add: AddDraft::default(),
             generate_length: DEFAULT_GENERATE_LENGTH,
             generate_no_symbols: false,
             watchtower: None,
+        }
+    }
+}
+
+impl PaneState {
+    fn new(profile: &str) -> Self {
+        PaneState {
+            profile: profile.to_string(),
+            ..PaneState::default()
         }
     }
 }
@@ -179,12 +196,12 @@ impl Sidebar {
 }
 
 /// Bind the control endpoint and serve it on a background thread.
-pub fn spawn() -> Result<Sidebar> {
+pub fn spawn(profile: &str) -> Result<Sidebar> {
     let listener = TcpListener::bind("127.0.0.1:0").context("binding sidebar control server")?;
     let port = listener.local_addr()?.port();
     let control_url = format!("http://127.0.0.1:{port}");
     let stop = Arc::new(AtomicBool::new(false));
-    let state = Arc::new(Mutex::new(PaneState::default()));
+    let state = Arc::new(Mutex::new(PaneState::new(profile)));
 
     {
         let stop = stop.clone();
@@ -203,21 +220,33 @@ pub fn spawn() -> Result<Sidebar> {
     Ok(Sidebar { control_url, stop })
 }
 
-/// `OSC 7717 ; sidebar ; <action> ; <base64 json>`. Carries the control endpoint
-/// and the pane buttons — never a schema, never a secret.
-pub fn emit_declare(session: &str, control: &str) {
+/// `OSC 7717 ; sidebar ; <action> ; <base64 json>`. Carries the control endpoint,
+/// the pane buttons, and a stamp over this host's web-content policy — never a
+/// schema, never a ruleset, never a secret.
+///
+/// `policy_version` is what makes the ~4s re-declare cheap: yggterm refetches
+/// `<control>/policy` only when the stamp moves. See [`crate::webpolicy`].
+pub fn emit_declare(session: &str, control: &str, policy_version: &str) {
     let payload = json!({
         "session": session,
         "control": control,
-        "panes": [{
-            "id": VAULT_PANE,
-            // U+FE0E VARIATION SELECTOR-15 forces TEXT presentation, so the key
-            // renders as a monochrome glyph that sits with yggterm's other chrome
-            // (▦ ⧉ ⚙) instead of a colour emoji. Without it WebKitGTK picks the
-            // emoji font and the button looks pasted on.
-            "icon": "🔑\u{fe0e}",
-            "title": "Vault (fill logins from Bitwarden)",
-        }],
+        "policy_version": policy_version,
+        "panes": [
+            {
+                "id": VAULT_PANE,
+                // U+FE0E VARIATION SELECTOR-15 forces TEXT presentation, so the key
+                // renders as a monochrome glyph that sits with yggterm's other chrome
+                // (▦ ⧉ ⚙) instead of a colour emoji. Without it WebKitGTK picks the
+                // emoji font and the button looks pasted on.
+                "icon": "🔑\u{fe0e}",
+                "title": "Vault (fill logins from Bitwarden)",
+            },
+            {
+                "id": SETTINGS_PANE,
+                "icon": "⚙\u{fe0e}",
+                "title": "ychrome settings (ad blocking, userscripts)",
+            },
+        ],
     });
     emit_osc("declare", &payload.to_string());
 }
@@ -277,6 +306,18 @@ fn handle_conn(stream: TcpStream, state: &Arc<Mutex<PaneState>>) {
                 vault_schema(&state, host.as_deref())
             };
             respond_json(stream, 200, &schema);
+        }
+        ("GET", p) if p == format!("/pane/{SETTINGS_PANE}") => {
+            let profile = state.lock().unwrap().profile.clone();
+            respond_json(stream, 200, &settings_schema(&profile));
+        }
+        // The EFFECTIVE web-content policy for the profile this ychrome is
+        // running: every enable/disable decision already made. yggterm applies
+        // it to the webview and persists nothing but WebKit's compiled cache.
+        // No `?host=` — unlike a pane schema, this is not about the open page.
+        ("GET", "/policy") => {
+            let profile = state.lock().unwrap().profile.clone();
+            respond_json(stream, 200, &crate::webpolicy::policy(&profile).to_json());
         }
         ("POST", "/action") => {
             let mut body = vec![0u8; content_length];
@@ -722,6 +763,12 @@ fn absorb_draft(state: &mut PaneState, values: &Value) {
 }
 
 fn run_action(state: &Arc<Mutex<PaneState>>, request: &Value) -> Value {
+    // Which pane the click came from. The two panes have disjoint action names,
+    // but they return DIFFERENT schemas — routing on the pane id is what stops a
+    // settings toggle from redrawing the rail as the vault.
+    if request["pane"].as_str() == Some(SETTINGS_PANE) {
+        return run_settings_action(state, request);
+    }
     let action = request["action"].as_str().unwrap_or_default();
     let values = &request["values"];
     let value = values["value"].as_str().unwrap_or_default().to_string();
@@ -918,6 +965,125 @@ fn reschema(state: &Arc<Mutex<PaneState>>, host: Option<&str>) -> Value {
     json!({ "schema": vault_schema(&state, host) })
 }
 
+// ---------------------------------------------------------------------------
+// The settings pane: ad blocking + userscripts, owned by THIS host.
+// ---------------------------------------------------------------------------
+
+/// Toggle ids double as action ids. A userscript's action carries its stem after
+/// the prefix, so one arm handles however many scripts the host has.
+const USERSCRIPT_ACTION_PREFIX: &str = "userscript:";
+
+/// Read this host's policy files and draw the pane. The I/O lives here so
+/// [`settings_schema_from`] stays pure and testable without touching the user's
+/// real config — the same split the vault pane uses.
+fn settings_schema(profile: &str) -> Value {
+    settings_schema_from(profile, &crate::webpolicy::state(profile))
+}
+
+fn settings_schema_from(profile: &str, state: &crate::webpolicy::PolicyState) -> Value {
+    let mut widgets = vec![json!({"kind": "section", "text": "Ad blocking"})];
+
+    if state.adblock_rules_present {
+        widgets.push(json!({
+            "kind": "toggle",
+            "id": "adblock-enabled",
+            "action": "adblock-enabled",
+            "label": format!("Block ads & trackers ({} rules)", state.adblock_rule_count),
+            "value": state.adblock_enabled,
+        }));
+        widgets.push(json!({
+            "kind": "toggle",
+            "id": "adblock-profile",
+            "action": "adblock-profile",
+            "label": format!("Enabled for “{profile}”"),
+            "value": !state.adblock_profile_disabled,
+        }));
+    } else {
+        widgets.push(json!({
+            "kind": "label",
+            "muted": true,
+            "text": "No ruleset installed (~/.yggterm/web-adblock/rules.json missing on this host).",
+        }));
+    }
+
+    widgets.push(json!({"kind": "section", "text": "Userscripts"}));
+    if state.userscripts.is_empty() {
+        widgets.push(json!({
+            "kind": "label",
+            "muted": true,
+            "text": "None installed. Drop *.js into ~/.yggterm/web-userscripts/ (all profiles) \
+                     or this profile's userscripts/ dir, on the host ychrome runs on.",
+        }));
+    }
+    for (stem, enabled) in &state.userscripts {
+        widgets.push(json!({
+            "kind": "toggle",
+            "id": format!("{USERSCRIPT_ACTION_PREFIX}{stem}"),
+            "action": format!("{USERSCRIPT_ACTION_PREFIX}{stem}"),
+            "label": stem,
+            "value": enabled,
+        }));
+    }
+
+    widgets.push(json!({
+        "kind": "label",
+        "muted": true,
+        "text": "Userscript changes apply when the surface reloads. An adblock RULESET change \
+                 needs a yggterm restart — WebKit compiles the filter once per GUI process.",
+    }));
+    widgets.push(json!({
+        "kind": "button",
+        "id": "reload-surface",
+        "action": "reload-surface",
+        "label": "Reload surface now",
+        "primary": true,
+    }));
+
+    json!({ "title": "ychrome", "widgets": widgets })
+}
+
+/// A settings click. Every mutation lands on THIS host's disk, then the pane
+/// re-reads it — the files are the source of truth, so the toggle can never
+/// disagree with what `/policy` will serve next.
+fn run_settings_action(state: &Arc<Mutex<PaneState>>, request: &Value) -> Value {
+    let action = request["action"].as_str().unwrap_or_default();
+    // A toggle posts its checkbox state as `values.value` ("true"/"false").
+    let on = request["values"]["value"].as_str() == Some("true");
+    let profile = state.lock().unwrap().profile.clone();
+
+    let outcome = match action {
+        "adblock-enabled" => crate::webpolicy::set_adblock_enabled(on),
+        "adblock-profile" => crate::webpolicy::set_adblock_profile_disabled(&profile, !on),
+        // Reloading is a page action, so it rides the `eval` channel the vault's
+        // fill already uses. No new GUI capability.
+        "reload-surface" => {
+            return json!({
+                "schema": settings_schema(&profile),
+                "eval": "location.reload()",
+                "toast": "Reloading the surface.",
+            });
+        }
+        script if script.starts_with(USERSCRIPT_ACTION_PREFIX) => {
+            crate::webpolicy::set_userscript_enabled(
+                script.trim_start_matches(USERSCRIPT_ACTION_PREFIX),
+                on,
+            )
+        }
+        other => return json!({ "toast": format!("unknown action {other:?}") }),
+    };
+
+    // Redraw from disk either way: a failed rename must snap the toggle back to
+    // what the file system actually says, not leave it showing the click.
+    let schema = settings_schema(&profile);
+    match outcome {
+        Ok(()) => json!({
+            "schema": schema,
+            "toast": "Saved. Reload the surface to apply.",
+        }),
+        Err(error) => json!({ "schema": schema, "toast": error.to_string() }),
+    }
+}
+
 fn merge(mut base: Value, extra: Value) -> Value {
     if let (Some(base), Some(extra)) = (base.as_object_mut(), extra.as_object()) {
         for (key, value) in extra {
@@ -1008,6 +1174,107 @@ fn totp_script(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // An action is routed by the pane it came from, not by its name. Without
+    // this, a settings click would be answered with the VAULT's schema and the
+    // rail would redraw as the wrong pane.
+    #[test]
+    fn a_settings_action_is_routed_to_the_settings_pane() {
+        let state = Arc::new(Mutex::new(PaneState::new("personal")));
+        let reply = run_action(
+            &state,
+            &json!({"pane": SETTINGS_PANE, "action": "reload-surface", "values": {}}),
+        );
+        assert_eq!(reply["eval"], "location.reload()");
+        assert_eq!(reply["schema"]["title"], "ychrome");
+    }
+
+    // An unknown settings action must not touch the disk or fall through to the
+    // vault's arms (where "sync" et al. would happily run).
+    #[test]
+    fn an_unknown_settings_action_only_toasts() {
+        let state = Arc::new(Mutex::new(PaneState::new("personal")));
+        let reply = run_action(
+            &state,
+            &json!({"pane": SETTINGS_PANE, "action": "sync", "values": {}}),
+        );
+        assert!(reply["schema"].is_null(), "an unknown action redrew the pane");
+        assert!(
+            reply["toast"].as_str().unwrap_or_default().contains("unknown"),
+            "expected an unknown-action toast, got {reply:?}"
+        );
+    }
+
+    // Reloading is a page action, so it must ride the existing `eval` channel
+    // rather than asking yggterm for a new capability.
+    #[test]
+    fn reloading_the_surface_rides_the_eval_channel() {
+        let state = Arc::new(Mutex::new(PaneState::new("default")));
+        let reply = run_settings_action(
+            &state,
+            &json!({"pane": SETTINGS_PANE, "action": "reload-surface", "values": {}}),
+        );
+        assert!(reply["eval"].is_string());
+    }
+
+    fn policy_state(rules: bool, userscripts: &[(&str, bool)]) -> crate::webpolicy::PolicyState {
+        crate::webpolicy::PolicyState {
+            adblock_rules_present: rules,
+            adblock_rule_count: 42,
+            adblock_enabled: true,
+            adblock_profile_disabled: false,
+            userscripts: userscripts
+                .iter()
+                .map(|(stem, on)| (stem.to_string(), *on))
+                .collect(),
+        }
+    }
+
+    // The per-profile override must name the jar it governs, or the user cannot
+    // tell which identity they just turned ad blocking off for.
+    #[test]
+    fn the_settings_schema_names_the_running_profile() {
+        let schema = settings_schema_from("work", &policy_state(true, &[]));
+        assert_eq!(schema["title"], "ychrome");
+        assert!(
+            schema.to_string().contains("work"),
+            "profile missing from {schema}"
+        );
+    }
+
+    // With no ruleset on this host there is nothing to toggle: say so, rather
+    // than offering a switch that governs nothing.
+    #[test]
+    fn a_host_with_no_ruleset_offers_no_adblock_toggle() {
+        let schema = settings_schema_from("work", &policy_state(false, &[]));
+        let widgets = schema["widgets"].as_array().expect("widgets");
+        assert!(
+            !widgets.iter().any(|w| w["id"] == "adblock-enabled"),
+            "offered an adblock toggle with no ruleset installed"
+        );
+    }
+
+    // A userscript's action carries its stem, so one arm serves every script the
+    // host has — and the toggle reflects the `.js.disabled` rename.
+    #[test]
+    fn each_userscript_gets_a_toggle_keyed_by_its_stem() {
+        let schema = settings_schema_from(
+            "work",
+            &policy_state(true, &[("sponsorblock", true), ("darkmode", false)]),
+        );
+        let widgets = schema["widgets"].as_array().expect("widgets");
+        let sponsor = widgets
+            .iter()
+            .find(|w| w["id"] == "userscript:sponsorblock")
+            .expect("sponsorblock toggle");
+        assert_eq!(sponsor["value"], true);
+        assert_eq!(sponsor["action"], "userscript:sponsorblock");
+        let dark = widgets
+            .iter()
+            .find(|w| w["id"] == "userscript:darkmode")
+            .expect("darkmode toggle");
+        assert_eq!(dark["value"], false);
+    }
 
     // A row id must survive names that contain the characters a vault really
     // holds — this user's vault has names with tabs and newlines.

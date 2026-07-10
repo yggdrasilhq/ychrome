@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 mod sidebar;
+mod webpolicy;
 use clap::Parser;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop};
@@ -193,13 +194,18 @@ fn run_thin_client(session: &str, url: &str, title: &str, profile: &str) -> Resu
         })
         .context("installing Ctrl+C handler")?;
     }
-    emit_web_surface_osc("open", session, url, title, profile);
-    // ychrome CONTRIBUTES its vault pane rather than yggterm hardcoding one.
-    // A failure here must never take the browser down: the surface is the
-    // product, the sidebar is an extra.
-    let sidebar = match sidebar::spawn() {
+    // ychrome CONTRIBUTES its vault and settings panes rather than yggterm
+    // hardcoding them. A failure here must never take the browser down: the
+    // surface is the product, the sidebar is an extra.
+    //
+    // DECLARE BEFORE OPEN. The GUI holds a surface's creation until it has
+    // fetched the app's policy, because a userscript only injects at
+    // document-start. Open first and the GUI's first apply pass sees a surface
+    // with no contribution and builds it unblocked — no userscripts, no adblock,
+    // silently, for the life of that webview.
+    let sidebar = match sidebar::spawn(profile) {
         Ok(sidebar) => {
-            sidebar::emit_declare(session, &sidebar.control_url);
+            sidebar::emit_declare(session, &sidebar.control_url, &webpolicy::policy_version(profile));
             Some(sidebar)
         }
         Err(error) => {
@@ -207,6 +213,7 @@ fn run_thin_client(session: &str, url: &str, title: &str, profile: &str) -> Resu
             None
         }
     };
+    emit_web_surface_osc("open", session, url, title, profile);
     eprintln!("ychrome: web surface open — {url} [{profile}]  (Ctrl+C to close, Ctrl+Z / yggterm Zzz to suspend)");
     let mut ticks: u32 = 0;
     let mut last_tick = std::time::Instant::now();
@@ -218,10 +225,17 @@ fn run_thin_client(session: &str, url: &str, title: &str, profile: &str) -> Resu
         // resume: heartbeats deliberately cannot re-CREATE a surface, and an
         // "open" with an unchanged URL is liveness-idempotent GUI-side.
         if last_tick.elapsed() > Duration::from_secs(3) {
-            emit_web_surface_osc("open", session, url, title, profile);
+            // Same order as the first emit, for the same reason: the GUI may have
+            // swept the contribution while we were stopped, and a surface
+            // recreated before the policy lands loses its userscripts.
             if let Some(sidebar) = &sidebar {
-                sidebar::emit_declare(session, &sidebar.control_url);
+                sidebar::emit_declare(
+                    session,
+                    &sidebar.control_url,
+                    &webpolicy::policy_version(profile),
+                );
             }
+            emit_web_surface_osc("open", session, url, title, profile);
         }
         last_tick = std::time::Instant::now();
         ticks += 1;
@@ -230,9 +244,15 @@ fn run_thin_client(session: &str, url: &str, title: &str, profile: &str) -> Resu
             emit_web_surface_osc("heartbeat", session, url, title, profile);
             // Re-declaring IS the sidebar's heartbeat: it is idempotent, and
             // the GUI expires a contribution whose declares stop, so a SIGKILLed
-            // ychrome never leaves phantom buttons in the rail.
+            // ychrome never leaves phantom buttons in the rail. The stamp rides
+            // along so the GUI notices a policy edit made while ychrome runs —
+            // it is stat-only, so recomputing it every 4s is cheap.
             if let Some(sidebar) = &sidebar {
-                sidebar::emit_declare(session, &sidebar.control_url);
+                sidebar::emit_declare(
+                    session,
+                    &sidebar.control_url,
+                    &webpolicy::policy_version(profile),
+                );
             }
         }
     }

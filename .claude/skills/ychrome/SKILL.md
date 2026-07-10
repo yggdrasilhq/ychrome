@@ -187,30 +187,29 @@ ychrome-vault edit ITEM --generate          # a PASSWORD-ONLY edit
 ychrome-vault get ITEM --field notes        # must still print "stamp"
 ```
 
-**Opening the vault pane in the live GUI (there is no CLI verb for the right
-panel).** The 🔑 button only renders when a web surface is active
-(`app_sidebar_available = snapshot.active_web_surface_profile.is_some()`,
-yggterm `shell.rs`), and `active_web_surface_profile` is **not** exposed in
-`app state` — look for the button in the DOM instead:
+**Opening a contributed pane in the live GUI.** `server app right-panel
+pane:<id>` opens it and fetches its schema — idempotent, unlike clicking the
+titlebar button. ychrome declares two ids: `vault` and `settings`.
 
 ```sh
 Y=~/.local/bin/yggterm
 S=$($Y server app terminal new | jq -r .data.session_path)
 printf '~/.local/bin/ychrome https://example.com\n' | $Y server app terminal send $S --stdin
 # ychrome is NOT on the non-interactive ssh PATH — use the absolute path.
-$Y server app dom-eval 'var b=Array.from(document.querySelectorAll("button")).find(function(x){return (x.title||"").indexOf("Vault")===0;}); if(b) b.click(); return !!b;'
+$Y server app right-panel pane:vault      # or pane:settings
 $Y server app screenshot /tmp/pane.png --crop 1400,0,520,700 --scale 2
 # cleanup: Ctrl+C the surface, `app session remove <that exact id>`, `app open <your session>`
 ```
 
-The pane renders `MAX_ROWS = 80` of the item list ("Showing 80 of 1107"), so
-count ⏱ buttons against the first 80 rows, not all of them.
+The vault pane renders `MAX_ROWS = 80` of the item list ("Showing 80 of 1107"),
+so count ⏱ buttons against the first 80 rows, not all of them.
 
 ## The sidebar contribution (`src/sidebar.rs`) — SHIPPED, live-proven
 
-ychrome DECLARES its vault pane over `OSC 7717 ; sidebar ; declare` and serves it
-from a loopback control endpoint. yggterm renders generic widgets and knows
-nothing about vaults. See `docs/protocol.md` and the `libyggterm-surfaces` SKILL.
+ychrome DECLARES two panes over `OSC 7717 ; sidebar ; declare` — `vault` and
+`settings` — and serves both from a loopback control endpoint. yggterm renders
+generic widgets and knows nothing about vaults or ad blocking. See
+`docs/protocol.md` and the `libyggterm-surfaces` SKILL.
 
 - The schema never leaves the app's host over the PTY — the GUI `GET`s it.
 - **No secret in a schema.** A credential reaches the page only as the `eval`
@@ -226,16 +225,31 @@ nothing about vaults. See `docs/protocol.md` and the `libyggterm-surfaces` SKILL
   pair, so no new agent op (and no forced re-unlock) was needed.
 - The pane shells out to the `ychrome-vault` CLI. The browser deliberately does
   **not** link the vault crate — the workspace keeps the browser build lean.
-- Open it headlessly: `yggterm server app right-panel pane:vault`.
+- Open one headlessly: `yggterm server app right-panel pane:vault`.
+
+## The web-content policy (`src/webpolicy.rs`) — the settings pane
+
+Ad blocking and userscripts are OURS, and they live on the host ychrome runs on
+(`~/.yggterm/web-adblock/*`, `~/.yggterm/web-userscripts/*`). They act on the
+GUI's webview, so we serve the *effective* policy and yggterm applies it:
+
+- `declare` carries `policy_version` — a **stat-only** stamp (paths, lengths,
+  mtimes, plus the enabled/disabled decision). yggterm refetches
+  `GET /policy` only when it moves, so a 10 KB `rules.json` never rides the ~4s
+  heartbeat. Never hash the file contents here.
+- `/policy` answers `{adblock_rules, userscripts}` with every decision made.
+  `adblock_rules: null` = no ad blocking; yggterm never asks why.
+- **`emit_declare` runs BEFORE `emit_web_surface_osc("open", ...)`**, in
+  `run_thin_client` and in the post-suspend re-emit. Userscripts inject at
+  document-start, so yggterm holds the surface's creation until the policy
+  lands. Open first and the surface is built unblocked — no userscripts, no
+  adblock, silently, forever.
+- An adblock RULESET change needs a yggterm restart (WebKit compiles the filter
+  once per GUI process). Toggling it off, and every userscript change, take
+  effect on the next surface (re)create — the pane's "Reload surface now" button
+  returns `{"eval": "location.reload()"}`.
 
 ## Still open
-
-- **Finish Phase A.** `RightPanelMode::Vault` is DELETED (2026-07-10): the pane
-  now carries the generator and the watchtower, `vault_password_is_weak` moved
-  here as `ychrome_vault::watchtower::is_weak`, and the password-manager doc is
-  now `docs/password-manager.md`. What remains is `::AppSidebar` — migrate
-  ychrome's adblock + userscript settings into a contributed `settings` pane
-  (per the "app's host owns its config" rule), then delete the variant.
 - **`restore`** (`PUT /api/ciphers/{id}/restore`) — `rm` has no undo, and because
   `sync` filters `deletedDate` items this client cannot even *show* the trash.
   A `list --trashed` plus `restore` would close the loop and make the
