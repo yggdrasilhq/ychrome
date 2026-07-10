@@ -14,7 +14,7 @@ use base64::Engine as _;
 use serde_json::Value;
 
 use crate::crypto::{AsymEncString, EncString, Kdf};
-use crate::model::RawCipher;
+use crate::model::{RawCipher, RawFido2Credential};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
@@ -357,7 +357,33 @@ fn parse_raw_cipher(cipher: &serde_json::Value) -> RawCipher {
                     .collect()
             })
             .unwrap_or_default(),
+        fido2: login.map(parse_fido2).unwrap_or_default(),
     }
+}
+
+/// Parse `login.fido2Credentials[]` into the still-encrypted passkey records.
+/// Every string field is an EncString except `creationDate` (plaintext), and a
+/// field that will not parse is simply dropped to `None` rather than failing.
+fn parse_fido2(login: &serde_json::Value) -> Vec<RawFido2Credential> {
+    let enc = |c: &serde_json::Value, k: &str| EncString::parse_opt(get_str(c, k)).ok().flatten();
+    get_array(login, "fido2Credentials")
+        .iter()
+        .map(|c| RawFido2Credential {
+            credential_id: enc(c, "credentialId"),
+            rp_id: enc(c, "rpId"),
+            rp_name: enc(c, "rpName"),
+            user_name: enc(c, "userName"),
+            user_display_name: enc(c, "userDisplayName"),
+            user_handle: enc(c, "userHandle"),
+            counter: enc(c, "counter"),
+            discoverable: enc(c, "discoverable"),
+            key_type: enc(c, "keyType"),
+            key_algorithm: enc(c, "keyAlgorithm"),
+            key_curve: enc(c, "keyCurve"),
+            key_value: enc(c, "keyValue"),
+            creation_date: get_str(c, "creationDate").map(str::to_string),
+        })
+        .collect()
 }
 
 /// A write endpoint that answers with an empty body on success.
@@ -483,5 +509,30 @@ mod tests {
         let trashed: Vec<&str> = sync.trashed.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(live, ["live-1", "live-2"]);
         assert_eq!(trashed, ["trashed-1"]);
+    }
+
+    #[test]
+    fn sync_parses_stored_passkeys_into_the_fido2_bucket() {
+        let doc: Value = serde_json::from_str(
+            r#"{"ciphers":[
+                {"id":"has-pk","type":1,"login":{"fido2Credentials":[
+                    {"credentialId":"2.aa|bb|cc","rpId":"2.dd|ee|ff",
+                     "creationDate":"2026-07-10T00:00:00Z"}
+                ]}},
+                {"id":"no-pk","type":1,"login":{"username":"2.gg|hh|ii"}}
+            ]}"#,
+        )
+        .unwrap();
+
+        let sync = parse_sync(&doc);
+        let by_id = |id: &str| sync.ciphers.iter().find(|c| c.id == id).unwrap();
+        // The credential lands in the fido2 bucket; the plaintext creationDate
+        // rides along even though the encrypted fields are placeholders here.
+        assert_eq!(by_id("has-pk").fido2.len(), 1);
+        assert_eq!(
+            by_id("has-pk").fido2[0].creation_date.as_deref(),
+            Some("2026-07-10T00:00:00Z")
+        );
+        assert!(by_id("no-pk").fido2.is_empty());
     }
 }

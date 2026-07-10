@@ -44,8 +44,8 @@ Requests and responses are one JSON object per line:
 ```
 
 Ops: `ping`, `status`, `unlock`, `lock`, `stop`, `sync`, `list` (`trashed:true`
-for the trash), `get`, `totp`, `match`, `suggest`, `add`, `edit`, `rm`,
-`restore`, `generate`. The agent auto-starts on `unlock` (and on
+for the trash), `get`, `totp`, `passkeys`, `match`, `suggest`, `add`, `edit`,
+`rm`, `restore`, `generate`. The agent auto-starts on `unlock` (and on
 `ping`) and detaches into its own process group, so the shell that first needed
 it can go away. A socket left behind by a SIGKILLed agent is detected (nobody
 answers) and reclaimed.
@@ -116,6 +116,7 @@ ychrome-vault configure --server https://vault.example.com --email you@example.c
 read -rs PW; echo "$PW" | ychrome-vault unlock   # once
 ychrome-vault get github.com                     # password on stdout
 ychrome-vault totp github.com                    # 6-digit code
+ychrome-vault passkeys github.com                # rpId<TAB>user<TAB>credId<TAB>created
 ychrome-vault list                               # name<TAB>user<TAB>folder
 ychrome-vault match chat.example.com                  # what an auto-fill may use
 ychrome-vault generate 24                        # local dice, no vault touched
@@ -242,5 +243,12 @@ never bring back or touch a live entry that happens to share a name. A
   create → soft-`rm` → `list --trashed` → `restore` → verify loop needs one live
   unlock with this binary (installing a new binary re-locks the agent). That is
   the one owed proof, exactly as `edit`/`rm` owed theirs until a live unlock.
-- **Passkeys** (`fido2Credentials`) — not started. Needs a
-  `navigator.credentials` shim, because WebKitGTK has no WebAuthn.
+- **Passkeys** (`fido2Credentials`) — **read layer built** (Phase D slice 1):
+  `sync` parses `login.fido2Credentials[]` into `RawCipher::fido2`, `list` badges
+  `has_passkey`, and `passkeys NAME` returns secret-free metadata
+  (`Vault::passkeys`). A `cargo test` proves the private key (`keyValue`) never
+  reaches the listing. **Not yet built:** the WebAuthn *ceremony* — an ES256
+  assertion signer over the decrypted `keyValue`, a `navigator.credentials`
+  userscript shim (WebKitGTK has no WebAuthn), a loopback signer bridge, and a
+  user-presence dialog. **The agent may never auto-consent** — the ceremony op
+  must require an explicit consent token the crate cannot fabricate.
