@@ -606,10 +606,10 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
         //
         // The honest boundary: on a single-uid host the socket cannot itself
         // distinguish the browser from another same-uid process, exactly as the
-        // `get` op (which already returns a plaintext password) cannot. The real,
-        // enforceable consent gate is the GUI dialog, whose Approve an agent's
-        // `dom-eval` cannot forge (`isTrusted`). This op is a pure signer behind
-        // that gate; it is no weaker than the vault already is.
+        // `get` op (which already returns a plaintext password) cannot. The
+        // strong, enforced gate is against the WEB threat — a page can trigger a
+        // ceremony but cannot reach the grant that unblocks this op. It is a pure
+        // signer behind the GUI dialog, and no weaker than the vault already is.
         "fido2-assert" => {
             let item_id =
                 string("item_id").ok_or_else(|| anyhow!("fido2-assert needs an item_id"))?;

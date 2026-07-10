@@ -20,14 +20,19 @@
 //! **Where consent lives.** The `UserPresence` that authorizes a signature is
 //! minted in the `ychrome-vault` agent — but only when THIS module calls its
 //! `fido2-assert` op, which it does exclusively after the GUI dialog's grant for
-//! that exact `request_id` arrives. The page can only *trigger* a ceremony (it
-//! cannot reach the grant channel: the `request_id` is never exposed to it, and
-//! `/fido2/grant` is a GUI→app call over `ssh -L`, not page-reachable over
-//! SOCKS). An agent's `dom-eval` cannot forge the dialog's Approve (`isTrusted`).
-//! On a single-uid host the socket cannot distinguish the GUI from another
-//! same-uid process, exactly as the vault's existing `get` op (which already
-//! returns a plaintext password) cannot — so passkeys are no weaker than the
-//! rest of the vault, and the human-facing gate is the dialog.
+//! that exact `request_id` arrives. The strong, enforced boundary is against the
+//! WEB threat: a page can only *trigger* a ceremony. It cannot reach the grant
+//! channel — the `request_id` is 128 bits of CSPRNG never exposed to it, and
+//! `/fido2/grant` is a GUI→app call over `ssh -L`, not page-reachable over the
+//! surface's SOCKS egress. So a malicious site can make a dialog appear but can
+//! never answer it.
+//!
+//! Against a same-uid process on the host the boundary is the vault's usual one:
+//! the socket cannot distinguish the GUI from another same-uid process, exactly
+//! as the `get` op (which already returns a plaintext password) cannot, so
+//! passkeys are no weaker than the rest of the vault. The human-facing gate is
+//! the GUI dialog; a grant requires a deliberate operator action at the GUI,
+//! never a silent socket call.
 //!
 //! **A secret never crosses into yggterm.** The OSC carries only rpId + a
 //! display label. The private key is decrypted, used once and zeroized inside
