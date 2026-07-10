@@ -214,21 +214,28 @@ nothing about vaults. See `docs/protocol.md` and the `libyggterm-surfaces` SKILL
 
 - The schema never leaves the app's host over the PTY — the GUI `GET`s it.
 - **No secret in a schema.** A credential reaches the page only as the `eval`
-  script an action returns, which the GUI injects into the surface.
+  script an action returns, which the GUI injects into the surface. A `secret`
+  field is one-way: it carries what the user TYPED up to us, and we declare it
+  back empty. An empty password on the Add tab means `add --generate`, so a
+  generated password is never echoed down into the GUI at all.
+- **We own every field's value.** yggterm's copy is only the user's edits since
+  the last schema, and applying a schema replaces it — so the Add-tab draft lives
+  in our `PaneState` and every schema echoes it back. A value we stop declaring is
+  dropped by the GUI (that is what keeps a typed password out of later POSTs).
 - Row ids are `name \x1f username`, not the cipher id: the agent resolves by that
   pair, so no new agent op (and no forced re-unlock) was needed.
 - The pane shells out to the `ychrome-vault` CLI. The browser deliberately does
   **not** link the vault crate — the workspace keeps the browser build lean.
+- Open it headlessly: `yggterm server app right-panel pane:vault`.
 
 ## Still open
 
-- **Finish Phase A.** yggterm still has `RightPanelMode::Vault` and
-  `::AppSidebar`, and they still work. The contributed pane does not yet cover
-  the **password generator** or **watchtower**, so deleting `::Vault` would
-  regress the UI. Port those, move `vault_password_is_weak` out of `shell.rs`,
-  migrate `::AppSidebar` (adblock + userscript settings, per the "app's host owns
-  its config" rule), then delete both variants and move
-  `yggterm/docs/ychrome-password-manager.md` here.
+- **Finish Phase A.** `RightPanelMode::Vault` is DELETED (2026-07-10): the pane
+  now carries the generator and the watchtower, `vault_password_is_weak` moved
+  here as `ychrome_vault::watchtower::is_weak`, and the password-manager doc is
+  now `docs/password-manager.md`. What remains is `::AppSidebar` — migrate
+  ychrome's adblock + userscript settings into a contributed `settings` pane
+  (per the "app's host owns its config" rule), then delete the variant.
 - **`restore`** (`PUT /api/ciphers/{id}/restore`) — `rm` has no undo, and because
   `sync` filters `deletedDate` items this client cannot even *show* the trash.
   A `list --trashed` plus `restore` would close the loop and make the

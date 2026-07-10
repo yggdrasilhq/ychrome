@@ -81,6 +81,22 @@ POST <control>/action  {pane, action, values} -> {schema?, toast?, eval?}
 credential reaches a client-rendered page. ychrome computes it; the GUI injects
 it. The vault never crosses the OSC, and a schema never carries a secret.
 
+**The app owns every field's value.** A schema declares what each field holds;
+the GUI's copy is only the user's edits since that schema arrived, and applying a
+schema replaces it. So a schema must **echo the draft back** or the fields blank
+— ychrome keeps the Add-tab draft in its own `PaneState`. Conversely, a value the
+schema stops declaring is dropped by the GUI, which is what stops a typed password
+riding along on the next unrelated action.
+
+**Secrets are one-way.** A `secret` text-input carries what the user typed UP to
+ychrome on an action; ychrome declares it back empty. A generated password is
+never echoed down: an empty password field means `ychrome-vault add --generate`,
+so the password is rolled on this host and stored encrypted without ever entering
+yggterm.
+
+An agent can open a contributed pane without clicking:
+`yggterm server app right-panel pane:vault`.
+
 Implementation: `src/sidebar.rs`. Widget vocabulary and the GUI side:
 `yggterm/.agents/skills/libyggterm-surfaces/SKILL.md`.
 
