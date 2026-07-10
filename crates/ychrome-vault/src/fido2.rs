@@ -19,9 +19,10 @@
 //! are the browser slice.
 
 use p256::ecdsa::signature::Signer;
-use p256::ecdsa::{Signature, SigningKey};
-use p256::pkcs8::DecodePrivateKey;
+use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Fido2Error {
@@ -112,11 +113,61 @@ pub fn sign_assertion(
     })
 }
 
+/// A freshly minted passkey, for a `create()` ceremony. The private key is
+/// PKCS#8 (what a decrypted `keyValue` decodes to) and held zeroized until the
+/// vault seals it; the COSE public key is what the RP stores; the credential id
+/// is the handle the RP references it by.
+pub struct GeneratedCredential {
+    pub credential_id: Vec<u8>,
+    pub pkcs8_der: Zeroizing<Vec<u8>>,
+    pub cose_public_key: Vec<u8>,
+}
+
+/// Mint a new ES256 (P-256) credential: a random key, a random 16-byte
+/// credential id, and the COSE_Key the RP will verify future assertions with.
+///
+/// `rng` is the OS CSPRNG at the call site — passed in so the crypto module
+/// stays deterministic-testable and does not reach for global randomness.
+pub fn generate_credential(rng: &mut (impl rand::RngCore + rand::CryptoRng)) -> GeneratedCredential {
+    let signing = SigningKey::random(rng);
+    let pkcs8 = signing
+        .to_pkcs8_der()
+        .expect("a freshly generated P-256 key always encodes to PKCS#8");
+    let mut credential_id = vec![0u8; 16];
+    rng.fill_bytes(&mut credential_id);
+    GeneratedCredential {
+        credential_id,
+        pkcs8_der: Zeroizing::new(pkcs8.as_bytes().to_vec()),
+        cose_public_key: cose_ec2_public_key(&VerifyingKey::from(&signing)),
+    }
+}
+
+/// The COSE_Key (RFC 8152) for a P-256 ES256 public key, CBOR-encoded — the
+/// bytes that go into a WebAuthn attestation's attestedCredentialData.
+///
+/// Canonical CTAP2 map, keys in encoded-byte order (1, 3, -1, -2, -3):
+/// `{1: 2 (kty EC2), 3: -7 (alg ES256), -1: 1 (crv P-256), -2: x, -3: y}`.
+fn cose_ec2_public_key(key: &VerifyingKey) -> Vec<u8> {
+    let point = key.to_encoded_point(false); // 0x04 ‖ X(32) ‖ Y(32)
+    let x = point.x().expect("P-256 public key has an x coordinate");
+    let y = point.y().expect("P-256 public key has a y coordinate");
+
+    let mut cbor = Vec::with_capacity(77);
+    cbor.push(0xa5); // map(5)
+    cbor.extend_from_slice(&[0x01, 0x02]); // 1: 2  (kty = EC2)
+    cbor.extend_from_slice(&[0x03, 0x26]); // 3: -7 (alg = ES256)
+    cbor.extend_from_slice(&[0x20, 0x01]); // -1: 1 (crv = P-256)
+    cbor.extend_from_slice(&[0x21, 0x58, 0x20]); // -2: bytes(32)
+    cbor.extend_from_slice(x);
+    cbor.extend_from_slice(&[0x22, 0x58, 0x20]); // -3: bytes(32)
+    cbor.extend_from_slice(y);
+    cbor
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use p256::ecdsa::signature::Verifier;
-    use p256::ecdsa::VerifyingKey;
     use p256::pkcs8::EncodePrivateKey;
 
     /// A deterministic P-256 key (fixed scalar), as PKCS#8 DER — the shape a
@@ -174,5 +225,56 @@ mod tests {
         let err = sign_assertion(&[1, 2, 3], "example.com", &[0u8; 32], 0, UserPresence::granted(true))
             .unwrap_err();
         assert!(matches!(err, Fido2Error::BadPrivateKey));
+    }
+
+    #[test]
+    fn cose_public_key_is_a_well_formed_es256_map() {
+        let signing = SigningKey::from_bytes(&[0x33u8; 32].into()).unwrap();
+        let cose = cose_ec2_public_key(&VerifyingKey::from(&signing));
+
+        // 5-entry map, then the fixed ES256/P-256 header, then two 32-byte
+        // coordinate byte strings — 77 bytes total.
+        assert_eq!(cose.len(), 77);
+        assert_eq!(&cose[0..8], &[0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21]);
+        assert_eq!(&cose[8..10], &[0x58, 0x20]); // -2: bytes(32)
+        assert_eq!(&cose[42..45], &[0x22, 0x58, 0x20]); // -3: bytes(32)
+
+        // The coordinates are exactly the SEC1 uncompressed point's X and Y, so
+        // an RP that CBOR-decodes this recovers the real public key.
+        let point = VerifyingKey::from(&signing).to_encoded_point(false);
+        assert_eq!(&cose[10..42], point.x().unwrap().as_slice());
+        assert_eq!(&cose[45..77], point.y().unwrap().as_slice());
+    }
+
+    #[test]
+    fn a_generated_credential_signs_and_verifies_under_its_own_public_key() {
+        let mut rng = rand::rngs::OsRng;
+        let credential = generate_credential(&mut rng);
+        assert_eq!(credential.credential_id.len(), 16);
+        assert_eq!(credential.cose_public_key.len(), 77);
+
+        // The whole point of create→get: an assertion signed with the generated
+        // private key verifies against the public key we handed the RP. Recover
+        // the public key from the SEC1 coordinates embedded in the COSE key.
+        let client_data_hash = Sha256::digest(b"create-then-get").to_vec();
+        let assertion = sign_assertion(
+            &credential.pkcs8_der,
+            "example.com",
+            &client_data_hash,
+            0,
+            UserPresence::granted(true),
+        )
+        .unwrap();
+
+        let x = &credential.cose_public_key[10..42];
+        let y = &credential.cose_public_key[45..77];
+        let mut sec1 = vec![0x04];
+        sec1.extend_from_slice(x);
+        sec1.extend_from_slice(y);
+        let verifying = VerifyingKey::from_sec1_bytes(&sec1).unwrap();
+        let sig = Signature::from_der(&assertion.signature).unwrap();
+        let mut message = assertion.authenticator_data.clone();
+        message.extend_from_slice(&client_data_hash);
+        verifying.verify(&message, &sig).expect("must verify");
     }
 }

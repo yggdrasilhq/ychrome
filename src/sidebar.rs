@@ -197,13 +197,29 @@ impl Sidebar {
     }
 }
 
+/// The control server's shared state: the pane draft (behind a lock, mutated by
+/// actions) and the passkey signer (its own internal locks). One `Arc` so a
+/// per-connection thread can hold both.
+struct ServerState {
+    pane: Mutex<PaneState>,
+    signer: Arc<crate::passkey::Signer>,
+}
+
 /// Bind the control endpoint and serve it on a background thread.
-pub fn spawn(profile: &str) -> Result<Sidebar> {
+///
+/// `session` is the emitting `YGGTERM_SESSION_ID`, carried in the passkey OSC
+/// for diagnostics (the GUI routes by stream). A connection is served on its own
+/// thread: a `/fido2/get` blocks for up to two minutes awaiting the presence
+/// dialog, and must not wedge the concurrent `/fido2/grant` the GUI sends back.
+pub fn spawn(profile: &str, session: &str) -> Result<Sidebar> {
     let listener = TcpListener::bind("127.0.0.1:0").context("binding sidebar control server")?;
     let port = listener.local_addr()?.port();
     let control_url = format!("http://127.0.0.1:{port}");
     let stop = Arc::new(AtomicBool::new(false));
-    let state = Arc::new(Mutex::new(PaneState::new(profile)));
+    let state = Arc::new(ServerState {
+        pane: Mutex::new(PaneState::new(profile)),
+        signer: crate::passkey::Signer::new(port, session.to_string()),
+    });
 
     {
         let stop = stop.clone();
@@ -213,7 +229,10 @@ pub fn spawn(profile: &str) -> Result<Sidebar> {
                     break;
                 }
                 match incoming {
-                    Ok(stream) => handle_conn(stream, &state),
+                    Ok(stream) => {
+                        let state = Arc::clone(&state);
+                        std::thread::spawn(move || handle_conn(stream, &state));
+                    }
                     Err(_) => continue,
                 }
             }
@@ -265,7 +284,7 @@ fn emit_osc(action: &str, payload: &str) {
     let _ = stdout.flush();
 }
 
-fn handle_conn(stream: TcpStream, state: &Arc<Mutex<PaneState>>) {
+fn handle_conn(stream: TcpStream, state: &ServerState) {
     let Ok(peek) = stream.try_clone() else { return };
     let mut reader = BufReader::new(peek);
     let mut line = String::new();
@@ -279,57 +298,93 @@ fn handle_conn(stream: TcpStream, state: &Arc<Mutex<PaneState>>) {
         .split_once('?')
         .unwrap_or((request_target, ""));
 
-    // Drain headers; capture Content-Length so a POST body can be read.
+    // Drain headers; capture Content-Length so a POST body can be read, and the
+    // passkey bearer token so a `/fido2/*` route can gate on it.
     let mut content_length = 0usize;
+    let mut fido2_token: Option<String> = None;
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
             break;
         }
-        if let Some(value) = header
-            .split_once(':')
-            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-            .map(|(_, value)| value.trim().to_string())
-        {
-            content_length = value.parse().unwrap_or(0);
+        if let Some((name, value)) = header.split_once(':') {
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("x-ychrome-fido2") {
+                fido2_token = Some(value.to_string());
+            }
         }
     }
+
+    // Read a POST body up front (routes that don't need it ignore it).
+    let read_body = |reader: &mut BufReader<TcpStream>| -> Option<Value> {
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 && reader.read_exact(&mut body).is_err() {
+            return None;
+        }
+        Some(serde_json::from_slice(&body).unwrap_or(Value::Null))
+    };
 
     match (method, path) {
         ("GET", p) if p == format!("/pane/{VAULT_PANE}") => {
             let host = query_value(query, "host");
             let schema = {
-                let mut state = state.lock().unwrap();
+                let mut pane = state.pane.lock().unwrap();
                 // Opening the pane straight onto the Add tab must seed the draft
                 // too, not only arriving there via the tab action.
-                if state.tab == "add" {
-                    state.seed_add_draft(host.as_deref());
+                if pane.tab == "add" {
+                    pane.seed_add_draft(host.as_deref());
                 }
-                vault_schema(&state, host.as_deref())
+                vault_schema(&pane, host.as_deref())
             };
             respond_json(stream, 200, &schema);
         }
         ("GET", p) if p == format!("/pane/{SETTINGS_PANE}") => {
-            let profile = state.lock().unwrap().profile.clone();
+            let profile = state.pane.lock().unwrap().profile.clone();
             respond_json(stream, 200, &settings_schema(&profile));
         }
         // The EFFECTIVE web-content policy for the profile this ychrome is
-        // running: every enable/disable decision already made. yggterm applies
-        // it to the webview and persists nothing but WebKit's compiled cache.
-        // No `?host=` — unlike a pane schema, this is not about the open page.
+        // running: every enable/disable decision already made, PLUS the passkey
+        // shim prepended (document-start, so `navigator.credentials` is patched
+        // before the page can call it). yggterm applies it to the webview.
         ("GET", "/policy") => {
-            let profile = state.lock().unwrap().profile.clone();
-            respond_json(stream, 200, &crate::webpolicy::policy(&profile).to_json());
+            let profile = state.pane.lock().unwrap().profile.clone();
+            let mut policy = crate::webpolicy::policy(&profile).to_json();
+            if let Some(scripts) = policy["userscripts"].as_array_mut() {
+                scripts.insert(0, json!(state.signer.shim_userscript()));
+            }
+            respond_json(stream, 200, &policy);
         }
         ("POST", "/action") => {
-            let mut body = vec![0u8; content_length];
-            if content_length > 0 && reader.read_exact(&mut body).is_err() {
+            let Some(request) = read_body(&mut reader) else {
                 respond_json(stream, 400, &json!({ "toast": "bad request" }));
                 return;
-            }
-            let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-            let reply = run_action(state, &request);
+            };
+            let reply = run_action(&state.pane, &request);
             respond_json(stream, 200, &reply);
+        }
+        // The WebAuthn signer routes. `/fido2/get` and `/fido2/create` come from
+        // the page (over SOCKS-loopback), bearer-token-gated; `/fido2/grant` and
+        // `/fido2/deny` come from the GUI dialog (over `ssh -L`). All require the
+        // token — the GUI is handed it the same way the shim is.
+        ("POST", p) if p.starts_with("/fido2/") => {
+            if !state.signer.authorized(fido2_token.as_deref()) {
+                respond_json(stream, 401, &json!({ "error": "unauthorized" }));
+                return;
+            }
+            let Some(body) = read_body(&mut reader) else {
+                respond_json(stream, 400, &json!({ "error": "bad request" }));
+                return;
+            };
+            let (status, reply) = match p {
+                "/fido2/get" => state.signer.handle_get(&body),
+                "/fido2/create" => state.signer.handle_create(&body),
+                "/fido2/grant" => state.signer.handle_grant(&body),
+                "/fido2/deny" => state.signer.handle_deny(&body),
+                _ => (404, json!({ "error": "unknown fido2 route" })),
+            };
+            respond_json(stream, status, &reply);
         }
         _ => respond_json(stream, 404, &json!({})),
     }
@@ -764,7 +819,7 @@ fn absorb_draft(state: &mut PaneState, values: &Value) {
     }
 }
 
-fn run_action(state: &Arc<Mutex<PaneState>>, request: &Value) -> Value {
+fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
     // Which pane the click came from. The two panes have disjoint action names,
     // but they return DIFFERENT schemas — routing on the pane id is what stops a
     // settings toggle from redrawing the rail as the vault.
@@ -962,7 +1017,7 @@ fn run_action(state: &Arc<Mutex<PaneState>>, request: &Value) -> Value {
     }
 }
 
-fn reschema(state: &Arc<Mutex<PaneState>>, host: Option<&str>) -> Value {
+fn reschema(state: &Mutex<PaneState>, host: Option<&str>) -> Value {
     let state = state.lock().unwrap();
     json!({ "schema": vault_schema(&state, host) })
 }
@@ -1047,7 +1102,7 @@ fn settings_schema_from(profile: &str, state: &crate::webpolicy::PolicyState) ->
 /// A settings click. Every mutation lands on THIS host's disk, then the pane
 /// re-reads it — the files are the source of truth, so the toggle can never
 /// disagree with what `/policy` will serve next.
-fn run_settings_action(state: &Arc<Mutex<PaneState>>, request: &Value) -> Value {
+fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
     let action = request["action"].as_str().unwrap_or_default();
     // A toggle posts its checkbox state as `values.value` ("true"/"false").
     let on = request["values"]["value"].as_str() == Some("true");

@@ -205,6 +205,26 @@ pub struct PasskeyInfo {
     pub creation_date: Option<String>,
 }
 
+/// A stored passkey that can answer a `get()` ceremony, resolved by RP. Carries
+/// the account fields the presence dialog and the assertion response need —
+/// `user_handle` is the WebAuthn `userHandle` an RP maps back to an account —
+/// but never the private key. Serializable because the agent hands it to the
+/// browser signer, which shows the account and echoes `item_id`/`credential_id`
+/// back to sign.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PasskeyMatch {
+    pub item_id: String,
+    pub credential_id: String,
+    pub rp_id: String,
+    pub rp_name: Option<String>,
+    pub user_name: Option<String>,
+    pub user_display_name: Option<String>,
+    pub user_handle: Option<String>,
+    /// The vault item's name — the label the presence dialog shows when the
+    /// passkey has no `userName`.
+    pub item_name: Option<String>,
+}
+
 /// A login to create. Plaintext — it is encrypted by [`Vault::new_login_body`]
 /// and never leaves this process in the clear.
 #[derive(Debug, Clone, Default)]
@@ -217,6 +237,32 @@ pub struct NewLogin {
     pub uri: Option<String>,
     pub notes: Option<String>,
     pub folder_id: Option<String>,
+}
+
+/// A passkey to store as a new vault login — the `create()` result. The private
+/// key is PKCS#8 (as [`crate::fido2::generate_credential`] produced it) and is
+/// base64url-sealed by [`Vault::new_passkey_login_body`]; it never leaves the
+/// process in the clear. `creation_date` is the plaintext ISO-8601 the sync
+/// record echoes back.
+#[derive(Debug, Clone, Default)]
+pub struct NewPasskey {
+    /// The vault item's name — usually the RP name, so the item reads sensibly
+    /// in a listing next to password logins.
+    pub item_name: String,
+    pub rp_id: String,
+    pub rp_name: String,
+    pub user_name: String,
+    pub user_display_name: String,
+    /// The WebAuthn `user.id` handle bytes (the RP's account id).
+    pub user_id: Vec<u8>,
+    /// The generated credential id bytes (the RP's handle for this passkey).
+    pub credential_id: Vec<u8>,
+    /// The generated P-256 private key, PKCS#8 DER.
+    pub pkcs8_der: Vec<u8>,
+    /// The login's `username`, for the item listing — often the same as
+    /// `user_name`. Optional: a usernameless passkey has none.
+    pub account_username: Option<String>,
+    pub creation_date: String,
 }
 
 /// The gap between "ciphers the server sent" and "items we can show".
@@ -453,6 +499,69 @@ impl Vault {
         )?)
     }
 
+    /// Resolve a `navigator.credentials.get()` request to the stored passkeys
+    /// that can answer it. The page names an `rp_id` and, for a non-discoverable
+    /// login, an `allow_credential_ids` allow-list (base64url credentialIds from
+    /// `allowCredentials`); an empty allow-list means "any resident credential
+    /// for this RP" (discoverable / usernameless).
+    ///
+    /// Returns one [`PasskeyMatch`] per candidate, secret-free — the private key
+    /// is not touched. The caller picks (usually the only one), shows the user
+    /// the account, and passes `item_id` + `credential_id` back to
+    /// [`fido2_assert`]. Multiple matches are the account-picker case, exactly as
+    /// `suggest` is for passwords.
+    ///
+    /// [`fido2_assert`]: Vault::fido2_assert
+    pub fn passkeys_for_assertion(
+        &self,
+        rp_id: &str,
+        allow_credential_ids: &[String],
+    ) -> Vec<PasskeyMatch> {
+        let mut matches = Vec::new();
+        for cipher in &self.ciphers {
+            if cipher.fido2.is_empty() {
+                continue;
+            }
+            let Ok(key) = self.cipher_key(cipher) else {
+                continue;
+            };
+            let decrypt = |enc: &Option<EncString>| {
+                enc.as_ref().and_then(|enc| key.decrypt_to_string(enc).ok())
+            };
+            let item_name = cipher
+                .name
+                .as_ref()
+                .and_then(|enc| key.decrypt_to_string(enc).ok());
+            for credential in &cipher.fido2 {
+                if decrypt(&credential.rp_id).as_deref() != Some(rp_id) {
+                    continue;
+                }
+                let credential_id = match decrypt(&credential.credential_id) {
+                    Some(id) => id,
+                    // A passkey we cannot name a credentialId for cannot be put
+                    // in a clientDataJSON, so it cannot answer a ceremony.
+                    None => continue,
+                };
+                if !allow_credential_ids.is_empty()
+                    && !allow_credential_ids.iter().any(|id| id == &credential_id)
+                {
+                    continue;
+                }
+                matches.push(PasskeyMatch {
+                    item_id: cipher.id.clone(),
+                    credential_id,
+                    rp_id: rp_id.to_string(),
+                    rp_name: decrypt(&credential.rp_name),
+                    user_name: decrypt(&credential.user_name),
+                    user_display_name: decrypt(&credential.user_display_name),
+                    user_handle: decrypt(&credential.user_handle),
+                    item_name: item_name.clone(),
+                });
+            }
+        }
+        matches
+    }
+
     /// Build the `POST /api/ciphers` body for a new login, encrypting every
     /// field under the user key. A newly created cipher carries no item key,
     /// so the user key is the cipher key — exactly what [`cipher_key`] will
@@ -491,6 +600,76 @@ impl Vault {
                 "password": enc_opt(&login.password)?,
                 "totp": enc_opt(&login.totp)?,
                 "uris": uris,
+            },
+        }))
+    }
+
+    /// Build the `POST /api/ciphers` body for a NEW login that carries a passkey
+    /// — a `navigator.credentials.create()` result stored in the vault, in the
+    /// same encrypted `Fido2Credential` shape `sync` reads back.
+    ///
+    /// Every field is sealed under the user key (a new cipher has no item key, so
+    /// the user key IS the cipher key — exactly what [`cipher_key`] resolves on
+    /// the next sync, and what [`fido2_assert`] then decrypts). The private key
+    /// arrives here already zeroized by the caller and is base64url-encoded into
+    /// `keyValue`, matching what [`fido2_assert`]'s `decode_key_value` accepts.
+    ///
+    /// [`cipher_key`]: Vault::cipher_key
+    /// [`fido2_assert`]: Vault::fido2_assert
+    pub fn new_passkey_login_body(
+        &self,
+        passkey: &NewPasskey,
+    ) -> Result<serde_json::Value, CryptoError> {
+        use base64::Engine;
+        let enc = |value: &str| -> Result<String, CryptoError> {
+            Ok(self.user_key.encrypt_string(value)?.to_string())
+        };
+        let enc_opt = |value: &Option<String>| -> Result<serde_json::Value, CryptoError> {
+            match value.as_deref().filter(|value| !value.is_empty()) {
+                Some(value) => Ok(serde_json::Value::String(enc(value)?)),
+                None => Ok(serde_json::Value::Null),
+            }
+        };
+        let b64url = |bytes: &[u8]| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        };
+        // The RP references the credential by this handle; the userHandle is the
+        // account id the RP maps back on a usernameless login — both base64url.
+        let credential_id = b64url(&passkey.credential_id);
+        let user_handle = b64url(&passkey.user_id);
+        let key_value = b64url(&passkey.pkcs8_der);
+
+        let fido2 = serde_json::json!({
+            "credentialId": enc(&credential_id)?,
+            "keyType": enc("public-key")?,
+            "keyAlgorithm": enc("ECDSA")?,
+            "keyCurve": enc("P-256")?,
+            "keyValue": enc(&key_value)?,
+            "rpId": enc(&passkey.rp_id)?,
+            "rpName": enc(&passkey.rp_name)?,
+            "userName": enc(&passkey.user_name)?,
+            "userDisplayName": enc(&passkey.user_display_name)?,
+            "userHandle": enc(&user_handle)?,
+            "counter": enc("0")?,
+            "discoverable": enc("true")?,
+            // Bitwarden stores this in the clear; the server keeps it verbatim.
+            "creationDate": passkey.creation_date,
+        });
+
+        Ok(serde_json::json!({
+            "type": 1,
+            "name": enc(&passkey.item_name)?,
+            "notes": serde_json::Value::Null,
+            "favorite": false,
+            "folderId": serde_json::Value::Null,
+            "reprompt": 0,
+            "fields": [],
+            "login": {
+                "username": enc_opt(&passkey.account_username)?,
+                "password": serde_json::Value::Null,
+                "totp": serde_json::Value::Null,
+                "uris": serde_json::json!([{ "uri": enc(&format!("https://{}", passkey.rp_id))?, "match": serde_json::Value::Null }]),
+                "fido2Credentials": [fido2],
             },
         }))
     }
@@ -1151,6 +1330,144 @@ mod tests {
 
         // An unknown item yields no passkeys rather than panicking.
         assert!(vault.passkeys("nope").is_empty());
+    }
+
+    #[test]
+    fn passkeys_for_assertion_resolves_by_rp_and_honors_allow_credentials() {
+        let key_bytes = [0x5au8; 64];
+        let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
+        let s = |text: &str| Some(seal(&key_bytes, text));
+        // A passkey with a given rpId + credentialId on a named item.
+        let passkey = |item: &str, rp: &str, cred: &str, user: &str| RawCipher {
+            id: item.into(),
+            item_type: 1,
+            name: Some(seal(&key_bytes, item)),
+            fido2: vec![RawFido2Credential {
+                credential_id: s(cred),
+                rp_id: s(rp),
+                user_name: s(user),
+                key_value: s("secret"),
+                counter: s("0"),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let vault = Vault::new(
+            user_key,
+            HashMap::new(),
+            vec![
+                passkey("gh-a", "github.com", "cred-a", "octocat"),
+                passkey("gh-b", "github.com", "cred-b", "hubot"),
+                passkey("other", "example.com", "cred-x", "someone"),
+            ],
+            vec![],
+            HashMap::new(),
+        );
+
+        // Discoverable (empty allow-list): every passkey for the RP, and NOT
+        // another RP's — that is the account-picker case.
+        let mut any = vault.passkeys_for_assertion("github.com", &[]);
+        any.sort_by(|a, b| a.credential_id.cmp(&b.credential_id));
+        assert_eq!(any.len(), 2);
+        assert_eq!(any[0].credential_id, "cred-a");
+        assert_eq!(any[0].user_name.as_deref(), Some("octocat"));
+        assert_eq!(any[1].credential_id, "cred-b");
+        assert!(any.iter().all(|m| m.rp_id == "github.com"));
+
+        // allowCredentials narrows to exactly the named credential.
+        let allowed = vault.passkeys_for_assertion("github.com", &["cred-b".into()]);
+        assert_eq!(allowed.len(), 1);
+        assert_eq!(allowed[0].item_id, "gh-b");
+
+        // An allow-list naming no stored credential resolves to nothing (the
+        // page offered credentials we do not hold), and a secret never rides in
+        // the match.
+        let none = vault.passkeys_for_assertion("github.com", &["cred-unknown".into()]);
+        assert!(none.is_empty());
+        assert!(!serde_json::to_string(&any).unwrap().contains("secret"));
+    }
+
+    // create() then get(): a passkey minted and stored by `new_passkey_login_body`
+    // must be signable when it comes back. This round-trips the whole vault path
+    // minus the network — generate, encrypt into a POST body, decrypt the sealed
+    // key back out, and sign an assertion that verifies. If the field encoding
+    // were wrong, the stored passkey would be unusable; this catches it.
+    #[test]
+    fn a_created_passkey_stores_a_key_that_signs_a_verifiable_assertion() {
+        use base64::Engine;
+        use p256::ecdsa::signature::Verifier;
+        use p256::ecdsa::{Signature, VerifyingKey};
+
+        let key_bytes = [0x5au8; 64];
+        let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
+        let vault = Vault::new(
+            SymmetricKey::from_bytes(&key_bytes).unwrap(),
+            HashMap::new(),
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+
+        let credential = crate::fido2::generate_credential(&mut rand::rngs::OsRng);
+        let cose = credential.cose_public_key.clone();
+        let passkey = NewPasskey {
+            item_name: "Cloudflare".into(),
+            rp_id: "dash.cloudflare.com".into(),
+            rp_name: "Cloudflare".into(),
+            user_name: "avikalpa".into(),
+            user_display_name: "Avikalpa".into(),
+            user_id: b"user-handle-bytes".to_vec(),
+            credential_id: credential.credential_id.clone(),
+            pkcs8_der: credential.pkcs8_der.to_vec(),
+            account_username: Some("avikalpa".into()),
+            creation_date: "2026-07-10T00:00:00.000Z".into(),
+        };
+        let body = vault.new_passkey_login_body(&passkey).unwrap();
+
+        // The wire shape Vaultwarden expects: a login cipher with one passkey.
+        assert_eq!(body["type"], 1);
+        let fido2 = &body["login"]["fido2Credentials"][0];
+        assert_eq!(fido2["creationDate"], "2026-07-10T00:00:00.000Z");
+
+        // Every secret field is an EncString, not plaintext — decrypt them back.
+        let dec = |field: &str| {
+            let enc = EncString::parse(fido2[field].as_str().unwrap()).unwrap();
+            user_key.decrypt_to_string(&enc).unwrap()
+        };
+        assert_eq!(dec("keyType"), "public-key");
+        assert_eq!(dec("keyAlgorithm"), "ECDSA");
+        assert_eq!(dec("keyCurve"), "P-256");
+        assert_eq!(dec("counter"), "0");
+        assert_eq!(dec("rpId"), "dash.cloudflare.com");
+        // The private key never appears in the clear anywhere in the body.
+        let key_value_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&credential.pkcs8_der);
+        assert!(!body.to_string().contains(&key_value_b64));
+
+        // THE round-trip: the sealed keyValue decrypts to the same PKCS#8 key,
+        // and an assertion signed with it verifies under the COSE public key we
+        // would have handed the RP at create time.
+        let stored_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(dec("keyValue"))
+            .unwrap();
+        let client_data_hash = [0x07u8; 32];
+        let assertion = crate::fido2::sign_assertion(
+            &stored_key,
+            "dash.cloudflare.com",
+            &client_data_hash,
+            0,
+            crate::fido2::UserPresence::granted(true),
+        )
+        .unwrap();
+
+        let mut sec1 = vec![0x04];
+        sec1.extend_from_slice(&cose[10..42]); // x
+        sec1.extend_from_slice(&cose[45..77]); // y
+        let verifying = VerifyingKey::from_sec1_bytes(&sec1).unwrap();
+        let sig = Signature::from_der(&assertion.signature).unwrap();
+        let mut message = assertion.authenticator_data.clone();
+        message.extend_from_slice(&client_data_hash);
+        verifying.verify(&message, &sig).expect("stored key must sign a verifiable assertion");
     }
 
     // THE contract this whole struct exists for. `PUT /api/ciphers/{id}`
