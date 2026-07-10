@@ -365,11 +365,15 @@ fn handle_conn(stream: TcpStream, state: &ServerState) {
             respond_json(stream, 200, &reply);
         }
         // The WebAuthn signer routes. `/fido2/get` and `/fido2/create` come from
-        // the page (over SOCKS-loopback), bearer-token-gated; `/fido2/grant` and
-        // `/fido2/deny` come from the GUI dialog (over `ssh -L`). All require the
-        // token — the GUI is handed it the same way the shim is.
+        // the PAGE (over SOCKS-loopback) and are bearer-token-gated, so a random
+        // local process cannot summon a presence dialog. `/fido2/grant` and
+        // `/fido2/deny` come from the GUI dialog (over `ssh -L`) and are
+        // authenticated instead by the unguessable per-ceremony `request_id`,
+        // which only the app (who emitted it) and the GUI (who received the OSC)
+        // know — the GUI never sees the page's token.
         ("POST", p) if p.starts_with("/fido2/") => {
-            if !state.signer.authorized(fido2_token.as_deref()) {
+            let page_route = p == "/fido2/get" || p == "/fido2/create";
+            if page_route && !state.signer.authorized(fido2_token.as_deref()) {
                 respond_json(stream, 401, &json!({ "error": "unauthorized" }));
                 return;
             }
