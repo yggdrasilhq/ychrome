@@ -196,6 +196,26 @@ fn run_thin_client(session: &str, url: &str, title: &str, profile: &str) -> Resu
         })
         .context("installing Ctrl+C handler")?;
     }
+    drive_surface(session, url, title, profile, stop)
+}
+
+/// The single owner of the web-surface loop: contribute the sidebar, open the
+/// surface, and heartbeat BOTH until `stop`. The `--url` fast path and the
+/// no-arg picker path (once the user has chosen a profile) both drive it, so the
+/// liveness + sidebar `DECLARE BEFORE OPEN` contract has ONE implementation. The
+/// picker path used to reimplement the heartbeat loop WITHOUT the sidebar, so a
+/// browser opened from the `+` menu had no vault/settings rail (and its surface
+/// was created with no adblock/userscript policy).
+///
+/// `stop` is owned by the caller because `ctrlc::set_handler` may be installed
+/// only once per process; the picker path installs it before it knows the URL.
+fn drive_surface(
+    session: &str,
+    url: &str,
+    title: &str,
+    profile: &str,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
     // ychrome CONTRIBUTES its vault and settings panes rather than yggterm
     // hardcoding them. A failure here must never take the browser down: the
     // surface is the product, the sidebar is an extra.
@@ -549,9 +569,15 @@ fn respond_empty(mut stream: TcpStream, status: u16) {
 }
 
 /// Handle one loopback request. `/` serves the picker; `/open?url=&profile=`
-/// retargets the surface (updates the heartbeat target + emits a fresh OSC
-/// open with the chosen url+profile).
+/// records the chosen (url, profile) as the new target with action "open".
+///
+/// It does NOT emit the OSC itself: the picker main loop notices the flip and
+/// hands off to `drive_surface`, which DECLARES the sidebar before it opens the
+/// page. Emitting "open" here would create the surface before the declare lands
+/// — the GUI builds a surface with no contribution unblocked, and that webview
+/// runs its whole life with no vault rail, no adblock, no userscripts.
 fn handle_picker_conn(stream: TcpStream, session: &str, target: &Arc<Mutex<SurfaceTarget>>) {
+    let _ = session;
     let peek = match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
@@ -582,7 +608,6 @@ fn handle_picker_conn(stream: TcpStream, session: &str, target: &Arc<Mutex<Surfa
                     action: "open",
                 };
             }
-            emit_web_surface_osc("open", session, &url, &title, &profile);
             eprintln!("ychrome: picker → {url} [{profile}]");
             respond_html(stream, 200, &opening_html(&url));
         }
@@ -627,10 +652,11 @@ fn run_thin_client_picker(session: &str) -> Result<()> {
     }
 
     // Announce the picker (action "pick": the GUI renders a NATIVE profile
-    // picker; the OSC url is this loopback CONTROL endpoint the GUI GETs
-    // /open on), then heartbeat the CURRENT target — which the server thread
-    // swaps to the chosen url+profile (action "open") on submit. A "pick"
-    // heartbeat keeps the picker alive; an "open" one the page.
+    // picker; the OSC url is this loopback CONTROL endpoint the GUI GETs /open
+    // on), then heartbeat "pick" to keep it alive until the user chooses. The
+    // server thread swaps `target` to the chosen url+profile (action "open") on
+    // submit; when we see that flip we STOP the picker phase and hand off to
+    // `drive_surface`, the ONE loop that declares the sidebar before it opens.
     {
         let t = target.lock().unwrap();
         emit_web_surface_osc(t.action, session, &t.url, &t.title, &t.profile);
@@ -638,12 +664,23 @@ fn run_thin_client_picker(session: &str) -> Result<()> {
     }
     let mut ticks: u32 = 0;
     let mut last_tick = std::time::Instant::now();
-    while !stop.load(Ordering::SeqCst) {
+    let chosen = loop {
+        if stop.load(Ordering::SeqCst) {
+            break None;
+        }
+        // The user submitted the picker: hand the chosen target to the shared
+        // surface loop (which contributes the sidebar). Kept behind the lock's
+        // scope so drive_surface runs without holding it.
+        {
+            let t = target.lock().unwrap();
+            if t.action == "open" {
+                break Some((t.url.clone(), t.title.clone(), t.profile.clone()));
+            }
+        }
         std::thread::sleep(Duration::from_millis(200));
         // Suspend/resume gap (Ctrl+Z / yggterm Zzz / machine sleep): the GUI
         // may have closed the surface, and heartbeats can't re-create one —
-        // re-announce the current target ("pick" re-announces itself; "open"
-        // is liveness-idempotent when nothing changed).
+        // re-announce the picker.
         if last_tick.elapsed() > Duration::from_secs(3) {
             let t = target.lock().unwrap();
             emit_web_surface_osc(t.action, session, &t.url, &t.title, &t.profile);
@@ -652,17 +689,22 @@ fn run_thin_client_picker(session: &str) -> Result<()> {
         ticks += 1;
         if ticks.is_multiple_of(20) {
             let t = target.lock().unwrap();
-            if t.action == "pick" {
-                emit_web_surface_osc("pick", session, &t.url, &t.title, &t.profile);
-            } else {
-                emit_web_surface_osc("heartbeat", session, &t.url, &t.title, &t.profile);
-            }
+            emit_web_surface_osc("pick", session, &t.url, &t.title, &t.profile);
+        }
+    };
+    match chosen {
+        // Hand off to the shared loop: it declares the sidebar, emits the first
+        // "open" (so DECLARE precedes OPEN), and heartbeats both. The detached
+        // picker HTTP thread is orphaned but harmless — it dies with the process.
+        Some((url, title, profile)) => drive_surface(session, &url, &title, &profile, stop),
+        // Ctrl+C during the picker phase: never opened a page, so just close.
+        None => {
+            let t = target.lock().unwrap();
+            emit_web_surface_osc("close", session, &t.url, &t.title, &t.profile);
+            eprintln!("ychrome: web surface closed");
+            Ok(())
         }
     }
-    let t = target.lock().unwrap();
-    emit_web_surface_osc("close", session, &t.url, &t.title, &t.profile);
-    eprintln!("ychrome: web surface closed");
-    Ok(())
 }
 
 /// Detect a yggterm-owned PTY. Primary signal is YGGTERM_SESSION_ID (the
