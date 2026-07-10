@@ -1,15 +1,17 @@
-//! ychrome's SIDEBAR CONTRIBUTION: the vault pane, owned by ychrome.
+//! ychrome's SIDEBAR CONTRIBUTION: the vault and settings panes, owned by ychrome.
 //!
-//! yggterm used to hardcode a `RightPanelMode::Vault` — app chrome living in the
-//! platform, which is the anti-pattern the libyggterm contract exists to
-//! prevent. Instead ychrome *declares* the pane over `OSC 7717 ; sidebar` and
-//! serves its content from a loopback control endpoint on the host ychrome runs
-//! on. yggterm draws generic widgets and knows nothing about vaults.
+//! yggterm used to hardcode a `RightPanelMode::Vault` and a `::AppSidebar` — app
+//! chrome living in the platform, which is the anti-pattern the libyggterm
+//! contract exists to prevent. Instead ychrome *declares* both panes over
+//! `OSC 7717 ; sidebar` and serves their content from a loopback control endpoint
+//! on the host ychrome runs on. yggterm draws generic widgets and knows nothing
+//! about vaults or ad blocking.
 //!
 //! ```text
-//! ychrome  --OSC 7717 sidebar;declare-->  yggterm GUI   (control url + pane buttons)
-//! yggterm  --GET  <control>/pane/vault->  ychrome       (schema; no secrets)
-//! yggterm  --POST <control>/action----->  ychrome       (schema? toast? eval?)
+//! ychrome  --OSC 7717 sidebar;declare-->  yggterm GUI  (control url, panes, policy stamp)
+//! yggterm  --GET  <control>/pane/<id>-->  ychrome      (schema; no secrets)
+//! yggterm  --GET  <control>/policy---->   ychrome      (adblock rules + userscripts)
+//! yggterm  --POST <control>/action---->   ychrome      (schema? toast? eval? reload_surface?)
 //! ```
 //!
 //! **The vault never crosses the OSC.** A 1100-row item list would not fit on a
@@ -18,7 +20,9 @@
 //! injects into the surface — the app computes, the GUI injects.
 //!
 //! State is host-resident: the unlocked vault lives in this host's
-//! `ychrome-vault` agent, which over ssh is the REMOTE host, not the GUI's.
+//! `ychrome-vault` agent, and the web-content policy in this host's
+//! `~/.yggterm/web-adblock` + `web-userscripts` — which over ssh is the REMOTE
+//! host, not the GUI's. See [`crate::webpolicy`].
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -161,9 +165,7 @@ impl PaneState {
             ..PaneState::default()
         }
     }
-}
 
-impl PaneState {
     /// Seed the Add draft from the page the user is looking at, once per host.
     /// The old hardcoded pane only offered this as a placeholder; naming the
     /// item after the host is what makes fill-matching find it later.
@@ -1054,13 +1056,16 @@ fn run_settings_action(state: &Arc<Mutex<PaneState>>, request: &Value) -> Value 
     let outcome = match action {
         "adblock-enabled" => crate::webpolicy::set_adblock_enabled(on),
         "adblock-profile" => crate::webpolicy::set_adblock_profile_disabled(&profile, !on),
-        // Reloading is a page action, so it rides the `eval` channel the vault's
-        // fill already uses. No new GUI capability.
+        // `reload_surface`, NOT `eval: "location.reload()"`. A content filter and
+        // its userscripts are attached to the WEBVIEW at creation, so reloading
+        // the document leaves both exactly as they were — turning ad blocking off
+        // and reloading in-page would appear to do nothing. Only the GUI can
+        // destroy and recreate the surface, and it refetches `/policy` first.
         "reload-surface" => {
             return json!({
                 "schema": settings_schema(&profile),
-                "eval": "location.reload()",
-                "toast": "Reloading the surface.",
+                "reload_surface": true,
+                "toast": "Reloading the surface with the current policy.",
             });
         }
         script if script.starts_with(USERSCRIPT_ACTION_PREFIX) => {
@@ -1185,7 +1190,7 @@ mod tests {
             &state,
             &json!({"pane": SETTINGS_PANE, "action": "reload-surface", "values": {}}),
         );
-        assert_eq!(reply["eval"], "location.reload()");
+        assert_eq!(reply["reload_surface"], true);
         assert_eq!(reply["schema"]["title"], "ychrome");
     }
 
@@ -1205,16 +1210,22 @@ mod tests {
         );
     }
 
-    // Reloading is a page action, so it must ride the existing `eval` channel
-    // rather than asking yggterm for a new capability.
+    // A policy change needs the WEBVIEW recreated, not the document reloaded: a
+    // content filter and its userscripts are attached at creation, so
+    // `location.reload()` would leave ad blocking exactly as it was. Asking for
+    // an in-page reload here is a silent no-op the user reads as a broken toggle.
     #[test]
-    fn reloading_the_surface_rides_the_eval_channel() {
+    fn reloading_the_surface_asks_the_gui_to_recreate_it() {
         let state = Arc::new(Mutex::new(PaneState::new("default")));
         let reply = run_settings_action(
             &state,
             &json!({"pane": SETTINGS_PANE, "action": "reload-surface", "values": {}}),
         );
-        assert!(reply["eval"].is_string());
+        assert_eq!(reply["reload_surface"], true);
+        assert!(
+            reply["eval"].is_null(),
+            "an in-page reload cannot detach a content filter"
+        );
     }
 
     fn policy_state(rules: bool, userscripts: &[(&str, bool)]) -> crate::webpolicy::PolicyState {
