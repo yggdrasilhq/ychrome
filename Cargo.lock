@@ -4115,6 +4115,7 @@ dependencies = [
  "ctrlc",
  "dirs 5.0.1",
  "serde_json",
+ "sha2",
  "tao",
  "url",
  "wry",

@@ -270,6 +270,25 @@ impl VaultManager {
         Ok(id)
     }
 
+    /// Store a freshly minted passkey as a new login and re-sync. The private
+    /// key is sealed under the user key by [`Vault::new_passkey_login_body`]; the
+    /// server only ever sees ciphertext. Returns the new item id.
+    ///
+    /// [`Vault::new_passkey_login_body`]: crate::model::Vault::new_passkey_login_body
+    pub fn add_passkey_login(
+        &mut self,
+        passkey: &crate::model::NewPasskey,
+    ) -> Result<String, VaultError> {
+        let config = self.config.clone().ok_or(VaultError::NotConfigured)?;
+        let token = self.access_token.clone().ok_or(VaultError::Locked)?;
+        let vault = self.vault.as_ref().ok_or(VaultError::Locked)?;
+        let body = vault.new_passkey_login_body(passkey)?;
+        let client = Client::new(&config.server_url)?;
+        let id = client.create_cipher(&token, &body)?;
+        self.resync()?;
+        Ok(id)
+    }
+
     /// Patch an existing item and re-sync. Only the fields named in `edit`
     /// change; everything else on the cipher — including what this client does
     /// not model — is carried back verbatim by [`Vault::edit_body`].

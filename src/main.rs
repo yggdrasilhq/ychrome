@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 mod manifest;
+mod passkey;
 mod sidebar;
 mod webpolicy;
 use clap::Parser;
@@ -204,7 +205,7 @@ fn run_thin_client(session: &str, url: &str, title: &str, profile: &str) -> Resu
     // document-start. Open first and the GUI's first apply pass sees a surface
     // with no contribution and builds it unblocked — no userscripts, no adblock,
     // silently, for the life of that webview.
-    let sidebar = match sidebar::spawn(profile) {
+    let sidebar = match sidebar::spawn(profile, session) {
         Ok(sidebar) => {
             sidebar::emit_declare(session, &sidebar.control_url, &webpolicy::policy_version(profile));
             Some(sidebar)

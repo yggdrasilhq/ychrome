@@ -576,6 +576,109 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             let vault = unlocked(&state)?;
             Ok(serde_json::to_value(vault.diagnose())?)
         }
+        // Resolve a `navigator.credentials.get()` request to the stored passkeys
+        // that can answer it — secret-free candidate metadata for the account
+        // the presence dialog will name. No private key crosses this socket.
+        // Reserved for the browser signer; there is no `ychrome-vault` CLI verb.
+        "fido2-resolve" => {
+            let rp_id = string("rp_id").ok_or_else(|| anyhow!("fido2-resolve needs an rp_id"))?;
+            let allow: Vec<String> = request
+                .get("allow_credential_ids")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let vault = unlocked(&state)?;
+            let matches = vault.passkeys_for_assertion(&rp_id, &allow);
+            state.touch();
+            Ok(json!({ "matches": matches }))
+        }
+        // Sign ONE WebAuthn assertion. This is the only op that mints a
+        // `UserPresence`, and it does so by value the moment it is called — so it
+        // MUST NOT be reachable except from the browser signer, AFTER the user
+        // approved the GUI presence dialog for this exact ceremony. There is
+        // deliberately no `ychrome-vault` CLI verb for it, and no way for the
+        // page (or a casual script) to reach this socket.
+        //
+        // The honest boundary: on a single-uid host the socket cannot itself
+        // distinguish the browser from another same-uid process, exactly as the
+        // `get` op (which already returns a plaintext password) cannot. The real,
+        // enforceable consent gate is the GUI dialog, whose Approve an agent's
+        // `dom-eval` cannot forge (`isTrusted`). This op is a pure signer behind
+        // that gate; it is no weaker than the vault already is.
+        "fido2-assert" => {
+            let item_id =
+                string("item_id").ok_or_else(|| anyhow!("fido2-assert needs an item_id"))?;
+            let rp_id = string("rp_id").ok_or_else(|| anyhow!("fido2-assert needs an rp_id"))?;
+            let client_data_hash = b64_standard_or_url(
+                &string("client_data_hash_b64")
+                    .ok_or_else(|| anyhow!("fido2-assert needs a client_data_hash_b64"))?,
+            )
+            .ok_or_else(|| anyhow!("client_data_hash_b64 did not base64-decode"))?;
+            let user_verified = request
+                .get("user_verified")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let vault = unlocked(&state)?;
+            let assertion = vault
+                .fido2_assert(
+                    &item_id,
+                    string("credential_id").as_deref(),
+                    &rp_id,
+                    &client_data_hash,
+                    crate::fido2::UserPresence::granted(user_verified),
+                )
+                .map_err(|error| anyhow!(error.to_string()))?;
+            state.touch();
+            Ok(json!({
+                "authenticator_data_b64": b64_url_no_pad(&assertion.authenticator_data),
+                "signature_b64": b64_url_no_pad(&assertion.signature),
+            }))
+        }
+        // Register a NEW passkey — a `navigator.credentials.create()`. Mints a
+        // P-256 credential, stores it as a login (private key sealed under the
+        // user key), and returns the PUBLIC material the browser needs to build
+        // the attestation: the credential id and the COSE public key. Like
+        // `fido2-assert`, this is a WRITE gated by the browser's GUI presence
+        // dialog and reachable only from the signer, never a CLI verb.
+        "fido2-create" => {
+            unlocked(&state)?;
+            let rp_id = string("rp_id").ok_or_else(|| anyhow!("fido2-create needs an rp_id"))?;
+            let user_id = b64_standard_or_url(
+                &string("user_id_b64").ok_or_else(|| anyhow!("fido2-create needs a user_id_b64"))?,
+            )
+            .ok_or_else(|| anyhow!("user_id_b64 did not base64-decode"))?;
+
+            let credential = crate::fido2::generate_credential(&mut rand::rngs::OsRng);
+            let rp_name = string("rp_name").unwrap_or_else(|| rp_id.clone());
+            let user_name = string("user_name").unwrap_or_default();
+            let passkey = crate::model::NewPasskey {
+                item_name: rp_name.clone(),
+                rp_id: rp_id.clone(),
+                rp_name,
+                user_name: user_name.clone(),
+                user_display_name: string("user_display_name").unwrap_or_else(|| user_name.clone()),
+                user_id,
+                credential_id: credential.credential_id.clone(),
+                pkcs8_der: credential.pkcs8_der.to_vec(),
+                account_username: (!user_name.is_empty()).then_some(user_name),
+                creation_date: iso8601_now(),
+            };
+            let id = state
+                .manager
+                .add_passkey_login(&passkey)
+                .map_err(|error| anyhow!(error.to_string()))?;
+            state.touch();
+            Ok(json!({
+                "item_id": id,
+                "credential_id_b64": b64_url_no_pad(&credential.credential_id),
+                "cose_public_key_b64": b64_url_no_pad(&credential.cose_public_key),
+            }))
+        }
         // Roll a password without touching the vault (the sidebar's generator).
         "generate" => {
             let length = request
@@ -591,6 +694,52 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
         }
         other => bail!("unknown op {other:?}"),
     }
+}
+
+/// Decode base64, accepting either standard or URL-safe-no-pad — the shim sends
+/// URL-safe, but a hand-run probe may paste standard.
+fn b64_standard_or_url(text: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let text = text.trim();
+    base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(text))
+        .ok()
+}
+
+/// WebAuthn wire encoding for binary response fields: base64url without padding.
+fn b64_url_no_pad(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.000Z` for now, for a new passkey's plaintext
+/// `creationDate`. Hand-rolled (no chrono dep) via Howard Hinnant's civil-date
+/// algorithm — the vault crate already avoids heavy deps.
+fn iso8601_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (days, sod) = ((secs / 86400) as i64, secs % 86400);
+    let (hour, minute, second) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.000Z")
+}
+
+/// (year, month, day) for a count of days since the Unix epoch. Howard
+/// Hinnant's `civil_from_days`, valid for the whole Gregorian range.
+fn civil_from_days(z: i64) -> (i64, u64, u64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 fn unlocked(state: &AgentState) -> Result<&crate::model::Vault> {
@@ -975,6 +1124,111 @@ mod tests {
         // An item with no passkey answers with an empty list, not an error.
         let none = dispatch(&json!({"op": "passkeys", "name": "gour.top"}), &state).unwrap();
         assert!(none["passkeys"].as_array().unwrap().is_empty());
+    }
+
+    // The `get()` ceremony over the agent socket, end to end with a REAL P-256
+    // key: `fido2-resolve` names the candidate secret-free, then `fido2-assert`
+    // returns an assertion that verifies against the credential's public key —
+    // exactly what an RP checks. This is the browser signer's whole agent path.
+    #[test]
+    fn agent_resolves_and_signs_a_real_passkey_assertion() {
+        use base64::Engine;
+        use p256::ecdsa::signature::Verifier;
+        use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+        use p256::pkcs8::EncodePrivateKey;
+        use sha2::{Digest, Sha256};
+
+        use crate::crypto::SymmetricKey;
+        use crate::model::{RawCipher, RawFido2Credential, Vault, seal};
+
+        // A real credential: fixed scalar so the test is deterministic, exported
+        // as the base64 PKCS#8 that a decrypted `keyValue` decodes to.
+        let signing = SigningKey::from_bytes(&[0x22u8; 32].into()).unwrap();
+        let pkcs8 = signing.to_pkcs8_der().unwrap();
+        let key_value_b64 =
+            base64::engine::general_purpose::STANDARD.encode(pkcs8.as_bytes());
+
+        let key_bytes = [0x5au8; 64];
+        let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
+        let enc = |text: &str| Some(seal(&key_bytes, text.as_bytes()));
+        let cipher = RawCipher {
+            id: "pk".into(),
+            item_type: 1,
+            name: enc("Cloudflare"),
+            fido2: vec![RawFido2Credential {
+                credential_id: enc("cred-real"),
+                rp_id: enc("dash.cloudflare.com"),
+                user_name: enc("avikalpa"),
+                counter: enc("0"),
+                key_value: enc(&key_value_b64),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let dir = temp_dir("fido2-assert");
+        let mut manager = VaultManager::load(&dir);
+        manager.install_vault_for_test(Vault::new(
+            user_key,
+            Default::default(),
+            vec![cipher],
+            vec![],
+            Default::default(),
+        ));
+        let state = test_state(manager, dir.clone());
+
+        // Resolve: the candidate carries the account to show, never the key.
+        let resolved = dispatch(
+            &json!({"op": "fido2-resolve", "rp_id": "dash.cloudflare.com"}),
+            &state,
+        )
+        .unwrap();
+        let matches = resolved["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["item_id"], "pk");
+        assert_eq!(matches[0]["credential_id"], "cred-real");
+        assert_eq!(matches[0]["user_name"], "avikalpa");
+        assert!(!resolved.to_string().contains(&key_value_b64));
+
+        // Assert: a real clientDataHash in, a verifiable assertion out.
+        let client_data_hash = Sha256::digest(br#"{"type":"webauthn.get"}"#);
+        let cdh_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(client_data_hash);
+        let assertion = dispatch(
+            &json!({
+                "op": "fido2-assert",
+                "item_id": "pk",
+                "credential_id": "cred-real",
+                "rp_id": "dash.cloudflare.com",
+                "client_data_hash_b64": cdh_b64,
+                "user_verified": true,
+            }),
+            &state,
+        )
+        .unwrap();
+
+        let decode = |field: &str| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(assertion[field].as_str().unwrap())
+                .unwrap()
+        };
+        let authenticator_data = decode("authenticator_data_b64");
+        let signature = decode("signature_b64");
+
+        // authenticatorData is rpIdHash ‖ flags(UP|UV) ‖ signCount(0).
+        assert_eq!(
+            &authenticator_data[0..32],
+            Sha256::digest(b"dash.cloudflare.com").as_slice()
+        );
+        assert_eq!(authenticator_data[32], 0b0000_0101);
+
+        // THE proof an RP does: the signature verifies over
+        // authenticatorData ‖ clientDataHash against the credential's public key.
+        let verifying = VerifyingKey::from(&signing);
+        let sig = Signature::from_der(&signature).unwrap();
+        let mut signed = authenticator_data.clone();
+        signed.extend_from_slice(&client_data_hash);
+        verifying.verify(&signed, &sig).expect("assertion must verify");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // The trash is a second, opt-in list. `restore` resolves names against it —
