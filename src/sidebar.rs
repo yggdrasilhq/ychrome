@@ -113,6 +113,7 @@ struct AddDraft {
     user: String,
     uri: String,
     folder: String,
+    notes: String,
     /// The page host this draft was seeded from, so re-entering the tab on the
     /// same site does not clobber what the user typed, and browsing to a new
     /// site does re-seed.
@@ -394,11 +395,76 @@ fn item_row(item: &Value) -> Value {
 /// size can have dozens of reuse groups; the panel is 300px wide.
 const MAX_REPORT_ROWS: usize = 30;
 
-/// Build the pane. NO SECRET is ever placed in a schema — only names, usernames
-/// and the booleans saying a password or TOTP secret exists. The Add tab's
-/// password field is declared EMPTY every time: it carries what the user types
-/// up to this process on an action, and nothing ever comes back down.
+/// The unlock screen, shown in place of the tabs whenever the vault is not
+/// unlocked. The master password is a `secret` field: it carries what the user
+/// types UP to this process on the `unlock` action and is declared back empty,
+/// so it never rides a schema down. The unlock itself runs `ychrome-vault
+/// unlock` on THIS host, reading the password from stdin — the same path the
+/// user would take at a shell, now without leaving the sidebar.
+fn locked_schema(status: &Value) -> Value {
+    let state = status["state"].as_str().unwrap_or("unknown");
+    let mut widgets = vec![];
+    match state {
+        "locked" => {
+            widgets.push(json!({"kind": "section", "text": "Unlock the vault"}));
+            if let Some(email) = status["email"].as_str().filter(|email| !email.is_empty()) {
+                widgets.push(json!({"kind": "label", "muted": true, "text": email}));
+            }
+            widgets.push(json!({
+                "kind": "text-input", "id": "unlock_password", "label": "Master password",
+                "placeholder": "Master password", "secret": true, "value": "",
+            }));
+            widgets.push(json!({
+                "kind": "button", "id": "unlock", "action": "unlock", "primary": true,
+                "label": "Unlock",
+            }));
+            widgets.push(json!({
+                "kind": "label", "muted": true,
+                "text": "Your password unlocks the vault on this host and is not stored. It never crosses the terminal or the GUI.",
+            }));
+        }
+        "not_configured" => {
+            widgets.push(json!({"kind": "section", "text": "Vault not set up"}));
+            widgets.push(json!({
+                "kind": "label", "muted": true,
+                "text": "No vault is configured on this host. Run `ychrome-vault configure --server <url> --email <you>` here, then unlock.",
+            }));
+        }
+        other => {
+            widgets.push(json!({"kind": "section", "text": "Vault"}));
+            widgets.push(json!({"kind": "label", "muted": true, "text": format!("Vault state: {other}.")}));
+        }
+    }
+    json!({ "title": "Vault", "widgets": widgets })
+}
+
+/// The pane, with lock state resolved. A locked vault shows an unlock form, not
+/// the item list; `status` is the SSOT for it (a cheap agent round-trip). An
+/// error here (agent unreachable) surfaces the reason rather than a broken tab.
+///
+/// The I/O lives here so [`unlocked_schema`] stays pure and testable without an
+/// agent — a test must never touch the user's real vault.
 fn vault_schema(state: &PaneState, host: Option<&str>) -> Value {
+    match vault_cli_json(&["status"]) {
+        Ok(status) if status["state"].as_str() == Some("unlocked") => {
+            unlocked_schema(state, host)
+        }
+        Ok(status) => locked_schema(&status),
+        Err(error) => json!({
+            "title": "Vault",
+            "widgets": [
+                {"kind": "section", "text": "Vault"},
+                {"kind": "label", "muted": true, "text": error.to_string()},
+            ],
+        }),
+    }
+}
+
+/// Build the unlocked pane. NO SECRET is ever placed in a schema — only names,
+/// usernames and the booleans saying a password or TOTP secret exists. The Add
+/// tab's password field is declared EMPTY every time: it carries what the user
+/// types up to this process on an action, and nothing ever comes back down.
+fn unlocked_schema(state: &PaneState, host: Option<&str>) -> Value {
     let mut widgets = vec![json!({
         "kind": "tabs",
         "id": "tab",
@@ -418,6 +484,11 @@ fn vault_schema(state: &PaneState, host: Option<&str>) -> Value {
             widgets.push(json!({"kind": "text-input", "id": "add_user", "label": "Username", "placeholder": "you@example.com", "value": state.add.user}));
             widgets.push(json!({"kind": "text-input", "id": "add_uri", "label": "URI", "placeholder": "https://example.com", "value": state.add.uri}));
             widgets.push(json!({"kind": "text-input", "id": "add_folder", "label": "Folder (optional)", "value": state.add.folder}));
+            widgets.push(json!({
+                "kind": "text-input", "id": "add_notes", "label": "Notes (optional)",
+                "placeholder": "Anything to remember", "value": state.add.notes,
+                "multiline": true, "rows": 10,
+            }));
             widgets.push(json!({
                 "kind": "text-input", "id": "add_password", "label": "Password",
                 "placeholder": "Leave empty to generate one", "secret": true, "value": "",
@@ -607,6 +678,9 @@ fn absorb_draft(state: &mut PaneState, values: &Value) {
     if let Some(folder) = text("add_folder") {
         state.add.folder = folder;
     }
+    if let Some(notes) = text("add_notes") {
+        state.add.notes = notes;
+    }
     if let Some(length) = values["generate_length"].as_str() {
         // An empty or half-typed number box must not wipe the setting.
         if let Ok(length) = length.parse::<i64>() {
@@ -667,6 +741,29 @@ fn run_action(state: &Arc<Mutex<PaneState>>, request: &Value) -> Value {
             }
             Err(error) => json!({ "toast": error.to_string() }),
         },
+        "unlock" => {
+            // The master password reaches `ychrome-vault unlock` on stdin and is
+            // used for this one call — never stored in PaneState, never echoed
+            // back. On success the vault is open and reschema falls through to the
+            // tabs; on failure it stays on the unlock form with the field cleared.
+            let password = values["unlock_password"].as_str().unwrap_or_default();
+            if password.is_empty() {
+                return json!({ "toast": "Enter your master password." });
+            }
+            match vault_cli_stdin(&["unlock"], Some(password)) {
+                Ok(reply) => {
+                    let count = serde_json::from_str::<Value>(&reply)
+                        .ok()
+                        .and_then(|value| value["item_count"].as_u64())
+                        .unwrap_or(0);
+                    merge(
+                        reschema(state, host.as_deref()),
+                        json!({ "toast": format!("Vault unlocked — {count} items.") }),
+                    )
+                }
+                Err(error) => merge(reschema(state, host.as_deref()), json!({ "toast": error.to_string() })),
+            }
+        }
         "lock" => match vault_cli_json(&["lock"]) {
             Ok(_) => {
                 // A locked vault's scan is stale and unrepeatable; do not keep
@@ -679,13 +776,14 @@ fn run_action(state: &Arc<Mutex<PaneState>>, request: &Value) -> Value {
         "add" => {
             // The draft was absorbed above, so it is this process's copy that
             // is authoritative — and it survives a failed save.
-            let (name, user, uri, folder, length, no_symbols) = {
+            let (name, user, uri, folder, notes, length, no_symbols) = {
                 let state = state.lock().unwrap();
                 (
                     state.add.name.trim().to_string(),
                     state.add.user.trim().to_string(),
                     state.add.uri.trim().to_string(),
                     state.add.folder.trim().to_string(),
+                    state.add.notes.trim().to_string(),
                     state.generate_length.to_string(),
                     state.generate_no_symbols,
                 )
@@ -706,6 +804,9 @@ fn run_action(state: &Arc<Mutex<PaneState>>, request: &Value) -> Value {
             }
             if !folder.is_empty() {
                 args.extend(["--folder", folder.as_str()]);
+            }
+            if !notes.is_empty() {
+                args.extend(["--notes", notes.as_str()]);
             }
             if password.is_empty() {
                 args.extend(["--generate", "--length", length.as_str()]);
@@ -947,7 +1048,9 @@ mod tests {
             ..PaneState::default()
         };
         state.seed_add_draft(Some("github.com"));
-        let schema = vault_schema(&state, Some("github.com"));
+        // `unlocked_schema`, not `vault_schema`: the latter shells out to
+        // `ychrome-vault status`, which a test must never do.
+        let schema = unlocked_schema(&state, Some("github.com"));
         let widgets = schema["widgets"].as_array().unwrap();
 
         let password = widgets
@@ -956,6 +1059,13 @@ mod tests {
             .expect("the Add tab has a password field");
         assert_eq!(password["secret"], true, "the password field must be masked");
         assert_eq!(password["value"], "", "a schema must never carry a secret");
+
+        // Notes is offered, seeded from the draft, and not a secret.
+        let notes = widgets
+            .iter()
+            .find(|widget| widget["id"] == "add_notes")
+            .expect("the Add tab has a notes field");
+        assert_ne!(notes["secret"], true, "notes are not a secret");
 
         // Seeded from the page the user is looking at.
         let named = |id: &str| {
@@ -992,6 +1102,51 @@ mod tests {
         blank.seed_add_draft(None);
         assert_eq!(blank.add.name, "");
         assert_eq!(blank.add.uri, "");
+    }
+
+    // A locked vault shows an unlock form in place of the tabs, and the master
+    // password field is a masked, declared-empty secret — never carried in the
+    // schema. `locked_schema` is pure, so this needs no agent.
+    #[test]
+    fn locked_schema_offers_a_masked_unlock_field() {
+        let schema = locked_schema(&json!({"state": "locked", "email": "you@example.com"}));
+        let widgets = schema["widgets"].as_array().unwrap();
+        // No tabs: a locked vault is an unlock prompt, not a browser.
+        assert!(!widgets.iter().any(|w| w["kind"] == "tabs"));
+        let field = widgets
+            .iter()
+            .find(|w| w["id"] == "unlock_password")
+            .expect("locked pane has a master-password field");
+        assert_eq!(field["secret"], true, "the master password must be masked");
+        assert_eq!(field["value"], "", "a schema must never carry a secret");
+        assert!(widgets.iter().any(|w| w["action"] == "unlock"));
+        // The account is shown for context; the password never is.
+        assert!(json!(widgets).to_string().contains("you@example.com"));
+
+        // A host with no vault gives instructions, not an unlock field.
+        let unconfigured = locked_schema(&json!({"state": "not_configured"}));
+        let wire = unconfigured.to_string();
+        assert!(!wire.contains("unlock_password"));
+        assert!(wire.contains("configure"));
+    }
+
+    // The Add tab carries a notes draft up to the app; absorb_draft folds it in.
+    #[test]
+    fn add_notes_round_trips_through_the_draft() {
+        let mut state = PaneState::default();
+        absorb_draft(&mut state, &json!({"add_notes": "recovery codes in 1Password"}));
+        assert_eq!(state.add.notes, "recovery codes in 1Password");
+        let schema = unlocked_schema(
+            &PaneState { tab: "add".to_string(), add: AddDraft { notes: "hi".to_string(), ..AddDraft::default() }, ..PaneState::default() },
+            None,
+        );
+        let notes = schema["widgets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["id"] == "add_notes")
+            .expect("notes field present");
+        assert_eq!(notes["value"], "hi");
     }
 
     // yggterm posts only the values its CURRENT schema declares. A `tab` action
