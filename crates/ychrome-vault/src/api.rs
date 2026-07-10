@@ -49,6 +49,10 @@ pub struct TokenResponse {
 /// Everything `sync` returns, still encrypted.
 pub struct SyncResponse {
     pub ciphers: Vec<RawCipher>,
+    /// Soft-deleted ciphers (each carries a `deletedDate`). Separated from
+    /// `ciphers` here rather than dropped, so the vault can offer `restore` and
+    /// `list --trashed`. A hard-deleted item is absent from `sync` entirely.
+    pub trashed: Vec<RawCipher>,
     /// `folder_id -> encrypted name` (always under the user key).
     pub folders: HashMap<String, EncString>,
     /// The user's RSA private key, sealed under the user key. Absent on an
@@ -176,77 +180,7 @@ impl Client {
             .send()
             .map_err(|error| ApiError::Network(error.to_string()))?;
         let value = json_or_err(resp)?;
-
-        // The user's RSA private key (sealed under the user key) and, per
-        // organization, that org's symmetric key (sealed to the user's public
-        // key). Without these, every organization cipher is undecryptable —
-        // which is exactly how 59 of them silently vanished from the item list.
-        let profile = get_ci(&value, "profile");
-        let private_key = profile
-            .and_then(|profile| EncString::parse_opt(get_str(profile, "privateKey")).ok().flatten());
-        let mut organization_keys = HashMap::new();
-        if let Some(profile) = profile {
-            for organization in get_array(profile, "organizations") {
-                if let (Some(id), Some(key)) =
-                    (get_str(organization, "id"), get_str(organization, "key"))
-                    && let Ok(key) = AsymEncString::parse(key)
-                {
-                    organization_keys.insert(id.to_string(), key);
-                }
-            }
-        }
-
-        let mut folders = HashMap::new();
-        for folder in get_array(&value, "folders") {
-            if let (Some(id), Some(name)) = (get_str(folder, "id"), get_str(folder, "name")) {
-                if let Ok(enc) = EncString::parse(name) {
-                    folders.insert(id.to_string(), enc);
-                }
-            }
-        }
-
-        let mut ciphers = Vec::new();
-        for cipher in get_array(&value, "ciphers") {
-            // Deleted items carry a deletedDate; skip them. A soft-deleted
-            // (trashed) item therefore leaves the item list on the next sync.
-            if get_str(cipher, "deletedDate").is_some() {
-                continue;
-            }
-            let login = get_ci(cipher, "login");
-            ciphers.push(RawCipher {
-                // The whole record, verbatim. An update PUT replaces the entire
-                // cipher, so the fields this client does not model (notes,
-                // custom fields, favorite, password history, and anything
-                // Bitwarden adds later) can only survive an edit by being
-                // carried back from here. See `Vault::edit_body`.
-                raw: (*cipher).clone(),
-                id: get_str(cipher, "id").unwrap_or_default().to_string(),
-                folder_id: get_str(cipher, "folderId").map(str::to_string),
-                organization_id: get_str(cipher, "organizationId").map(str::to_string),
-                item_type: get_u64(cipher, "type").unwrap_or(1) as u8,
-                key: EncString::parse_opt(get_str(cipher, "key")).ok().flatten(),
-                name: EncString::parse_opt(get_str(cipher, "name")).ok().flatten(),
-                username: login
-                    .and_then(|l| EncString::parse_opt(get_str(l, "username")).ok().flatten()),
-                password: login
-                    .and_then(|l| EncString::parse_opt(get_str(l, "password")).ok().flatten()),
-                totp: login.and_then(|l| EncString::parse_opt(get_str(l, "totp")).ok().flatten()),
-                uris: login
-                    .map(|l| {
-                        get_array(l, "uris")
-                            .iter()
-                            .filter_map(|u| EncString::parse_opt(get_str(u, "uri")).ok().flatten())
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            });
-        }
-        Ok(SyncResponse {
-            ciphers,
-            folders,
-            private_key,
-            organization_keys,
-        })
+        Ok(parse_sync(&value))
     }
 
     /// `POST /api/ciphers` → the created cipher's id. `body` must already be
@@ -320,6 +254,109 @@ impl Client {
         }
         .map_err(|error| ApiError::Network(error.to_string()))?;
         ok_or_err(resp)
+    }
+
+    /// Restore a soft-deleted cipher: `PUT /api/ciphers/{id}/restore` — the
+    /// inverse of a `SoftSingle` delete, verified against the same deployed
+    /// vaultwarden commit. Only a trashed item can be restored; a hard-deleted
+    /// one is gone, and the server answers with an error that surfaces here.
+    pub fn restore_cipher(&self, access_token: &str, id: &str) -> Result<(), ApiError> {
+        let resp = self
+            .http
+            .put(format!("{}/api/ciphers/{id}/restore", self.base))
+            .bearer_auth(access_token)
+            .send()
+            .map_err(|error| ApiError::Network(error.to_string()))?;
+        ok_or_err(resp)
+    }
+}
+
+/// Parse a `GET /api/sync` document into a [`SyncResponse`]. Pure (no network),
+/// so the cipher/trash split and the org/folder extraction are unit-testable.
+///
+/// Every sub-parse is lenient: a folder or org key that will not parse is
+/// dropped rather than failing the whole sync, matching the vault's
+/// decrypt-what-you-can posture (`Vault::diagnose` accounts for the gap).
+fn parse_sync(value: &serde_json::Value) -> SyncResponse {
+    // The user's RSA private key (sealed under the user key) and, per
+    // organization, that org's symmetric key (sealed to the user's public key).
+    // Without these, every organization cipher is undecryptable — which is
+    // exactly how 59 of them silently vanished from the item list.
+    let profile = get_ci(value, "profile");
+    let private_key = profile
+        .and_then(|profile| EncString::parse_opt(get_str(profile, "privateKey")).ok().flatten());
+    let mut organization_keys = HashMap::new();
+    if let Some(profile) = profile {
+        for organization in get_array(profile, "organizations") {
+            if let (Some(id), Some(key)) =
+                (get_str(organization, "id"), get_str(organization, "key"))
+                && let Ok(key) = AsymEncString::parse(key)
+            {
+                organization_keys.insert(id.to_string(), key);
+            }
+        }
+    }
+
+    let mut folders = HashMap::new();
+    for folder in get_array(value, "folders") {
+        if let (Some(id), Some(name)) = (get_str(folder, "id"), get_str(folder, "name")) {
+            if let Ok(enc) = EncString::parse(name) {
+                folders.insert(id.to_string(), enc);
+            }
+        }
+    }
+
+    // A soft-deleted item carries a `deletedDate`. It is not dropped — it goes
+    // to the `trashed` bucket so `restore` can find it by name and
+    // `list --trashed` can show it. A hard delete removes it from `sync`.
+    let mut ciphers = Vec::new();
+    let mut trashed = Vec::new();
+    for cipher in get_array(value, "ciphers") {
+        let parsed = parse_raw_cipher(cipher);
+        if get_str(cipher, "deletedDate").is_some() {
+            trashed.push(parsed);
+        } else {
+            ciphers.push(parsed);
+        }
+    }
+    SyncResponse {
+        ciphers,
+        trashed,
+        folders,
+        private_key,
+        organization_keys,
+    }
+}
+
+/// Parse one `sync` cipher record into a [`RawCipher`], keeping the untouched
+/// JSON alongside the fields this client models. Live and trashed ciphers are
+/// parsed identically — only which bucket they land in differs.
+fn parse_raw_cipher(cipher: &serde_json::Value) -> RawCipher {
+    let login = get_ci(cipher, "login");
+    RawCipher {
+        // The whole record, verbatim. An update PUT replaces the entire cipher,
+        // so the fields this client does not model (notes, custom fields,
+        // favorite, password history, and anything Bitwarden adds later) can
+        // only survive an edit by being carried back from here. See
+        // `Vault::edit_body`.
+        raw: cipher.clone(),
+        id: get_str(cipher, "id").unwrap_or_default().to_string(),
+        folder_id: get_str(cipher, "folderId").map(str::to_string),
+        organization_id: get_str(cipher, "organizationId").map(str::to_string),
+        item_type: get_u64(cipher, "type").unwrap_or(1) as u8,
+        key: EncString::parse_opt(get_str(cipher, "key")).ok().flatten(),
+        name: EncString::parse_opt(get_str(cipher, "name")).ok().flatten(),
+        username: login.and_then(|l| EncString::parse_opt(get_str(l, "username")).ok().flatten()),
+        password: login.and_then(|l| EncString::parse_opt(get_str(l, "password")).ok().flatten()),
+        totp: login.and_then(|l| EncString::parse_opt(get_str(l, "totp")).ok().flatten()),
+        uris: login
+            .map(|l| {
+                get_array(l, "uris")
+                    .iter()
+                    .filter_map(|u| EncString::parse_opt(get_str(u, "uri")).ok().flatten())
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -422,5 +459,29 @@ mod tests {
         assert_eq!(get_u64(&v, "a"), Some(5));
         assert_eq!(get_u64(&v, "b"), Some(7));
         assert_eq!(get_u64(&v, "c"), None);
+    }
+
+    #[test]
+    fn sync_splits_live_from_trashed_by_deleted_date() {
+        // A soft-deleted item carries a non-null deletedDate; a live one does
+        // not (absent or explicitly null). The split must key on presence, not
+        // on the field merely existing as null — vaultwarden emits `null` for
+        // live items.
+        let doc: Value = serde_json::from_str(
+            r#"{
+                "ciphers": [
+                    {"id": "live-1", "type": 1, "deletedDate": null},
+                    {"id": "trashed-1", "type": 1, "deletedDate": "2026-07-10T00:00:00Z"},
+                    {"id": "live-2", "type": 1}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let sync = parse_sync(&doc);
+        let live: Vec<&str> = sync.ciphers.iter().map(|c| c.id.as_str()).collect();
+        let trashed: Vec<&str> = sync.trashed.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(live, ["live-1", "live-2"]);
+        assert_eq!(trashed, ["trashed-1"]);
     }
 }

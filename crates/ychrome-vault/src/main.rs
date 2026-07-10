@@ -65,6 +65,10 @@ enum Command {
         query: Option<String>,
         #[arg(long)]
         json: bool,
+        /// List the recoverable soft-deleted items (the trash) instead of the
+        /// live ones. Restore one with `restore NAME`.
+        #[arg(long)]
+        trashed: bool,
     },
     /// Print an item's password (or another field) — `rbw get` parity.
     Get {
@@ -145,6 +149,14 @@ enum Command {
         /// Destroy the item outright instead of trashing it. Irreversible.
         #[arg(long)]
         permanent: bool,
+    },
+    /// Restore a soft-deleted item from the trash — the inverse of a soft `rm`.
+    ///
+    /// The name is resolved among trashed items only (`list --trashed` shows
+    /// them). A `--permanent` removal is gone and cannot be restored.
+    Restore {
+        name: String,
+        user: Option<String>,
     },
     /// Roll a password without touching the vault.
     Generate {
@@ -247,8 +259,15 @@ fn main() -> Result<()> {
         Command::Lock => print_json(&agent::request(&dir, &json!({"op": "lock"}))?),
         Command::Sync => print_json(&agent::request(&dir, &json!({"op": "sync"}))?),
         Command::Watchtower => print_json(&agent::request(&dir, &json!({"op": "watchtower"}))?),
-        Command::List { query, json } => {
-            let response = agent::request(&dir, &json!({"op": "list", "query": query}))?;
+        Command::List {
+            query,
+            json,
+            trashed,
+        } => {
+            let response = agent::request(
+                &dir,
+                &json!({"op": "list", "query": query, "trashed": trashed}),
+            )?;
             let items = response["items"].as_array().cloned().unwrap_or_default();
             if json {
                 return print_json(&response["items"]);
@@ -381,6 +400,14 @@ fn main() -> Result<()> {
                 // interchangeable: only a trashed item can be restored.
                 "trashed": response["trashed"],
                 "permanent": response["permanent"],
+            }))
+        }
+        Command::Restore { name, user } => {
+            let response =
+                agent::request(&dir, &json!({"op": "restore", "name": name, "user": user}))?;
+            print_json(&json!({
+                "restored": response["name"],
+                "id": response["id"],
             }))
         }
         Command::Match { host } => {

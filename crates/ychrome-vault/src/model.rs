@@ -174,6 +174,13 @@ pub struct Vault {
     /// the user's RSA private key. Empty when the account is in no orgs.
     organization_keys: HashMap<String, SymmetricKey>,
     ciphers: Vec<RawCipher>,
+    /// Soft-deleted ciphers (each carries a `deletedDate`). Kept OUT of
+    /// [`items`] so the live list never shows them, but retained so `restore`
+    /// can look a trashed item up by name and `list --trashed` can show what is
+    /// recoverable. A hard delete leaves nothing here — the server drops it.
+    ///
+    /// [`items`]: Vault::items
+    trashed: Vec<RawCipher>,
     folder_names: HashMap<String, EncString>,
 }
 
@@ -182,12 +189,14 @@ impl Vault {
         user_key: SymmetricKey,
         organization_keys: HashMap<String, SymmetricKey>,
         ciphers: Vec<RawCipher>,
+        trashed: Vec<RawCipher>,
         folders: HashMap<String, EncString>,
     ) -> Self {
         Vault {
             user_key,
             organization_keys,
             ciphers,
+            trashed,
             folder_names: folders,
         }
     }
@@ -239,7 +248,20 @@ impl Vault {
     /// The secret-free item list. A cipher that fails to decrypt (corrupt, or a
     /// type we do not model) is skipped rather than aborting the whole vault.
     pub fn items(&self) -> Vec<VaultItem> {
-        self.ciphers
+        self.items_from(&self.ciphers)
+    }
+
+    /// The soft-deleted items, same secret-free shape as [`items`]. These are
+    /// what `restore` can bring back and what `list --trashed` shows; the two
+    /// buckets never overlap (a cipher is either live or trashed).
+    ///
+    /// [`items`]: Vault::items
+    pub fn trashed_items(&self) -> Vec<VaultItem> {
+        self.items_from(&self.trashed)
+    }
+
+    fn items_from(&self, ciphers: &[RawCipher]) -> Vec<VaultItem> {
+        ciphers
             .iter()
             .filter_map(|cipher| {
                 let key = self.cipher_key(cipher).ok()?;
@@ -428,10 +450,12 @@ impl Vault {
         &mut self,
         organization_keys: HashMap<String, SymmetricKey>,
         ciphers: Vec<RawCipher>,
+        trashed: Vec<RawCipher>,
         folders: HashMap<String, EncString>,
     ) {
         self.organization_keys = organization_keys;
         self.ciphers = ciphers;
+        self.trashed = trashed;
         self.folder_names = folders;
     }
 
@@ -681,7 +705,7 @@ mod tests {
             organization_id: None,
             raw: serde_json::Value::Null,
         };
-        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], folders);
+        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], vec![], folders);
 
         let items = vault.items();
         assert_eq!(items.len(), 1);
@@ -742,7 +766,7 @@ mod tests {
         ];
         // WITHOUT the org key: the two org ciphers are unreadable, and the
         // diagnostic says exactly why. This is the 59-cipher gap in miniature.
-        let blind = Vault::new(user_key.clone(), HashMap::new(), ciphers.clone(), HashMap::new());
+        let blind = Vault::new(user_key.clone(), HashMap::new(), ciphers.clone(), vec![], HashMap::new());
         assert_eq!(blind.items().len(), 1, "only the user-key cipher is readable");
         assert_eq!(
             blind.diagnose(),
@@ -761,7 +785,7 @@ mod tests {
         // item key is sealed under the org key rather than the user key.
         let mut org_keys = HashMap::new();
         org_keys.insert("org1".to_string(), SymmetricKey::from_bytes(&org_bytes).unwrap());
-        let seeing = Vault::new(user_key, org_keys, ciphers, HashMap::new());
+        let seeing = Vault::new(user_key, org_keys, ciphers, vec![], HashMap::new());
         let names: Vec<String> = seeing.items().into_iter().map(|item| item.name).collect();
         assert_eq!(names, ["GitHub", "Shared Login", "Shared Note"]);
         let diagnostic = seeing.diagnose();
@@ -788,7 +812,7 @@ mod tests {
     fn new_login_body_encrypts_every_field_and_reads_back() {
         let key_bytes = [0x5au8; 64];
         let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
-        let vault = Vault::new(user_key.clone(), HashMap::new(), vec![], HashMap::new());
+        let vault = Vault::new(user_key.clone(), HashMap::new(), vec![], vec![], HashMap::new());
 
         let body = vault
             .new_login_body(&NewLogin {
@@ -826,7 +850,7 @@ mod tests {
     #[test]
     fn new_login_body_omits_an_empty_uri() {
         let user_key = SymmetricKey::from_bytes(&[0x11u8; 64]).unwrap();
-        let vault = Vault::new(user_key, HashMap::new(), vec![], HashMap::new());
+        let vault = Vault::new(user_key, HashMap::new(), vec![], vec![], HashMap::new());
         let body = vault
             .new_login_body(&NewLogin {
                 name: "bare".to_string(),
@@ -882,7 +906,34 @@ mod tests {
             uris: vec![seal(key_bytes, "https://github.com")],
             ..Default::default()
         };
-        Vault::new(user_key, HashMap::new(), vec![cipher], HashMap::new())
+        Vault::new(user_key, HashMap::new(), vec![cipher], vec![], HashMap::new())
+    }
+
+    #[test]
+    fn trashed_items_stay_out_of_the_live_list_and_vice_versa() {
+        let key_bytes = [0x42u8; 64];
+        let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
+        let named = |id: &str, name: &str| RawCipher {
+            id: id.into(),
+            item_type: 1,
+            name: Some(seal(&key_bytes, name)),
+            ..Default::default()
+        };
+        let vault = Vault::new(
+            user_key,
+            HashMap::new(),
+            vec![named("live", "Live Entry")],
+            vec![named("trashed", "Trashed Entry")],
+            HashMap::new(),
+        );
+
+        let live: Vec<String> = vault.items().into_iter().map(|i| i.name).collect();
+        let trashed: Vec<String> = vault.trashed_items().into_iter().map(|i| i.name).collect();
+        assert_eq!(live, ["Live Entry"]);
+        assert_eq!(trashed, ["Trashed Entry"]);
+        // The whole point: a trashed name never leaks into the live list, so an
+        // auto-fill or the sidebar cannot surface a deleted credential.
+        assert!(!live.iter().any(|name| name == "Trashed Entry"));
     }
 
     // THE contract this whole struct exists for. `PUT /api/ciphers/{id}`
@@ -974,7 +1025,7 @@ mod tests {
             password: Some(seal(&key_bytes, "old-password")),
             ..Default::default()
         };
-        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], HashMap::new());
+        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], vec![], HashMap::new());
         let body = vault
             .edit_body("c1", &CipherEdit { password: Some("new".into()), ..Default::default() })
             .unwrap();
@@ -1000,7 +1051,7 @@ mod tests {
             password: Some(seal(&item_bytes, "under-item-key")),
             ..Default::default()
         };
-        let vault = Vault::new(user_key.clone(), HashMap::new(), vec![cipher], HashMap::new());
+        let vault = Vault::new(user_key.clone(), HashMap::new(), vec![cipher], vec![], HashMap::new());
         let body = vault
             .edit_body("c1", &CipherEdit { password: Some("rotated".into()), ..Default::default() })
             .unwrap();
@@ -1032,7 +1083,7 @@ mod tests {
         };
         let mut org_keys = HashMap::new();
         org_keys.insert("org1".to_string(), org_key.clone());
-        let vault = Vault::new(user_key.clone(), org_keys, vec![cipher], HashMap::new());
+        let vault = Vault::new(user_key.clone(), org_keys, vec![cipher], vec![], HashMap::new());
 
         let body = vault
             .edit_body("c1", &CipherEdit { name: Some("Renamed".into()), ..Default::default() })
@@ -1059,7 +1110,7 @@ mod tests {
             item_type: 1,
             ..Default::default()
         };
-        let vault = Vault::new(user_key.clone(), HashMap::new(), vec![cipher], HashMap::new());
+        let vault = Vault::new(user_key.clone(), HashMap::new(), vec![cipher], vec![], HashMap::new());
         let body = vault
             .edit_body(
                 "c1",
@@ -1106,7 +1157,7 @@ mod tests {
             ..Default::default()
         };
         let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
-        let notes_vault = Vault::new(user_key, HashMap::new(), vec![note], HashMap::new());
+        let notes_vault = Vault::new(user_key, HashMap::new(), vec![note], vec![], HashMap::new());
         let bad = notes_vault.edit_body("n1", &CipherEdit { password: Some("x".into()), ..Default::default() });
         assert!(matches!(bad, Err(EditError::NotALogin(_))));
         // But its NOTES are editable.
@@ -1122,7 +1173,7 @@ mod tests {
         let key_bytes = [0x5au8; 64];
         let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
         let cipher = RawCipher { id: "c1".into(), item_type: 1, ..Default::default() };
-        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], HashMap::new());
+        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], vec![], HashMap::new());
         let result = vault.edit_body("c1", &CipherEdit { name: Some("x".into()), ..Default::default() });
         assert!(matches!(result, Err(EditError::NoRawRecord(_))));
     }
@@ -1144,7 +1195,7 @@ mod tests {
             password: Some(seal(&key_bytes, "old-password")),
             ..Default::default()
         };
-        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], HashMap::new());
+        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], vec![], HashMap::new());
         assert_eq!(vault.notes("c1").as_deref(), Some("remember me"));
         assert!(vault.notes("nope").is_none());
 
@@ -1205,7 +1256,7 @@ mod tests {
             password: Some(seal(&item_bytes, "under-item-key")),
             ..Default::default()
         };
-        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], HashMap::new());
+        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], vec![], HashMap::new());
         assert_eq!(vault.items()[0].name, "Sealed Item");
         assert_eq!(vault.password("c1").as_deref(), Some("under-item-key"));
     }

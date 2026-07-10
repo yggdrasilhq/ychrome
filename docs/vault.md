@@ -43,8 +43,9 @@ Requests and responses are one JSON object per line:
 {"ok":true,"entry":{"name":"github.com","username":"octocat","password":"…"}}
 ```
 
-Ops: `ping`, `status`, `unlock`, `lock`, `stop`, `sync`, `list`, `get`, `totp`,
-`match`, `suggest`, `add`, `generate`. The agent auto-starts on `unlock` (and on
+Ops: `ping`, `status`, `unlock`, `lock`, `stop`, `sync`, `list` (`trashed:true`
+for the trash), `get`, `totp`, `match`, `suggest`, `add`, `edit`, `rm`,
+`restore`, `generate`. The agent auto-starts on `unlock` (and on
 `ping`) and detaches into its own process group, so the shell that first needed
 it can go away. A socket left behind by a SIGKILLed agent is detected (nobody
 answers) and reclaimed.
@@ -121,6 +122,8 @@ ychrome-vault generate 24                        # local dice, no vault touched
 ychrome-vault add example.com alice --generate --uri https://example.com
 ychrome-vault edit example.com alice --generate   # rotate the password
 ychrome-vault rm example.com alice                # to the trash, restorable
+ychrome-vault list --trashed                      # show the trash
+ychrome-vault restore example.com alice           # bring it back from the trash
 ychrome-vault lock
 ychrome-vault stop-agent                          # after every rebuild
 ```
@@ -143,6 +146,8 @@ terminal on stdin is refused rather than echoed into the user's scrollback.
 | _(none — rbw has no watchtower)_ | `ychrome-vault watchtower` (reused + weak, labels only) |
 | `rbw remove NAME [USER]` | `ychrome-vault rm NAME [USER]` (trash, not destroy) |
 | — (rbw has none) | `ychrome-vault edit NAME [USER]` |
+| — (rbw has none) | `ychrome-vault restore NAME [USER]` (undo a soft `rm`) |
+| — (rbw has none) | `ychrome-vault list --trashed` (show the trash) |
 
 ## Writes
 
@@ -192,6 +197,16 @@ Soft is the default at every layer, and the CLI reports which one happened
 deliberately safer than parity. `rm` is **not** wired into the sidebar — a
 destructive verb needs its contract confirmed before it gets a button.
 
+### `restore` undoes a soft `rm`
+
+A soft-deleted item is retained, not dropped: `sync` sorts every cipher carrying
+a `deletedDate` into a separate **trash** bucket instead of discarding it, so the
+client can now both *show* the trash (`list --trashed`) and reverse the delete
+(`restore NAME [USER]` → `PUT /api/ciphers/{id}/restore`). The two buckets never
+overlap, and `restore` resolves its name **against the trash only** — it can
+never bring back or touch a live entry that happens to share a name. A
+`--permanent` removal leaves nothing in the trash and cannot be restored.
+
 ## What is proven, and what is not
 
 - **Read path** — proven end to end against the real vault at `vault.example.com`
@@ -219,9 +234,13 @@ destructive verb needs its contract confirmed before it gets a button.
   refused the write ("The client copy of this cipher is out of date"). Two
   long-lived agents WILL go stale against each other — `sync` before a write.
 - **`rm` against a real server** — proven: the item was trashed (`"trashed": true`)
-  and left the item list (1108 → 1107). Note that `sync` filters `deletedDate`
-  items, so this client cannot *display* the trash: "restorable" rests on the
-  route, verified in the deployed server's source, not on an observed restore.
-  A `restore` verb would close that loop and give `rm` an undo. Not built.
+  and left the item list (1108 → 1107).
+- **`restore` + `list --trashed`** — built, and covered by `cargo test`: `sync`
+  now retains `deletedDate` ciphers in a trash bucket, the live list and the
+  trash provably never overlap, and `restore` resolves names against the trash
+  only. **Not yet exercised against a real server** — the full
+  create → soft-`rm` → `list --trashed` → `restore` → verify loop needs one live
+  unlock with this binary (installing a new binary re-locks the agent). That is
+  the one owed proof, exactly as `edit`/`rm` owed theirs until a live unlock.
 - **Passkeys** (`fido2Credentials`) — not started. Needs a
   `navigator.credentials` shim, because WebKitGTK has no WebAuthn.
