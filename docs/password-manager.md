@@ -5,9 +5,11 @@ Status: autofill + TOTP shipped; the vault client is now **native**
 "Engine reality" and "signer" notes below that name rbw/goldwarden are the
 original design and are superseded by the native client. Passkeys: the READ
 layer is built (`sync` → `RawCipher::fido2`, `list` badges `has_passkey`,
-`passkeys NAME` returns secret-free metadata; see `docs/vault.md`); the WebAuthn
-ceremony (ES256 signer + `navigator.credentials` shim + user-presence dialog)
-is still to build. Companion to the ychrome daily-browser campaign. User setup:
+`passkeys NAME` returns secret-free metadata) AND the ES256 **assertion signer**
+(`fido2.rs`, `Vault::fido2_assert`, KAT-proven; consent gated by a
+`UserPresence` the agent cannot forge). Still to build (the browser slice): the
+`navigator.credentials` userscript shim, the loopback signer bridge, the
+user-presence dialog, and credential creation. See `docs/vault.md`. Companion to the ychrome daily-browser campaign. User setup:
 Bitwarden clients against a self-hosted Vaultwarden, passkeys stored in the vault.
 
 ## Shipped: autofill MVP (slice 1, 2.9.66)

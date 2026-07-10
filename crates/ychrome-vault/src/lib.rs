@@ -14,6 +14,7 @@
 pub mod agent;
 pub mod api;
 pub mod crypto;
+pub mod fido2;
 pub mod generator;
 pub mod matching;
 pub mod model;

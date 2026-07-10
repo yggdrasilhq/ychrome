@@ -243,12 +243,24 @@ never bring back or touch a live entry that happens to share a name. A
   create → soft-`rm` → `list --trashed` → `restore` → verify loop needs one live
   unlock with this binary (installing a new binary re-locks the agent). That is
   the one owed proof, exactly as `edit`/`rm` owed theirs until a live unlock.
-- **Passkeys** (`fido2Credentials`) — **read layer built** (Phase D slice 1):
-  `sync` parses `login.fido2Credentials[]` into `RawCipher::fido2`, `list` badges
-  `has_passkey`, and `passkeys NAME` returns secret-free metadata
-  (`Vault::passkeys`). A `cargo test` proves the private key (`keyValue`) never
-  reaches the listing. **Not yet built:** the WebAuthn *ceremony* — an ES256
-  assertion signer over the decrypted `keyValue`, a `navigator.credentials`
-  userscript shim (WebKitGTK has no WebAuthn), a loopback signer bridge, and a
-  user-presence dialog. **The agent may never auto-consent** — the ceremony op
-  must require an explicit consent token the crate cannot fabricate.
+- **Passkeys** (`fido2Credentials`) — **read layer + assertion signer built**:
+  - *Read* (slice 1): `sync` parses `login.fido2Credentials[]` into
+    `RawCipher::fido2`, `list` badges `has_passkey`, `passkeys NAME` returns
+    secret-free metadata (`Vault::passkeys`). A `cargo test` proves the private
+    key (`keyValue`) never reaches the listing; live-checked against the real
+    vault (23 items badge a passkey; `dash.cloudflare.com` decrypts, no leak).
+  - *Assertion signer* (`crates/ychrome-vault/src/fido2.rs`,
+    `Vault::fido2_assert`): the `get()` ceremony's crypto — builds
+    `authenticatorData` (SHA-256(rpId)‖flags‖signCount) and signs
+    `authenticatorData‖clientDataHash` with ES256 (P-256) over the decrypted
+    `keyValue`, DER-encoded. KAT-proven: the signature verifies against the
+    credential's public key. **The agent may never auto-consent** — the signer
+    takes a `fido2::UserPresence` **by value**, and its only constructor is
+    `granted()`, which the GUI's presence dialog calls; a headless agent has no
+    path to a signature. There is deliberately **no agent/CLI op** for it yet —
+    exposing one over the socket would be an auto-consent path.
+  - **Not yet built** (the browser slice): the `navigator.credentials` userscript
+    shim (WebKitGTK has no WebAuthn), the loopback signer bridge, the
+    user-presence dialog that mints `UserPresence`, credential *creation*
+    (`create()`), and signCount increment. `keyValue` decoding + real-RP
+    acceptance are validated there.
