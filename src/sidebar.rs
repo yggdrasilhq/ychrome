@@ -211,7 +211,11 @@ pub fn emit_declare(session: &str, control: &str) {
         "control": control,
         "panes": [{
             "id": VAULT_PANE,
-            "icon": "🔑",
+            // U+FE0E VARIATION SELECTOR-15 forces TEXT presentation, so the key
+            // renders as a monochrome glyph that sits with yggterm's other chrome
+            // (▦ ⧉ ⚙) instead of a colour emoji. Without it WebKitGTK picks the
+            // emoji font and the button looks pasted on.
+            "icon": "🔑\u{fe0e}",
             "title": "Vault (fill logins from Bitwarden)",
         }],
     });
