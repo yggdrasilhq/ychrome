@@ -148,6 +148,32 @@ pub enum EditError {
     Crypto(#[from] CryptoError),
 }
 
+/// Why a passkey assertion could not be produced.
+#[derive(Debug, thiserror::Error)]
+pub enum Fido2AssertError {
+    #[error("no vault item with that id")]
+    UnknownItem,
+    #[error("the item has no passkey matching that credential id")]
+    NoSuchPasskey,
+    #[error("the stored passkey key did not base64-decode")]
+    BadPrivateKey,
+    #[error(transparent)]
+    Crypto(#[from] CryptoError),
+    #[error(transparent)]
+    Fido2(#[from] crate::fido2::Fido2Error),
+}
+
+/// Decode a decrypted `keyValue` (base64 text) to the raw PKCS#8 DER bytes.
+/// Standard base64 first, then URL-safe, since clients have differed.
+fn decode_key_value(b64: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let b64 = b64.trim();
+    base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64))
+        .ok()
+}
+
 /// Decrypted, secret-free metadata for one vault item. Serializable because
 /// the agent hands this list to clients — it carries no password and no TOTP
 /// secret, only the booleans saying one exists.
@@ -368,6 +394,63 @@ impl Vault {
                 creation_date: credential.creation_date.clone(),
             })
             .collect()
+    }
+
+    /// Sign a WebAuthn assertion for one of an item's stored passkeys — the
+    /// `navigator.credentials.get()` ceremony, answered from the vault.
+    ///
+    /// `credential_id` selects which passkey by its decrypted credentialId;
+    /// `None` uses the item's first (the common single-passkey case). The
+    /// private key (`keyValue`) is decrypted here, used once, and zeroized — it
+    /// never leaves the process and is never returned. A [`UserPresence`] is
+    /// REQUIRED by value, so there is no path to a signature without consent.
+    ///
+    /// [`UserPresence`]: crate::fido2::UserPresence
+    pub fn fido2_assert(
+        &self,
+        id: &str,
+        credential_id: Option<&str>,
+        rp_id: &str,
+        client_data_hash: &[u8],
+        consent: crate::fido2::UserPresence,
+    ) -> Result<crate::fido2::Fido2Assertion, Fido2AssertError> {
+        let cipher = self.find(id).ok_or(Fido2AssertError::UnknownItem)?;
+        let key = self.cipher_key(cipher)?;
+        let decrypt = |enc: &Option<EncString>| {
+            enc.as_ref().and_then(|enc| key.decrypt_to_string(enc).ok())
+        };
+
+        let credential = match credential_id {
+            Some(wanted) => cipher.fido2.iter().find(|c| {
+                decrypt(&c.credential_id).as_deref() == Some(wanted)
+            }),
+            None => cipher.fido2.first(),
+        }
+        .ok_or(Fido2AssertError::NoSuchPasskey)?;
+
+        // keyValue is base64 text (the fido2 fields are strings) of a P-256
+        // PKCS#8 key. Held zeroized: neither the base64 nor the DER lingers.
+        let key_value = credential
+            .key_value
+            .as_ref()
+            .ok_or(Fido2AssertError::NoSuchPasskey)?;
+        let b64 = zeroize::Zeroizing::new(key.decrypt_to_string(key_value)?);
+        let pkcs8 =
+            zeroize::Zeroizing::new(decode_key_value(&b64).ok_or(Fido2AssertError::BadPrivateKey)?);
+
+        // WebAuthn signCount. Bitwarden stores it as a stringified int; a
+        // missing/garbled one signs with 0 (many authenticators never increment).
+        let sign_count = decrypt(&credential.counter)
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+
+        Ok(crate::fido2::sign_assertion(
+            &pkcs8,
+            rp_id,
+            client_data_hash,
+            sign_count,
+            consent,
+        )?)
     }
 
     /// Build the `POST /api/ciphers` body for a new login, encrypting every

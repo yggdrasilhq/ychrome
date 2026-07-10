@@ -36,6 +36,9 @@ sha2 = "0.10"
 sha1 = "0.10"
 argon2 = "0.5"
 rsa = "0.9"
+# ES256 (ECDSA P-256) for the WebAuthn passkey ceremony: sign an assertion with
+# the vault-stored FIDO2 private key. Same RustCrypto generation as the rest.
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 base64 = "0.22"
 rand = "0.8"
 subtle = "2"
