@@ -56,10 +56,11 @@ still open.
 
 ## Sidebar contribution (`sidebar` verb) — SHIPPED
 
-ychrome contributes its vault pane rather than yggterm hardcoding one.
+ychrome contributes its vault and settings panes rather than yggterm hardcoding
+them. `RightPanelMode::Vault` and `::AppSidebar` are both deleted from yggterm.
 
 ```
-ESC ] 7717 ; sidebar ; declare ; <base64 {"session","control","panes":[{id,icon,title}]}> BEL
+ESC ] 7717 ; sidebar ; declare ; <base64 {"session","control","panes":[{id,icon,title}],"policy_version"}> BEL
 ESC ] 7717 ; sidebar ; close   ; <base64 {"session"}> BEL
 ```
 
@@ -67,15 +68,36 @@ ESC ] 7717 ; sidebar ; close   ; <base64 {"session"}> BEL
 web surface — that IS the contribution's liveness signal, and the GUI expires a
 contribution whose declares stop, so a SIGKILLed ychrome leaves no phantom
 buttons. It carries **no schema and no secret**: only a loopback control
-endpoint and the pane buttons.
+endpoint, the pane buttons, and a stamp over this host's web-content policy.
 
 The GUI then talks to the control endpoint itself, over a plain socket (through
 an `ssh -L` forward when ychrome runs remotely):
 
 ```
-GET  <control>/pane/vault?host=<page host>   -> the schema
+GET  <control>/pane/vault?host=<page host>    -> the schema
+GET  <control>/pane/settings                  -> the schema
+GET  <control>/policy                         -> {adblock_rules, userscripts}
 POST <control>/action  {pane, action, values} -> {schema?, toast?, eval?}
 ```
+
+An action is routed by the `pane` it came from, not by its name: the two panes
+return different schemas.
+
+### `policy_version` and `/policy`
+
+Ad blocking and userscripts are ychrome's config, on ychrome's host — but they
+act on the GUI's webview, so the GUI must apply them. ychrome serves the
+*effective* policy (every enable/disable decision already made) and yggterm
+persists nothing but a compiled-filter cache WebKit demands.
+
+`policy_version` is a **stat-only** stamp: paths, lengths, mtimes, plus the
+adblock decision. The GUI refetches `/policy` only when it moves, so a 10 KB
+`rules.json` never rides the ~4s heartbeat.
+
+**`declare` is emitted BEFORE `web-surface;open`** — in `run_thin_client` and in
+the post-suspend re-emit. Userscripts inject at document-start, so the GUI holds
+the surface's creation until the policy lands. Open first and the surface is
+created unblocked: no userscripts, no adblock, silently, for its whole life.
 
 `eval` is a script the GUI runs in the surface — the only way a host-resident
 credential reaches a client-rendered page. ychrome computes it; the GUI injects
