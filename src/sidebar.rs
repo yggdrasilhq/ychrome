@@ -22,7 +22,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -48,10 +48,36 @@ const ROW_SEP: char = '\u{1f}';
 /// this pane existed. It talks to the host's unlock-caching agent, so a read is
 /// cheap and keyless once the user has unlocked.
 fn vault_cli(args: &[&str]) -> Result<String> {
-    let output = Command::new("ychrome-vault")
+    vault_cli_stdin(args, None)
+}
+
+/// As [`vault_cli`], but writes `stdin` to the child first. A password reaches
+/// `ychrome-vault add` this way and no other: never a flag (it would show up in
+/// `ps`), never an environment variable.
+fn vault_cli_stdin(args: &[&str], stdin: Option<&str>) -> Result<String> {
+    let mut command = Command::new("ychrome-vault");
+    command
         .args(args)
-        .output()
+        .stdin(match stdin {
+            Some(_) => Stdio::piped(),
+            // `read_secret` refuses a terminal on stdin, and ychrome's stdin IS
+            // the session's PTY — so a no-secret call must not inherit it.
+            None => Stdio::null(),
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
         .context("run ychrome-vault (is it installed on this host?)")?;
+    if let Some(secret) = stdin {
+        child
+            .stdin
+            .take()
+            .context("ychrome-vault stdin")?
+            .write_all(secret.as_bytes())
+            .context("writing the password to ychrome-vault")?;
+    }
+    let output = child.wait_with_output().context("ychrome-vault failed")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
@@ -69,11 +95,41 @@ fn vault_cli_json(args: &[&str]) -> Result<Value> {
     serde_json::from_str(&stdout).context("ychrome-vault did not return json")
 }
 
+/// Default length of a generated password, mirroring `ychrome-vault generate`.
+const DEFAULT_GENERATE_LENGTH: i64 = 20;
+const MIN_GENERATE_LENGTH: i64 = 8;
+const MAX_GENERATE_LENGTH: i64 = 128;
+
+/// The Add tab's draft. It lives HERE, not in the GUI: yggterm's copy of a
+/// pane's field values is only the user's edits since the last schema, and the
+/// app re-declares them on every render.
+///
+/// The password is deliberately absent. It reaches this process as one action's
+/// `values.add_password`, goes straight to `ychrome-vault add`'s stdin, and is
+/// dropped — it is never stored, never echoed into a schema.
+#[derive(Default)]
+struct AddDraft {
+    name: String,
+    user: String,
+    uri: String,
+    folder: String,
+    /// The page host this draft was seeded from, so re-entering the tab on the
+    /// same site does not clobber what the user typed, and browsing to a new
+    /// site does re-seed.
+    seeded_host: Option<String>,
+}
+
 /// What the pane is currently showing. Host-resident, like everything else the
 /// app owns: yggterm holds no vault state, not even which tab is selected.
 struct PaneState {
     tab: String,
     query: String,
+    add: AddDraft,
+    generate_length: i64,
+    generate_no_symbols: bool,
+    /// The last watchtower scan. Labels only — the report type cannot carry a
+    /// password (see `ychrome_vault::watchtower`).
+    watchtower: Option<Value>,
 }
 
 impl Default for PaneState {
@@ -81,7 +137,29 @@ impl Default for PaneState {
         PaneState {
             tab: "fill".to_string(),
             query: String::new(),
+            add: AddDraft::default(),
+            generate_length: DEFAULT_GENERATE_LENGTH,
+            generate_no_symbols: false,
+            watchtower: None,
         }
+    }
+}
+
+impl PaneState {
+    /// Seed the Add draft from the page the user is looking at, once per host.
+    /// The old hardcoded pane only offered this as a placeholder; naming the
+    /// item after the host is what makes fill-matching find it later.
+    fn seed_add_draft(&mut self, host: Option<&str>) {
+        let host = host.filter(|host| !host.is_empty());
+        if self.add.seeded_host.as_deref() == host {
+            return;
+        }
+        self.add = AddDraft {
+            name: host.unwrap_or_default().to_string(),
+            uri: host.map(|host| format!("https://{host}")).unwrap_or_default(),
+            seeded_host: host.map(str::to_string),
+            ..AddDraft::default()
+        };
     }
 }
 
@@ -185,7 +263,12 @@ fn handle_conn(stream: TcpStream, state: &Arc<Mutex<PaneState>>) {
         ("GET", p) if p == format!("/pane/{VAULT_PANE}") => {
             let host = query_value(query, "host");
             let schema = {
-                let state = state.lock().unwrap();
+                let mut state = state.lock().unwrap();
+                // Opening the pane straight onto the Add tab must seed the draft
+                // too, not only arriving there via the tab action.
+                if state.tab == "add" {
+                    state.seed_add_draft(host.as_deref());
+                }
                 vault_schema(&state, host.as_deref())
             };
             respond_json(stream, 200, &schema);
@@ -307,8 +390,14 @@ fn item_row(item: &Value) -> Value {
     })
 }
 
+/// Rows of a watchtower report rendered before it is truncated. A vault this
+/// size can have dozens of reuse groups; the panel is 300px wide.
+const MAX_REPORT_ROWS: usize = 30;
+
 /// Build the pane. NO SECRET is ever placed in a schema — only names, usernames
-/// and the booleans saying a password or TOTP secret exists.
+/// and the booleans saying a password or TOTP secret exists. The Add tab's
+/// password field is declared EMPTY every time: it carries what the user types
+/// up to this process on an action, and nothing ever comes back down.
 fn vault_schema(state: &PaneState, host: Option<&str>) -> Value {
     let mut widgets = vec![json!({
         "kind": "tabs",
@@ -325,17 +414,31 @@ fn vault_schema(state: &PaneState, host: Option<&str>) -> Value {
     match state.tab.as_str() {
         "add" => {
             widgets.push(json!({"kind": "section", "text": "Add a login"}));
-            widgets.push(json!({"kind": "text-input", "id": "add_name", "label": "Name", "placeholder": "example.com"}));
-            widgets.push(json!({"kind": "text-input", "id": "add_user", "label": "Username", "placeholder": "you@example.com"}));
-            widgets.push(json!({"kind": "text-input", "id": "add_uri", "label": "URI", "placeholder": "https://example.com"}));
-            widgets.push(json!({"kind": "text-input", "id": "add_folder", "label": "Folder (optional)"}));
+            widgets.push(json!({"kind": "text-input", "id": "add_name", "label": "Name", "placeholder": "example.com", "value": state.add.name}));
+            widgets.push(json!({"kind": "text-input", "id": "add_user", "label": "Username", "placeholder": "you@example.com", "value": state.add.user}));
+            widgets.push(json!({"kind": "text-input", "id": "add_uri", "label": "URI", "placeholder": "https://example.com", "value": state.add.uri}));
+            widgets.push(json!({"kind": "text-input", "id": "add_folder", "label": "Folder (optional)", "value": state.add.folder}));
+            widgets.push(json!({
+                "kind": "text-input", "id": "add_password", "label": "Password",
+                "placeholder": "Leave empty to generate one", "secret": true, "value": "",
+            }));
+            widgets.push(json!({"kind": "section", "text": "Generator"}));
+            widgets.push(json!({
+                "kind": "number-input", "id": "generate_length", "label": "Length",
+                "value": state.generate_length,
+                "min": MIN_GENERATE_LENGTH, "max": MAX_GENERATE_LENGTH,
+            }));
+            widgets.push(json!({
+                "kind": "toggle", "id": "generate_no_symbols", "label": "No symbols",
+                "value": state.generate_no_symbols,
+            }));
             widgets.push(json!({
                 "kind": "label", "muted": true,
-                "text": "The password is generated on this host and stored straight into the vault. It never crosses the terminal or the GUI.",
+                "text": "An empty password is rolled on this host with the settings above and stored straight into the vault. It never crosses the terminal or the GUI. Name the entry after the site's host so fill matching finds it.",
             }));
             widgets.push(json!({
                 "kind": "button", "id": "add", "action": "add", "primary": true,
-                "label": "Add with a generated password",
+                "label": "Save to vault",
             }));
         }
         "tools" => {
@@ -355,6 +458,19 @@ fn vault_schema(state: &PaneState, host: Option<&str>) -> Value {
             }
             widgets.push(json!({"kind": "button", "id": "sync", "action": "sync", "label": "Re-sync from the server"}));
             widgets.push(json!({"kind": "button", "id": "lock", "action": "lock", "label": "Lock the vault"}));
+
+            widgets.push(json!({"kind": "section", "text": "Watchtower"}));
+            widgets.push(json!({
+                "kind": "label", "muted": true,
+                "text": "Finds logins that share a password, and passwords that are short or single-class. The scan runs inside the vault agent; only entry names come back.",
+            }));
+            widgets.push(json!({
+                "kind": "button", "id": "watchtower", "action": "watchtower",
+                "label": if state.watchtower.is_some() { "Scan again" } else { "Run watchtower scan" },
+            }));
+            if let Some(report) = &state.watchtower {
+                widgets.extend(watchtower_widgets(report));
+            }
         }
         _ => {
             widgets.push(json!({
@@ -416,11 +532,98 @@ fn vault_schema(state: &PaneState, host: Option<&str>) -> Value {
     json!({ "title": "Vault", "widgets": widgets })
 }
 
+/// Render a watchtower report. The report carries labels only, so this cannot
+/// leak a password however it is written.
+fn watchtower_widgets(report: &Value) -> Vec<Value> {
+    let scanned = report["scanned"].as_u64().unwrap_or(0);
+    let reused = report["reused"].as_array().cloned().unwrap_or_default();
+    let weak = report["weak"].as_array().cloned().unwrap_or_default();
+    let mut widgets = vec![json!({
+        "kind": "label", "muted": true,
+        "text": format!(
+            "Scanned {scanned} logins: {} reused-password groups, {} weak.",
+            reused.len(), weak.len(),
+        ),
+    })];
+
+    if !reused.is_empty() {
+        widgets.push(json!({"kind": "section", "text": format!("Reused passwords ({})", reused.len())}));
+        for group in reused.iter().take(MAX_REPORT_ROWS) {
+            let labels: Vec<&str> = group.as_array().map(|group| {
+                group.iter().filter_map(Value::as_str).collect()
+            }).unwrap_or_default();
+            widgets.push(json!({
+                "kind": "label",
+                "text": format!("Shared by {} logins", labels.len()),
+            }));
+            widgets.push(json!({"kind": "label", "muted": true, "text": labels.join(" · ")}));
+        }
+        if reused.len() > MAX_REPORT_ROWS {
+            widgets.push(json!({
+                "kind": "label", "muted": true,
+                "text": format!("Showing {MAX_REPORT_ROWS} groups of {}.", reused.len()),
+            }));
+        }
+    }
+
+    if !weak.is_empty() {
+        widgets.push(json!({"kind": "section", "text": format!("Weak passwords ({})", weak.len())}));
+        let shown: Vec<&str> = weak.iter().filter_map(Value::as_str).take(MAX_REPORT_ROWS).collect();
+        widgets.push(json!({"kind": "label", "muted": true, "text": shown.join(" · ")}));
+        if weak.len() > MAX_REPORT_ROWS {
+            widgets.push(json!({
+                "kind": "label", "muted": true,
+                "text": format!("Showing {MAX_REPORT_ROWS} of {}.", weak.len()),
+            }));
+        }
+    }
+
+    if reused.is_empty() && weak.is_empty() && scanned > 0 {
+        widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": "No reused or weak passwords. Nothing to do.",
+        }));
+    }
+    widgets
+}
+
+/// Fold the GUI's draft edits back into the app's state.
+///
+/// yggterm's copy of a pane's values is only what the user has typed since the
+/// last schema; this process owns them. A field the current schema does not
+/// declare is simply absent, which is why every read is conditional — a `tab`
+/// action fired from the Fill tab must not blank the Add draft.
+fn absorb_draft(state: &mut PaneState, values: &Value) {
+    let text = |key: &str| values[key].as_str().map(str::to_string);
+    if let Some(name) = text("add_name") {
+        state.add.name = name;
+    }
+    if let Some(user) = text("add_user") {
+        state.add.user = user;
+    }
+    if let Some(uri) = text("add_uri") {
+        state.add.uri = uri;
+    }
+    if let Some(folder) = text("add_folder") {
+        state.add.folder = folder;
+    }
+    if let Some(length) = values["generate_length"].as_str() {
+        // An empty or half-typed number box must not wipe the setting.
+        if let Ok(length) = length.parse::<i64>() {
+            state.generate_length = length.clamp(MIN_GENERATE_LENGTH, MAX_GENERATE_LENGTH);
+        }
+    }
+    if let Some(no_symbols) = values["generate_no_symbols"].as_str() {
+        state.generate_no_symbols = no_symbols == "true";
+    }
+}
+
 fn run_action(state: &Arc<Mutex<PaneState>>, request: &Value) -> Value {
     let action = request["action"].as_str().unwrap_or_default();
     let values = &request["values"];
     let value = values["value"].as_str().unwrap_or_default().to_string();
     let host = values["host"].as_str().map(str::to_string);
+    absorb_draft(&mut state.lock().unwrap(), values);
 
     match action {
         "tab" => {
@@ -430,6 +633,9 @@ fn run_action(state: &Arc<Mutex<PaneState>>, request: &Value) -> Value {
                 // A tab switch abandons the search: the query belonged to the
                 // list the user just left.
                 state.query.clear();
+                if state.tab == "add" {
+                    state.seed_add_draft(host.as_deref());
+                }
             }
             reschema(state, host.as_deref())
         }
@@ -440,6 +646,20 @@ fn run_action(state: &Arc<Mutex<PaneState>>, request: &Value) -> Value {
             }
             reschema(state, host.as_deref())
         }
+        "watchtower" => match vault_cli_json(&["watchtower"]) {
+            Ok(report) => {
+                let (reused, weak) = (
+                    report["reused"].as_array().map_or(0, Vec::len),
+                    report["weak"].as_array().map_or(0, Vec::len),
+                );
+                state.lock().unwrap().watchtower = Some(report);
+                merge(
+                    reschema(state, host.as_deref()),
+                    json!({ "toast": format!("Watchtower: {reused} reused-password groups, {weak} weak.") }),
+                )
+            }
+            Err(error) => json!({ "toast": error.to_string() }),
+        },
         "sync" => match vault_cli_json(&["sync"]) {
             Ok(reply) => {
                 let count = reply["item_count"].as_u64().unwrap_or(0);
@@ -448,36 +668,71 @@ fn run_action(state: &Arc<Mutex<PaneState>>, request: &Value) -> Value {
             Err(error) => json!({ "toast": error.to_string() }),
         },
         "lock" => match vault_cli_json(&["lock"]) {
-            Ok(_) => merge(reschema(state, host.as_deref()), json!({ "toast": "Vault locked." })),
+            Ok(_) => {
+                // A locked vault's scan is stale and unrepeatable; do not keep
+                // showing which of the user's logins share a password.
+                state.lock().unwrap().watchtower = None;
+                merge(reschema(state, host.as_deref()), json!({ "toast": "Vault locked." }))
+            }
             Err(error) => json!({ "toast": error.to_string() }),
         },
         "add" => {
-            let name = values["add_name"].as_str().unwrap_or_default();
-            if name.trim().is_empty() {
+            // The draft was absorbed above, so it is this process's copy that
+            // is authoritative — and it survives a failed save.
+            let (name, user, uri, folder, length, no_symbols) = {
+                let state = state.lock().unwrap();
+                (
+                    state.add.name.trim().to_string(),
+                    state.add.user.trim().to_string(),
+                    state.add.uri.trim().to_string(),
+                    state.add.folder.trim().to_string(),
+                    state.generate_length.to_string(),
+                    state.generate_no_symbols,
+                )
+            };
+            if name.is_empty() {
                 return json!({ "toast": "An item needs a name." });
             }
-            let user = values["add_user"].as_str().unwrap_or_default();
-            let uri = values["add_uri"].as_str().unwrap_or_default();
-            let folder = values["add_folder"].as_str().unwrap_or_default();
-            // `--generate` rolls the password on this host and stores it
-            // encrypted. It is never echoed back into a schema: a schema is not
-            // a place for a secret.
-            let mut args = vec!["add", name.trim()];
+            // The typed password is used for this call and dropped. An empty one
+            // means `--generate`: rolled on this host, stored encrypted, and
+            // never echoed back — a schema is not a place for a secret.
+            let password = values["add_password"].as_str().unwrap_or_default();
+            let mut args = vec!["add", name.as_str()];
             if !user.is_empty() {
-                args.push(user);
+                args.push(user.as_str());
             }
             if !uri.is_empty() {
-                args.extend(["--uri", uri]);
+                args.extend(["--uri", uri.as_str()]);
             }
             if !folder.is_empty() {
-                args.extend(["--folder", folder]);
+                args.extend(["--folder", folder.as_str()]);
             }
-            args.push("--generate");
-            match vault_cli(&args) {
-                Ok(_) => merge(
-                    reschema(state, host.as_deref()),
-                    json!({ "toast": format!("Added {name} with a generated password.") }),
-                ),
+            if password.is_empty() {
+                args.extend(["--generate", "--length", length.as_str()]);
+                if no_symbols {
+                    args.push("--no-symbols");
+                }
+            }
+            let stdin = (!password.is_empty()).then_some(password);
+            match vault_cli_stdin(&args, stdin) {
+                Ok(_) => {
+                    let how = if password.is_empty() {
+                        "a generated password"
+                    } else {
+                        "the password you typed"
+                    };
+                    {
+                        // The item exists now: clear the draft so the tab is
+                        // ready for the next one rather than re-adding this.
+                        let mut state = state.lock().unwrap();
+                        state.add = AddDraft::default();
+                        state.seed_add_draft(host.as_deref());
+                    }
+                    merge(
+                        reschema(state, host.as_deref()),
+                        json!({ "toast": format!("Added {name} with {how}.") }),
+                    )
+                }
                 Err(error) => json!({ "toast": error.to_string() }),
             }
         }
@@ -681,6 +936,113 @@ mod tests {
     fn js_string_escapes_control_characters_and_angle_brackets() {
         assert_eq!(js_string("a\nb"), r#""a\nb""#);
         assert_eq!(js_string("</script>"), r#""\u003c/script>""#);
+    }
+
+    // The Add tab is buildable without an agent (it shells out to nothing), so
+    // the pane's central promise is testable: a schema never carries a secret.
+    #[test]
+    fn add_tab_schema_never_declares_a_password() {
+        let mut state = PaneState {
+            tab: "add".to_string(),
+            ..PaneState::default()
+        };
+        state.seed_add_draft(Some("github.com"));
+        let schema = vault_schema(&state, Some("github.com"));
+        let widgets = schema["widgets"].as_array().unwrap();
+
+        let password = widgets
+            .iter()
+            .find(|widget| widget["id"] == "add_password")
+            .expect("the Add tab has a password field");
+        assert_eq!(password["secret"], true, "the password field must be masked");
+        assert_eq!(password["value"], "", "a schema must never carry a secret");
+
+        // Seeded from the page the user is looking at.
+        let named = |id: &str| {
+            widgets
+                .iter()
+                .find(|widget| widget["id"] == id)
+                .unwrap()["value"]
+                .clone()
+        };
+        assert_eq!(named("add_name"), "github.com");
+        assert_eq!(named("add_uri"), "https://github.com");
+        // The generator knobs round-trip through the schema.
+        assert_eq!(named("generate_length"), DEFAULT_GENERATE_LENGTH);
+        assert_eq!(named("generate_no_symbols"), false);
+    }
+
+    // The draft is seeded once per host: re-entering the tab must not clobber
+    // what the user typed, and browsing elsewhere must re-seed.
+    #[test]
+    fn add_draft_is_seeded_once_per_host() {
+        let mut state = PaneState::default();
+        state.seed_add_draft(Some("github.com"));
+        state.add.user = "octocat".to_string();
+
+        state.seed_add_draft(Some("github.com"));
+        assert_eq!(state.add.user, "octocat", "re-seeding clobbered the draft");
+
+        state.seed_add_draft(Some("gitlab.com"));
+        assert_eq!(state.add.name, "gitlab.com");
+        assert_eq!(state.add.user, "", "a new site starts a new draft");
+
+        // No host (a page with no host, or no surface): nothing to seed from.
+        let mut blank = PaneState::default();
+        blank.seed_add_draft(None);
+        assert_eq!(blank.add.name, "");
+        assert_eq!(blank.add.uri, "");
+    }
+
+    // yggterm posts only the values its CURRENT schema declares. A `tab` action
+    // fired from the Fill tab carries no `add_*` keys, and must not blank them.
+    #[test]
+    fn absorb_draft_ignores_fields_the_schema_did_not_declare() {
+        let mut state = PaneState::default();
+        state.add.name = "github.com".to_string();
+        state.generate_length = 32;
+        state.generate_no_symbols = true;
+
+        absorb_draft(&mut state, &json!({ "value": "fill", "host": "github.com" }));
+        assert_eq!(state.add.name, "github.com", "an absent field wiped the draft");
+        assert_eq!(state.generate_length, 32);
+        assert!(state.generate_no_symbols);
+
+        // Present fields are adopted; the number box is clamped and a half-typed
+        // value leaves the setting alone.
+        absorb_draft(
+            &mut state,
+            &json!({"add_name": "gitlab.com", "generate_length": "9999", "generate_no_symbols": "false"}),
+        );
+        assert_eq!(state.add.name, "gitlab.com");
+        assert_eq!(state.generate_length, MAX_GENERATE_LENGTH);
+        assert!(!state.generate_no_symbols);
+
+        absorb_draft(&mut state, &json!({"generate_length": ""}));
+        assert_eq!(state.generate_length, MAX_GENERATE_LENGTH, "a half-typed number wiped the setting");
+    }
+
+    // The report the agent returns carries labels only. Rendering it cannot
+    // invent a secret, but the widgets must still show what the user needs.
+    #[test]
+    fn watchtower_widgets_report_labels_only() {
+        let widgets = watchtower_widgets(&json!({
+            "scanned": 4,
+            "reused": [["a (x)", "b (y)"]],
+            "weak": ["c (z)"],
+        }));
+        let wire = json!(widgets).to_string();
+        assert!(wire.contains("Scanned 4 logins: 1 reused-password groups, 1 weak."));
+        assert!(wire.contains("Shared by 2 logins"));
+        assert!(wire.contains("a (x) · b (y)"));
+        assert!(wire.contains("Weak passwords (1)"));
+        assert!(wire.contains("c (z)"));
+
+        // A clean vault says so rather than rendering two empty headings.
+        let clean = json!(watchtower_widgets(&json!({"scanned": 9, "reused": [], "weak": []})))
+            .to_string();
+        assert!(clean.contains("No reused or weak passwords"));
+        assert!(!clean.contains("Reused passwords ("));
     }
 
     #[test]

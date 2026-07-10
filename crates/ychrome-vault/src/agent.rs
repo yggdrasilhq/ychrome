@@ -272,6 +272,25 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             state.touch();
             Ok(json!({ "items": items }))
         }
+        // The whole scan runs HERE, where the ciphers are already decrypted.
+        // The sidebar used to ask for all ~1100 passwords over this socket, 25
+        // at a time, to do the same arithmetic in the GUI. Only labels come out.
+        "watchtower" => {
+            let vault = unlocked(&state)?;
+            let report = crate::watchtower::analyze(
+                vault
+                    .items()
+                    .into_iter()
+                    .filter(|item| item.has_password)
+                    .filter_map(|item| {
+                        let password = vault.password(&item.id)?;
+                        let label = crate::watchtower::label(&item.name, item.username.as_deref());
+                        Some((label, zeroize::Zeroizing::new(password)))
+                    }),
+            );
+            state.touch();
+            Ok(serde_json::to_value(report)?)
+        }
         "get" => {
             let name = string("name").ok_or_else(|| anyhow!("get needs a name"))?;
             let vault = unlocked(&state)?;
@@ -730,7 +749,16 @@ mod tests {
 
         // The write ops refuse on the LOCK, not on a missing argument — a
         // destructive verb must never get as far as resolving a target.
-        for op in ["list", "get", "totp", "match", "suggest", "rm", "edit"] {
+        for op in [
+            "list",
+            "get",
+            "totp",
+            "match",
+            "suggest",
+            "rm",
+            "edit",
+            "watchtower",
+        ] {
             let error = dispatch(
                 &json!({"op": op, "name": "x", "host": "example.com"}),
                 &state,

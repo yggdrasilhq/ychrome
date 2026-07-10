@@ -56,6 +56,10 @@ enum Command {
     Lock,
     /// Re-pull the ciphers into the unlocked agent (no password needed).
     Sync,
+    /// Report reused and weak passwords as JSON. The scan runs inside the
+    /// agent, where the ciphers are already decrypted; only entry names come
+    /// back, never a password.
+    Watchtower,
     /// List items as `name<TAB>user<TAB>folder`, optionally filtered.
     List {
         query: Option<String>,
@@ -242,6 +246,7 @@ fn main() -> Result<()> {
         Command::Diagnose => print_json(&agent::request(&dir, &json!({"op": "diagnose"}))?),
         Command::Lock => print_json(&agent::request(&dir, &json!({"op": "lock"}))?),
         Command::Sync => print_json(&agent::request(&dir, &json!({"op": "sync"}))?),
+        Command::Watchtower => print_json(&agent::request(&dir, &json!({"op": "watchtower"}))?),
         Command::List { query, json } => {
             let response = agent::request(&dir, &json!({"op": "list", "query": query}))?;
             let items = response["items"].as_array().cloned().unwrap_or_default();

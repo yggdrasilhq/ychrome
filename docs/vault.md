@@ -18,6 +18,7 @@ State: `~/.yggterm/vault/` — `config.json` (secret-free) and `agent.sock`.
 | `totp` | RFC 6238, `otpauth://` URIs |
 | `matching` | Page-host → item rules (below) |
 | `generator` | Local password generation (no server, no `rbw generate` subprocess) |
+| `watchtower` | Reused + weak password analysis. Groups by SHA-256 digest, so no plaintext password ever sits in a collection; only entry labels leave the module |
 | `session` | `VaultManager`: config, unlock/lock, `add_login`, and the bearer token held for `resync` |
 | `agent` | The unlock cache: a unix-socket daemon holding the decrypted vault |
 
@@ -139,6 +140,7 @@ terminal on stdin is refused rather than echoed into the user's scrollback.
 | `rbw lock` | `ychrome-vault lock` |
 | `rbw add NAME [USER]` | `ychrome-vault add NAME [USER]` |
 | `rbw generate` | `ychrome-vault generate` |
+| _(none — rbw has no watchtower)_ | `ychrome-vault watchtower` (reused + weak, labels only) |
 | `rbw remove NAME [USER]` | `ychrome-vault rm NAME [USER]` (trash, not destroy) |
 | — (rbw has none) | `ychrome-vault edit NAME [USER]` |
 

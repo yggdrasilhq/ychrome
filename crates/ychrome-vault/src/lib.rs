@@ -19,6 +19,7 @@ pub mod matching;
 pub mod model;
 pub mod session;
 pub mod totp;
+pub mod watchtower;
 
 pub use crypto::{AsymEncString, CryptoError, EncString, Kdf, MasterKey, PrivateKey, SymmetricKey};
 pub use generator::{DEFAULT_LENGTH, MIN_LENGTH, generate_password};
@@ -28,3 +29,4 @@ pub use session::{
     DEFAULT_LOCK_TIMEOUT_SECS, VaultConfig, VaultError, VaultManager, VaultStatus,
 };
 pub use totp::{Totp, TotpError};
+pub use watchtower::Report as WatchtowerReport;
