@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+mod manifest;
 mod sidebar;
 mod webpolicy;
 use clap::Parser;
@@ -696,6 +697,13 @@ fn display_available() -> bool {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Declare ourselves to this host's yggterm launcher registry, on EVERY run:
+    // that is what repairs the recorded binary path after an upgrade moves it.
+    // Never fatal — a browser must not refuse to start over a menu entry.
+    if let Err(error) = manifest::write() {
+        eprintln!("ychrome: could not register launcher manifest ({error})");
+    }
 
     let raw_url = args.url.clone().unwrap_or_else(|| "about:blank".into());
     let raw_url = if raw_url.contains("://") || raw_url == "about:blank" {
