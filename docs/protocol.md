@@ -60,7 +60,7 @@ ychrome contributes its vault and settings panes rather than yggterm hardcoding
 them. `RightPanelMode::Vault` and `::AppSidebar` are both deleted from yggterm.
 
 ```
-ESC ] 7717 ; sidebar ; declare ; <base64 {"session","control","panes":[{id,icon,title}],"policy_version"}> BEL
+ESC ] 7717 ; sidebar ; declare ; <base64 {"session","control","app_name","panes":[{id,icon,title}],"policy_version","zoom_version"}> BEL
 ESC ] 7717 ; sidebar ; close   ; <base64 {"session"}> BEL
 ```
 
@@ -74,14 +74,23 @@ The GUI then talks to the control endpoint itself, over a plain socket (through
 an `ssh -L` forward when ychrome runs remotely):
 
 ```
-GET  <control>/pane/vault?host=<page host>    -> the schema
-GET  <control>/pane/settings                  -> the schema
-GET  <control>/policy                         -> {adblock_rules, userscripts}
-POST <control>/action  {pane, action, values} -> {schema?, toast?, eval?}
+GET  <control>/pane/vault?host=<page host>            -> the schema
+GET  <control>/pane/settings?host=<host>&zoom=<pct>   -> the schema
+GET  <control>/policy                                 -> {adblock_rules, userscripts}
+GET  <control>/zoom                                   -> {sites:{host:percent}}
+POST <control>/action  {pane, action, values}         -> {schema?, toast?, eval?, reload_surface?, refetch_zoom?}
 ```
 
 An action is routed by the `pane` it came from, not by its name: the two panes
-return different schemas.
+return different schemas. The GUI injects the active surface's page host as
+`values.host` and its live effective zoom as `values.zoom` on every action, so a
+pane control can act relative to what is on screen.
+
+### `app_name`
+
+The display name yggterm shows on the main zoom control ("Ychrome Global Zoom").
+The app names itself; yggterm hardcodes nothing. Absent ⇒ the generic "Web View
+Zoom".
 
 ### `policy_version` and `/policy`
 
@@ -98,6 +107,31 @@ adblock decision. The GUI refetches `/policy` only when it moves, so a 10 KB
 the post-suspend re-emit. Userscripts inject at document-start, so the GUI holds
 the surface's creation until the policy lands. Open first and the surface is
 created unblocked: no userscripts, no adblock, silently, for its whole life.
+
+### `zoom_version` and `/zoom` — per-site zoom
+
+yggterm has one global "Ychrome Global Zoom" (`web_surface_zoom_percent`). A
+daily browser needs a per-site number too: some sites read better at 130%, some
+at 80%, and it must persist per site. That is browsing config, so it lives on
+ychrome's host in `~/.yggterm/web-zoom.json` (`{ "sites": { host: percent } }`,
+host-global across profiles — zoom is readability, not identity).
+
+`zoom_version` is a **stat-only-style** stamp over that map, the same trick as
+`policy_version`: the GUI refetches `/zoom` only when it moves, so an unchanged
+map never rides the ~4s heartbeat. `/zoom` returns `{ "sites": { host: percent } }`.
+
+yggterm does the matching on the live page (longest-suffix: an entry for
+`youtube.com` covers `music.youtube.com` too — the sub-domain reach Chrome lacks;
+a bare TLD is never consulted) and applies the override on navigation, falling
+back to the global when a site has none. Unlike `/policy`, `/zoom` is
+**non-gating**: a slow fetch just leaves a surface on the global until the map
+lands. The old map stays applied while a new one is in flight, so there is no
+flicker to global and back.
+
+The settings pane's "This site" row steps the current host's override with `−`/
+`+` (from the live `values.zoom` the GUI injects) and clears it with `Reset`. The
+action reply sets `refetch_zoom: true` so the GUI re-reads `/zoom` and applies
+the change to the live page at once, without waiting for the next declare.
 
 `eval` is a script the GUI runs in the surface — the only way a host-resident
 credential reaches a client-rendered page. ychrome computes it; the GUI injects

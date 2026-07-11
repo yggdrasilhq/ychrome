@@ -247,11 +247,17 @@ pub fn spawn(profile: &str, session: &str) -> Result<Sidebar> {
 ///
 /// `policy_version` is what makes the ~4s re-declare cheap: yggterm refetches
 /// `<control>/policy` only when the stamp moves. See [`crate::webpolicy`].
-pub fn emit_declare(session: &str, control: &str, policy_version: &str) {
+/// `zoom_version` is the same trick for per-site zoom (`<control>/zoom`, see
+/// [`crate::webzoom`]). `app_name` is the display name yggterm shows on the main
+/// zoom control ("Ychrome Global Zoom") — the app names itself, yggterm never
+/// hardcodes it.
+pub fn emit_declare(session: &str, control: &str, policy_version: &str, zoom_version: &str) {
     let payload = json!({
         "session": session,
         "control": control,
+        "app_name": "Ychrome",
         "policy_version": policy_version,
+        "zoom_version": zoom_version,
         "panes": [
             {
                 "id": VAULT_PANE,
@@ -348,8 +354,20 @@ fn handle_conn(stream: TcpStream, state: &ServerState) {
             respond_json(stream, 200, &schema);
         }
         ("GET", p) if p == format!("/pane/{SETTINGS_PANE}") => {
+            let host = query_value(query, "host");
+            let live_zoom = query_value(query, "zoom").and_then(|text| text.parse::<f64>().ok());
             let profile = state.pane.lock().unwrap().profile.clone();
-            respond_json(stream, 200, &settings_schema(&profile));
+            respond_json(
+                stream,
+                200,
+                &settings_schema(&profile, host.as_deref(), live_zoom),
+            );
+        }
+        // The per-site zoom overrides for this host. yggterm applies the entry
+        // for the current page's host on navigation and falls back to its global
+        // "Ychrome Global Zoom" — the GUI does the matching, ychrome owns the map.
+        ("GET", "/zoom") => {
+            respond_json(stream, 200, &crate::webzoom::to_json());
         }
         // The EFFECTIVE web-content policy for the profile this ychrome is
         // running: every enable/disable decision already made, PLUS the passkey
@@ -1071,15 +1089,85 @@ fn reschema(state: &Mutex<PaneState>, host: Option<&str>) -> Value {
 /// the prefix, so one arm handles however many scripts the host has.
 const USERSCRIPT_ACTION_PREFIX: &str = "userscript:";
 
+/// The per-site zoom controls' action ids.
+const ZOOM_IN_ACTION: &str = "zoom-in";
+const ZOOM_OUT_ACTION: &str = "zoom-out";
+const ZOOM_RESET_ACTION: &str = "zoom-reset";
+
+/// The "This site" zoom row. ychrome owns the per-site override; the row shows a
+/// real number either way — the stored override when custom, else the GUI's
+/// reported live (global) zoom. `−`/`+` step the override from whatever is on
+/// screen now, and `Reset` clears it back to the global.
+fn current_site_zoom_widgets(
+    host: Option<&str>,
+    live_zoom: Option<f64>,
+    zoom_sites: &std::collections::BTreeMap<String, f64>,
+) -> Vec<Value> {
+    let Some(host) = host.filter(|host| !host.is_empty()) else {
+        return vec![json!({
+            "kind": "label",
+            "muted": true,
+            "text": "Open a site in this surface to set its zoom.",
+        })];
+    };
+    let override_pct = crate::webzoom::zoom_for_host(zoom_sites, host);
+    // The number to show: the stored override when the site is custom, else the
+    // live global the GUI reported. ychrome does not know yggterm's global, so
+    // with neither we say so plainly rather than invent a number.
+    let subtitle = match (override_pct, live_zoom) {
+        (Some(pct), _) => format!("{}% · this site", pct as i64),
+        (None, Some(global)) => format!("{}% · global default", global as i64),
+        (None, None) => "Using the global zoom".to_string(),
+    };
+    let mut actions = vec![
+        json!({ "action": ZOOM_OUT_ACTION, "label": "−", "title": "Zoom out" }),
+        json!({ "action": ZOOM_IN_ACTION, "label": "+", "title": "Zoom in" }),
+    ];
+    // Reset only means something once there is an override to clear.
+    if override_pct.is_some() {
+        actions.insert(
+            1,
+            json!({ "action": ZOOM_RESET_ACTION, "label": "Reset", "title": "Use the global zoom" }),
+        );
+    }
+    vec![json!({
+        "kind": "list-row",
+        "id": "site-zoom",
+        "title": host,
+        "subtitle": subtitle,
+        "actions": actions,
+    })]
+}
+
 /// Read this host's policy files and draw the pane. The I/O lives here so
 /// [`settings_schema_from`] stays pure and testable without touching the user's
 /// real config — the same split the vault pane uses.
-fn settings_schema(profile: &str) -> Value {
-    settings_schema_from(profile, &crate::webpolicy::state(profile))
+///
+/// `host` is the page the surface is on and `live_zoom` its current effective
+/// zoom percent, both reported by the GUI (which owns the live surface). ychrome
+/// owns the per-site OVERRIDE; it never knows yggterm's global, so `live_zoom` is
+/// how the "This site" row shows a real number when a site is on the global.
+fn settings_schema(profile: &str, host: Option<&str>, live_zoom: Option<f64>) -> Value {
+    settings_schema_from(
+        profile,
+        host,
+        live_zoom,
+        &crate::webzoom::sites(),
+        &crate::webpolicy::state(profile),
+    )
 }
 
-fn settings_schema_from(profile: &str, state: &crate::webpolicy::PolicyState) -> Value {
-    let mut widgets = vec![json!({"kind": "section", "text": "Ad blocking"})];
+fn settings_schema_from(
+    profile: &str,
+    host: Option<&str>,
+    live_zoom: Option<f64>,
+    zoom_sites: &std::collections::BTreeMap<String, f64>,
+    state: &crate::webpolicy::PolicyState,
+) -> Value {
+    let mut widgets = vec![json!({"kind": "section", "text": "This site"})];
+    widgets.extend(current_site_zoom_widgets(host, live_zoom, zoom_sites));
+
+    widgets.push(json!({"kind": "section", "text": "Ad blocking"}));
 
     if state.adblock_rules_present {
         widgets.push(json!({
@@ -1147,7 +1235,17 @@ fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
     let action = request["action"].as_str().unwrap_or_default();
     // A toggle posts its checkbox state as `values.value` ("true"/"false").
     let on = request["values"]["value"].as_str() == Some("true");
+    // The GUI injects the active surface's host and its live effective zoom.
+    let host = request["values"]["host"].as_str().filter(|host| !host.is_empty());
+    let live_zoom = read_zoom(&request["values"]["zoom"]);
     let profile = state.lock().unwrap().profile.clone();
+
+    // Per-site zoom lands FIRST: it needs the host and reports back with a fresh
+    // schema plus `refetch_zoom` so the GUI re-reads `/zoom` and re-applies the
+    // override to the live page without waiting for the ~4s heartbeat.
+    if matches!(action, ZOOM_IN_ACTION | ZOOM_OUT_ACTION | ZOOM_RESET_ACTION) {
+        return run_zoom_action(&profile, action, host, live_zoom);
+    }
 
     let outcome = match action {
         "adblock-enabled" => crate::webpolicy::set_adblock_enabled(on),
@@ -1159,7 +1257,7 @@ fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
         // destroy and recreate the surface, and it refetches `/policy` first.
         "reload-surface" => {
             return json!({
-                "schema": settings_schema(&profile),
+                "schema": settings_schema(&profile, host, live_zoom),
                 "reload_surface": true,
                 "toast": "Reloading the surface with the current policy.",
             });
@@ -1175,7 +1273,7 @@ fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
 
     // Redraw from disk either way: a failed rename must snap the toggle back to
     // what the file system actually says, not leave it showing the click.
-    let schema = settings_schema(&profile);
+    let schema = settings_schema(&profile, host, live_zoom);
     match outcome {
         Ok(()) => json!({
             "schema": schema,
@@ -1183,6 +1281,43 @@ fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
         }),
         Err(error) => json!({ "schema": schema, "toast": error.to_string() }),
     }
+}
+
+/// A per-site zoom click. `−`/`+` step the override from the live effective zoom
+/// the GUI reported; `Reset` clears it. The reply asks the GUI to re-read `/zoom`
+/// so the change reaches the live page at once.
+fn run_zoom_action(
+    profile: &str,
+    action: &str,
+    host: Option<&str>,
+    live_zoom: Option<f64>,
+) -> Value {
+    let Some(host) = host else {
+        return json!({ "toast": "No site is open to zoom." });
+    };
+    let base = live_zoom.unwrap_or(100.0);
+    let outcome = match action {
+        ZOOM_IN_ACTION => crate::webzoom::set(host, Some(base + crate::webzoom::ZOOM_STEP)),
+        ZOOM_OUT_ACTION => crate::webzoom::set(host, Some(base - crate::webzoom::ZOOM_STEP)),
+        ZOOM_RESET_ACTION => crate::webzoom::set(host, None),
+        _ => return json!({ "toast": "unknown zoom action" }),
+    };
+    // Redraw: for a step the override now exists and the row shows it exactly;
+    // for a reset it is gone, so pass no live zoom and the row reads "global".
+    let redraw_zoom = if action == ZOOM_RESET_ACTION { None } else { live_zoom };
+    let schema = settings_schema(profile, Some(host), redraw_zoom);
+    match outcome {
+        Ok(()) => json!({ "schema": schema, "refetch_zoom": true }),
+        Err(error) => json!({ "schema": schema, "toast": error.to_string() }),
+    }
+}
+
+/// The live zoom the GUI reports, tolerant of a number or a stringified number
+/// (action values arrive as strings; a query param is text too).
+fn read_zoom(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
 }
 
 fn merge(mut base: Value, extra: Value) -> Value {
@@ -1337,11 +1472,54 @@ mod tests {
         }
     }
 
+    fn no_zoom() -> std::collections::BTreeMap<String, f64> {
+        std::collections::BTreeMap::new()
+    }
+
+    // The "This site" row shows the override number and a Reset when a site is
+    // custom; on the global it shows the GUI's reported number and no Reset.
+    #[test]
+    fn the_zoom_row_reflects_override_vs_global() {
+        let sites: std::collections::BTreeMap<String, f64> =
+            [("youtube.com".to_string(), 130.0)].into_iter().collect();
+
+        let custom = current_site_zoom_widgets(Some("www.youtube.com"), Some(130.0), &sites);
+        let row = &custom[0];
+        assert_eq!(row["kind"], "list-row");
+        assert!(row["subtitle"].as_str().unwrap().contains("130% · this site"));
+        let actions: Vec<&str> = row["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["action"].as_str().unwrap())
+            .collect();
+        assert_eq!(actions, [ZOOM_OUT_ACTION, ZOOM_RESET_ACTION, ZOOM_IN_ACTION]);
+
+        let global = current_site_zoom_widgets(Some("example.com"), Some(110.0), &sites);
+        let row = &global[0];
+        assert!(row["subtitle"].as_str().unwrap().contains("110% · global"));
+        let actions: Vec<&str> = row["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["action"].as_str().unwrap())
+            .collect();
+        assert_eq!(actions, [ZOOM_OUT_ACTION, ZOOM_IN_ACTION], "no Reset on the global");
+    }
+
+    // No site open ⇒ a hint, never a zoom row that would act on nothing.
+    #[test]
+    fn the_zoom_row_needs_a_site() {
+        let widgets = current_site_zoom_widgets(None, None, &no_zoom());
+        assert_eq!(widgets[0]["kind"], "label");
+        assert!(widgets[0]["text"].as_str().unwrap().contains("Open a site"));
+    }
+
     // The per-profile override must name the jar it governs, or the user cannot
     // tell which identity they just turned ad blocking off for.
     #[test]
     fn the_settings_schema_names_the_running_profile() {
-        let schema = settings_schema_from("work", &policy_state(true, &[]));
+        let schema = settings_schema_from("work", None, None, &no_zoom(), &policy_state(true, &[]));
         assert_eq!(schema["title"], "ychrome");
         assert!(
             schema.to_string().contains("work"),
@@ -1353,7 +1531,8 @@ mod tests {
     // than offering a switch that governs nothing.
     #[test]
     fn a_host_with_no_ruleset_offers_no_adblock_toggle() {
-        let schema = settings_schema_from("work", &policy_state(false, &[]));
+        let schema =
+            settings_schema_from("work", None, None, &no_zoom(), &policy_state(false, &[]));
         let widgets = schema["widgets"].as_array().expect("widgets");
         assert!(
             !widgets.iter().any(|w| w["id"] == "adblock-enabled"),
@@ -1367,6 +1546,9 @@ mod tests {
     fn each_userscript_gets_a_toggle_keyed_by_its_stem() {
         let schema = settings_schema_from(
             "work",
+            None,
+            None,
+            &no_zoom(),
             &policy_state(true, &[("sponsorblock", true), ("darkmode", false)]),
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
