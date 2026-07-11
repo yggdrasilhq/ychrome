@@ -356,11 +356,12 @@ fn handle_conn(stream: TcpStream, state: &ServerState) {
         ("GET", p) if p == format!("/pane/{SETTINGS_PANE}") => {
             let host = query_value(query, "host");
             let live_zoom = query_value(query, "zoom").and_then(|text| text.parse::<f64>().ok());
+            let secure = query_value(query, "secure").map(|text| text == "true");
             let profile = state.pane.lock().unwrap().profile.clone();
             respond_json(
                 stream,
                 200,
-                &settings_schema(&profile, host.as_deref(), live_zoom),
+                &settings_schema(&profile, host.as_deref(), live_zoom, secure),
             );
         }
         // The per-site zoom overrides for this host. yggterm applies the entry
@@ -1088,6 +1089,10 @@ fn reschema(state: &Mutex<PaneState>, host: Option<&str>) -> Value {
 /// Toggle ids double as action ids. A userscript's action carries its stem after
 /// the prefix, so one arm handles however many scripts the host has.
 const USERSCRIPT_ACTION_PREFIX: &str = "userscript:";
+/// Delete a userscript (the list-row's trash action).
+const USERSCRIPT_DELETE_PREFIX: &str = "userscript-delete:";
+/// Install a bundled extension by its catalog stem (the "Add an extension" list).
+const INSTALL_ACTION_PREFIX: &str = "install:";
 
 /// The per-site zoom controls' action ids.
 const ZOOM_IN_ACTION: &str = "zoom-in";
@@ -1143,15 +1148,22 @@ fn current_site_zoom_widgets(
 /// [`settings_schema_from`] stays pure and testable without touching the user's
 /// real config — the same split the vault pane uses.
 ///
-/// `host` is the page the surface is on and `live_zoom` its current effective
-/// zoom percent, both reported by the GUI (which owns the live surface). ychrome
-/// owns the per-site OVERRIDE; it never knows yggterm's global, so `live_zoom` is
-/// how the "This site" row shows a real number when a site is on the global.
-fn settings_schema(profile: &str, host: Option<&str>, live_zoom: Option<f64>) -> Value {
+/// `host` is the page the surface is on, `live_zoom` its current effective zoom
+/// percent, and `secure` whether it loaded over HTTPS — all reported by the GUI
+/// (which owns the live surface). ychrome owns the per-site OVERRIDE; it never
+/// knows yggterm's global, so `live_zoom` is how the "This site" row shows a real
+/// number when a site is on the global.
+fn settings_schema(
+    profile: &str,
+    host: Option<&str>,
+    live_zoom: Option<f64>,
+    secure: Option<bool>,
+) -> Value {
     settings_schema_from(
         profile,
         host,
         live_zoom,
+        secure,
         &crate::webzoom::sites(),
         &crate::webpolicy::state(profile),
     )
@@ -1161,14 +1173,15 @@ fn settings_schema_from(
     profile: &str,
     host: Option<&str>,
     live_zoom: Option<f64>,
+    secure: Option<bool>,
     zoom_sites: &std::collections::BTreeMap<String, f64>,
     state: &crate::webpolicy::PolicyState,
 ) -> Value {
     let mut widgets = vec![json!({"kind": "section", "text": "This site"})];
     widgets.extend(current_site_zoom_widgets(host, live_zoom, zoom_sites));
+    widgets.extend(current_site_security_widgets(host, secure));
 
     widgets.push(json!({"kind": "section", "text": "Ad blocking"}));
-
     if state.adblock_rules_present {
         widgets.push(json!({
             "kind": "toggle",
@@ -1192,23 +1205,57 @@ fn settings_schema_from(
         }));
     }
 
+    // SponsorBlock is a userscript, but a flagship one, so it gets its own named
+    // section with a friendly toggle — pulled out of the generic list below.
+    widgets.extend(sponsorblock_widgets(state));
+
+    // Everything EXCEPT sponsorblock: one list-row each, with Enable/Disable and
+    // a Delete (the "toggle + trash icon" the design calls for).
     widgets.push(json!({"kind": "section", "text": "Userscripts"}));
-    if state.userscripts.is_empty() {
+    let managed: Vec<&(String, bool)> = state
+        .userscripts
+        .iter()
+        .filter(|(stem, _)| stem != crate::extensions::SPONSORBLOCK_STEM)
+        .collect();
+    if managed.is_empty() {
         widgets.push(json!({
             "kind": "label",
             "muted": true,
-            "text": "None installed. Drop *.js into ~/.yggterm/web-userscripts/ (all profiles) \
-                     or this profile's userscripts/ dir, on the host ychrome runs on.",
+            "text": "None installed. Add one below, or drop *.js into \
+                     ~/.yggterm/web-userscripts/ on the host ychrome runs on.",
         }));
     }
-    for (stem, enabled) in &state.userscripts {
-        widgets.push(json!({
-            "kind": "toggle",
-            "id": format!("{USERSCRIPT_ACTION_PREFIX}{stem}"),
-            "action": format!("{USERSCRIPT_ACTION_PREFIX}{stem}"),
-            "label": stem,
-            "value": enabled,
-        }));
+    for (stem, enabled) in managed {
+        widgets.push(userscript_row(stem, *enabled));
+    }
+
+    // The catalog, filtered to what is not already installed. "Installed" is read
+    // from the SAME `state` snapshot the rest of the pane draws from — one source
+    // of truth per render, so the catalog can never disagree with the list above
+    // it. Omit the whole section when there is nothing left to add.
+    let installed: std::collections::HashSet<&str> =
+        state.userscripts.iter().map(|(stem, _)| stem.as_str()).collect();
+    let installable: Vec<&crate::extensions::Extension> = crate::extensions::catalog()
+        .iter()
+        .filter(|ext| !installed.contains(ext.stem))
+        .collect();
+    if !installable.is_empty() {
+        widgets.push(json!({"kind": "section", "text": "Add an extension"}));
+        for ext in installable {
+            widgets.push(json!({
+                "kind": "list-row",
+                "id": format!("catalog-{}", ext.stem),
+                "title": ext.name,
+                "subtitle": ext.description,
+                "actions": [
+                    {
+                        "action": format!("{INSTALL_ACTION_PREFIX}{}", ext.stem),
+                        "label": "Install",
+                        "title": format!("Install {}", ext.name),
+                    }
+                ],
+            }));
+        }
     }
 
     widgets.push(json!({
@@ -1228,58 +1275,150 @@ fn settings_schema_from(
     json!({ "title": "ychrome", "widgets": widgets })
 }
 
+/// The connection line for "This site". Honest and narrow: HTTPS vs not, which is
+/// what the GUI can tell us. Full certificate detail (issuer, expiry) would need
+/// WebKit's TLS certificate, a capability yggterm does not expose yet. When the
+/// GUI reports nothing (older GUI, or no site), the line is simply omitted.
+fn current_site_security_widgets(host: Option<&str>, secure: Option<bool>) -> Vec<Value> {
+    let Some(host) = host.filter(|host| !host.is_empty()) else {
+        return Vec::new();
+    };
+    match secure {
+        Some(true) => vec![json!({
+            "kind": "label",
+            "text": format!("🔒 Secure connection to {host} (HTTPS)"),
+        })],
+        Some(false) => vec![json!({
+            "kind": "label",
+            "muted": true,
+            "text": format!("⚠ Not secure — {host} loaded over HTTP."),
+        })],
+        None => Vec::new(),
+    }
+}
+
+/// The SponsorBlock section. Installed ⇒ a friendly toggle (its state is the
+/// `sponsorblock.js` vs `.js.disabled` rename, exactly like any userscript).
+/// Not installed ⇒ nothing here; it appears under "Add an extension" instead.
+fn sponsorblock_widgets(state: &crate::webpolicy::PolicyState) -> Vec<Value> {
+    let installed = state
+        .userscripts
+        .iter()
+        .find(|(stem, _)| stem == crate::extensions::SPONSORBLOCK_STEM);
+    let Some((stem, enabled)) = installed else {
+        return Vec::new();
+    };
+    vec![
+        json!({"kind": "section", "text": "SponsorBlock"}),
+        json!({
+            "kind": "toggle",
+            "id": format!("{USERSCRIPT_ACTION_PREFIX}{stem}"),
+            "action": format!("{USERSCRIPT_ACTION_PREFIX}{stem}"),
+            "label": "Skip YouTube sponsor segments",
+            "value": enabled,
+        }),
+    ]
+}
+
+/// One managed userscript as a list-row: its on/off state in the subtitle, an
+/// Enable/Disable action, and a Delete. Keyed by stem so Dioxus never patches one
+/// script's row into another's (identity, not index — the pane's hard-won rule).
+fn userscript_row(stem: &str, enabled: bool) -> Value {
+    let toggle_label = if enabled { "Disable" } else { "Enable" };
+    json!({
+        "kind": "list-row",
+        "id": format!("script-{stem}"),
+        "title": stem,
+        "subtitle": if enabled { "Enabled" } else { "Disabled" },
+        "actions": [
+            {
+                "action": format!("{USERSCRIPT_ACTION_PREFIX}{stem}"),
+                "label": toggle_label,
+                "title": format!("{toggle_label} {stem}"),
+            },
+            {
+                "action": format!("{USERSCRIPT_DELETE_PREFIX}{stem}"),
+                "label": "Delete",
+                "title": format!("Delete {stem}"),
+            }
+        ],
+    })
+}
+
 /// A settings click. Every mutation lands on THIS host's disk, then the pane
 /// re-reads it — the files are the source of truth, so the toggle can never
 /// disagree with what `/policy` will serve next.
 fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
     let action = request["action"].as_str().unwrap_or_default();
-    // A toggle posts its checkbox state as `values.value` ("true"/"false").
-    let on = request["values"]["value"].as_str() == Some("true");
-    // The GUI injects the active surface's host and its live effective zoom.
+    // The GUI injects the active surface's host, live zoom, and HTTPS state.
     let host = request["values"]["host"].as_str().filter(|host| !host.is_empty());
     let live_zoom = read_zoom(&request["values"]["zoom"]);
+    let secure = read_bool(&request["values"]["secure"]);
     let profile = state.lock().unwrap().profile.clone();
+    let redraw = |extra: Value| {
+        merge(
+            json!({ "schema": settings_schema(&profile, host, live_zoom, secure) }),
+            extra,
+        )
+    };
 
     // Per-site zoom lands FIRST: it needs the host and reports back with a fresh
     // schema plus `refetch_zoom` so the GUI re-reads `/zoom` and re-applies the
     // override to the live page without waiting for the ~4s heartbeat.
     if matches!(action, ZOOM_IN_ACTION | ZOOM_OUT_ACTION | ZOOM_RESET_ACTION) {
-        return run_zoom_action(&profile, action, host, live_zoom);
+        return run_zoom_action(&profile, action, host, live_zoom, secure);
     }
 
+    // A toggle widget posts its checkbox state as `values.value`; a list-row
+    // button posts none. A `userscript:`/adblock arm reads it, defaulting to the
+    // FLIP of the current state so the row's Enable/Disable button works.
+    let posted = request["values"]["value"].as_str();
+
     let outcome = match action {
-        "adblock-enabled" => crate::webpolicy::set_adblock_enabled(on),
-        "adblock-profile" => crate::webpolicy::set_adblock_profile_disabled(&profile, !on),
+        "adblock-enabled" => crate::webpolicy::set_adblock_enabled(posted == Some("true")),
+        "adblock-profile" => {
+            crate::webpolicy::set_adblock_profile_disabled(&profile, posted != Some("true"))
+        }
         // `reload_surface`, NOT `eval: "location.reload()"`. A content filter and
         // its userscripts are attached to the WEBVIEW at creation, so reloading
         // the document leaves both exactly as they were — turning ad blocking off
         // and reloading in-page would appear to do nothing. Only the GUI can
         // destroy and recreate the surface, and it refetches `/policy` first.
         "reload-surface" => {
-            return json!({
-                "schema": settings_schema(&profile, host, live_zoom),
+            return redraw(json!({
                 "reload_surface": true,
                 "toast": "Reloading the surface with the current policy.",
-            });
+            }));
+        }
+        script if script.starts_with(USERSCRIPT_DELETE_PREFIX) => {
+            let stem = script.trim_start_matches(USERSCRIPT_DELETE_PREFIX);
+            crate::webpolicy::delete_userscript(stem)
+        }
+        install if install.starts_with(INSTALL_ACTION_PREFIX) => {
+            let stem = install.trim_start_matches(INSTALL_ACTION_PREFIX);
+            match crate::extensions::find(stem) {
+                Some(ext) => crate::webpolicy::install_userscript(ext.stem, ext.body),
+                None => Err(anyhow::anyhow!("no bundled extension named {stem:?}")),
+            }
         }
         script if script.starts_with(USERSCRIPT_ACTION_PREFIX) => {
-            crate::webpolicy::set_userscript_enabled(
-                script.trim_start_matches(USERSCRIPT_ACTION_PREFIX),
-                on,
-            )
+            let stem = script.trim_start_matches(USERSCRIPT_ACTION_PREFIX);
+            // Toggle widget → its posted state; list-row button → flip current.
+            let enable = match posted {
+                Some("true") => true,
+                Some("false") => false,
+                _ => !crate::webpolicy::userscript_enabled(stem).unwrap_or(false),
+            };
+            crate::webpolicy::set_userscript_enabled(stem, enable)
         }
         other => return json!({ "toast": format!("unknown action {other:?}") }),
     };
 
     // Redraw from disk either way: a failed rename must snap the toggle back to
     // what the file system actually says, not leave it showing the click.
-    let schema = settings_schema(&profile, host, live_zoom);
     match outcome {
-        Ok(()) => json!({
-            "schema": schema,
-            "toast": "Saved. Reload the surface to apply.",
-        }),
-        Err(error) => json!({ "schema": schema, "toast": error.to_string() }),
+        Ok(()) => redraw(json!({ "toast": "Saved. Reload the surface to apply." })),
+        Err(error) => redraw(json!({ "toast": error.to_string() })),
     }
 }
 
@@ -1291,6 +1430,7 @@ fn run_zoom_action(
     action: &str,
     host: Option<&str>,
     live_zoom: Option<f64>,
+    secure: Option<bool>,
 ) -> Value {
     let Some(host) = host else {
         return json!({ "toast": "No site is open to zoom." });
@@ -1305,7 +1445,7 @@ fn run_zoom_action(
     // Redraw: for a step the override now exists and the row shows it exactly;
     // for a reset it is gone, so pass no live zoom and the row reads "global".
     let redraw_zoom = if action == ZOOM_RESET_ACTION { None } else { live_zoom };
-    let schema = settings_schema(profile, Some(host), redraw_zoom);
+    let schema = settings_schema(profile, Some(host), redraw_zoom, secure);
     match outcome {
         Ok(()) => json!({ "schema": schema, "refetch_zoom": true }),
         Err(error) => json!({ "schema": schema, "toast": error.to_string() }),
@@ -1318,6 +1458,17 @@ fn read_zoom(value: &Value) -> Option<f64> {
     value
         .as_f64()
         .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
+/// A bool the GUI reports, tolerant of a real bool or the strings "true"/"false".
+fn read_bool(value: &Value) -> Option<bool> {
+    value
+        .as_bool()
+        .or_else(|| match value.as_str() {
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            _ => None,
+        })
 }
 
 fn merge(mut base: Value, extra: Value) -> Value {
@@ -1519,7 +1670,8 @@ mod tests {
     // tell which identity they just turned ad blocking off for.
     #[test]
     fn the_settings_schema_names_the_running_profile() {
-        let schema = settings_schema_from("work", None, None, &no_zoom(), &policy_state(true, &[]));
+        let schema =
+            settings_schema_from("work", None, None, None, &no_zoom(), &policy_state(true, &[]));
         assert_eq!(schema["title"], "ychrome");
         assert!(
             schema.to_string().contains("work"),
@@ -1532,7 +1684,7 @@ mod tests {
     #[test]
     fn a_host_with_no_ruleset_offers_no_adblock_toggle() {
         let schema =
-            settings_schema_from("work", None, None, &no_zoom(), &policy_state(false, &[]));
+            settings_schema_from("work", None, None, None, &no_zoom(), &policy_state(false, &[]));
         let widgets = schema["widgets"].as_array().expect("widgets");
         assert!(
             !widgets.iter().any(|w| w["id"] == "adblock-enabled"),
@@ -1540,29 +1692,83 @@ mod tests {
         );
     }
 
-    // A userscript's action carries its stem, so one arm serves every script the
-    // host has — and the toggle reflects the `.js.disabled` rename.
+    // SponsorBlock gets its own named toggle; a plain userscript becomes a
+    // list-row with Enable/Disable + Delete actions, keyed by stem.
     #[test]
-    fn each_userscript_gets_a_toggle_keyed_by_its_stem() {
+    fn sponsorblock_is_promoted_and_other_scripts_get_delete_rows() {
         let schema = settings_schema_from(
             "work",
+            None,
             None,
             None,
             &no_zoom(),
             &policy_state(true, &[("sponsorblock", true), ("darkmode", false)]),
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
+        // SponsorBlock: its own toggle, friendly label, NOT in the generic list.
         let sponsor = widgets
             .iter()
             .find(|w| w["id"] == "userscript:sponsorblock")
             .expect("sponsorblock toggle");
+        assert_eq!(sponsor["kind"], "toggle");
         assert_eq!(sponsor["value"], true);
-        assert_eq!(sponsor["action"], "userscript:sponsorblock");
+        assert!(widgets.iter().any(|w| w["text"] == "SponsorBlock"));
+        // darkmode: a managed list-row with a toggle action and a delete action.
         let dark = widgets
             .iter()
-            .find(|w| w["id"] == "userscript:darkmode")
-            .expect("darkmode toggle");
-        assert_eq!(dark["value"], false);
+            .find(|w| w["id"] == "script-darkmode")
+            .expect("darkmode row");
+        assert_eq!(dark["kind"], "list-row");
+        assert_eq!(dark["subtitle"], "Disabled");
+        let actions: Vec<&str> = dark["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["action"].as_str().unwrap())
+            .collect();
+        assert_eq!(actions, ["userscript:darkmode", "userscript-delete:darkmode"]);
+        // sponsorblock must NOT also appear as a managed script row.
+        assert!(
+            !widgets.iter().any(|w| w["id"] == "script-sponsorblock"),
+            "sponsorblock leaked into the generic userscripts list"
+        );
+    }
+
+    // The catalog shows only what is NOT installed, judged against the SAME state
+    // snapshot the pane draws from. sponsorblock is installed here, so it is
+    // absent from "Add an extension"; unblock-select is not, so it is offered.
+    #[test]
+    fn the_catalog_offers_only_uninstalled_extensions() {
+        let schema = settings_schema_from(
+            "work",
+            None,
+            None,
+            None,
+            &no_zoom(),
+            &policy_state(true, &[("sponsorblock", true)]),
+        );
+        let widgets = schema["widgets"].as_array().expect("widgets");
+        assert!(
+            !widgets.iter().any(|w| w["id"] == "catalog-sponsorblock"),
+            "an installed extension was still offered in the catalog"
+        );
+        let unblock = widgets
+            .iter()
+            .find(|w| w["id"] == "catalog-unblock-select")
+            .expect("unblock-select should be offered when not installed");
+        assert_eq!(unblock["actions"][0]["action"], "install:unblock-select");
+    }
+
+    // The security line is honest and omitted when unknown: HTTPS -> a lock,
+    // HTTP -> a warning, None (older GUI) -> nothing.
+    #[test]
+    fn the_security_line_reflects_https_or_is_omitted() {
+        assert!(current_site_security_widgets(None, Some(true)).is_empty());
+        assert!(current_site_security_widgets(Some("x.com"), None).is_empty());
+        let secure = current_site_security_widgets(Some("x.com"), Some(true));
+        assert!(secure[0]["text"].as_str().unwrap().contains("Secure"));
+        let insecure = current_site_security_widgets(Some("x.com"), Some(false));
+        assert!(insecure[0]["text"].as_str().unwrap().contains("Not secure"));
     }
 
     // A row id must survive names that contain the characters a vault really

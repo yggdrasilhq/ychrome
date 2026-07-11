@@ -25,6 +25,11 @@ remote one), never on the GUI host.
 ```
 src/main.rs                     the browser: OSC 7717 thin client, profile picker,
                                 loopback control server, ssh -L tunnel, standalone window
+src/sidebar.rs                  the control server: vault + settings pane schemas, actions
+src/webpolicy.rs                adblock + userscripts (enable/disable/delete/install)
+src/webzoom.rs                  per-site zoom overrides (web-zoom.json)
+src/extensions.rs               the bundled userscript catalog ("Add an extension")
+assets/web-userscripts/         bundled scripts embedded by extensions.rs
 crates/ychrome-vault/src/
   crypto.rs    KDF -> master key -> stretched key -> user key; EncString (type 2)
                decrypt AND encrypt; AsymEncString (type 3/4, RSA-OAEP); PrivateKey
@@ -270,6 +275,30 @@ profiles — zoom is readability, not identity).
   the change reaches the live page at once (the zoom analogue of
   `reload_surface`). `Reset` clears the override so the site falls back to the
   global — it never persists "same as global".
+
+## The settings pane's sections (`src/sidebar.rs`)
+
+`settings_schema_from` draws, in order: **This site** (per-site zoom + an honest
+HTTPS connection line from `values.secure`; full cert detail is future, needs
+WebKit's TLS cert), **Ad blocking**, **SponsorBlock** (the `sponsorblock`
+userscript promoted to its own friendly toggle), **Userscripts** (every OTHER
+script as a `list-row` with Enable/Disable + Delete actions), and **Add an
+extension** (the `extensions.rs` catalog, filtered to what is not installed).
+
+- The catalog's "installed" test reads the SAME `PolicyState` the rest of the
+  pane draws from — one source per render, so the catalog never disagrees with
+  the list above it. Do NOT re-read the disk for it.
+- A list-row Enable/Disable button carries no checkbox value, so the
+  `userscript:` action FLIPS `webpolicy::userscript_enabled` when `values.value`
+  is absent; a real toggle (SponsorBlock, adblock) posts its state.
+- `install` embeds the bundled body via `include_str!` and refuses to clobber an
+  existing script; `delete` removes both `.js` and `.js.disabled`. Both redraw +
+  toast "reload to apply" (a userscript binds at surface creation) — the user
+  hits "Reload surface now".
+- E2E-proven against the real control server 2026-07-11: install writes
+  `sponsorblock.js` and promotes it; `/policy` then serves its body; zoom-in
+  persists `web-zoom.json` and returns `refetch_zoom`; a list-row toggle renames
+  the file; delete removes it.
 
 ## Still open
 - **`restore`** (`PUT /api/ciphers/{id}/restore`) — `rm` has no undo, and because
