@@ -25,6 +25,7 @@ mod manifest;
 mod passkey;
 mod sidebar;
 mod webpolicy;
+mod webzoom;
 use clap::Parser;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop};
@@ -227,7 +228,12 @@ fn drive_surface(
     // silently, for the life of that webview.
     let sidebar = match sidebar::spawn(profile, session) {
         Ok(sidebar) => {
-            sidebar::emit_declare(session, &sidebar.control_url, &webpolicy::policy_version(profile));
+            sidebar::emit_declare(
+                session,
+                &sidebar.control_url,
+                &webpolicy::policy_version(profile),
+                &webzoom::zoom_version(),
+            );
             Some(sidebar)
         }
         Err(error) => {
@@ -255,6 +261,7 @@ fn drive_surface(
                     session,
                     &sidebar.control_url,
                     &webpolicy::policy_version(profile),
+                    &webzoom::zoom_version(),
                 );
             }
             emit_web_surface_osc("open", session, url, title, profile);
@@ -274,6 +281,7 @@ fn drive_surface(
                     session,
                     &sidebar.control_url,
                     &webpolicy::policy_version(profile),
+                    &webzoom::zoom_version(),
                 );
             }
         }
