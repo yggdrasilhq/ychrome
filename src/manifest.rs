@@ -91,7 +91,8 @@ mod tests {
     /// A private temp dir for one test, removed on the way in so a rerun starts
     /// clean. Keyed by test name — no randomness, no shared state.
     fn scratch_dir(test: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ychrome-manifest-{test}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ychrome-manifest-{test}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }

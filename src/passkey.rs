@@ -127,10 +127,9 @@ impl Signer {
                 json!({ "error": "no passkey in this vault answers that request" }),
             ),
             Err(GetError::Denied) => (403, json!({ "error": "the user declined" })),
-            Err(GetError::TimedOut) => (
-                408,
-                json!({ "error": "the user did not respond in time" }),
-            ),
+            Err(GetError::TimedOut) => {
+                (408, json!({ "error": "the user did not respond in time" }))
+            }
             Err(GetError::Bad(message)) => (400, json!({ "error": message })),
         }
     }
@@ -177,10 +176,7 @@ impl Signer {
             "allow_credential_ids": allow,
         }))
         .map_err(|error| GetError::Bad(error.to_string()))?;
-        let matches: Vec<Value> = resolved["matches"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let matches: Vec<Value> = resolved["matches"].as_array().cloned().unwrap_or_default();
         if matches.is_empty() {
             return Err(GetError::NoCredential);
         }
@@ -211,7 +207,10 @@ impl Signer {
         let outcome = self.wait_for_outcome(&request_id);
 
         let (user_verified, chosen_id) = match outcome {
-            Some(Outcome::Granted { user_verified, credential_id }) => (user_verified, credential_id),
+            Some(Outcome::Granted {
+                user_verified,
+                credential_id,
+            }) => (user_verified, credential_id),
             Some(Outcome::Denied) => return Err(GetError::Denied),
             None => return Err(GetError::TimedOut),
         };
@@ -222,11 +221,19 @@ impl Signer {
             Some(id) => matches
                 .iter()
                 .find(|c| c["credential_id"].as_str() == Some(id.as_str()))
-                .ok_or_else(|| GetError::Bad("chosen passkey is not among the offered accounts".into()))?,
+                .ok_or_else(|| {
+                    GetError::Bad("chosen passkey is not among the offered accounts".into())
+                })?,
             None => &matches[0],
         };
-        let item_id = candidate["item_id"].as_str().unwrap_or_default().to_string();
-        let credential_id = candidate["credential_id"].as_str().unwrap_or_default().to_string();
+        let item_id = candidate["item_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let credential_id = candidate["credential_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         let user_handle = candidate["user_handle"].as_str().map(str::to_string);
 
         // Consent in hand: the agent mints UserPresence and signs.
@@ -256,7 +263,9 @@ impl Signer {
         match self.try_create(body) {
             Ok(response) => (200, response),
             Err(GetError::Denied) => (403, json!({ "error": "the user declined" })),
-            Err(GetError::TimedOut) => (408, json!({ "error": "the user did not respond in time" })),
+            Err(GetError::TimedOut) => {
+                (408, json!({ "error": "the user did not respond in time" }))
+            }
             Err(GetError::Bad(message)) => (400, json!({ "error": message })),
             // create() has no "no credential" case; fold it into a 400.
             Err(GetError::NoCredential) => (400, json!({ "error": "invalid create request" })),
@@ -308,10 +317,21 @@ impl Signer {
         // (the one being created), so the dialog is a plain Approve, never a
         // picker; a chosen credential_id in the grant is ignored here.
         let request_id = hex_token(16);
-        let label = if display_name.is_empty() { user_name } else { display_name };
+        let label = if display_name.is_empty() {
+            user_name
+        } else {
+            display_name
+        };
         let accounts = vec![json!({ "label": label })];
         self.register(&request_id);
-        emit_fido2_request(&self.session, &request_id, rp_id, &accounts, "create", origin);
+        emit_fido2_request(
+            &self.session,
+            &request_id,
+            rp_id,
+            &accounts,
+            "create",
+            origin,
+        );
         let user_verified = match self.wait_for_outcome(&request_id) {
             Some(Outcome::Granted { user_verified, .. }) => user_verified,
             Some(Outcome::Denied) => return Err(GetError::Denied),
@@ -773,17 +793,29 @@ mod tests {
     fn rp_id_must_be_a_suffix_of_the_origin_host() {
         assert!(rp_id_matches_origin("github.com", "https://github.com"));
         assert!(rp_id_matches_origin("github.com", "https://sub.github.com"));
-        assert!(rp_id_matches_origin("github.com", "https://github.com:443/x"));
+        assert!(rp_id_matches_origin(
+            "github.com",
+            "https://github.com:443/x"
+        ));
         // A page cannot claim a parent it is not under, nor an unrelated RP.
         assert!(!rp_id_matches_origin("github.com", "https://evil.com"));
         assert!(!rp_id_matches_origin("github.com", "https://notgithub.com"));
-        assert!(!rp_id_matches_origin("github.com", "https://github.com.evil.com"));
+        assert!(!rp_id_matches_origin(
+            "github.com",
+            "https://github.com.evil.com"
+        ));
     }
 
     #[test]
     fn origin_host_strips_scheme_and_port() {
-        assert_eq!(origin_host("https://example.com").as_deref(), Some("example.com"));
-        assert_eq!(origin_host("https://example.com:8443/a/b").as_deref(), Some("example.com"));
+        assert_eq!(
+            origin_host("https://example.com").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            origin_host("https://example.com:8443/a/b").as_deref(),
+            Some("example.com")
+        );
         assert_eq!(origin_host("about:blank"), None);
     }
 

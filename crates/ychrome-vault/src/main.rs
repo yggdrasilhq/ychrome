@@ -27,7 +27,11 @@ use ychrome_vault::VaultManager;
 use ychrome_vault::agent;
 
 #[derive(Parser)]
-#[command(name = "ychrome-vault", version, about = "ychrome's native Bitwarden/Vaultwarden client")]
+#[command(
+    name = "ychrome-vault",
+    version,
+    about = "ychrome's native Bitwarden/Vaultwarden client"
+)]
 struct Cli {
     /// Vault directory (config + agent socket). Default `~/.yggterm/vault`.
     #[arg(long, global = true)]
@@ -159,10 +163,7 @@ enum Command {
     ///
     /// The name is resolved among trashed items only (`list --trashed` shows
     /// them). A `--permanent` removal is gone and cannot be restored.
-    Restore {
-        name: String,
-        user: Option<String>,
-    },
+    Restore { name: String, user: Option<String> },
     /// Roll a password without touching the vault.
     Generate {
         #[arg(default_value_t = ychrome_vault::DEFAULT_LENGTH)]
@@ -318,7 +319,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Totp { name, user } => {
-            let response = agent::request(&dir, &json!({"op": "totp", "name": name, "user": user}))?;
+            let response =
+                agent::request(&dir, &json!({"op": "totp", "name": name, "user": user}))?;
             println!("{}", string_field(&response, "code"));
             Ok(())
         }
@@ -440,7 +442,9 @@ fn main() -> Result<()> {
         Command::Check => {
             let mut manager = VaultManager::load(&dir);
             if !manager.is_configured() {
-                bail!("not configured; run `ychrome-vault configure --server <url> --email <email>`");
+                bail!(
+                    "not configured; run `ychrome-vault configure --server <url> --email <email>`"
+                );
             }
             let password = read_master_password()?;
             manager
@@ -449,7 +453,11 @@ fn main() -> Result<()> {
             let vault = manager.vault().expect("unlocked");
             let items = vault.items();
             let with_totp = items.iter().filter(|item| item.has_totp).count();
-            let sample: Vec<&str> = items.iter().take(8).map(|item| item.name.as_str()).collect();
+            let sample: Vec<&str> = items
+                .iter()
+                .take(8)
+                .map(|item| item.name.as_str())
+                .collect();
             // Prove the URI index is live too — this is what `rbw list` never had.
             let with_uris = items.iter().filter(|item| !item.uris.is_empty()).count();
             print_json(&json!({

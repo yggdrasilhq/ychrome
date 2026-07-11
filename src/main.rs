@@ -19,12 +19,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 mod extensions;
 mod manifest;
 mod passkey;
 mod sidebar;
+mod useragent;
 mod webpolicy;
 mod webzoom;
 use clap::Parser;
@@ -243,7 +244,9 @@ fn drive_surface(
         }
     };
     emit_web_surface_osc("open", session, url, title, profile);
-    eprintln!("ychrome: web surface open — {url} [{profile}]  (Ctrl+C to close, Ctrl+Z / yggterm Zzz to suspend)");
+    eprintln!(
+        "ychrome: web surface open — {url} [{profile}]  (Ctrl+C to close, Ctrl+Z / yggterm Zzz to suspend)"
+    );
     let mut ticks: u32 = 0;
     let mut last_tick = std::time::Instant::now();
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
@@ -365,7 +368,10 @@ fn web_surface_config_string(key: &str) -> Option<String> {
     let raw = std::fs::read_to_string(dirs::home_dir()?.join(".yggterm").join("web-surface.json"))
         .ok()?;
     let config: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    config.get(key).and_then(|value| value.as_str()).map(str::to_string)
+    config
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
 }
 
 /// Default start page when the picker's URL field is left empty — the configured
@@ -402,8 +408,10 @@ fn normalize_target_url(raw: &str) -> String {
     let is_hostish = !raw.contains(char::is_whitespace)
         && (host == "localhost" || authority.contains('.') || authority.contains(':'));
     if is_hostish {
-        let loopback =
-            matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1" | "[::1]");
+        let loopback = matches!(
+            host,
+            "localhost" | "127.0.0.1" | "0.0.0.0" | "::1" | "[::1]"
+        );
         let scheme = if loopback { "http" } else { "https" };
         format!("{scheme}://{raw}")
     } else {
@@ -572,7 +580,8 @@ fn respond_html(mut stream: TcpStream, status: u16, body: &str) {
 
 fn respond_empty(mut stream: TcpStream, status: u16) {
     let reason = if status == 204 { "No Content" } else { "OK" };
-    let resp = format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let resp =
+        format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     let _ = stream.write_all(resp.as_bytes());
     let _ = stream.flush();
 }
@@ -807,7 +816,9 @@ fn main() -> Result<()> {
         eprintln!("ychrome: opening ssh SOCKS tunnel via {via} …");
         let t = open_tunnel(via)?;
         let local_port = t.local_port;
-        eprintln!("ychrome: tunnel up — egress on {via}'s network (socks5://127.0.0.1:{local_port})");
+        eprintln!(
+            "ychrome: tunnel up — egress on {via}'s network (socks5://127.0.0.1:{local_port})"
+        );
         tunnel = Some(t);
         Some(ProxyConfig::Socks5(ProxyEndpoint {
             host: "127.0.0.1".to_string(),
@@ -846,6 +857,12 @@ fn main() -> Result<()> {
     let mut builder = WebViewBuilder::new_with_web_context(&mut web_context).with_url(&final_url);
     if let Some(proxy_config) = proxy_config {
         builder = builder.with_proxy_config(proxy_config);
+    }
+    // The same identity the thin-client surfaces get (yggterm applies it there,
+    // from `/policy`). A standalone window is the same browser: it must not be the
+    // one place claude.ai still answers "Request not allowed".
+    if let Some(user_agent) = crate::useragent::effective() {
+        builder = builder.with_user_agent(&user_agent);
     }
 
     #[cfg(not(target_os = "linux"))]

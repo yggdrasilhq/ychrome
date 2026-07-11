@@ -24,10 +24,10 @@ pub mod watchtower;
 
 pub use crypto::{AsymEncString, CryptoError, EncString, Kdf, MasterKey, PrivateKey, SymmetricKey};
 pub use generator::{DEFAULT_LENGTH, MIN_LENGTH, generate_password};
-pub use matching::{auto_match_for_host, find_by_name, item_applies_to_host, item_auto_matches_host};
-pub use model::{NewLogin, RawCipher, Vault, VaultDiagnostic, VaultItem};
-pub use session::{
-    DEFAULT_LOCK_TIMEOUT_SECS, VaultConfig, VaultError, VaultManager, VaultStatus,
+pub use matching::{
+    auto_match_for_host, find_by_name, item_applies_to_host, item_auto_matches_host,
 };
+pub use model::{NewLogin, RawCipher, Vault, VaultDiagnostic, VaultItem};
+pub use session::{DEFAULT_LOCK_TIMEOUT_SECS, VaultConfig, VaultError, VaultManager, VaultStatus};
 pub use totp::{Totp, TotpError};
 pub use watchtower::Report as WatchtowerReport;
