@@ -317,6 +317,78 @@ pub fn set_userscript_enabled(stem: &str, enabled: bool) -> Result<()> {
     Ok(())
 }
 
+/// Reject anything that is not a bare filename stem. Shared by delete and
+/// install: an action payload is attacker-influenced, so `../` never reaches a
+/// path join.
+fn checked_stem(stem: &str) -> Result<()> {
+    if stem.is_empty() || stem.contains('/') || stem.contains("..") {
+        anyhow::bail!("userscript name must be a plain name, not a path: {stem:?}");
+    }
+    Ok(())
+}
+
+/// Remove a shared userscript outright — both the enabled `<stem>.js` and the
+/// disabled `<stem>.js.disabled`, whichever exists. Deleting a file that is not
+/// there is not an error (the pane may be a beat stale). A per-profile script of
+/// the same name is left alone: this pane only manages the shared ones, one
+/// owner per control.
+pub fn delete_userscript(stem: &str) -> Result<()> {
+    checked_stem(stem)?;
+    let dir = shared_userscript_dir()?;
+    let mut removed = false;
+    for name in [format!("{stem}.js"), format!("{stem}.js.disabled")] {
+        match std::fs::remove_file(dir.join(&name)) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("deleting {name}")),
+        }
+    }
+    if !removed {
+        anyhow::bail!("no userscript named {stem:?} to delete");
+    }
+    Ok(())
+}
+
+/// Whether a shared userscript with this stem is installed (enabled or not).
+/// Used to filter the "add an extension" catalog down to what is NOT yet here.
+pub fn userscript_installed(stem: &str) -> bool {
+    let Ok(dir) = shared_userscript_dir() else {
+        return false;
+    };
+    dir.join(format!("{stem}.js")).exists() || dir.join(format!("{stem}.js.disabled")).exists()
+}
+
+/// The current enabled state of a shared userscript: `Some(true)` for
+/// `<stem>.js`, `Some(false)` for `<stem>.js.disabled`, `None` if absent. A
+/// list-row Enable/Disable button carries no checkbox value, so the action reads
+/// this to flip.
+pub fn userscript_enabled(stem: &str) -> Option<bool> {
+    let dir = shared_userscript_dir().ok()?;
+    if dir.join(format!("{stem}.js")).exists() {
+        Some(true)
+    } else if dir.join(format!("{stem}.js.disabled")).exists() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Install a bundled userscript body as `<stem>.js` in the shared directory,
+/// enabled. Refuses to clobber an existing script of the same name (enabled or
+/// disabled) — an install is additive, never a silent overwrite of what the user
+/// may have edited.
+pub fn install_userscript(stem: &str, body: &str) -> Result<()> {
+    checked_stem(stem)?;
+    if userscript_installed(stem) {
+        anyhow::bail!("{stem} is already installed");
+    }
+    let dir = shared_userscript_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(format!("{stem}.js")), body)
+        .with_context(|| format!("installing userscript {stem}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
