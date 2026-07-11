@@ -103,7 +103,10 @@ mod tests {
         pairs
             .iter()
             .map(|(label, password)| {
-                ((*label).to_string(), Zeroizing::new((*password).to_string()))
+                (
+                    (*label).to_string(),
+                    Zeroizing::new((*password).to_string()),
+                )
             })
             .collect()
     }
@@ -138,12 +141,18 @@ mod tests {
         // The report is the only thing that leaves — it must not carry secrets.
         let wire = serde_json::to_string(&report).expect("report serializes");
         assert!(!wire.contains("hunter2"), "password leaked into a report");
-        assert!(!wire.contains("shared-Passw0rd"), "password leaked into a report");
+        assert!(
+            !wire.contains("shared-Passw0rd"),
+            "password leaked into a report"
+        );
     }
 
     #[test]
     fn a_password_used_once_is_not_reuse() {
-        let report = analyze(entries(&[("a", "unique-Passw0rd!"), ("b", "another-Passw0rd!")]));
+        let report = analyze(entries(&[
+            ("a", "unique-Passw0rd!"),
+            ("b", "another-Passw0rd!"),
+        ]));
         assert!(report.reused.is_empty());
         assert_eq!(report.scanned, 2);
     }

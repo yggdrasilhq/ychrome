@@ -68,7 +68,11 @@ mod tests {
             assert!(!ext.stem.is_empty());
             assert!(!ext.stem.contains('/') && !ext.stem.contains(".."));
             assert!(!ext.name.is_empty());
-            assert!(!ext.body.trim().is_empty(), "{} has an empty body", ext.stem);
+            assert!(
+                !ext.body.trim().is_empty(),
+                "{} has an empty body",
+                ext.stem
+            );
         }
     }
 

@@ -92,7 +92,14 @@ fn vault_cli_stdin(args: &[&str], stdin: Option<&str>) -> Result<String> {
         if stderr.contains("locked") {
             bail!("vault locked: run `ychrome-vault unlock` on this host");
         }
-        bail!("{}", if stderr.is_empty() { "ychrome-vault failed" } else { stderr });
+        bail!(
+            "{}",
+            if stderr.is_empty() {
+                "ychrome-vault failed"
+            } else {
+                stderr
+            }
+        );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -176,7 +183,9 @@ impl PaneState {
         }
         self.add = AddDraft {
             name: host.unwrap_or_default().to_string(),
-            uri: host.map(|host| format!("https://{host}")).unwrap_or_default(),
+            uri: host
+                .map(|host| format!("https://{host}"))
+                .unwrap_or_default(),
             seeded_host: host.map(str::to_string),
             ..AddDraft::default()
         };
@@ -354,15 +363,9 @@ fn handle_conn(stream: TcpStream, state: &ServerState) {
             respond_json(stream, 200, &schema);
         }
         ("GET", p) if p == format!("/pane/{SETTINGS_PANE}") => {
-            let host = query_value(query, "host");
-            let live_zoom = query_value(query, "zoom").and_then(|text| text.parse::<f64>().ok());
-            let secure = query_value(query, "secure").map(|text| text == "true");
             let profile = state.pane.lock().unwrap().profile.clone();
-            respond_json(
-                stream,
-                200,
-                &settings_schema(&profile, host.as_deref(), live_zoom, secure),
-            );
+            let page = PageContext::from_query(query);
+            respond_json(stream, 200, &settings_schema(&profile, &page));
         }
         // The per-site zoom overrides for this host. yggterm applies the entry
         // for the current page's host on navigation and falls back to its global
@@ -622,7 +625,9 @@ fn locked_schema(status: &Value) -> Value {
         }
         other => {
             widgets.push(json!({"kind": "section", "text": "Vault"}));
-            widgets.push(json!({"kind": "label", "muted": true, "text": format!("Vault state: {other}.")}));
+            widgets.push(
+                json!({"kind": "label", "muted": true, "text": format!("Vault state: {other}.")}),
+            );
         }
     }
     json!({ "title": "Vault", "widgets": widgets })
@@ -736,7 +741,9 @@ fn unlocked_schema(state: &PaneState, host: Option<&str>, status: &Value) -> Val
                 "placeholder": "Search vault…", "value": state.query,
             }));
             let query = state.query.trim();
-            if query.is_empty() && let Some(host) = host.filter(|host| !host.is_empty()) {
+            if query.is_empty()
+                && let Some(host) = host.filter(|host| !host.is_empty())
+            {
                 widgets.push(json!({"kind": "section", "text": format!("For {host}")}));
                 match vault_cli_json(&["suggest", host]) {
                     Ok(items) => {
@@ -805,11 +812,14 @@ fn watchtower_widgets(report: &Value) -> Vec<Value> {
     })];
 
     if !reused.is_empty() {
-        widgets.push(json!({"kind": "section", "text": format!("Reused passwords ({})", reused.len())}));
+        widgets.push(
+            json!({"kind": "section", "text": format!("Reused passwords ({})", reused.len())}),
+        );
         for group in reused.iter().take(MAX_REPORT_ROWS) {
-            let labels: Vec<&str> = group.as_array().map(|group| {
-                group.iter().filter_map(Value::as_str).collect()
-            }).unwrap_or_default();
+            let labels: Vec<&str> = group
+                .as_array()
+                .map(|group| group.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
             widgets.push(json!({
                 "kind": "label",
                 "text": format!("Shared by {} logins", labels.len()),
@@ -825,8 +835,13 @@ fn watchtower_widgets(report: &Value) -> Vec<Value> {
     }
 
     if !weak.is_empty() {
-        widgets.push(json!({"kind": "section", "text": format!("Weak passwords ({})", weak.len())}));
-        let shown: Vec<&str> = weak.iter().filter_map(Value::as_str).take(MAX_REPORT_ROWS).collect();
+        widgets
+            .push(json!({"kind": "section", "text": format!("Weak passwords ({})", weak.len())}));
+        let shown: Vec<&str> = weak
+            .iter()
+            .filter_map(Value::as_str)
+            .take(MAX_REPORT_ROWS)
+            .collect();
         widgets.push(json!({"kind": "label", "muted": true, "text": shown.join(" · ")}));
         if weak.len() > MAX_REPORT_ROWS {
             widgets.push(json!({
@@ -930,7 +945,10 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
         "sync" => match vault_cli_json(&["sync"]) {
             Ok(reply) => {
                 let count = reply["item_count"].as_u64().unwrap_or(0);
-                merge(reschema(state, host.as_deref()), json!({ "toast": format!("Synced {count} items.") }))
+                merge(
+                    reschema(state, host.as_deref()),
+                    json!({ "toast": format!("Synced {count} items.") }),
+                )
             }
             Err(error) => json!({ "toast": error.to_string() }),
         },
@@ -954,7 +972,10 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                         json!({ "toast": format!("Vault unlocked — {count} items.") }),
                     )
                 }
-                Err(error) => merge(reschema(state, host.as_deref()), json!({ "toast": error.to_string() })),
+                Err(error) => merge(
+                    reschema(state, host.as_deref()),
+                    json!({ "toast": error.to_string() }),
+                ),
             }
         }
         "restart_agent" => match vault_cli_json(&["stop-agent"]) {
@@ -974,7 +995,10 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 // A locked vault's scan is stale and unrepeatable; do not keep
                 // showing which of the user's logins share a password.
                 state.lock().unwrap().watchtower = None;
-                merge(reschema(state, host.as_deref()), json!({ "toast": "Vault locked." }))
+                merge(
+                    reschema(state, host.as_deref()),
+                    json!({ "toast": "Vault locked." }),
+                )
             }
             Err(error) => json!({ "toast": error.to_string() }),
         },
@@ -1098,6 +1122,124 @@ const INSTALL_ACTION_PREFIX: &str = "install:";
 const ZOOM_IN_ACTION: &str = "zoom-in";
 const ZOOM_OUT_ACTION: &str = "zoom-out";
 const ZOOM_RESET_ACTION: &str = "zoom-reset";
+/// Vertical tabs and "continue where you left off". Both are yggterm's prefs —
+/// it owns the tabs, the tab tree and the chrome that draws them — so the pane
+/// only VIEWS them (from the injected page context) and asks the GUI to change
+/// them (`surface_prefs` on the reply). ychrome stores neither.
+const VERTICAL_TABS_ACTION: &str = "tabs-vertical";
+const RESTORE_TABS_ACTION: &str = "tabs-restore";
+/// Pick the browser identity. Carries the preset id after the prefix.
+const USER_AGENT_ACTION_PREFIX: &str = "user-agent:";
+
+/// What the GUI reports about the live surface, on the schema GET (as query
+/// params) and on every action (as `values`). All non-secret, and none of it is
+/// something ychrome could know: the surface is the GUI's.
+///
+/// `vertical_tabs` and `restore_tabs` are yggterm's own web-surface preferences,
+/// injected so the browser's settings pane can hold the browser's settings
+/// without either side keeping a second copy of the truth.
+#[derive(Debug, Clone, Default)]
+struct PageContext {
+    host: Option<String>,
+    zoom: Option<f64>,
+    secure: Option<bool>,
+    vertical_tabs: bool,
+    restore_tabs: bool,
+}
+
+impl PageContext {
+    fn from_query(query: &str) -> Self {
+        PageContext {
+            host: query_value(query, "host").filter(|host| !host.is_empty()),
+            zoom: query_value(query, "zoom").and_then(|text| text.parse::<f64>().ok()),
+            secure: query_value(query, "secure").map(|text| text == "true"),
+            vertical_tabs: query_value(query, "vertical_tabs").as_deref() == Some("true"),
+            restore_tabs: query_value(query, "restore_tabs").as_deref() == Some("true"),
+        }
+    }
+
+    fn from_values(values: &Value) -> Self {
+        PageContext {
+            host: values["host"]
+                .as_str()
+                .filter(|host| !host.is_empty())
+                .map(ToOwned::to_owned),
+            zoom: read_zoom(&values["zoom"]),
+            secure: read_bool(&values["secure"]),
+            vertical_tabs: read_bool(&values["vertical_tabs"]).unwrap_or(false),
+            restore_tabs: read_bool(&values["restore_tabs"]).unwrap_or(false),
+        }
+    }
+
+    fn host(&self) -> Option<&str> {
+        self.host.as_deref()
+    }
+}
+
+/// The browsing-mode section: where the tabs live, and what happens to them on
+/// the next visit. The toggles the user asked for, in the browser's own settings
+/// pane rather than buried in the tab strip.
+fn browsing_widgets(page: &PageContext) -> Vec<Value> {
+    vec![
+        json!({"kind": "section", "text": "Tabs"}),
+        json!({
+            "kind": "toggle",
+            "id": "tabs-vertical",
+            "action": VERTICAL_TABS_ACTION,
+            "label": "Vertical tabs",
+            "value": page.vertical_tabs,
+        }),
+        json!({
+            "kind": "label",
+            "muted": true,
+            "text": "Tabs move out of the page into a sidebar tree with folders you can \
+                     make, rename and drag tabs into. Classic tabs put them back in a strip \
+                     at the top, where folders cannot be drawn.",
+        }),
+        json!({
+            "kind": "toggle",
+            "id": "tabs-restore",
+            "action": RESTORE_TABS_ACTION,
+            "label": "Continue tabs from last time",
+            "value": page.restore_tabs,
+        }),
+        json!({
+            "kind": "label",
+            "muted": true,
+            "text": "Off: each visit starts fresh, and the loose tabs from last time are \
+                     purged. Folders and the tabs filed in them are saved either way.",
+        }),
+    ]
+}
+
+/// The browser identity. The default UA a WebKitGTK build sends describes Safari
+/// on Linux — a browser that does not exist — and UA-allowlisting edges refuse
+/// it outright (claude.ai answers "Request not allowed"). Presented as a row per
+/// preset rather than a free-text field: the failure mode of a hand-typed UA is a
+/// site quietly serving you the wrong code, which is worse than not offering it.
+fn user_agent_widgets() -> Vec<Value> {
+    let current = crate::useragent::preset();
+    let mut widgets = vec![json!({"kind": "section", "text": "Browser identity"})];
+    for preset in crate::useragent::Preset::ALL {
+        let selected = preset == current;
+        widgets.push(json!({
+            "kind": "list-row",
+            "id": format!("ua-{}", preset.id()),
+            "title": if selected { format!("● {}", preset.label()) } else { preset.label().to_string() },
+            "subtitle": preset.description(),
+            "actions": if selected {
+                json!([])
+            } else {
+                json!([{
+                    "action": format!("{USER_AGENT_ACTION_PREFIX}{}", preset.id()),
+                    "label": "Use",
+                    "title": format!("Identify as {}", preset.label()),
+                }])
+            },
+        }));
+    }
+    widgets
+}
 
 /// The "This site" zoom row. ychrome owns the per-site override; the row shows a
 /// real number either way — the stored override when custom, else the GUI's
@@ -1148,22 +1290,15 @@ fn current_site_zoom_widgets(
 /// [`settings_schema_from`] stays pure and testable without touching the user's
 /// real config — the same split the vault pane uses.
 ///
-/// `host` is the page the surface is on, `live_zoom` its current effective zoom
-/// percent, and `secure` whether it loaded over HTTPS — all reported by the GUI
-/// (which owns the live surface). ychrome owns the per-site OVERRIDE; it never
-/// knows yggterm's global, so `live_zoom` is how the "This site" row shows a real
+/// Everything the GUI knows about the live surface arrives in [`PageContext`]:
+/// the page's host, its live zoom, its HTTPS state, and yggterm's two
+/// web-surface prefs. ychrome owns the per-site zoom OVERRIDE; it never knows
+/// yggterm's global, so `page.zoom` is how the "This site" row shows a real
 /// number when a site is on the global.
-fn settings_schema(
-    profile: &str,
-    host: Option<&str>,
-    live_zoom: Option<f64>,
-    secure: Option<bool>,
-) -> Value {
+fn settings_schema(profile: &str, page: &PageContext) -> Value {
     settings_schema_from(
         profile,
-        host,
-        live_zoom,
-        secure,
+        page,
         &crate::webzoom::sites(),
         &crate::webpolicy::state(profile),
     )
@@ -1171,15 +1306,18 @@ fn settings_schema(
 
 fn settings_schema_from(
     profile: &str,
-    host: Option<&str>,
-    live_zoom: Option<f64>,
-    secure: Option<bool>,
+    page: &PageContext,
     zoom_sites: &std::collections::BTreeMap<String, f64>,
     state: &crate::webpolicy::PolicyState,
 ) -> Value {
+    let (host, live_zoom, secure) = (page.host(), page.zoom, page.secure);
     let mut widgets = vec![json!({"kind": "section", "text": "This site"})];
     widgets.extend(current_site_zoom_widgets(host, live_zoom, zoom_sites));
     widgets.extend(current_site_security_widgets(host, secure));
+
+    // Tabs first among the browser-wide settings: it is the one that changes what
+    // the window looks like.
+    widgets.extend(browsing_widgets(page));
 
     widgets.push(json!({"kind": "section", "text": "Ad blocking"}));
     if state.adblock_rules_present {
@@ -1233,8 +1371,11 @@ fn settings_schema_from(
     // from the SAME `state` snapshot the rest of the pane draws from — one source
     // of truth per render, so the catalog can never disagree with the list above
     // it. Omit the whole section when there is nothing left to add.
-    let installed: std::collections::HashSet<&str> =
-        state.userscripts.iter().map(|(stem, _)| stem.as_str()).collect();
+    let installed: std::collections::HashSet<&str> = state
+        .userscripts
+        .iter()
+        .map(|(stem, _)| stem.as_str())
+        .collect();
     let installable: Vec<&crate::extensions::Extension> = crate::extensions::catalog()
         .iter()
         .filter(|ext| !installed.contains(ext.stem))
@@ -1258,11 +1399,14 @@ fn settings_schema_from(
         }
     }
 
+    widgets.extend(user_agent_widgets());
+
     widgets.push(json!({
         "kind": "label",
         "muted": true,
-        "text": "Userscript changes apply when the surface reloads. An adblock RULESET change \
-                 needs a yggterm restart — WebKit compiles the filter once per GUI process.",
+        "text": "Userscript and identity changes apply when the surface reloads. An adblock \
+                 RULESET change needs a yggterm restart — WebKit compiles the filter once per \
+                 GUI process.",
     }));
     widgets.push(json!({
         "kind": "button",
@@ -1272,7 +1416,7 @@ fn settings_schema_from(
         "primary": true,
     }));
 
-    json!({ "title": "ychrome", "widgets": widgets })
+    json!({ "title": "YChrome Settings", "widgets": widgets })
 }
 
 /// The connection line for "This site". Honest and narrow: HTTPS vs not, which is
@@ -1350,29 +1494,57 @@ fn userscript_row(stem: &str, enabled: bool) -> Value {
 /// disagree with what `/policy` will serve next.
 fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
     let action = request["action"].as_str().unwrap_or_default();
-    // The GUI injects the active surface's host, live zoom, and HTTPS state.
-    let host = request["values"]["host"].as_str().filter(|host| !host.is_empty());
-    let live_zoom = read_zoom(&request["values"]["zoom"]);
-    let secure = read_bool(&request["values"]["secure"]);
+    // Everything the GUI knows about the live surface: host, zoom, HTTPS, and its
+    // own web-surface prefs.
+    let page = PageContext::from_values(&request["values"]);
     let profile = state.lock().unwrap().profile.clone();
-    let redraw = |extra: Value| {
-        merge(
-            json!({ "schema": settings_schema(&profile, host, live_zoom, secure) }),
-            extra,
-        )
-    };
+    let redraw = |extra: Value| merge(json!({ "schema": settings_schema(&profile, &page) }), extra);
 
     // Per-site zoom lands FIRST: it needs the host and reports back with a fresh
     // schema plus `refetch_zoom` so the GUI re-reads `/zoom` and re-applies the
     // override to the live page without waiting for the ~4s heartbeat.
     if matches!(action, ZOOM_IN_ACTION | ZOOM_OUT_ACTION | ZOOM_RESET_ACTION) {
-        return run_zoom_action(&profile, action, host, live_zoom, secure);
+        return run_zoom_action(&profile, action, &page);
     }
 
-    // A toggle widget posts its checkbox state as `values.value`; a list-row
-    // button posts none. A `userscript:`/adblock arm reads it, defaulting to the
-    // FLIP of the current state so the row's Enable/Disable button works.
+    // A toggle widget posts its new state as `values.value`; a list-row button
+    // posts none. A `userscript:`/adblock arm reads it, defaulting to the FLIP of
+    // the current state so the row's Enable/Disable button works.
     let posted = request["values"]["value"].as_str();
+
+    // The two prefs yggterm owns. ychrome writes nothing: it echoes the requested
+    // state back in the schema (so the switch lands under the finger) and asks the
+    // GUI to apply it. The next schema GET reads the truth back out of the page
+    // context, so a refused change would correct itself rather than lie.
+    if matches!(action, VERTICAL_TABS_ACTION | RESTORE_TABS_ACTION) {
+        let want = posted == Some("true");
+        let mut next = page.clone();
+        let patch = if action == VERTICAL_TABS_ACTION {
+            next.vertical_tabs = want;
+            json!({ "vertical_tabs": want })
+        } else {
+            next.restore_tabs = want;
+            json!({ "restore_tabs": want })
+        };
+        return json!({
+            "schema": settings_schema(&profile, &next),
+            "surface_prefs": patch,
+        });
+    }
+
+    if let Some(preset) = action.strip_prefix(USER_AGENT_ACTION_PREFIX) {
+        return match crate::useragent::set_preset(preset) {
+            // The UA is fixed when the webview is CREATED, so an in-page reload
+            // would keep the old identity. `reload_surface` destroys and recreates
+            // it (refetching /policy first), which is the only thing that can
+            // change what the browser says it is.
+            Ok(()) => redraw(json!({
+                "reload_surface": true,
+                "toast": "Browser identity changed. Reloading the surface.",
+            })),
+            Err(error) => redraw(json!({ "toast": error.to_string() })),
+        };
+    }
 
     let outcome = match action {
         "adblock-enabled" => crate::webpolicy::set_adblock_enabled(posted == Some("true")),
@@ -1425,17 +1597,11 @@ fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
 /// A per-site zoom click. `−`/`+` step the override from the live effective zoom
 /// the GUI reported; `Reset` clears it. The reply asks the GUI to re-read `/zoom`
 /// so the change reaches the live page at once.
-fn run_zoom_action(
-    profile: &str,
-    action: &str,
-    host: Option<&str>,
-    live_zoom: Option<f64>,
-    secure: Option<bool>,
-) -> Value {
-    let Some(host) = host else {
+fn run_zoom_action(profile: &str, action: &str, page: &PageContext) -> Value {
+    let Some(host) = page.host() else {
         return json!({ "toast": "No site is open to zoom." });
     };
-    let base = live_zoom.unwrap_or(100.0);
+    let base = page.zoom.unwrap_or(100.0);
     let outcome = match action {
         ZOOM_IN_ACTION => crate::webzoom::set(host, Some(base + crate::webzoom::ZOOM_STEP)),
         ZOOM_OUT_ACTION => crate::webzoom::set(host, Some(base - crate::webzoom::ZOOM_STEP)),
@@ -1444,8 +1610,11 @@ fn run_zoom_action(
     };
     // Redraw: for a step the override now exists and the row shows it exactly;
     // for a reset it is gone, so pass no live zoom and the row reads "global".
-    let redraw_zoom = if action == ZOOM_RESET_ACTION { None } else { live_zoom };
-    let schema = settings_schema(profile, Some(host), redraw_zoom, secure);
+    let mut next = page.clone();
+    if action == ZOOM_RESET_ACTION {
+        next.zoom = None;
+    }
+    let schema = settings_schema(profile, &next);
     match outcome {
         Ok(()) => json!({ "schema": schema, "refetch_zoom": true }),
         Err(error) => json!({ "schema": schema, "toast": error.to_string() }),
@@ -1462,13 +1631,11 @@ fn read_zoom(value: &Value) -> Option<f64> {
 
 /// A bool the GUI reports, tolerant of a real bool or the strings "true"/"false".
 fn read_bool(value: &Value) -> Option<bool> {
-    value
-        .as_bool()
-        .or_else(|| match value.as_str() {
-            Some("true") => Some(true),
-            Some("false") => Some(false),
-            _ => None,
-        })
+    value.as_bool().or_else(|| match value.as_str() {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    })
 }
 
 fn merge(mut base: Value, extra: Value) -> Value {
@@ -1573,7 +1740,7 @@ mod tests {
             &json!({"pane": SETTINGS_PANE, "action": "reload-surface", "values": {}}),
         );
         assert_eq!(reply["reload_surface"], true);
-        assert_eq!(reply["schema"]["title"], "ychrome");
+        assert_eq!(reply["schema"]["title"], "YChrome Settings");
     }
 
     // An unknown settings action must not touch the disk or fall through to the
@@ -1585,9 +1752,15 @@ mod tests {
             &state,
             &json!({"pane": SETTINGS_PANE, "action": "sync", "values": {}}),
         );
-        assert!(reply["schema"].is_null(), "an unknown action redrew the pane");
         assert!(
-            reply["toast"].as_str().unwrap_or_default().contains("unknown"),
+            reply["schema"].is_null(),
+            "an unknown action redrew the pane"
+        );
+        assert!(
+            reply["toast"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown"),
             "expected an unknown-action toast, got {reply:?}"
         );
     }
@@ -1637,14 +1810,22 @@ mod tests {
         let custom = current_site_zoom_widgets(Some("www.youtube.com"), Some(130.0), &sites);
         let row = &custom[0];
         assert_eq!(row["kind"], "list-row");
-        assert!(row["subtitle"].as_str().unwrap().contains("130% · this site"));
+        assert!(
+            row["subtitle"]
+                .as_str()
+                .unwrap()
+                .contains("130% · this site")
+        );
         let actions: Vec<&str> = row["actions"]
             .as_array()
             .unwrap()
             .iter()
             .map(|a| a["action"].as_str().unwrap())
             .collect();
-        assert_eq!(actions, [ZOOM_OUT_ACTION, ZOOM_RESET_ACTION, ZOOM_IN_ACTION]);
+        assert_eq!(
+            actions,
+            [ZOOM_OUT_ACTION, ZOOM_RESET_ACTION, ZOOM_IN_ACTION]
+        );
 
         let global = current_site_zoom_widgets(Some("example.com"), Some(110.0), &sites);
         let row = &global[0];
@@ -1655,7 +1836,11 @@ mod tests {
             .iter()
             .map(|a| a["action"].as_str().unwrap())
             .collect();
-        assert_eq!(actions, [ZOOM_OUT_ACTION, ZOOM_IN_ACTION], "no Reset on the global");
+        assert_eq!(
+            actions,
+            [ZOOM_OUT_ACTION, ZOOM_IN_ACTION],
+            "no Reset on the global"
+        );
     }
 
     // No site open ⇒ a hint, never a zoom row that would act on nothing.
@@ -1670,21 +1855,109 @@ mod tests {
     // tell which identity they just turned ad blocking off for.
     #[test]
     fn the_settings_schema_names_the_running_profile() {
-        let schema =
-            settings_schema_from("work", None, None, None, &no_zoom(), &policy_state(true, &[]));
-        assert_eq!(schema["title"], "ychrome");
+        let schema = settings_schema_from(
+            "work",
+            &PageContext::default(),
+            &no_zoom(),
+            &policy_state(true, &[]),
+        );
+        assert_eq!(schema["title"], "YChrome Settings");
         assert!(
             schema.to_string().contains("work"),
             "profile missing from {schema}"
         );
     }
 
+    // The tab toggles are a VIEW of yggterm's prefs: they render what the GUI
+    // injected, never a copy ychrome keeps.
+    #[test]
+    fn the_tab_toggles_render_the_prefs_the_gui_reported() {
+        let page = PageContext {
+            vertical_tabs: true,
+            restore_tabs: false,
+            ..PageContext::default()
+        };
+        let schema = settings_schema_from("work", &page, &no_zoom(), &policy_state(true, &[]));
+        let widgets = schema["widgets"].as_array().expect("widgets");
+        let toggle = |id: &str| {
+            widgets
+                .iter()
+                .find(|widget| widget["id"] == id)
+                .unwrap_or_else(|| panic!("no {id} toggle in {schema}"))
+        };
+        assert_eq!(toggle("tabs-vertical")["value"], true);
+        assert_eq!(toggle("tabs-vertical")["action"], VERTICAL_TABS_ACTION);
+        assert_eq!(toggle("tabs-restore")["value"], false);
+        assert_eq!(toggle("tabs-restore")["action"], RESTORE_TABS_ACTION);
+    }
+
+    // Flipping a tab toggle writes nothing here: it asks the GUI (which owns the
+    // tabs) via `surface_prefs`, and echoes the requested state so the switch
+    // lands under the user's finger instead of snapping back for a heartbeat.
+    #[test]
+    fn a_tab_toggle_asks_the_gui_and_echoes_the_new_state() {
+        let state = Mutex::new(PaneState::new("work"));
+        let reply = run_settings_action(
+            &state,
+            &json!({
+                "pane": SETTINGS_PANE,
+                "action": VERTICAL_TABS_ACTION,
+                "values": { "value": "true", "vertical_tabs": false, "restore_tabs": false },
+            }),
+        );
+        assert_eq!(reply["surface_prefs"]["vertical_tabs"], true);
+        assert!(
+            reply["surface_prefs"].get("restore_tabs").is_none(),
+            "an untouched pref must be absent, not sent as false: {reply}"
+        );
+        let widgets = reply["schema"]["widgets"].as_array().expect("widgets");
+        let vertical = widgets
+            .iter()
+            .find(|widget| widget["id"] == "tabs-vertical")
+            .expect("vertical toggle");
+        assert_eq!(
+            vertical["value"], true,
+            "the schema must echo the new state"
+        );
+    }
+
+    // The identity picker marks the live preset and offers "Use" on the others.
+    #[test]
+    fn the_identity_rows_offer_every_preset_but_the_current_one() {
+        let schema = settings_schema_from(
+            "work",
+            &PageContext::default(),
+            &no_zoom(),
+            &policy_state(true, &[]),
+        );
+        let widgets = schema["widgets"].as_array().expect("widgets");
+        for preset in crate::useragent::Preset::ALL {
+            let row = widgets
+                .iter()
+                .find(|widget| widget["id"] == format!("ua-{}", preset.id()))
+                .unwrap_or_else(|| panic!("no row for {}", preset.id()));
+            let actions = row["actions"].as_array().expect("actions");
+            if preset == crate::useragent::preset() {
+                assert!(actions.is_empty(), "the live identity offered a Use button");
+            } else {
+                assert_eq!(
+                    actions[0]["action"],
+                    format!("{USER_AGENT_ACTION_PREFIX}{}", preset.id())
+                );
+            }
+        }
+    }
+
     // With no ruleset on this host there is nothing to toggle: say so, rather
     // than offering a switch that governs nothing.
     #[test]
     fn a_host_with_no_ruleset_offers_no_adblock_toggle() {
-        let schema =
-            settings_schema_from("work", None, None, None, &no_zoom(), &policy_state(false, &[]));
+        let schema = settings_schema_from(
+            "work",
+            &PageContext::default(),
+            &no_zoom(),
+            &policy_state(false, &[]),
+        );
         let widgets = schema["widgets"].as_array().expect("widgets");
         assert!(
             !widgets.iter().any(|w| w["id"] == "adblock-enabled"),
@@ -1698,9 +1971,7 @@ mod tests {
     fn sponsorblock_is_promoted_and_other_scripts_get_delete_rows() {
         let schema = settings_schema_from(
             "work",
-            None,
-            None,
-            None,
+            &PageContext::default(),
             &no_zoom(),
             &policy_state(true, &[("sponsorblock", true), ("darkmode", false)]),
         );
@@ -1726,7 +1997,10 @@ mod tests {
             .iter()
             .map(|a| a["action"].as_str().unwrap())
             .collect();
-        assert_eq!(actions, ["userscript:darkmode", "userscript-delete:darkmode"]);
+        assert_eq!(
+            actions,
+            ["userscript:darkmode", "userscript-delete:darkmode"]
+        );
         // sponsorblock must NOT also appear as a managed script row.
         assert!(
             !widgets.iter().any(|w| w["id"] == "script-sponsorblock"),
@@ -1741,9 +2015,7 @@ mod tests {
     fn the_catalog_offers_only_uninstalled_extensions() {
         let schema = settings_schema_from(
             "work",
-            None,
-            None,
-            None,
+            &PageContext::default(),
             &no_zoom(),
             &policy_state(true, &[("sponsorblock", true)]),
         );
@@ -1806,7 +2078,10 @@ mod tests {
         let row = item_row(&item);
         let wire = row.to_string();
         assert!(!wire.contains("hunter2"), "password leaked into a row");
-        assert!(!wire.contains("GEZDGNBVGY3TQOJQ"), "totp secret leaked into a row");
+        assert!(
+            !wire.contains("GEZDGNBVGY3TQOJQ"),
+            "totp secret leaked into a row"
+        );
         assert_eq!(row["title"], "github.com");
         assert_eq!(row["subtitle"], "octocat · Work");
         // ⏱ only where a secret actually exists — `rbw list` could not say.
@@ -1831,7 +2106,10 @@ mod tests {
         let script = fill_script("a\"b", "p\"; alert(1); //");
         assert!(script.contains(r#""a\"b""#));
         assert!(script.contains(r#""p\"; alert(1); //""#));
-        assert!(!script.contains("\"; alert(1); //\";"), "escaped out of the literal");
+        assert!(
+            !script.contains("\"; alert(1); //\";"),
+            "escaped out of the literal"
+        );
     }
 
     // `<` is escaped so an injected value can never open a tag if the script
@@ -1860,7 +2138,10 @@ mod tests {
             .iter()
             .find(|widget| widget["id"] == "add_password")
             .expect("the Add tab has a password field");
-        assert_eq!(password["secret"], true, "the password field must be masked");
+        assert_eq!(
+            password["secret"], true,
+            "the password field must be masked"
+        );
         assert_eq!(password["value"], "", "a schema must never carry a secret");
 
         // Notes is offered, seeded from the draft, and not a secret.
@@ -1871,13 +2152,8 @@ mod tests {
         assert_ne!(notes["secret"], true, "notes are not a secret");
 
         // Seeded from the page the user is looking at.
-        let named = |id: &str| {
-            widgets
-                .iter()
-                .find(|widget| widget["id"] == id)
-                .unwrap()["value"]
-                .clone()
-        };
+        let named =
+            |id: &str| widgets.iter().find(|widget| widget["id"] == id).unwrap()["value"].clone();
         assert_eq!(named("add_name"), "github.com");
         assert_eq!(named("add_uri"), "https://github.com");
         // The generator knobs round-trip through the schema.
@@ -1939,10 +2215,20 @@ mod tests {
     #[test]
     fn add_notes_round_trips_through_the_draft() {
         let mut state = PaneState::default();
-        absorb_draft(&mut state, &json!({"add_notes": "recovery codes in 1Password"}));
+        absorb_draft(
+            &mut state,
+            &json!({"add_notes": "recovery codes in 1Password"}),
+        );
         assert_eq!(state.add.notes, "recovery codes in 1Password");
         let schema = unlocked_schema(
-            &PaneState { tab: "add".to_string(), add: AddDraft { notes: "hi".to_string(), ..AddDraft::default() }, ..PaneState::default() },
+            &PaneState {
+                tab: "add".to_string(),
+                add: AddDraft {
+                    notes: "hi".to_string(),
+                    ..AddDraft::default()
+                },
+                ..PaneState::default()
+            },
             None,
             &json!({"state": "unlocked"}),
         );
@@ -1962,8 +2248,14 @@ mod tests {
     fn a_stale_agent_is_surfaced_with_a_restart_button() {
         let stale = json!({"state": "locked", "email": "you@example.com", "agent_stale": true});
         let wire = locked_schema(&stale).to_string();
-        assert!(wire.contains("restart_agent"), "no remedy offered for a stale agent");
-        assert!(wire.contains("re-locks"), "the cost of restarting must be stated");
+        assert!(
+            wire.contains("restart_agent"),
+            "no remedy offered for a stale agent"
+        );
+        assert!(
+            wire.contains("re-locks"),
+            "the cost of restarting must be stated"
+        );
         // Still an unlock form: restarting lands the user right back here.
         assert!(wire.contains("unlock_password"));
 
@@ -1971,10 +2263,17 @@ mod tests {
         let fresh = json!({"state": "locked", "email": "you@example.com", "agent_stale": false});
         assert!(!locked_schema(&fresh).to_string().contains("restart_agent"));
         // Absent field (an older `status`) is treated as healthy, not stale.
-        assert!(!locked_schema(&json!({"state": "locked"})).to_string().contains("restart_agent"));
+        assert!(
+            !locked_schema(&json!({"state": "locked"}))
+                .to_string()
+                .contains("restart_agent")
+        );
 
         // Tools tab surfaces it too, for a vault that went stale while unlocked.
-        let tools = PaneState { tab: "tools".to_string(), ..PaneState::default() };
+        let tools = PaneState {
+            tab: "tools".to_string(),
+            ..PaneState::default()
+        };
         let unlocked_stale = json!({"state": "unlocked", "item_count": 1107, "agent_stale": true});
         let wire = unlocked_schema(&tools, None, &unlocked_stale).to_string();
         assert!(wire.contains("restart_agent"));
@@ -1990,8 +2289,14 @@ mod tests {
         state.generate_length = 32;
         state.generate_no_symbols = true;
 
-        absorb_draft(&mut state, &json!({ "value": "fill", "host": "github.com" }));
-        assert_eq!(state.add.name, "github.com", "an absent field wiped the draft");
+        absorb_draft(
+            &mut state,
+            &json!({ "value": "fill", "host": "github.com" }),
+        );
+        assert_eq!(
+            state.add.name, "github.com",
+            "an absent field wiped the draft"
+        );
         assert_eq!(state.generate_length, 32);
         assert!(state.generate_no_symbols);
 
@@ -2006,7 +2311,10 @@ mod tests {
         assert!(!state.generate_no_symbols);
 
         absorb_draft(&mut state, &json!({"generate_length": ""}));
-        assert_eq!(state.generate_length, MAX_GENERATE_LENGTH, "a half-typed number wiped the setting");
+        assert_eq!(
+            state.generate_length, MAX_GENERATE_LENGTH,
+            "a half-typed number wiped the setting"
+        );
     }
 
     // The report the agent returns carries labels only. Rendering it cannot
@@ -2026,16 +2334,24 @@ mod tests {
         assert!(wire.contains("c (z)"));
 
         // A clean vault says so rather than rendering two empty headings.
-        let clean = json!(watchtower_widgets(&json!({"scanned": 9, "reused": [], "weak": []})))
-            .to_string();
+        let clean = json!(watchtower_widgets(
+            &json!({"scanned": 9, "reused": [], "weak": []})
+        ))
+        .to_string();
         assert!(clean.contains("No reused or weak passwords"));
         assert!(!clean.contains("Reused passwords ("));
     }
 
     #[test]
     fn query_values_are_percent_decoded() {
-        assert_eq!(query_value("host=example.com", "host").as_deref(), Some("example.com"));
-        assert_eq!(query_value("a=1&host=a%2Eb", "host").as_deref(), Some("a.b"));
+        assert_eq!(
+            query_value("host=example.com", "host").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            query_value("a=1&host=a%2Eb", "host").as_deref(),
+            Some("a.b")
+        );
         assert_eq!(query_value("a=1", "host"), None);
     }
 }

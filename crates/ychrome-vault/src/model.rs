@@ -421,10 +421,8 @@ impl Vault {
         let Ok(key) = self.cipher_key(cipher) else {
             return Vec::new();
         };
-        let decrypt = |enc: &Option<EncString>| {
-            enc.as_ref()
-                .and_then(|enc| key.decrypt_to_string(enc).ok())
-        };
+        let decrypt =
+            |enc: &Option<EncString>| enc.as_ref().and_then(|enc| key.decrypt_to_string(enc).ok());
         cipher
             .fido2
             .iter()
@@ -462,14 +460,14 @@ impl Vault {
     ) -> Result<crate::fido2::Fido2Assertion, Fido2AssertError> {
         let cipher = self.find(id).ok_or(Fido2AssertError::UnknownItem)?;
         let key = self.cipher_key(cipher)?;
-        let decrypt = |enc: &Option<EncString>| {
-            enc.as_ref().and_then(|enc| key.decrypt_to_string(enc).ok())
-        };
+        let decrypt =
+            |enc: &Option<EncString>| enc.as_ref().and_then(|enc| key.decrypt_to_string(enc).ok());
 
         let credential = match credential_id {
-            Some(wanted) => cipher.fido2.iter().find(|c| {
-                decrypt(&c.credential_id).as_deref() == Some(wanted)
-            }),
+            Some(wanted) => cipher
+                .fido2
+                .iter()
+                .find(|c| decrypt(&c.credential_id).as_deref() == Some(wanted)),
             None => cipher.fido2.first(),
         }
         .ok_or(Fido2AssertError::NoSuchPasskey)?;
@@ -584,7 +582,9 @@ impl Vault {
             }
         };
         let uris = match login.uri.as_deref().filter(|uri| !uri.is_empty()) {
-            Some(uri) => serde_json::json!([{ "uri": enc(uri)?, "match": serde_json::Value::Null }]),
+            Some(uri) => {
+                serde_json::json!([{ "uri": enc(uri)?, "match": serde_json::Value::Null }])
+            }
             None => serde_json::json!([]),
         };
         Ok(serde_json::json!({
@@ -630,9 +630,7 @@ impl Vault {
                 None => Ok(serde_json::Value::Null),
             }
         };
-        let b64url = |bytes: &[u8]| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-        };
+        let b64url = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
         // The RP references the credential by this handle; the userHandle is the
         // account id the RP maps back on a usernameless login — both base64url.
         let credential_id = b64url(&passkey.credential_id);
@@ -720,8 +718,9 @@ impl Vault {
             .ok_or_else(|| EditError::NoRawRecord(id.to_string()))?;
 
         let key = self.cipher_key(cipher)?;
-        let encrypt =
-            |value: &str| -> Result<Value, CryptoError> { Ok(json!(key.encrypt_string(value)?.to_string())) };
+        let encrypt = |value: &str| -> Result<Value, CryptoError> {
+            Ok(json!(key.encrypt_string(value)?.to_string()))
+        };
 
         let mut body = raw.clone();
         let revision = get_ci(&body, "revisionDate").cloned();
@@ -859,7 +858,8 @@ impl Vault {
         let cipher = self.find(id)?;
         let encrypted = get_ci(cipher.raw.as_object()?, "notes")?.as_str()?;
         let key = self.cipher_key(cipher).ok()?;
-        key.decrypt_to_string(&EncString::parse(encrypted).ok()?).ok()
+        key.decrypt_to_string(&EncString::parse(encrypted).ok()?)
+            .ok()
     }
 
     /// The current TOTP code for a specific item, with the seconds until it
@@ -923,10 +923,7 @@ fn set_ci(object: &mut JsonMap, key: &str, value: serde_json::Value) {
 ///
 /// The old ciphertext is reused exactly as the server sent it — re-encrypting
 /// it would need the plaintext, and history is not worth decrypting a secret.
-fn password_history_with_current(
-    raw: &JsonMap,
-    cipher: &RawCipher,
-) -> Option<serde_json::Value> {
+fn password_history_with_current(raw: &JsonMap, cipher: &RawCipher) -> Option<serde_json::Value> {
     let current = cipher.password.as_ref()?;
     let mut history: Vec<serde_json::Value> = get_ci(raw, "passwordHistory")
         .and_then(serde_json::Value::as_array)
@@ -1108,8 +1105,18 @@ mod tests {
         ];
         // WITHOUT the org key: the two org ciphers are unreadable, and the
         // diagnostic says exactly why. This is the 59-cipher gap in miniature.
-        let blind = Vault::new(user_key.clone(), HashMap::new(), ciphers.clone(), vec![], HashMap::new());
-        assert_eq!(blind.items().len(), 1, "only the user-key cipher is readable");
+        let blind = Vault::new(
+            user_key.clone(),
+            HashMap::new(),
+            ciphers.clone(),
+            vec![],
+            HashMap::new(),
+        );
+        assert_eq!(
+            blind.items().len(),
+            1,
+            "only the user-key cipher is readable"
+        );
         assert_eq!(
             blind.diagnose(),
             VaultDiagnostic {
@@ -1126,7 +1133,10 @@ mod tests {
         // WITH the org key: both org ciphers decrypt, including the one whose
         // item key is sealed under the org key rather than the user key.
         let mut org_keys = HashMap::new();
-        org_keys.insert("org1".to_string(), SymmetricKey::from_bytes(&org_bytes).unwrap());
+        org_keys.insert(
+            "org1".to_string(),
+            SymmetricKey::from_bytes(&org_bytes).unwrap(),
+        );
         let seeing = Vault::new(user_key, org_keys, ciphers, vec![], HashMap::new());
         let names: Vec<String> = seeing.items().into_iter().map(|item| item.name).collect();
         assert_eq!(names, ["GitHub", "Shared Login", "Shared Note"]);
@@ -1154,7 +1164,13 @@ mod tests {
     fn new_login_body_encrypts_every_field_and_reads_back() {
         let key_bytes = [0x5au8; 64];
         let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
-        let vault = Vault::new(user_key.clone(), HashMap::new(), vec![], vec![], HashMap::new());
+        let vault = Vault::new(
+            user_key.clone(),
+            HashMap::new(),
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
 
         let body = vault
             .new_login_body(&NewLogin {
@@ -1176,7 +1192,10 @@ mod tests {
         assert_eq!(decrypt(&body["name"]), "example.com");
         assert_eq!(decrypt(&body["login"]["username"]), "alice");
         assert_eq!(decrypt(&body["login"]["password"]), "hunter2");
-        assert_eq!(decrypt(&body["login"]["uris"][0]["uri"]), "https://example.com");
+        assert_eq!(
+            decrypt(&body["login"]["uris"][0]["uri"]),
+            "https://example.com"
+        );
         // Fields the user left out are null, not an encrypted empty string.
         assert!(body["login"]["totp"].is_null());
         assert!(body["notes"].is_null());
@@ -1184,7 +1203,10 @@ mod tests {
         // No plaintext anywhere in the serialized request.
         let wire = body.to_string();
         for secret in ["hunter2", "alice", "example.com"] {
-            assert!(!wire.contains(secret), "{secret} leaked into the request body");
+            assert!(
+                !wire.contains(secret),
+                "{secret} leaked into the request body"
+            );
         }
     }
 
@@ -1248,7 +1270,13 @@ mod tests {
             uris: vec![seal(key_bytes, "https://github.com")],
             ..Default::default()
         };
-        Vault::new(user_key, HashMap::new(), vec![cipher], vec![], HashMap::new())
+        Vault::new(
+            user_key,
+            HashMap::new(),
+            vec![cipher],
+            vec![],
+            HashMap::new(),
+        )
     }
 
     #[test]
@@ -1304,7 +1332,13 @@ mod tests {
             }],
             ..Default::default()
         };
-        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], vec![], HashMap::new());
+        let vault = Vault::new(
+            user_key,
+            HashMap::new(),
+            vec![cipher],
+            vec![],
+            HashMap::new(),
+        );
 
         // The badge is set without decrypting anything secret.
         assert!(vault.items()[0].has_passkey);
@@ -1326,7 +1360,10 @@ mod tests {
             !json.contains("SUPER-SECRET-PKCS8-PRIVATE-KEY"),
             "private key leaked into the listing: {json}"
         );
-        assert!(!json.contains("key_value") && !json.contains("user_handle"), "{json}");
+        assert!(
+            !json.contains("key_value") && !json.contains("user_handle"),
+            "{json}"
+        );
 
         // An unknown item yields no passkeys rather than panicking.
         assert!(vault.passkeys("nope").is_empty());
@@ -1467,7 +1504,9 @@ mod tests {
         let sig = Signature::from_der(&assertion.signature).unwrap();
         let mut message = assertion.authenticator_data.clone();
         message.extend_from_slice(&client_data_hash);
-        verifying.verify(&message, &sig).expect("stored key must sign a verifiable assertion");
+        verifying
+            .verify(&message, &sig)
+            .expect("stored key must sign a verifiable assertion");
     }
 
     // THE contract this whole struct exists for. `PUT /api/ciphers/{id}`
@@ -1503,12 +1542,26 @@ mod tests {
         // The password IS changed, and decrypts to the new value.
         let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
         let written = EncString::parse(body["login"]["password"].as_str().unwrap()).unwrap();
-        assert_eq!(user_key.decrypt_to_string(&written).unwrap(), "new-password");
+        assert_eq!(
+            user_key.decrypt_to_string(&written).unwrap(),
+            "new-password"
+        );
 
         // Server-managed keys never go back.
-        for key in ["id", "object", "revisionDate", "creationDate", "deletedDate",
-                    "collectionIds", "edit", "viewPassword"] {
-            assert!(body.get(key).is_none(), "{key} must be stripped from the update body");
+        for key in [
+            "id",
+            "object",
+            "revisionDate",
+            "creationDate",
+            "deletedDate",
+            "collectionIds",
+            "edit",
+            "viewPassword",
+        ] {
+            assert!(
+                body.get(key).is_none(),
+                "{key} must be stripped from the update body"
+            );
         }
         // ...except as the concurrency guard, which is how a stale client is
         // refused instead of clobbering a concurrent edit.
@@ -1525,20 +1578,35 @@ mod tests {
         let key_bytes = [0x5au8; 64];
         let vault = login_vault(&key_bytes);
         let body = vault
-            .edit_body("c1", &CipherEdit { password: Some("new".into()), ..Default::default() })
+            .edit_body(
+                "c1",
+                &CipherEdit {
+                    password: Some("new".into()),
+                    ..Default::default()
+                },
+            )
             .unwrap();
 
         let history = body["passwordHistory"].as_array().unwrap();
         assert_eq!(history.len(), 2, "old password prepended, prior entry kept");
         let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
         let remembered = EncString::parse(history[0]["password"].as_str().unwrap()).unwrap();
-        assert_eq!(user_key.decrypt_to_string(&remembered).unwrap(), "old-password");
+        assert_eq!(
+            user_key.decrypt_to_string(&remembered).unwrap(),
+            "old-password"
+        );
         assert!(history[0]["lastUsedDate"].as_str().unwrap().ends_with('Z'));
         assert_eq!(history[1]["password"], "2.older", "prior history survives");
 
         // An edit that does NOT touch the password leaves history exactly as-is.
         let renamed = vault
-            .edit_body("c1", &CipherEdit { name: Some("New Name".into()), ..Default::default() })
+            .edit_body(
+                "c1",
+                &CipherEdit {
+                    name: Some("New Name".into()),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert_eq!(renamed["passwordHistory"].as_array().unwrap().len(), 1);
     }
@@ -1549,7 +1617,8 @@ mod tests {
         let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
         let mut raw = raw_login_record();
         raw["passwordHistory"] = serde_json::json!(
-            (0..PASSWORD_HISTORY_LIMIT).map(|i| serde_json::json!({"password": format!("2.old{i}")}))
+            (0..PASSWORD_HISTORY_LIMIT)
+                .map(|i| serde_json::json!({"password": format!("2.old{i}")}))
                 .collect::<Vec<_>>()
         );
         let cipher = RawCipher {
@@ -1559,11 +1628,26 @@ mod tests {
             password: Some(seal(&key_bytes, "old-password")),
             ..Default::default()
         };
-        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], vec![], HashMap::new());
+        let vault = Vault::new(
+            user_key,
+            HashMap::new(),
+            vec![cipher],
+            vec![],
+            HashMap::new(),
+        );
         let body = vault
-            .edit_body("c1", &CipherEdit { password: Some("new".into()), ..Default::default() })
+            .edit_body(
+                "c1",
+                &CipherEdit {
+                    password: Some("new".into()),
+                    ..Default::default()
+                },
+            )
             .unwrap();
-        assert_eq!(body["passwordHistory"].as_array().unwrap().len(), PASSWORD_HISTORY_LIMIT);
+        assert_eq!(
+            body["passwordHistory"].as_array().unwrap().len(),
+            PASSWORD_HISTORY_LIMIT
+        );
     }
 
     // An edited field must be sealed under the key that `items()` will use to
@@ -1585,14 +1669,29 @@ mod tests {
             password: Some(seal(&item_bytes, "under-item-key")),
             ..Default::default()
         };
-        let vault = Vault::new(user_key.clone(), HashMap::new(), vec![cipher], vec![], HashMap::new());
+        let vault = Vault::new(
+            user_key.clone(),
+            HashMap::new(),
+            vec![cipher],
+            vec![],
+            HashMap::new(),
+        );
         let body = vault
-            .edit_body("c1", &CipherEdit { password: Some("rotated".into()), ..Default::default() })
+            .edit_body(
+                "c1",
+                &CipherEdit {
+                    password: Some("rotated".into()),
+                    ..Default::default()
+                },
+            )
             .unwrap();
 
         let written = EncString::parse(body["login"]["password"].as_str().unwrap()).unwrap();
         assert_eq!(item_key.decrypt_to_string(&written).unwrap(), "rotated");
-        assert!(user_key.decrypt_to_string(&written).is_err(), "must NOT be under the user key");
+        assert!(
+            user_key.decrypt_to_string(&written).is_err(),
+            "must NOT be under the user key"
+        );
         // The sealed item key rides back so the server keeps it.
         assert!(body["key"].is_string() || body.get("key").is_none());
     }
@@ -1617,15 +1716,30 @@ mod tests {
         };
         let mut org_keys = HashMap::new();
         org_keys.insert("org1".to_string(), org_key.clone());
-        let vault = Vault::new(user_key.clone(), org_keys, vec![cipher], vec![], HashMap::new());
+        let vault = Vault::new(
+            user_key.clone(),
+            org_keys,
+            vec![cipher],
+            vec![],
+            HashMap::new(),
+        );
 
         let body = vault
-            .edit_body("c1", &CipherEdit { name: Some("Renamed".into()), ..Default::default() })
+            .edit_body(
+                "c1",
+                &CipherEdit {
+                    name: Some("Renamed".into()),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         let written = EncString::parse(body["name"].as_str().unwrap()).unwrap();
         assert_eq!(org_key.decrypt_to_string(&written).unwrap(), "Renamed");
         assert!(user_key.decrypt_to_string(&written).is_err());
-        assert_eq!(body["organizationId"], "org1", "org ownership must survive the edit");
+        assert_eq!(
+            body["organizationId"], "org1",
+            "org ownership must survive the edit"
+        );
     }
 
     // Vaultwarden has drifted between PascalCase and camelCase. A patch must
@@ -1644,7 +1758,13 @@ mod tests {
             item_type: 1,
             ..Default::default()
         };
-        let vault = Vault::new(user_key.clone(), HashMap::new(), vec![cipher], vec![], HashMap::new());
+        let vault = Vault::new(
+            user_key.clone(),
+            HashMap::new(),
+            vec![cipher],
+            vec![],
+            HashMap::new(),
+        );
         let body = vault
             .edit_body(
                 "c1",
@@ -1658,9 +1778,21 @@ mod tests {
 
         let object = body.as_object().unwrap();
         // Exactly one key for each concept, and it is the camelCase one.
-        assert_eq!(object.keys().filter(|k| k.eq_ignore_ascii_case("name")).count(), 1);
+        assert_eq!(
+            object
+                .keys()
+                .filter(|k| k.eq_ignore_ascii_case("name"))
+                .count(),
+            1
+        );
         assert!(object.contains_key("name") && !object.contains_key("Name"));
-        assert_eq!(object.keys().filter(|k| k.eq_ignore_ascii_case("login")).count(), 1);
+        assert_eq!(
+            object
+                .keys()
+                .filter(|k| k.eq_ignore_ascii_case("login"))
+                .count(),
+            1
+        );
         assert!(object.contains_key("lastKnownRevisionDate"));
         assert!(!object.contains_key("Id") && !object.contains_key("RevisionDate"));
         // The un-patched PascalCase field is preserved as it came.
@@ -1668,7 +1800,13 @@ mod tests {
         let written = EncString::parse(body["name"].as_str().unwrap()).unwrap();
         assert_eq!(user_key.decrypt_to_string(&written).unwrap(), "Renamed");
         let login = body["login"].as_object().unwrap();
-        assert_eq!(login.keys().filter(|k| k.eq_ignore_ascii_case("username")).count(), 1);
+        assert_eq!(
+            login
+                .keys()
+                .filter(|k| k.eq_ignore_ascii_case("username"))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1677,10 +1815,22 @@ mod tests {
         let vault = login_vault(&key_bytes);
 
         // Clearing a field is not expressible — it must not silently encrypt "".
-        let empty = vault.edit_body("c1", &CipherEdit { notes: Some(String::new()), ..Default::default() });
+        let empty = vault.edit_body(
+            "c1",
+            &CipherEdit {
+                notes: Some(String::new()),
+                ..Default::default()
+            },
+        );
         assert!(matches!(empty, Err(EditError::EmptyValue)));
 
-        let unknown = vault.edit_body("nope", &CipherEdit { name: Some("x".into()), ..Default::default() });
+        let unknown = vault.edit_body(
+            "nope",
+            &CipherEdit {
+                name: Some("x".into()),
+                ..Default::default()
+            },
+        );
         assert!(matches!(unknown, Err(EditError::UnknownItem(_))));
 
         // A secure note (type 2) has no login fields.
@@ -1692,12 +1842,26 @@ mod tests {
         };
         let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
         let notes_vault = Vault::new(user_key, HashMap::new(), vec![note], vec![], HashMap::new());
-        let bad = notes_vault.edit_body("n1", &CipherEdit { password: Some("x".into()), ..Default::default() });
+        let bad = notes_vault.edit_body(
+            "n1",
+            &CipherEdit {
+                password: Some("x".into()),
+                ..Default::default()
+            },
+        );
         assert!(matches!(bad, Err(EditError::NotALogin(_))));
         // But its NOTES are editable.
-        assert!(notes_vault
-            .edit_body("n1", &CipherEdit { notes: Some("hello".into()), ..Default::default() })
-            .is_ok());
+        assert!(
+            notes_vault
+                .edit_body(
+                    "n1",
+                    &CipherEdit {
+                        notes: Some("hello".into()),
+                        ..Default::default()
+                    }
+                )
+                .is_ok()
+        );
     }
 
     // A cipher that never came from `sync` (no raw record) must fail loudly
@@ -1706,9 +1870,25 @@ mod tests {
     fn edit_body_refuses_a_cipher_with_no_raw_record() {
         let key_bytes = [0x5au8; 64];
         let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
-        let cipher = RawCipher { id: "c1".into(), item_type: 1, ..Default::default() };
-        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], vec![], HashMap::new());
-        let result = vault.edit_body("c1", &CipherEdit { name: Some("x".into()), ..Default::default() });
+        let cipher = RawCipher {
+            id: "c1".into(),
+            item_type: 1,
+            ..Default::default()
+        };
+        let vault = Vault::new(
+            user_key,
+            HashMap::new(),
+            vec![cipher],
+            vec![],
+            HashMap::new(),
+        );
+        let result = vault.edit_body(
+            "c1",
+            &CipherEdit {
+                name: Some("x".into()),
+                ..Default::default()
+            },
+        );
         assert!(matches!(result, Err(EditError::NoRawRecord(_))));
     }
 
@@ -1729,13 +1909,25 @@ mod tests {
             password: Some(seal(&key_bytes, "old-password")),
             ..Default::default()
         };
-        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], vec![], HashMap::new());
+        let vault = Vault::new(
+            user_key,
+            HashMap::new(),
+            vec![cipher],
+            vec![],
+            HashMap::new(),
+        );
         assert_eq!(vault.notes("c1").as_deref(), Some("remember me"));
         assert!(vault.notes("nope").is_none());
 
         // A password-only edit carries the SAME encrypted notes back.
         let body = vault
-            .edit_body("c1", &CipherEdit { password: Some("new".into()), ..Default::default() })
+            .edit_body(
+                "c1",
+                &CipherEdit {
+                    password: Some("new".into()),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         let carried = EncString::parse(body["notes"].as_str().unwrap()).unwrap();
         let key = SymmetricKey::from_bytes(&key_bytes).unwrap();
@@ -1747,13 +1939,22 @@ mod tests {
         let key_bytes = [0x5au8; 64];
         let vault = login_vault(&key_bytes);
         let body = vault
-            .edit_body("c1", &CipherEdit { uri: Some("https://example.com".into()), ..Default::default() })
+            .edit_body(
+                "c1",
+                &CipherEdit {
+                    uri: Some("https://example.com".into()),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         let uris = body["login"]["uris"].as_array().unwrap();
         assert_eq!(uris.len(), 1);
         let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
         let written = EncString::parse(uris[0]["uri"].as_str().unwrap()).unwrap();
-        assert_eq!(user_key.decrypt_to_string(&written).unwrap(), "https://example.com");
+        assert_eq!(
+            user_key.decrypt_to_string(&written).unwrap(),
+            "https://example.com"
+        );
     }
 
     // The timestamp goes into other clients' password history, so its shape is
@@ -1790,7 +1991,13 @@ mod tests {
             password: Some(seal(&item_bytes, "under-item-key")),
             ..Default::default()
         };
-        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], vec![], HashMap::new());
+        let vault = Vault::new(
+            user_key,
+            HashMap::new(),
+            vec![cipher],
+            vec![],
+            HashMap::new(),
+        );
         assert_eq!(vault.items()[0].name, "Sealed Item");
         assert_eq!(vault.password("c1").as_deref(), Some("under-item-key"));
     }

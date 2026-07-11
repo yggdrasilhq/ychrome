@@ -437,7 +437,10 @@ mod tests {
         let id = new_device_id();
         assert_eq!(id.len(), 36);
         let parts: Vec<&str> = id.split('-').collect();
-        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), vec![8, 4, 4, 4, 12]);
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12]
+        );
         assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
         assert_eq!(&parts[2][0..1], "4", "version nibble");
         assert_ne!(new_device_id(), new_device_id(), "ids are random");

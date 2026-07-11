@@ -110,7 +110,8 @@ pub fn serve(dir: &Path) -> Result<()> {
         // Bind fails on an existing path; a socket nobody answers on is stale
         // (the agent was killed). Removing it is the only way forward, and it
         // is safe precisely because the connect above proved it is dead.
-        std::fs::remove_file(&socket).with_context(|| format!("removing stale {}", socket.display()))?;
+        std::fs::remove_file(&socket)
+            .with_context(|| format!("removing stale {}", socket.display()))?;
     }
     let listener =
         UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
@@ -276,8 +277,14 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
                 });
             }
             items.sort_by(|a, b| {
-                (a.name.to_lowercase(), a.username.clone().unwrap_or_default())
-                    .cmp(&(b.name.to_lowercase(), b.username.clone().unwrap_or_default()))
+                (
+                    a.name.to_lowercase(),
+                    a.username.clone().unwrap_or_default(),
+                )
+                    .cmp(&(
+                        b.name.to_lowercase(),
+                        b.username.clone().unwrap_or_default(),
+                    ))
             });
             state.touch();
             Ok(json!({ "items": items }))
@@ -406,7 +413,8 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
                 let length = request
                     .get("length")
                     .and_then(Value::as_u64)
-                    .unwrap_or(crate::generator::DEFAULT_LENGTH as u64) as usize;
+                    .unwrap_or(crate::generator::DEFAULT_LENGTH as u64)
+                    as usize;
                 let symbols = request
                     .get("symbols")
                     .and_then(Value::as_bool)
@@ -463,7 +471,8 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
                 let length = request
                     .get("length")
                     .and_then(Value::as_u64)
-                    .unwrap_or(crate::generator::DEFAULT_LENGTH as u64) as usize;
+                    .unwrap_or(crate::generator::DEFAULT_LENGTH as u64)
+                    as usize;
                 let symbols = request
                     .get("symbols")
                     .and_then(Value::as_bool)
@@ -539,8 +548,8 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             let name = string("name").ok_or_else(|| anyhow!("restore needs a name"))?;
             let vault = unlocked(&state)?;
             let items = vault.trashed_items();
-            let item = find_by_name(&items, &name, string("user").as_deref())
-                .map_err(|candidates| {
+            let item =
+                find_by_name(&items, &name, string("user").as_deref()).map_err(|candidates| {
                     if candidates.is_empty() {
                         anyhow!(
                             "no trashed entry named {name:?} \
@@ -649,7 +658,8 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             unlocked(&state)?;
             let rp_id = string("rp_id").ok_or_else(|| anyhow!("fido2-create needs an rp_id"))?;
             let user_id = b64_standard_or_url(
-                &string("user_id_b64").ok_or_else(|| anyhow!("fido2-create needs a user_id_b64"))?,
+                &string("user_id_b64")
+                    .ok_or_else(|| anyhow!("fido2-create needs a user_id_b64"))?,
             )
             .ok_or_else(|| anyhow!("user_id_b64 did not base64-decode"))?;
 
@@ -684,7 +694,8 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             let length = request
                 .get("length")
                 .and_then(Value::as_u64)
-                .unwrap_or(crate::generator::DEFAULT_LENGTH as u64) as usize;
+                .unwrap_or(crate::generator::DEFAULT_LENGTH as u64)
+                as usize;
             let symbols = request
                 .get("symbols")
                 .and_then(Value::as_bool)
@@ -808,8 +819,12 @@ pub fn is_running(dir: &Path) -> bool {
 /// Send one request to a running agent. Does not start one.
 pub fn request(dir: &Path, request: &Value) -> Result<Value> {
     let socket = socket_path(dir);
-    let stream = UnixStream::connect(&socket)
-        .with_context(|| format!("no agent on {} — start one with `ychrome-vault unlock`", socket.display()))?;
+    let stream = UnixStream::connect(&socket).with_context(|| {
+        format!(
+            "no agent on {} — start one with `ychrome-vault unlock`",
+            socket.display()
+        )
+    })?;
     stream.set_read_timeout(Some(Duration::from_secs(120)))?;
     let mut writer = stream.try_clone()?;
     writeln!(writer, "{request}")?;
@@ -941,7 +956,10 @@ mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ychrome-vault-agent-test-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "ychrome-vault-agent-test-{tag}-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1145,8 +1163,7 @@ mod tests {
         // as the base64 PKCS#8 that a decrypted `keyValue` decodes to.
         let signing = SigningKey::from_bytes(&[0x22u8; 32].into()).unwrap();
         let pkcs8 = signing.to_pkcs8_der().unwrap();
-        let key_value_b64 =
-            base64::engine::general_purpose::STANDARD.encode(pkcs8.as_bytes());
+        let key_value_b64 = base64::engine::general_purpose::STANDARD.encode(pkcs8.as_bytes());
 
         let key_bytes = [0x5au8; 64];
         let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
@@ -1226,7 +1243,9 @@ mod tests {
         let sig = Signature::from_der(&signature).unwrap();
         let mut signed = authenticator_data.clone();
         signed.extend_from_slice(&client_data_hash);
-        verifying.verify(&signed, &sig).expect("assertion must verify");
+        verifying
+            .verify(&signed, &sig)
+            .expect("assertion must verify");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1241,7 +1260,10 @@ mod tests {
         let live = dispatch(&json!({"op": "list"}), &state).unwrap();
         let live = live["items"].as_array().unwrap();
         assert_eq!(live.len(), 2);
-        assert!(live.iter().all(|item| item["name"] != "deleted-site.example"));
+        assert!(
+            live.iter()
+                .all(|item| item["name"] != "deleted-site.example")
+        );
 
         // ...but `list --trashed` shows exactly it, secret-free like any list.
         let trashed = dispatch(&json!({"op": "list", "trashed": true}), &state).unwrap();

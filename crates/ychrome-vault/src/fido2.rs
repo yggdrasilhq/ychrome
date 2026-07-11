@@ -128,7 +128,9 @@ pub struct GeneratedCredential {
 ///
 /// `rng` is the OS CSPRNG at the call site — passed in so the crypto module
 /// stays deterministic-testable and does not reach for global randomness.
-pub fn generate_credential(rng: &mut (impl rand::RngCore + rand::CryptoRng)) -> GeneratedCredential {
+pub fn generate_credential(
+    rng: &mut (impl rand::RngCore + rand::CryptoRng),
+) -> GeneratedCredential {
     let signing = SigningKey::random(rng);
     let pkcs8 = signing
         .to_pkcs8_der()
@@ -184,9 +186,14 @@ mod tests {
         let rp_id = "example.com";
         let client_data_hash = Sha256::digest(b"clientDataJSON goes here").to_vec();
 
-        let assertion =
-            sign_assertion(&pkcs8, rp_id, &client_data_hash, 7, UserPresence::granted(true))
-                .unwrap();
+        let assertion = sign_assertion(
+            &pkcs8,
+            rp_id,
+            &client_data_hash,
+            7,
+            UserPresence::granted(true),
+        )
+        .unwrap();
 
         // authenticatorData is byte-exact: rpIdHash ‖ flags ‖ signCount.
         let ad = &assertion.authenticator_data;
@@ -202,7 +209,9 @@ mod tests {
         let sig = Signature::from_der(&assertion.signature).unwrap();
         let mut message = assertion.authenticator_data.clone();
         message.extend_from_slice(&client_data_hash);
-        verifying.verify(&message, &sig).expect("assertion must verify");
+        verifying
+            .verify(&message, &sig)
+            .expect("assertion must verify");
     }
 
     #[test]
@@ -215,15 +224,27 @@ mod tests {
     #[test]
     fn a_non_32_byte_client_data_hash_is_refused() {
         let (_, pkcs8) = fixed_key();
-        let err = sign_assertion(&pkcs8, "example.com", &[0u8; 16], 0, UserPresence::granted(true))
-            .unwrap_err();
+        let err = sign_assertion(
+            &pkcs8,
+            "example.com",
+            &[0u8; 16],
+            0,
+            UserPresence::granted(true),
+        )
+        .unwrap_err();
         assert!(matches!(err, Fido2Error::BadClientDataHash(16)));
     }
 
     #[test]
     fn a_garbage_private_key_is_refused() {
-        let err = sign_assertion(&[1, 2, 3], "example.com", &[0u8; 32], 0, UserPresence::granted(true))
-            .unwrap_err();
+        let err = sign_assertion(
+            &[1, 2, 3],
+            "example.com",
+            &[0u8; 32],
+            0,
+            UserPresence::granted(true),
+        )
+        .unwrap_err();
         assert!(matches!(err, Fido2Error::BadPrivateKey));
     }
 
@@ -235,7 +256,10 @@ mod tests {
         // 5-entry map, then the fixed ES256/P-256 header, then two 32-byte
         // coordinate byte strings — 77 bytes total.
         assert_eq!(cose.len(), 77);
-        assert_eq!(&cose[0..8], &[0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21]);
+        assert_eq!(
+            &cose[0..8],
+            &[0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21]
+        );
         assert_eq!(&cose[8..10], &[0x58, 0x20]); // -2: bytes(32)
         assert_eq!(&cose[42..45], &[0x22, 0x58, 0x20]); // -3: bytes(32)
 

@@ -174,8 +174,14 @@ mod tests {
 
     #[test]
     fn uri_host_extracts_only_web_hosts() {
-        assert_eq!(uri_host("https://Example.com/login?a=1").as_deref(), Some("example.com"));
-        assert_eq!(uri_host("http://user:pw@example.com:8443/x").as_deref(), Some("example.com"));
+        assert_eq!(
+            uri_host("https://Example.com/login?a=1").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            uri_host("http://user:pw@example.com:8443/x").as_deref(),
+            Some("example.com")
+        );
         assert_eq!(uri_host("example.com").as_deref(), Some("example.com"));
         assert_eq!(uri_host("android://com.example"), None);
         assert_eq!(uri_host("https://"), None);
@@ -194,8 +200,14 @@ mod tests {
             ("EXAMPLE.com", "example.com"),
         ] {
             let entry = item(name, &[]);
-            assert!(item_auto_matches_host(&entry, host), "auto: {name} / {host}");
-            assert!(item_applies_to_host(&entry, host), "applies: {name} / {host}");
+            assert!(
+                item_auto_matches_host(&entry, host),
+                "auto: {name} / {host}"
+            );
+            assert!(
+                item_applies_to_host(&entry, host),
+                "applies: {name} / {host}"
+            );
         }
         let base = item("gour.top", &[]);
         assert!(item_applies_to_host(&base, "chat.example.com"));
@@ -228,8 +240,7 @@ mod tests {
         abe.username = Some("abe".to_string());
         let items = vec![zed, abe];
         assert_eq!(
-            auto_match_for_host(&items, "example.com")
-                .and_then(|i| i.username.as_deref()),
+            auto_match_for_host(&items, "example.com").and_then(|i| i.username.as_deref()),
             Some("abe")
         );
 
@@ -249,7 +260,11 @@ mod tests {
         );
         // "git" is a substring of both — ambiguous, and the candidates come back.
         assert_eq!(find_by_name(&items, "git", None).unwrap_err().len(), 2);
-        assert!(find_by_name(&items, "nothing", None).unwrap_err().is_empty());
+        assert!(
+            find_by_name(&items, "nothing", None)
+                .unwrap_err()
+                .is_empty()
+        );
     }
 
     #[test]

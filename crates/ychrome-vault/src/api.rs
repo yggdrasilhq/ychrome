@@ -283,8 +283,11 @@ fn parse_sync(value: &serde_json::Value) -> SyncResponse {
     // Without these, every organization cipher is undecryptable — which is
     // exactly how 59 of them silently vanished from the item list.
     let profile = get_ci(value, "profile");
-    let private_key = profile
-        .and_then(|profile| EncString::parse_opt(get_str(profile, "privateKey")).ok().flatten());
+    let private_key = profile.and_then(|profile| {
+        EncString::parse_opt(get_str(profile, "privateKey"))
+            .ok()
+            .flatten()
+    });
     let mut organization_keys = HashMap::new();
     if let Some(profile) = profile {
         for organization in get_array(profile, "organizations") {
@@ -447,12 +450,15 @@ fn get_ci<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
 }
 
 fn get_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-    get_ci(value, key).and_then(Value::as_str).filter(|s| !s.is_empty())
+    get_ci(value, key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
 }
 
 fn get_u64(value: &Value, key: &str) -> Option<u64> {
     let v = get_ci(value, key)?;
-    v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
 fn get_array<'a>(value: &'a Value, key: &str) -> Vec<&'a Value> {

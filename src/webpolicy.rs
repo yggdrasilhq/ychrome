@@ -59,6 +59,11 @@ pub struct Policy {
     /// directory sorted by filename. Deterministic: the same host state always
     /// produces the same order.
     pub userscripts: Vec<String>,
+    /// The UA the surface identifies as; `None` leaves WebKitGTK's default,
+    /// which UA-allowlisting edges refuse. Owned by [`crate::useragent`] and
+    /// carried here because /policy is the one channel the GUI applies at
+    /// webview creation, which is the only moment a UA can be set.
+    pub user_agent: Option<String>,
 }
 
 impl Policy {
@@ -66,6 +71,7 @@ impl Policy {
         json!({
             "adblock_rules": self.adblock_rules,
             "userscripts": self.userscripts,
+            "user_agent": self.user_agent,
         })
     }
 }
@@ -145,6 +151,7 @@ pub fn policy(profile: &str) -> Policy {
     Policy {
         adblock_rules,
         userscripts,
+        user_agent: crate::useragent::effective(),
     }
 }
 
@@ -170,6 +177,8 @@ pub fn policy_version(profile: &str) -> String {
         adblock_enabled(&config),
         adblock_profile_disabled(&config, profile)
     ));
+    // Same reason: the UA is a decision, not a file the GUI could stat.
+    manifest.push_str(&crate::useragent::stamp());
     if let Ok(rules) = rules_path() {
         stamp(&mut manifest, &rules);
     }
@@ -445,9 +454,11 @@ mod tests {
         let policy = Policy {
             adblock_rules: Some("[]".to_string()),
             userscripts: vec!["x".to_string()],
+            user_agent: Some("UA/1".to_string()),
         };
         let value = policy.to_json();
         assert_eq!(value["adblock_rules"], "[]");
         assert_eq!(value["userscripts"][0], "x");
+        assert_eq!(value["user_agent"], "UA/1");
     }
 }

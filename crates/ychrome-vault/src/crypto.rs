@@ -130,9 +130,13 @@ impl MasterKey {
                 // Bitwarden salts Argon2id with SHA-256(email), and its
                 // "memory" is MiB where argon2 wants KiB.
                 let argon_salt = Sha256::digest(salt.as_bytes());
-                let params =
-                    argon2::Params::new(memory_mib.saturating_mul(1024), iterations, parallelism, Some(32))
-                        .map_err(|error| CryptoError::Argon2(error.to_string()))?;
+                let params = argon2::Params::new(
+                    memory_mib.saturating_mul(1024),
+                    iterations,
+                    parallelism,
+                    Some(32),
+                )
+                .map_err(|error| CryptoError::Argon2(error.to_string()))?;
                 let argon = argon2::Argon2::new(
                     argon2::Algorithm::Argon2id,
                     argon2::Version::V0x13,
@@ -158,7 +162,8 @@ impl MasterKey {
     /// used in expand-only mode (PRK = master key), with the fixed info labels
     /// Bitwarden uses.
     pub fn stretch(&self) -> SymmetricKey {
-        let hkdf = Hkdf::<Sha256>::from_prk(&self.0[..]).expect("master key is 32 bytes >= HashLen");
+        let hkdf =
+            Hkdf::<Sha256>::from_prk(&self.0[..]).expect("master key is 32 bytes >= HashLen");
         let mut enc = Zeroizing::new([0u8; 32]);
         let mut mac = Zeroizing::new([0u8; 32]);
         hkdf.expand(b"enc", enc.as_mut_slice())
@@ -195,7 +200,8 @@ impl SymmetricKey {
     /// Decrypt an [`EncString`] to raw bytes with encrypt-then-MAC checking.
     pub fn decrypt(&self, enc: &EncString) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
         // Encrypt-then-MAC: authenticate iv||ct BEFORE touching the cipher.
-        let mut mac = HmacSha256::new_from_slice(&self.mac[..]).expect("HMAC accepts any key length");
+        let mut mac =
+            HmacSha256::new_from_slice(&self.mac[..]).expect("HMAC accepts any key length");
         mac.update(&enc.iv);
         mac.update(&enc.ct);
         let expected = mac.finalize().into_bytes();
@@ -240,7 +246,8 @@ impl SymmetricKey {
     ) -> Result<EncString, CryptoError> {
         let ct = Aes256CbcEnc::new((&self.enc_arr()).into(), (&iv).into())
             .encrypt_padded_vec_mut::<Pkcs7>(plaintext);
-        let mut mac = HmacSha256::new_from_slice(&self.mac[..]).expect("HMAC accepts any key length");
+        let mut mac =
+            HmacSha256::new_from_slice(&self.mac[..]).expect("HMAC accepts any key length");
         mac.update(&iv);
         mac.update(&ct);
         Ok(EncString {
@@ -423,8 +430,7 @@ mod tests {
     /// AES-256-CBC + HMAC-SHA256 over `"s3cret!"`, key = 64 × `0x5a`,
     /// iv = 16 × `0x24`. Captured once from a verified run; a change here means
     /// the wire format moved.
-    const PINNED_ENCRYPT_VECTOR: &str =
-        "2.JCQkJCQkJCQkJCQkJCQkJA==|m2JG1xRlopnafzGD7/heTA==|docRQwq1qGqe7hMmsMIwB+Ak6B6joaSFE/AaR2kxDYY=";
+    const PINNED_ENCRYPT_VECTOR: &str = "2.JCQkJCQkJCQkJCQkJCQkJA==|m2JG1xRlopnafzGD7/heTA==|docRQwq1qGqe7hMmsMIwB+Ak6B6joaSFE/AaR2kxDYY=";
 
     // An organization's symmetric key arrives sealed to the user's PUBLIC key
     // as a type-4 (RSA-OAEP-SHA1) EncString. Both fixtures were produced by
@@ -538,7 +544,10 @@ mod tests {
         let mine = SymmetricKey::from_bytes(&[0x01u8; 64]).unwrap();
         let theirs = SymmetricKey::from_bytes(&[0x02u8; 64]).unwrap();
         let enc = mine.encrypt_string("mine").unwrap();
-        assert!(matches!(theirs.decrypt(&enc), Err(CryptoError::MacMismatch)));
+        assert!(matches!(
+            theirs.decrypt(&enc),
+            Err(CryptoError::MacMismatch)
+        ));
     }
 
     // RFC 5869 Appendix A.2 uses HKDF-SHA256 with extract+expand; Bitwarden uses
@@ -551,7 +560,10 @@ mod tests {
         let b = mk.stretch();
         assert_eq!(*a.enc, *b.enc, "stretch must be deterministic");
         assert_eq!(*a.mac, *b.mac);
-        assert_ne!(*a.enc, *a.mac, "enc and mac come from different info labels");
+        assert_ne!(
+            *a.enc, *a.mac,
+            "enc and mac come from different info labels"
+        );
     }
 
     // Round-trip: encrypt with the RustCrypto primitives exactly as a Bitwarden
@@ -580,21 +592,35 @@ mod tests {
         m.update(&ct);
         let mac = m.finalize().into_bytes().to_vec();
 
-        let encoded = format!("2.{}|{}|{}", B64.encode(iv), B64.encode(&ct), B64.encode(&mac));
+        let encoded = format!(
+            "2.{}|{}|{}",
+            B64.encode(iv),
+            B64.encode(&ct),
+            B64.encode(&mac)
+        );
         let parsed = EncString::parse(&encoded).unwrap();
-        assert_eq!(key.decrypt_to_string(&parsed).unwrap(), "correct horse battery staple");
+        assert_eq!(
+            key.decrypt_to_string(&parsed).unwrap(),
+            "correct horse battery staple"
+        );
 
         // Wrong key rejected by MAC, not by padding — no oracle.
         let wrong = SymmetricKey {
             enc: Zeroizing::new([0x11; 32]),
             mac: Zeroizing::new([0x99; 32]),
         };
-        assert!(matches!(wrong.decrypt(&parsed), Err(CryptoError::MacMismatch)));
+        assert!(matches!(
+            wrong.decrypt(&parsed),
+            Err(CryptoError::MacMismatch)
+        ));
 
         // A tampered MAC byte is rejected.
         let mut tampered = parsed.clone();
         tampered.mac[0] ^= 0x01;
-        assert!(matches!(key.decrypt(&tampered), Err(CryptoError::MacMismatch)));
+        assert!(matches!(
+            key.decrypt(&tampered),
+            Err(CryptoError::MacMismatch)
+        ));
     }
 
     // PBKDF2-HMAC-SHA256 known-answer (widely published vector:
@@ -623,17 +649,28 @@ mod tests {
 
     #[test]
     fn password_hash_is_stable() {
-        let mk = MasterKey::derive("hunter2", "User@Example.com ", Kdf::Pbkdf2 { iterations: 100_000 })
-            .unwrap();
+        let mk = MasterKey::derive(
+            "hunter2",
+            "User@Example.com ",
+            Kdf::Pbkdf2 {
+                iterations: 100_000,
+            },
+        )
+        .unwrap();
         // Same inputs -> same hash; different password -> different hash.
         let a = mk.password_hash_b64("hunter2");
         let b = mk.password_hash_b64("hunter2");
         assert_eq!(a, b);
         assert_ne!(a, mk.password_hash_b64("hunter3"));
         // Email is normalized: trailing space + case must not matter.
-        let mk2 =
-            MasterKey::derive("hunter2", "user@example.com", Kdf::Pbkdf2 { iterations: 100_000 })
-                .unwrap();
+        let mk2 = MasterKey::derive(
+            "hunter2",
+            "user@example.com",
+            Kdf::Pbkdf2 {
+                iterations: 100_000,
+            },
+        )
+        .unwrap();
         assert_eq!(a, mk2.password_hash_b64("hunter2"));
     }
 }
