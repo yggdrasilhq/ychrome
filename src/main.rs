@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+mod extensions;
 mod manifest;
 mod passkey;
 mod sidebar;
