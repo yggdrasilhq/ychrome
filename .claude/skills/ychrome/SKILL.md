@@ -247,7 +247,29 @@ GUI's webview, so we serve the *effective* policy and yggterm applies it:
 - An adblock RULESET change needs a yggterm restart (WebKit compiles the filter
   once per GUI process). Toggling it off, and every userscript change, take
   effect on the next surface (re)create — the pane's "Reload surface now" button
-  returns `{"eval": "location.reload()"}`.
+  returns `{"reload_surface": true}`, NOT `eval: location.reload()`: a content
+  filter and its userscripts bind to the WEBVIEW at creation, so an in-page reload
+  leaves them attached. Only destroy-and-recreate applies a new policy.
+
+## Per-site zoom (`src/webzoom.rs`) — the settings pane's "This site" row
+
+yggterm has one global zoom; a per-site number is OURS, host-resident in
+`~/.yggterm/web-zoom.json` (`{sites:{host:percent}}`, host-global across
+profiles — zoom is readability, not identity).
+
+- `declare` carries `app_name` ("Ychrome" — labels the main zoom control "Ychrome
+  Global Zoom") and `zoom_version` (a change-detector stamp over the map, the same
+  trick as `policy_version`, a SEPARATE stamp so a zoom edit never drags the
+  ruleset over the wire).
+- `GET /zoom` → `{sites:{host:percent}}`. yggterm does the host match itself
+  (longest-suffix, so `youtube.com` covers `music.youtube.com`; a bare TLD never
+  matches). `webzoom::zoom_for_host` is the CLI/test twin of yggterm's matcher —
+  keep them in step.
+- The pane's "This site" row (`−`/`+`/`Reset`) steps the override from the live
+  `values.zoom` the GUI injects, and the action reply sets `refetch_zoom: true` so
+  the change reaches the live page at once (the zoom analogue of
+  `reload_surface`). `Reset` clears the override so the site falls back to the
+  global — it never persists "same as global".
 
 ## Still open
 - **`restore`** (`PUT /api/ciphers/{id}/restore`) — `rm` has no undo, and because
