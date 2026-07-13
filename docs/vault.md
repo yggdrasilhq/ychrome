@@ -100,7 +100,7 @@ called "Amazon" never matched `amazon.com`.)
 
 - **Loose — `suggest`.** Exact host, its `www.` twin, or a base-domain suffix.
   Used to float rows to the top of the sidebar; a human then clicks one. An
-  entry for `gour.top` is offered on `chat.example.com`.
+  entry for `example.com` is offered on `chat.example.com`.
 - **Strict — `match`.** Exact host or its `www.` twin only. Used by the auto
   paths (password fill, TOTP), which commit a secret to a page with nobody
   confirming the choice. A base-domain entry must **never** auto-fill a

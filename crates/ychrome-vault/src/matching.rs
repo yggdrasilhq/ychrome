@@ -4,7 +4,7 @@
 //! to live in `yggterm-shell`:
 //!
 //! * [`item_applies_to_host`] — LOOSE. It only *suggests* rows; a human then
-//!   picks one. Base-domain suffixes count (an entry for `gour.top` is offered
+//!   picks one. Base-domain suffixes count (an entry for `example.com` is offered
 //!   on `chat.example.com`).
 //! * [`item_auto_matches_host`] — STRICT. The auto paths (password fill, TOTP)
 //!   commit a secret to a page with nobody confirming the choice, so a
@@ -44,7 +44,7 @@ fn normalize_host(host: &str) -> String {
 }
 
 /// Loose: exact host, its `www.`-stripped twin, that twin re-prefixed with
-/// `www.`, or a base-domain suffix (`gour.top` labels `chat.example.com`).
+/// `www.`, or a base-domain suffix (`example.com` labels `chat.example.com`).
 ///
 /// The suffix test strips `www.` from BOTH sides, so a stored URI of
 /// `https://www.amazon.com/…` still suggests itself on `smile.amazon.com`. The
@@ -209,7 +209,7 @@ mod tests {
                 "applies: {name} / {host}"
             );
         }
-        let base = item("gour.top", &[]);
+        let base = item("example.com", &[]);
         assert!(item_applies_to_host(&base, "chat.example.com"));
         assert!(!item_auto_matches_host(&base, "chat.example.com"));
 

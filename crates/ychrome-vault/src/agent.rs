@@ -1033,7 +1033,7 @@ mod tests {
             RawCipher {
                 id: "gt".to_string(),
                 item_type: 1,
-                name: enc("gour.top"),
+                name: enc("ygg.example"),
                 username: enc("avikalpa"),
                 password: enc("hunter2"),
                 ..Default::default()
@@ -1085,7 +1085,7 @@ mod tests {
         // Metadata must never carry the secret itself.
         assert!(items[0].get("password").is_none());
 
-        let query = dispatch(&json!({"op": "list", "query": "GOUR"}), &state).unwrap();
+        let query = dispatch(&json!({"op": "list", "query": "YGG"}), &state).unwrap();
         assert_eq!(query["items"].as_array().unwrap().len(), 1);
 
         let got = dispatch(&json!({"op": "get", "name": "github"}), &state).unwrap();
@@ -1094,18 +1094,18 @@ mod tests {
 
         let totp = dispatch(&json!({"op": "totp", "name": "GitHub"}), &state).unwrap();
         assert_eq!(totp["code"].as_str().unwrap().len(), 6);
-        assert!(dispatch(&json!({"op": "totp", "name": "gour.top"}), &state).is_err());
+        assert!(dispatch(&json!({"op": "totp", "name": "ygg.example"}), &state).is_err());
 
         // Strict rule: the github URI auto-matches its own host...
         let matched = dispatch(&json!({"op": "match", "host": "github.com"}), &state).unwrap();
         assert_eq!(matched["entry"]["password"], "s3cret!");
         // ...but a base-domain entry never auto-fills a subdomain.
-        assert!(dispatch(&json!({"op": "match", "host": "chat.example.com"}), &state).is_err());
+        assert!(dispatch(&json!({"op": "match", "host": "chat.ygg.example"}), &state).is_err());
         // Loose rule: the sidebar still suggests it there, secret-free.
-        let suggested = dispatch(&json!({"op": "suggest", "host": "chat.example.com"}), &state).unwrap();
+        let suggested = dispatch(&json!({"op": "suggest", "host": "chat.ygg.example"}), &state).unwrap();
         let suggested = suggested["items"].as_array().unwrap();
         assert_eq!(suggested.len(), 1);
-        assert_eq!(suggested[0]["name"], "gour.top");
+        assert_eq!(suggested[0]["name"], "ygg.example");
         assert!(suggested[0].get("password").is_none());
 
         assert!(dispatch(&json!({"op": "get", "name": "nope"}), &state).is_err());
@@ -1140,7 +1140,7 @@ mod tests {
         );
 
         // An item with no passkey answers with an empty list, not an error.
-        let none = dispatch(&json!({"op": "passkeys", "name": "gour.top"}), &state).unwrap();
+        let none = dispatch(&json!({"op": "passkeys", "name": "ygg.example"}), &state).unwrap();
         assert!(none["passkeys"].as_array().unwrap().is_empty());
     }
 
