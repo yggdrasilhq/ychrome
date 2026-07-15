@@ -1,0 +1,43 @@
+name: Vouch check
+
+# Trust gate (github.com/mitchellh/vouch). Currently PERMISSIVE:
+# require-vouch is false, so only explicitly denounced users are
+# closed/locked. Flip require-vouch to true to hard-gate on vouching
+# when traffic warrants it.
+
+on:
+  issues:
+    types: [opened, reopened]
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  check-issue:
+    if: github.event_name == 'issues'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: mitchellh/vouch/action/check-issue@v1
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          require-vouch: false
+          auto-close: true
+          auto-lock: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  check-pr:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: mitchellh/vouch/action/check-pr@v1
+        with:
+          pr-number: ${{ github.event.pull_request.number }}
+          require-vouch: false
+          auto-close: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
