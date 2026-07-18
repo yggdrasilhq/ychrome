@@ -317,6 +317,37 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             state.touch();
             Ok(json!({ "notes": notes, "name": name }))
         }
+        // The RAW TOTP secret, decrypted but not parsed — recovers a value a
+        // user mis-stored in the authenticator slot (which `totp` rejects).
+        "totp-secret" => {
+            let name = string("name").ok_or_else(|| anyhow!("totp-secret needs a name"))?;
+            let vault = unlocked(&state)?;
+            let items = vault.items();
+            let item = resolve(&items, &name, string("user").as_deref())?;
+            let secret = vault
+                .totp_secret(&item.id)
+                .ok_or_else(|| anyhow!("{} has no authenticator secret", item.name))?;
+            let name = item.name.clone();
+            state.touch();
+            Ok(json!({ "totp_secret": secret, "name": name }))
+        }
+        // Custom fields also live only in the raw record (like notes), so this
+        // is the sole read that surfaces a hidden/text field's value.
+        "fields" => {
+            let name = string("name").ok_or_else(|| anyhow!("fields needs a name"))?;
+            let vault = unlocked(&state)?;
+            let items = vault.items();
+            let item = resolve(&items, &name, string("user").as_deref())?;
+            let fields: Vec<Value> = vault
+                .fields(&item.id)
+                .into_iter()
+                .map(|(name, value)| json!({ "name": name, "value": value }))
+                .collect();
+            let raw_field_count = vault.raw_field_count(&item.id);
+            let name = item.name.clone();
+            state.touch();
+            Ok(json!({ "fields": fields, "name": name, "raw_field_count": raw_field_count }))
+        }
         "totp" => {
             let name = string("name").ok_or_else(|| anyhow!("totp needs a name"))?;
             let vault = unlocked(&state)?;
@@ -472,6 +503,10 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
                 username: string("set_user"),
                 password: password.clone(),
                 totp: string("totp"),
+                clear_totp: request
+                    .get("clear_totp")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 uri: string("uri"),
                 notes: string("notes"),
                 folder_id,
