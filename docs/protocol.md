@@ -156,11 +156,14 @@ An agent can open a contributed pane without clicking:
 Implementation: `src/sidebar.rs`. Widget vocabulary and the GUI side:
 `yggterm/.agents/skills/libyggterm-surfaces/SKILL.md`.
 
-## Command envelope on ping replies — SPEC agreed 2026-07-18, NOT BUILT
+## Command envelope on ping replies — BUILT 2026-07-18 (`src/daemon.rs`)
 
 The app→GUI ingress primitive (design: `docs/host-daemon.md`; normative
-platform copy: yggterm's `libyggterm-surfaces` SKILL). Wire shape from the
-app's side:
+platform copy: yggterm's `libyggterm-surfaces` SKILL). Served by the host
+daemon: each anchored session's control endpoint answers `GET /ping` (which,
+before the daemon, ychrome did not serve at all — liveness rode the OSC
+re-declare), and the daemon drains that session's routing queue on the reply.
+Wire shape from the app's side:
 
 - The GUI pings `GET <control>/ping?session=<env_id>&ack=<batch_id>`. The
   `session` param names which session the ping is about (the env id our

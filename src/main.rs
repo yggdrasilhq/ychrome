@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+mod daemon;
 mod extensions;
 mod manifest;
 mod passkey;
@@ -53,6 +54,11 @@ struct Args {
     /// Window title (default: derived from the URL)
     #[arg(long)]
     title: Option<String>,
+
+    /// Anchor a NEW surface in this terminal even when a matching surface is
+    /// already open elsewhere (the default is to route the url into that one).
+    #[arg(long)]
+    here: bool,
 }
 
 struct Tunnel {
@@ -220,26 +226,29 @@ fn drive_surface(
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     // ychrome CONTRIBUTES its vault and settings panes rather than yggterm
-    // hardcoding them. A failure here must never take the browser down: the
-    // surface is the product, the sidebar is an extra.
+    // hardcoding them, and the HOST DAEMON now serves that contribution's
+    // control endpoint (one process per host, one listener per session) — so
+    // the pane draft survives a client exit and a routed open can be delivered.
+    // A daemon failure must never take the browser down: the surface is the
+    // product, the sidebar is an extra.
     //
     // DECLARE BEFORE OPEN. The GUI holds a surface's creation until it has
     // fetched the app's policy, because a userscript only injects at
     // document-start. Open first and the GUI's first apply pass sees a surface
     // with no contribution and builds it unblocked — no userscripts, no adblock,
     // silently, for the life of that webview.
-    let sidebar = match sidebar::spawn(profile, session) {
-        Ok(sidebar) => {
+    let mut control_url: Option<String> = match daemon::register_supervised(session, profile) {
+        Some(url) => {
             sidebar::emit_declare(
                 session,
-                &sidebar.control_url,
+                &url,
                 &webpolicy::policy_version(profile),
                 &webzoom::zoom_version(),
             );
-            Some(sidebar)
+            Some(url)
         }
-        Err(error) => {
-            eprintln!("ychrome: sidebar unavailable ({error})");
+        None => {
+            eprintln!("ychrome: sidebar unavailable (daemon did not come up)");
             None
         }
     };
@@ -249,51 +258,52 @@ fn drive_surface(
     );
     let mut ticks: u32 = 0;
     let mut last_tick = std::time::Instant::now();
+    // Re-declare with the CURRENT control url — it moves if the daemon respawned
+    // onto a fresh listener. The declare IS the contribution's liveness signal,
+    // and it must precede an "open" so a recreated surface never loads before its
+    // policy (userscripts inject at document-start).
+    let redeclare = |control_url: &Option<String>| {
+        if let Some(url) = control_url {
+            sidebar::emit_declare(
+                session,
+                url,
+                &webpolicy::policy_version(profile),
+                &webzoom::zoom_version(),
+            );
+        }
+    };
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(200));
         // A large gap between ticks means we were suspended (Ctrl+Z /
         // SIGSTOP — yggterm's Zzz button) or the machine slept, and the GUI
-        // may have closed or swept the surface meanwhile. Re-emit "open" on
-        // resume: heartbeats deliberately cannot re-CREATE a surface, and an
-        // "open" with an unchanged URL is liveness-idempotent GUI-side.
+        // may have closed or swept the surface meanwhile. Re-register (the
+        // daemon may have reaped us) and re-emit "open" on resume: heartbeats
+        // deliberately cannot re-CREATE a surface, and an "open" with an
+        // unchanged URL is liveness-idempotent GUI-side.
         if last_tick.elapsed() > Duration::from_secs(3) {
-            // Same order as the first emit, for the same reason: the GUI may have
-            // swept the contribution while we were stopped, and a surface
-            // recreated before the policy lands loses its userscripts.
-            if let Some(sidebar) = &sidebar {
-                sidebar::emit_declare(
-                    session,
-                    &sidebar.control_url,
-                    &webpolicy::policy_version(profile),
-                    &webzoom::zoom_version(),
-                );
-            }
+            control_url = daemon::register_supervised(session, profile).or(control_url);
+            redeclare(&control_url);
             emit_web_surface_osc("open", session, url, title, profile);
         }
         last_tick = std::time::Instant::now();
         ticks += 1;
-        // Heartbeat every ~4s (20 × 200ms) — the GUI's liveness truth.
+        // Heartbeat every ~4s (20 × 200ms) — the GUI's liveness truth, and the
+        // daemon re-register that keeps this session in the registry.
         if ticks.is_multiple_of(20) {
             emit_web_surface_osc("heartbeat", session, url, title, profile);
-            // Re-declaring IS the sidebar's heartbeat: it is idempotent, and
-            // the GUI expires a contribution whose declares stop, so a SIGKILLed
-            // ychrome never leaves phantom buttons in the rail. The stamp rides
-            // along so the GUI notices a policy edit made while ychrome runs —
-            // it is stat-only, so recomputing it every 4s is cheap.
-            if let Some(sidebar) = &sidebar {
-                sidebar::emit_declare(
-                    session,
-                    &sidebar.control_url,
-                    &webpolicy::policy_version(profile),
-                    &webzoom::zoom_version(),
-                );
+            // The daemon heartbeat: re-registering keeps the entry alive (the
+            // reaper drops a session whose client goes quiet) and re-earns it
+            // after a daemon respawn. A moved control url means a new listener —
+            // re-declare so the GUI follows it.
+            let refreshed = daemon::register_supervised(session, profile);
+            if refreshed.is_some() && refreshed != control_url {
+                control_url = refreshed;
             }
+            redeclare(&control_url);
         }
     }
-    if let Some(sidebar) = &sidebar {
-        sidebar::emit_close(session);
-        sidebar.stop();
-    }
+    sidebar::emit_close(session);
+    daemon::deregister(session);
     emit_web_surface_osc("close", session, url, title, profile);
     eprintln!("ychrome: web surface closed");
     Ok(())
@@ -756,7 +766,68 @@ fn display_available() -> bool {
     true
 }
 
+/// `ychrome status [--json]` — host-side truth for agents (docs/host-daemon.md
+/// §6): the registry, queue depths, vault-agent reachability, config stamps, the
+/// daemon version, and a self-staleness stamp so the stale-daemon class ("an old
+/// daemon running for hours while the fix sits on disk") cannot silently recur.
+/// Spawns a daemon if none is running — a status query should not need a browser
+/// already open.
+fn run_status(as_json: bool) -> Result<()> {
+    let status = daemon::status()?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        return Ok(());
+    }
+    let version = status["version"].as_str().unwrap_or("?");
+    let pid = status["pid"].as_u64().unwrap_or(0);
+    let uptime = status["uptime_secs"].as_u64().unwrap_or(0);
+    let stale = status["stale"].as_bool().unwrap_or(false);
+    let vault = status["vault_agent_reachable"].as_bool().unwrap_or(false);
+    println!(
+        "ychrome daemon {version}  pid {pid}  up {uptime}s{}",
+        if stale {
+            "  [STALE — the binary on disk changed; restart the daemon]"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "vault agent: {}",
+        if vault { "reachable" } else { "not reachable" }
+    );
+    let sessions = status["sessions"].as_array().cloned().unwrap_or_default();
+    if sessions.is_empty() {
+        println!("no anchored sessions");
+    } else {
+        println!("{} anchored session(s):", sessions.len());
+        for session in &sessions {
+            let env = session["env_id"].as_str().unwrap_or("?");
+            let profile = session["profile"].as_str().unwrap_or("?");
+            let depth = session["queue_depth"].as_u64().unwrap_or(0);
+            let routable = session["routing_capable"].as_bool().unwrap_or(false);
+            println!(
+                "  {env}  profile={profile}  queue={depth}  routable={}",
+                if routable { "yes" } else { "no" }
+            );
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    // Two internal/agent entry points, dispatched off argv before clap so the
+    // open-a-url arg shape stays exactly as it was. `--daemon` is the host
+    // daemon itself (spawned detached by the view client); `status` is the
+    // host-side truth for agents.
+    let raw: Vec<String> = std::env::args().collect();
+    if raw.get(1).map(String::as_str) == Some("--daemon") {
+        return daemon::run();
+    }
+    if raw.get(1).map(String::as_str) == Some("status") {
+        let as_json = raw.iter().any(|arg| arg == "--json");
+        return run_status(as_json);
+    }
+
     let args = Args::parse();
 
     // Declare ourselves to this host's yggterm launcher registry, on EVERY run:
@@ -783,6 +854,29 @@ fn main() -> Result<()> {
         // the old about:blank open, which the GUI's scheme gate rejects.
         if args.url.is_none() {
             return run_thin_client_picker(&session);
+        }
+        // A url typed in a terminal ROUTES into a matching surface if one is
+        // open (Chrome-like: raise the session, open the tab), unless --here
+        // forces a new anchor in THIS terminal. No match (or no daemon, or a
+        // GUI too old to route) falls through and anchors here, exactly as
+        // before — the queue-and-ping transport is the only fleet-correct one
+        // (docs/host-daemon.md §4).
+        if !args.here {
+            match daemon::route(&args.profile, &raw_url, None, false) {
+                Ok(reply) if reply["routed"].as_bool() == Some(true) => {
+                    let target = reply["session"].as_str().unwrap_or("a running surface");
+                    println!("ychrome: opened {raw_url} in session {target}");
+                    return Ok(());
+                }
+                Ok(reply) if reply["reason"].as_str() == Some("gui_not_routing_capable") => {
+                    eprintln!(
+                        "ychrome: a matching surface is open but its GUI predates command routing \
+                         — opening here instead"
+                    );
+                }
+                // no_match / no_such_session / no daemon: anchor here.
+                _ => {}
+            }
         }
         let title = args.title.clone().unwrap_or_else(|| {
             Url::parse(&raw_url)

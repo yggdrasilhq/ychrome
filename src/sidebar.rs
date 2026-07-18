@@ -25,9 +25,8 @@
 //! host, not the GUI's. See [`crate::webpolicy`].
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
@@ -136,7 +135,7 @@ struct AddDraft {
 
 /// What the pane is currently showing. Host-resident, like everything else the
 /// app owns: yggterm holds no vault state, not even which tab is selected.
-struct PaneState {
+pub(crate) struct PaneState {
     /// The profile this ychrome is running. The settings pane needs it to show
     /// the per-profile adblock override, and `/policy` needs it to decide which
     /// userscripts apply.
@@ -192,62 +191,96 @@ impl PaneState {
     }
 }
 
-pub struct Sidebar {
-    /// Loopback control endpoint, e.g. `http://127.0.0.1:41234`. Reachable by
-    /// the GUI only through an `ssh -L` forward when ychrome runs remotely —
-    /// which yggterm sets up, not us.
-    pub control_url: String,
-    stop: Arc<AtomicBool>,
+/// The control endpoint's per-session state: the pane draft (behind a lock,
+/// mutated by actions) and the passkey signer (its own internal locks). The
+/// host daemon owns one of these per registered session — the per-invocation
+/// control server is gone; the daemon serves every session's endpoint from one
+/// process (see [`crate::daemon`]).
+pub(crate) struct ControlState {
+    pub(crate) pane: Mutex<PaneState>,
+    pub(crate) signer: Arc<crate::passkey::Signer>,
 }
 
-impl Sidebar {
-    pub fn stop(&self) {
-        self.stop.store(true, Ordering::SeqCst);
+impl ControlState {
+    /// `session` is the emitting `YGGTERM_SESSION_ID` (the routing `env_id`),
+    /// carried in the passkey OSC for diagnostics — the GUI routes by stream.
+    /// `port` is the daemon's per-session control listener port (the passkey
+    /// shim ignores it; it reaches the signer through the `yggterm-appctl://`
+    /// bridge, so the port need not be page-reachable).
+    pub(crate) fn new(profile: &str, session: &str, port: u16) -> ControlState {
+        ControlState {
+            pane: Mutex::new(PaneState::new(profile)),
+            signer: crate::passkey::Signer::new(port, session.to_string()),
+        }
     }
 }
 
-/// The control server's shared state: the pane draft (behind a lock, mutated by
-/// actions) and the passkey signer (its own internal locks). One `Arc` so a
-/// per-connection thread can hold both.
-struct ServerState {
-    pane: Mutex<PaneState>,
-    signer: Arc<crate::passkey::Signer>,
+/// A control-endpoint HTTP request, parsed off the wire (request line, headers,
+/// body). Returned by [`read_request`] so the daemon's connection handler can
+/// dispatch it — and, for a `/ping`, drain the session's command queue itself.
+pub(crate) struct ParsedRequest {
+    pub(crate) method: String,
+    /// Path without the query, e.g. `/pane/vault` or `/ping`.
+    pub(crate) path: String,
+    /// The raw query string (no leading `?`).
+    pub(crate) query: String,
+    /// The `X-Ychrome-Fido2` bearer token, if the request carried one.
+    pub(crate) fido2_token: Option<String>,
+    /// The POST body parsed as JSON (`Value::Null` for a bodyless GET).
+    pub(crate) body: Value,
 }
 
-/// Bind the control endpoint and serve it on a background thread.
-///
-/// `session` is the emitting `YGGTERM_SESSION_ID`, carried in the passkey OSC
-/// for diagnostics (the GUI routes by stream). A connection is served on its own
-/// thread: a `/fido2/get` blocks for up to two minutes awaiting the presence
-/// dialog, and must not wedge the concurrent `/fido2/grant` the GUI sends back.
-pub fn spawn(profile: &str, session: &str) -> Result<Sidebar> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("binding sidebar control server")?;
-    let port = listener.local_addr()?.port();
-    let control_url = format!("http://127.0.0.1:{port}");
-    let stop = Arc::new(AtomicBool::new(false));
-    let state = Arc::new(ServerState {
-        pane: Mutex::new(PaneState::new(profile)),
-        signer: crate::passkey::Signer::new(port, session.to_string()),
-    });
+/// Read one HTTP request off a control-endpoint connection. `None` on an IO
+/// error or a truncated body. A `/fido2/get` blocks up to two minutes awaiting
+/// the presence dialog, so the daemon serves each connection on its own thread.
+pub(crate) fn read_request(stream: &TcpStream) -> Option<ParsedRequest> {
+    let peek = stream.try_clone().ok()?;
+    let mut reader = BufReader::new(peek);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let request_target = parts.next().unwrap_or("/");
+    let (path, query) = request_target
+        .split_once('?')
+        .unwrap_or((request_target, ""));
+    let path = path.to_string();
+    let query = query.to_string();
 
-    {
-        let stop = stop.clone();
-        std::thread::spawn(move || {
-            for incoming in listener.incoming() {
-                if stop.load(Ordering::SeqCst) {
-                    break;
-                }
-                match incoming {
-                    Ok(stream) => {
-                        let state = Arc::clone(&state);
-                        std::thread::spawn(move || handle_conn(stream, &state));
-                    }
-                    Err(_) => continue,
-                }
+    // Drain headers; capture Content-Length so a POST body can be read, and the
+    // passkey bearer token so a `/fido2/*` route can gate on it.
+    let mut content_length = 0usize;
+    let mut fido2_token: Option<String> = None;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':') {
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("x-ychrome-fido2") {
+                fido2_token = Some(value.to_string());
             }
-        });
+        }
     }
-    Ok(Sidebar { control_url, stop })
+
+    let body = if content_length > 0 {
+        let mut raw = vec![0u8; content_length];
+        reader.read_exact(&mut raw).ok()?;
+        serde_json::from_slice(&raw).unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+
+    Some(ParsedRequest {
+        method,
+        path,
+        query,
+        fido2_token,
+        body,
+    })
 }
 
 /// `OSC 7717 ; sidebar ; <action> ; <base64 json>`. Carries the control endpoint,
@@ -263,6 +296,12 @@ pub fn spawn(profile: &str, session: &str) -> Result<Sidebar> {
 pub fn emit_declare(session: &str, control: &str, policy_version: &str, zoom_version: &str) {
     let payload = json!({
         "session": session,
+        // The routing identity the GUI stamps on this contribution (Phase 5):
+        // a host daemon targets commands at `env_id`, the GUI reverses it to the
+        // session path. It IS `YGGTERM_SESSION_ID` — the same value as `session`
+        // — named separately because `session` is diagnostic (the GUI routes the
+        // OSC by stream) while `env_id` is load-bearing for routing.
+        "env_id": session,
         "control": control,
         "app_name": "Ychrome",
         "policy_version": policy_version,
@@ -299,80 +338,34 @@ fn emit_osc(action: &str, payload: &str) {
     let _ = stdout.flush();
 }
 
-fn handle_conn(stream: TcpStream, state: &ServerState) {
-    let Ok(peek) = stream.try_clone() else { return };
-    let mut reader = BufReader::new(peek);
-    let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
-        return;
-    }
-    let mut parts = line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let request_target = parts.next().unwrap_or("/");
-    let (path, query) = request_target
-        .split_once('?')
-        .unwrap_or((request_target, ""));
-
-    // Drain headers; capture Content-Length so a POST body can be read, and the
-    // passkey bearer token so a `/fido2/*` route can gate on it.
-    let mut content_length = 0usize;
-    let mut fido2_token: Option<String> = None;
-    loop {
-        let mut header = String::new();
-        if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
-            break;
-        }
-        if let Some((name, value)) = header.split_once(':') {
-            let value = value.trim();
-            if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.parse().unwrap_or(0);
-            } else if name.eq_ignore_ascii_case("x-ychrome-fido2") {
-                fido2_token = Some(value.to_string());
-            }
-        }
-    }
-
-    // Read a POST body up front (routes that don't need it ignore it).
-    let read_body = |reader: &mut BufReader<TcpStream>| -> Option<Value> {
-        let mut body = vec![0u8; content_length];
-        if content_length > 0 && reader.read_exact(&mut body).is_err() {
-            return None;
-        }
-        Some(serde_json::from_slice(&body).unwrap_or(Value::Null))
-    };
-
-    // A cross-origin fetch from an RP's page (the passkey shim) preflights with
-    // OPTIONS before the real POST — answer it, whatever the path.
-    if method == "OPTIONS" {
-        respond_preflight(stream);
-        return;
-    }
-
-    match (method, path) {
+/// Route one parsed control request against a session's [`ControlState`] and
+/// return `(status, json)`. The `OPTIONS` preflight and the `/ping` command
+/// envelope are handled by the daemon's connection loop BEFORE this — the
+/// former needs no state, the latter reads the session's command queue, which
+/// lives on the daemon, not here. Everything else (panes, policy, zoom,
+/// appearance, actions, the WebAuthn signer) is the app's, and answers here.
+pub(crate) fn dispatch(state: &ControlState, req: &ParsedRequest) -> (u16, Value) {
+    let query = req.query.as_str();
+    match (req.method.as_str(), req.path.as_str()) {
         ("GET", p) if p == format!("/pane/{VAULT_PANE}") => {
             let host = query_value(query, "host");
-            let schema = {
-                let mut pane = state.pane.lock().unwrap();
-                // Opening the pane straight onto the Add tab must seed the draft
-                // too, not only arriving there via the tab action.
-                if pane.tab == "add" {
-                    pane.seed_add_draft(host.as_deref());
-                }
-                vault_schema(&pane, host.as_deref())
-            };
-            respond_json(stream, 200, &schema);
+            let mut pane = state.pane.lock().unwrap();
+            // Opening the pane straight onto the Add tab must seed the draft
+            // too, not only arriving there via the tab action.
+            if pane.tab == "add" {
+                pane.seed_add_draft(host.as_deref());
+            }
+            (200, vault_schema(&pane, host.as_deref()))
         }
         ("GET", p) if p == format!("/pane/{SETTINGS_PANE}") => {
             let profile = state.pane.lock().unwrap().profile.clone();
             let page = PageContext::from_query(query);
-            respond_json(stream, 200, &settings_schema(&profile, &page));
+            (200, settings_schema(&profile, &page))
         }
         // The per-site zoom overrides for this host. yggterm applies the entry
         // for the current page's host on navigation and falls back to its global
         // "Ychrome Global Zoom" — the GUI does the matching, ychrome owns the map.
-        ("GET", "/zoom") => {
-            respond_json(stream, 200, &crate::webzoom::to_json());
-        }
+        ("GET", "/zoom") => (200, crate::webzoom::to_json()),
         // The EFFECTIVE web-content policy for the profile this ychrome is
         // running: every enable/disable decision already made, PLUS the passkey
         // shim prepended (document-start, so `navigator.credentials` is patched
@@ -383,15 +376,13 @@ fn handle_conn(stream: TcpStream, state: &ServerState) {
             if let Some(scripts) = policy["userscripts"].as_array_mut() {
                 scripts.insert(0, json!(state.signer.shim_userscript()));
             }
-            respond_json(stream, 200, &policy);
+            (200, policy)
         }
         ("POST", "/action") => {
-            let Some(request) = read_body(&mut reader) else {
-                respond_json(stream, 400, &json!({ "toast": "bad request" }));
-                return;
-            };
-            let reply = run_action(&state.pane, &request);
-            respond_json(stream, 200, &reply);
+            if req.body.is_null() {
+                return (400, json!({ "toast": "bad request" }));
+            }
+            (200, run_action(&state.pane, &req.body))
         }
         // The WebAuthn signer routes. `/fido2/get` and `/fido2/create` come from
         // the PAGE (over SOCKS-loopback) and are bearer-token-gated, so a random
@@ -402,28 +393,25 @@ fn handle_conn(stream: TcpStream, state: &ServerState) {
         // know — the GUI never sees the page's token.
         ("POST", p) if p.starts_with("/fido2/") => {
             let page_route = p == "/fido2/get" || p == "/fido2/create";
-            if page_route && !state.signer.authorized(fido2_token.as_deref()) {
-                respond_json(stream, 401, &json!({ "error": "unauthorized" }));
-                return;
+            if page_route && !state.signer.authorized(req.fido2_token.as_deref()) {
+                return (401, json!({ "error": "unauthorized" }));
             }
-            let Some(body) = read_body(&mut reader) else {
-                respond_json(stream, 400, &json!({ "error": "bad request" }));
-                return;
-            };
-            let (status, reply) = match p {
-                "/fido2/get" => state.signer.handle_get(&body),
-                "/fido2/create" => state.signer.handle_create(&body),
-                "/fido2/grant" => state.signer.handle_grant(&body),
-                "/fido2/deny" => state.signer.handle_deny(&body),
+            if req.body.is_null() {
+                return (400, json!({ "error": "bad request" }));
+            }
+            match p {
+                "/fido2/get" => state.signer.handle_get(&req.body),
+                "/fido2/create" => state.signer.handle_create(&req.body),
+                "/fido2/grant" => state.signer.handle_grant(&req.body),
+                "/fido2/deny" => state.signer.handle_deny(&req.body),
                 _ => (404, json!({ "error": "unknown fido2 route" })),
-            };
-            respond_json(stream, status, &reply);
+            }
         }
-        _ => respond_json(stream, 404, &json!({})),
+        _ => (404, json!({})),
     }
 }
 
-fn query_value(query: &str, key: &str) -> Option<String> {
+pub(crate) fn query_value(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (name, value) = pair.split_once('=')?;
         (name == key).then(|| percent_decode(value))
@@ -462,7 +450,7 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn respond_json(mut stream: TcpStream, status: u16, body: &Value) {
+pub(crate) fn respond_json(mut stream: TcpStream, status: u16, body: &Value) {
     let body = body.to_string();
     let reason = match status {
         200 => "OK",
@@ -500,7 +488,7 @@ fn cors_headers() -> &'static str {
 
 /// Answer a CORS preflight: 204, the CORS headers, no body. Without this the
 /// browser never sends the real `/fido2/*` POST.
-fn respond_preflight(mut stream: TcpStream) {
+pub(crate) fn respond_preflight(mut stream: TcpStream) {
     let response = format!(
         "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n{cors}\r\n",
         cors = cors_headers(),

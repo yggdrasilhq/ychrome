@@ -1,9 +1,27 @@
 # The ychrome host daemon and the routing verb
 
-Status: **SPEC, design agreed 2026-07-18** (four open calls settled with the
+Status: **BUILT 2026-07-18** (the daemon, the routing verb, the `/ping` command
+envelope, and `ychrome status` ship in `src/daemon.rs`; the GUI half shipped in
+yggterm a7534bca). Design agreed 2026-07-18 (four open calls settled with the
 owner: route-on-profile-match, vault agent stays a peer process, the command
-envelope is a generic libyggterm primitive, the agent engine mounts inside
-this daemon). Nothing below is built yet except where marked "exists today".
+envelope is a generic libyggterm primitive, the agent engine mounts inside this
+daemon). Two things are NOT built and stay spec-only, marked below: the vault
+agent PEER hop (`ychrome-vault-proto` — the pane still shells out to the CLI,
+which is already a peer, so nothing regressed) and the agent engine (§7).
+
+**One implementation call the spec did not foresee (built as such):** the daemon
+serves ONE control listener PER registered session (a plain
+`http://127.0.0.1:<port>`), not a single host-wide port demuxed by session. A
+single port would need the declared control url to carry a per-session
+discriminator (a path prefix), and the GUI's vendored `yggterm-appctl://` proxy
+(`forward_to_control`) parses a control base as `http://host:port` with no path —
+a prefix breaks the passkey signer and would force a coordinated GUI change. Per-
+session listeners keep the contribution protocol and the appctl bridge byte-for-
+byte unchanged (zero GUI change, passkeys untouched) at the cost of the "one
+ssh -L per host" reduction, which is deferred to when the appctl proxy learns to
+preserve a base path. State, lifecycle, registry, queue and routing are still
+fully consolidated in one daemon process — the routing mechanism the spec is
+about.
 
 ## 1. Why these are one design, not two
 

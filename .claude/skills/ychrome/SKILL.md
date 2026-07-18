@@ -24,8 +24,12 @@ remote one), never on the GUI host.
 
 ```
 src/main.rs                     the browser: OSC 7717 thin client, profile picker,
-                                loopback control server, ssh -L tunnel, standalone window
-src/sidebar.rs                  the control server: vault + settings pane schemas, actions
+                                the ROUTING decision, ssh -L tunnel, standalone window
+src/daemon.rs                   the HOST DAEMON: one per host, owns every session's
+                                control listener + registry + command queue + routing +
+                                journal + `status`. `ychrome --daemon` runs it; the view
+                                client spawns + supervises it (docs/host-daemon.md)
+src/sidebar.rs                  the control routes: vault + settings pane schemas, actions
 src/webpolicy.rs                adblock + userscripts (enable/disable/delete/install)
 src/webzoom.rs                  per-site zoom overrides (web-zoom.json)
 src/extensions.rs               the bundled userscript catalog ("Add an extension")
@@ -208,6 +212,49 @@ $Y server app screenshot /tmp/pane.png --crop 1400,0,520,700 --scale 2
 
 The vault pane renders `MAX_ROWS = 80` of the item list ("Showing 80 of 1107"),
 so count ⏱ buttons against the first 80 rows, not all of them.
+
+## The host daemon + routing verb (`src/daemon.rs`) — BUILT 2026-07-18
+
+`ychrome <url>` typed in one terminal can now open a tab in a surface anchored by
+another. The transport is a host-resident QUEUE the GUI's liveness ping drains on
+its reply — a queue needs something durable on the app host, and that is the
+daemon (docs/host-daemon.md; consolidation IS the routing mechanism, not a
+prerequisite).
+
+- **One daemon per host per user**, auto-spawned + supervised by the view client
+  (the yedit pattern). `ychrome --daemon` runs it. Singleton via the unix-socket
+  bind itself (`~/.yggterm/ychrome/daemon.sock`, 0600); a stale socket is
+  reclaimed. `~/.yggterm/ychrome/journal.jsonl` audits every route/deliver/drop/
+  reap. **A fleet deploy self-heals:** the view client's `ensure()` stops a
+  running daemon whose version differs from its own and respawns it, so the next
+  `ychrome` invocation after a deploy rebuilds the registry in one heartbeat.
+- **It owns every session's control endpoint** — one plain
+  `http://127.0.0.1:<port>` listener per registered session (NOT a single port;
+  see docs/host-daemon.md for why the appctl proxy forces this). The view client
+  no longer runs its own control server: it `register`s and declares the daemon's
+  url. `sidebar::dispatch` serves the same pane/policy/zoom/appearance/action/
+  fido2 routes; the daemon adds `GET /ping?session=<env_id>&ack=<batch>`, which
+  ychrome did not serve before — liveness used to ride the OSC re-declare only.
+- **Routing** (`ychrome [--profile P] [--here] <url>`): a live registered session
+  with the requested profile → the daemon enqueues `open_tab {url, raise:true}`
+  into ITS queue, the GUI drains it on the next ping, `--here` forces a new
+  anchor, no match anchors as before. **Skew honesty:** the daemon marks a session
+  routing-capable only once it has seen a `?session=` ping; without it /route
+  refuses and the CLI anchors with a warning rather than claiming a success it
+  cannot deliver. The fleet router is `ssh <host> ychrome <url>` — zero code.
+- **Liveness / no phantom:** the client re-registers on its ~4s heartbeat; the
+  daemon reaps a session ~14s after the last heartbeat, closing its control
+  listener so the GUI's ping fails and the contribution expires — a SIGKILLed
+  client leaves no phantom rail. Daemon death is self-healing: the client's
+  supervision respawns it and re-declares.
+- **`ychrome status [--json]`** — host-side truth for agents: the registry, queue
+  depths, vault-agent reachability, config stamps, the daemon version, and a
+  self-staleness stamp (`path@mtime`, the vault agent's precedent) so an old
+  daemon running while the fix sits on disk cannot silently recur.
+
+Proven end-to-end on dev via socket + curl (register → skew-honest refuse →
+`?session=` ping → route → envelope drain → at-least-once re-send → ack →
+staleness → reap-closes-the-port). Live GUI proof: see the deploy section.
 
 ## The sidebar contribution (`src/sidebar.rs`) — SHIPPED, live-proven
 
