@@ -35,31 +35,16 @@ use serde_json::{Value, json};
 use crate::matching::{auto_match_for_host, find_by_name};
 use crate::session::{VaultManager, VaultStatus};
 
-/// How long a client waits for a freshly spawned agent to bind its socket.
-const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
+use ychrome_vault_proto::pid_path;
+/// The agent's client transport — connect/send/read, autostart, stop, and the
+/// socket path — lives in the crypto-free `ychrome-vault-proto` crate so the
+/// browser can speak this same wire without linking the crypto below. Re-exported
+/// so `agent::request` and friends keep their call sites (the CLI here, the
+/// sidebar in the browser).
+pub use ychrome_vault_proto::{is_running, request, request_autostart, socket_path, stop};
+
 /// How often the idle-lock thread wakes to check the clock.
 const LOCK_TICK: Duration = Duration::from_secs(5);
-
-pub fn socket_path(dir: &Path) -> PathBuf {
-    dir.join("agent.sock")
-}
-
-/// The agent's pid, written beside the socket.
-///
-/// `stop` is an op like any other, which means an agent old enough not to know
-/// it cannot be asked to leave — precisely the agent you most want gone after a
-/// rebuild. The pid file is the escape hatch: signal it instead.
-fn pid_path(dir: &Path) -> PathBuf {
-    dir.join("agent.pid")
-}
-
-fn read_pid(dir: &Path) -> Option<i32> {
-    std::fs::read_to_string(pid_path(dir))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-}
 
 struct AgentState {
     manager: VaultManager,
@@ -83,16 +68,9 @@ impl AgentState {
 /// comes back "unknown op", and the confusion is total. Clients compare this
 /// stamp against their own and say so.
 pub fn exe_stamp() -> String {
-    let Ok(path) = std::env::current_exe() else {
-        return String::new();
-    };
-    let mtime = std::fs::metadata(&path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|since| since.as_secs())
-        .unwrap_or(0);
-    format!("{}@{mtime}", path.display())
+    std::env::current_exe()
+        .map(|path| ychrome_vault_proto::exe_stamp_of(&path))
+        .unwrap_or_default()
 }
 
 /// Run the agent in the foreground, serving `dir/agent.sock` until killed.
@@ -811,145 +789,10 @@ pub fn status_json(manager: &VaultManager) -> Value {
     status
 }
 
-/// Is an agent answering on this vault dir's socket?
-pub fn is_running(dir: &Path) -> bool {
-    UnixStream::connect(socket_path(dir)).is_ok()
-}
-
-/// Send one request to a running agent. Does not start one.
-pub fn request(dir: &Path, request: &Value) -> Result<Value> {
-    let socket = socket_path(dir);
-    let stream = UnixStream::connect(&socket).with_context(|| {
-        format!(
-            "no agent on {} — start one with `ychrome-vault unlock`",
-            socket.display()
-        )
-    })?;
-    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
-    let mut writer = stream.try_clone()?;
-    writeln!(writer, "{request}")?;
-    writer.flush()?;
-
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
-    let response: Value = serde_json::from_str(line.trim())
-        .with_context(|| format!("agent sent a malformed response: {line:?}"))?;
-    if response.get("ok").and_then(Value::as_bool) == Some(true) {
-        return Ok(response);
-    }
-    let error = response
-        .get("error")
-        .and_then(Value::as_str)
-        .unwrap_or("agent refused the request");
-    // The agent outlives the binary that spawned it. An op this binary knows
-    // but the agent does not means the running agent predates the rebuild —
-    // say so, instead of leaving the caller staring at "unknown op". `stop` is
-    // exempt: it is the remedy, and `stop()` has its own fallback for an agent
-    // too old to perform it.
-    let stopping = request.get("op").and_then(Value::as_str) == Some("stop");
-    if error.starts_with("unknown op") && !stopping {
-        bail!("{error} — the running agent predates this binary; run `ychrome-vault stop-agent`");
-    }
-    Err(anyhow!(error.to_string()))
-}
-
-/// Ask a running agent to drop its keys and exit. Returns false when none ran.
-///
-/// An agent predating the `stop` op cannot answer the request that would retire
-/// it, so fall back to signalling the pid file. An agent predating *that* is
-/// unreachable by any means we control, and says so rather than pretending.
-pub fn stop(dir: &Path) -> Result<bool> {
-    if !is_running(dir) {
-        clear_agent_files(dir);
-        return Ok(false);
-    }
-    match request(dir, &json!({"op": "stop"})) {
-        Ok(_) => Ok(true),
-        Err(error) => {
-            let Some(pid) = read_pid(dir) else {
-                bail!(
-                    "{error}\nit also predates the agent pid file, so it cannot be \
-                     retired automatically — run: pkill -f 'ychrome-vault agent'"
-                );
-            };
-            terminate(pid, dir)?;
-            clear_agent_files(dir);
-            Ok(true)
-        }
-    }
-}
-
-/// SIGTERM, then SIGKILL if it will not go. An agent holds decrypted keys, so
-/// "still running" is never an acceptable outcome of `stop`.
-fn terminate(pid: i32, dir: &Path) -> Result<()> {
-    // SAFETY: `kill` on a pid we wrote ourselves; a stale pid at worst returns
-    // ESRCH, which the deadline loop below treats as "already gone".
-    unsafe { libc::kill(pid, libc::SIGTERM) };
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if !is_running(dir) {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    unsafe { libc::kill(pid, libc::SIGKILL) };
-    std::thread::sleep(Duration::from_millis(100));
-    if is_running(dir) {
-        bail!("the vault agent (pid {pid}) survived SIGKILL");
-    }
-    Ok(())
-}
-
-/// Socket and pid file left behind by a killed agent.
-fn clear_agent_files(dir: &Path) {
-    let _ = std::fs::remove_file(socket_path(dir));
-    let _ = std::fs::remove_file(pid_path(dir));
-}
-
-/// Send one request, starting an agent first if none is listening.
-///
-/// Only `unlock` uses this. Autostarting for a read op would buy nothing — the
-/// fresh agent holds no keys, so `get` would still fail — and would leave a
-/// pointless daemon behind; those ops report "no agent, run unlock" instead.
-pub fn request_autostart(dir: &Path, req: &Value) -> Result<Value> {
-    if !is_running(dir) {
-        spawn_agent(dir)?;
-    }
-    request(dir, req)
-}
-
-/// Spawn `ychrome-vault agent` detached from this process group, then wait for
-/// it to bind. `process_group(0)` keeps a terminal's Ctrl+C / SIGHUP from
-/// reaching the agent when the shell that first needed it goes away.
-fn spawn_agent(dir: &Path) -> Result<()> {
-    use std::os::unix::process::CommandExt as _;
-
-    let exe = std::env::current_exe().context("locating the ychrome-vault binary")?;
-    let mut command = std::process::Command::new(exe);
-    command
-        .arg("agent")
-        .arg("--dir")
-        .arg(dir)
-        .current_dir("/")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    command.process_group(0);
-    command.spawn().context("spawning the vault agent")?;
-
-    let deadline = Instant::now() + SPAWN_TIMEOUT;
-    while Instant::now() < deadline {
-        if is_running(dir) {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    bail!(
-        "the vault agent did not bind {} within {}s",
-        socket_path(dir).display(),
-        SPAWN_TIMEOUT.as_secs()
-    )
-}
+// The client transport — `is_running`, `request`, `request_autostart`, `stop`,
+// `socket_path` — is re-exported at the top of this module from
+// `ychrome-vault-proto`. The agent (server) below and those clients share one
+// wire, owned there.
 
 #[cfg(test)]
 mod tests {

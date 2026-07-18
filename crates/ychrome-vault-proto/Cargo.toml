@@ -1,0 +1,18 @@
+[package]
+name = "ychrome-vault-proto"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "The ychrome vault agent's client transport — the newline-JSON unix-socket wire, with no crypto and no http. The browser/daemon talks to the agent through this instead of spawning the ychrome-vault CLI per operation; the agent (server) and the crypto stay in ychrome-vault."
+repository = "https://github.com/yggdrasilhq/ychrome"
+
+[lib]
+name = "ychrome_vault_proto"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+dirs = "5"
+# For `stop`'s SIGTERM/SIGKILL fallback when an agent predates the `stop` op.
+libc = "0.2"

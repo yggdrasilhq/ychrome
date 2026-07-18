@@ -26,10 +26,9 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use serde_json::{Value, json};
 
 /// The pane ids ychrome declares. yggterm only ever echoes them back.
@@ -46,66 +45,57 @@ const MAX_ROWS: usize = 80;
 /// newlines, so a printable separator would be ambiguous.
 const ROW_SEP: char = '\u{1f}';
 
-/// Run the `ychrome-vault` CLI on THIS host and return its stdout.
+/// This host's vault directory (`~/.yggterm/vault`), where the agent's socket
+/// and secret-free config live.
+fn vault_dir() -> Result<std::path::PathBuf> {
+    ychrome_vault_proto::default_dir()
+}
+
+/// Send one op to this host's vault agent and return its reply.
 ///
-/// The browser deliberately does not link `ychrome-vault`: the workspace keeps
-/// the browser build lean (no crypto, no http client), and the CLI is already
-/// the one documented interface to the vault — the same one yggterm used before
-/// this pane existed. It talks to the host's unlock-caching agent, so a read is
-/// cheap and keyless once the user has unlocked.
-fn vault_cli(args: &[&str]) -> Result<String> {
-    vault_cli_stdin(args, None)
+/// The browser speaks the agent's unix socket DIRECTLY through the crypto-free
+/// [`ychrome_vault_proto`] — it no longer spawns the `ychrome-vault` CLI per
+/// operation. The agent is host-resident and caches the unlocked vault, so a
+/// read is cheap and keyless once the user has unlocked. The workspace still
+/// keeps the crypto in `ychrome-vault`; only the wire (this op) is shared.
+fn vault_op(op: Value) -> Result<Value> {
+    with_readable_error(ychrome_vault_proto::request(&vault_dir()?, &op))
 }
 
-/// As [`vault_cli`], but writes `stdin` to the child first. A password reaches
-/// `ychrome-vault add` this way and no other: never a flag (it would show up in
-/// `ps`), never an environment variable.
-fn vault_cli_stdin(args: &[&str], stdin: Option<&str>) -> Result<String> {
-    let mut command = Command::new("ychrome-vault");
-    command
-        .args(args)
-        .stdin(match stdin {
-            Some(_) => Stdio::piped(),
-            // `read_secret` refuses a terminal on stdin, and ychrome's stdin IS
-            // the session's PTY — so a no-secret call must not inherit it.
-            None => Stdio::null(),
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .context("run ychrome-vault (is it installed on this host?)")?;
-    if let Some(secret) = stdin {
-        child
-            .stdin
-            .take()
-            .context("ychrome-vault stdin")?
-            .write_all(secret.as_bytes())
-            .context("writing the password to ychrome-vault")?;
-    }
-    let output = child.wait_with_output().context("ychrome-vault failed")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr = stderr.trim();
-        // The one failure the user can act on gets the wording it deserves.
-        if stderr.contains("locked") {
-            bail!("vault locked: run `ychrome-vault unlock` on this host");
+/// As [`vault_op`], but starts an agent first if none is listening — the
+/// `unlock` path, where the spawn is the point.
+fn vault_op_autostart(op: Value) -> Result<Value> {
+    with_readable_error(ychrome_vault_proto::request_autostart(&vault_dir()?, &op))
+}
+
+/// The lock/staleness status the pane gates on — a running agent is
+/// authoritative, else the secret-free config answers (see
+/// [`ychrome_vault_proto::status`]).
+fn vault_status() -> Result<Value> {
+    ychrome_vault_proto::status(&vault_dir()?)
+}
+
+/// Re-word the one failure the user can act on. The agent replies "the vault is
+/// locked"; point them at the fix, exactly as the old CLI shell-out did.
+fn with_readable_error(result: Result<Value>) -> Result<Value> {
+    result.map_err(|error| {
+        if error.to_string().contains("locked") {
+            anyhow::anyhow!("vault locked: run `ychrome-vault unlock` on this host")
+        } else {
+            error
         }
-        bail!(
-            "{}",
-            if stderr.is_empty() {
-                "ychrome-vault failed"
-            } else {
-                stderr
-            }
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    })
 }
 
-fn vault_cli_json(args: &[&str]) -> Result<Value> {
-    let stdout = vault_cli(args)?;
-    serde_json::from_str(&stdout).context("ychrome-vault did not return json")
+/// A vault op field: the string when non-empty, JSON `null` otherwise — the same
+/// present-or-null shape the `ychrome-vault` CLI sent, so the agent sees no
+/// difference between this path and a shell invocation.
+fn opt_field(value: &str) -> Value {
+    if value.is_empty() {
+        Value::Null
+    } else {
+        Value::String(value.to_string())
+    }
 }
 
 /// Default length of a generated password, mirroring `ychrome-vault generate`.
@@ -631,7 +621,7 @@ fn vault_schema(state: &PaneState, host: Option<&str>) -> Value {
     // ONE `status` call per schema. It is the SSOT for lock state AND agent
     // staleness, so both branches read the same answer — the Tools tab used to
     // fetch it a second time and could disagree with the gate above it.
-    match vault_cli_json(&["status"]) {
+    match vault_status() {
         Ok(status) if status["state"].as_str() == Some("unlocked") => {
             unlocked_schema(state, host, &status)
         }
@@ -733,9 +723,9 @@ fn unlocked_schema(state: &PaneState, host: Option<&str>, status: &Value) -> Val
                 && let Some(host) = host.filter(|host| !host.is_empty())
             {
                 widgets.push(json!({"kind": "section", "text": format!("For {host}")}));
-                match vault_cli_json(&["suggest", host]) {
-                    Ok(items) => {
-                        let items = items.as_array().cloned().unwrap_or_default();
+                match vault_op(json!({"op": "suggest", "host": host})) {
+                    Ok(reply) => {
+                        let items = reply["items"].as_array().cloned().unwrap_or_default();
                         if items.is_empty() {
                             widgets.push(json!({
                                 "kind": "label", "muted": true,
@@ -755,14 +745,9 @@ fn unlocked_schema(state: &PaneState, host: Option<&str>, status: &Value) -> Val
                 "kind": "section",
                 "text": if query.is_empty() { "All items".to_string() } else { format!("Matching “{query}”") },
             }));
-            let list_args: Vec<&str> = if query.is_empty() {
-                vec!["list", "--json"]
-            } else {
-                vec!["list", "--json", query]
-            };
-            match vault_cli_json(&list_args) {
-                Ok(items) => {
-                    let items = items.as_array().cloned().unwrap_or_default();
+            match vault_op(json!({"op": "list", "query": opt_field(query), "trashed": false})) {
+                Ok(reply) => {
+                    let items = reply["items"].as_array().cloned().unwrap_or_default();
                     let total = items.len();
                     widgets.extend(items.iter().take(MAX_ROWS).map(item_row));
                     if total > MAX_ROWS {
@@ -916,7 +901,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
             }
             reschema(state, host.as_deref())
         }
-        "watchtower" => match vault_cli_json(&["watchtower"]) {
+        "watchtower" => match vault_op(json!({"op": "watchtower"})) {
             Ok(report) => {
                 let (reused, weak) = (
                     report["reused"].as_array().map_or(0, Vec::len),
@@ -930,7 +915,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
             }
             Err(error) => json!({ "toast": error.to_string() }),
         },
-        "sync" => match vault_cli_json(&["sync"]) {
+        "sync" => match vault_op(json!({"op": "sync"})) {
             Ok(reply) => {
                 let count = reply["item_count"].as_u64().unwrap_or(0);
                 merge(
@@ -949,12 +934,9 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
             if password.is_empty() {
                 return json!({ "toast": "Enter your master password." });
             }
-            match vault_cli_stdin(&["unlock"], Some(password)) {
+            match vault_op_autostart(json!({"op": "unlock", "password": password})) {
                 Ok(reply) => {
-                    let count = serde_json::from_str::<Value>(&reply)
-                        .ok()
-                        .and_then(|value| value["item_count"].as_u64())
-                        .unwrap_or(0);
+                    let count = reply["item_count"].as_u64().unwrap_or(0);
                     merge(
                         reschema(state, host.as_deref()),
                         json!({ "toast": format!("Vault unlocked — {count} items.") }),
@@ -966,7 +948,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 ),
             }
         }
-        "restart_agent" => match vault_cli_json(&["stop-agent"]) {
+        "restart_agent" => match vault_dir().and_then(|dir| ychrome_vault_proto::stop(&dir)) {
             Ok(_) => {
                 // The agent held the keys, so the vault is locked now and the old
                 // scan is meaningless. Reschema lands on the unlock form.
@@ -978,7 +960,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
             }
             Err(error) => json!({ "toast": error.to_string() }),
         },
-        "lock" => match vault_cli_json(&["lock"]) {
+        "lock" => match vault_op(json!({"op": "lock"})) {
             Ok(_) => {
                 // A locked vault's scan is stale and unrepeatable; do not keep
                 // showing which of the user's logins share a password.
@@ -1001,7 +983,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                     state.add.uri.trim().to_string(),
                     state.add.folder.trim().to_string(),
                     state.add.notes.trim().to_string(),
-                    state.generate_length.to_string(),
+                    state.generate_length,
                     state.generate_no_symbols,
                 )
             };
@@ -1009,30 +991,24 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 return json!({ "toast": "An item needs a name." });
             }
             // The typed password is used for this call and dropped. An empty one
-            // means `--generate`: rolled on this host, stored encrypted, and
-            // never echoed back — a schema is not a place for a secret.
+            // means generate: rolled on this host, stored encrypted, and never
+            // echoed back — a schema is not a place for a secret. The op carries
+            // present-or-null fields, exactly the shape the CLI sent the agent.
             let password = values["add_password"].as_str().unwrap_or_default();
-            let mut args = vec!["add", name.as_str()];
-            if !user.is_empty() {
-                args.push(user.as_str());
-            }
-            if !uri.is_empty() {
-                args.extend(["--uri", uri.as_str()]);
-            }
-            if !folder.is_empty() {
-                args.extend(["--folder", folder.as_str()]);
-            }
-            if !notes.is_empty() {
-                args.extend(["--notes", notes.as_str()]);
-            }
-            if password.is_empty() {
-                args.extend(["--generate", "--length", length.as_str()]);
-                if no_symbols {
-                    args.push("--no-symbols");
-                }
-            }
-            let stdin = (!password.is_empty()).then_some(password);
-            match vault_cli_stdin(&args, stdin) {
+            let op = json!({
+                "op": "add",
+                "name": name,
+                "user": opt_field(&user),
+                "uri": opt_field(&uri),
+                "folder": opt_field(&folder),
+                "notes": opt_field(&notes),
+                "totp": Value::Null,
+                "password": opt_field(password),
+                "generate": password.is_empty(),
+                "length": length,
+                "symbols": !no_symbols,
+            });
+            match vault_op(op) {
                 Ok(_) => {
                     let how = if password.is_empty() {
                         "a generated password"
@@ -1056,32 +1032,30 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
         }
         "fill" => {
             let (name, user) = split_row_id(&value);
-            let mut args = vec!["get", name.as_str()];
-            if !user.is_empty() {
-                args.push(user.as_str());
-            }
-            match vault_cli(&args) {
-                // The password is on stdout of a process on THIS host, goes
-                // straight into the eval script, and is dropped. It never enters
-                // a schema, the OSC stream, or yggterm's state.
-                Ok(password) => json!({
-                    "eval": fill_script(&user, &password),
-                    "toast": format!("Filled {name}."),
-                }),
+            match vault_op(json!({"op": "get", "name": name, "user": opt_field(&user)})) {
+                // The password comes off the host's agent, goes straight into the
+                // eval script, and is dropped. It never enters a schema, the OSC
+                // stream, or yggterm's state.
+                Ok(reply) => {
+                    let password = reply["entry"]["password"].as_str().unwrap_or_default();
+                    json!({
+                        "eval": fill_script(&user, password),
+                        "toast": format!("Filled {name}."),
+                    })
+                }
                 Err(error) => json!({ "toast": error.to_string() }),
             }
         }
         "totp" => {
             let (name, user) = split_row_id(&value);
-            let mut args = vec!["totp", name.as_str()];
-            if !user.is_empty() {
-                args.push(user.as_str());
-            }
-            match vault_cli(&args) {
-                Ok(code) => json!({
-                    "eval": totp_script(&code),
-                    "toast": format!("Filled {name}'s authenticator code."),
-                }),
+            match vault_op(json!({"op": "totp", "name": name, "user": opt_field(&user)})) {
+                Ok(reply) => {
+                    let code = reply["code"].as_str().unwrap_or_default();
+                    json!({
+                        "eval": totp_script(code),
+                        "toast": format!("Filled {name}'s authenticator code."),
+                    })
+                }
                 Err(error) => json!({ "toast": error.to_string() }),
             }
         }
