@@ -90,6 +90,17 @@ enum Command {
     /// Metadata only — the passkey private key is never printed, and a listing
     /// can never trigger a WebAuthn ceremony.
     Passkeys { name: String, user: Option<String> },
+    /// Print an item's custom fields as `name<TAB>value`, one per line — the read
+    /// `get --field` cannot do (it only models password/username/totp/notes).
+    /// With `--field-name NAME`, print just that field's value, unadorned.
+    Fields {
+        name: String,
+        user: Option<String>,
+        /// Print only the value of the custom field with this exact name
+        /// (case-insensitive), with no name column — for scripting.
+        #[arg(long)]
+        field_name: Option<String>,
+    },
     /// Create a login — `rbw add` parity. The password is read from stdin, or
     /// rolled locally with `--generate` (and echoed once, so you can save it).
     Add {
@@ -130,6 +141,10 @@ enum Command {
         uri: Option<String>,
         #[arg(long)]
         totp: Option<String>,
+        /// Clear the authenticator secret entirely (removes a value mis-stored
+        /// in the TOTP slot). Cannot be combined with --totp.
+        #[arg(long, conflicts_with = "totp")]
+        clear_totp: bool,
         #[arg(long)]
         notes: Option<String>,
         /// Move the item to this existing folder.
@@ -310,10 +325,24 @@ fn main() -> Result<()> {
                     println!("{}", string_field(&response, "notes"));
                     return Ok(());
                 }
+                // The verbatim text in the TOTP slot, even when it is not a valid
+                // authenticator (a key pasted there by mistake) — `totp` would
+                // reject it, this recovers it.
+                "totp-secret" => {
+                    let response = agent::request(
+                        &dir,
+                        &json!({"op": "totp-secret", "name": name, "user": user}),
+                    )?;
+                    println!("{}", string_field(&response, "totp_secret"));
+                    return Ok(());
+                }
                 "password" | "username" => {
                     agent::request(&dir, &json!({"op": "get", "name": name, "user": user}))?
                 }
-                other => bail!("unknown --field {other:?} (password | username | totp | notes)"),
+                other => bail!(
+                    "unknown --field {other:?} (password | username | totp | notes); \
+                     for custom fields use `fields`"
+                ),
             };
             println!("{}", string_field(&entry["entry"], &field));
             Ok(())
@@ -337,6 +366,43 @@ fn main() -> Result<()> {
                     tsv_field(&pk["credential_id"]),
                     tsv_field(&pk["creation_date"]),
                 );
+            }
+            Ok(())
+        }
+        Command::Fields {
+            name,
+            user,
+            field_name,
+        } => {
+            let response =
+                agent::request(&dir, &json!({"op": "fields", "name": name, "user": user}))?;
+            let fields = response["fields"].as_array().cloned().unwrap_or_default();
+            // `--field-name` prints exactly one value with no name column, so a
+            // script can capture it; an unknown name is an error, not silence.
+            if let Some(want) = field_name {
+                for field in &fields {
+                    if field["name"]
+                        .as_str()
+                        .is_some_and(|got| got.eq_ignore_ascii_case(&want))
+                    {
+                        println!("{}", field["value"].as_str().unwrap_or(""));
+                        return Ok(());
+                    }
+                }
+                bail!("no custom field named {want:?}");
+            }
+            // name<TAB>value — same TSV discipline as `list`/`passkeys`.
+            for field in &fields {
+                println!("{}\t{}", tsv_field(&field["name"]), tsv_field(&field["value"]));
+            }
+            // When nothing prints, say whether the item truly has no custom
+            // fields or has some that would not decrypt — on stderr, so a script
+            // capturing stdout is unaffected.
+            if fields.is_empty() {
+                match response["raw_field_count"].as_u64() {
+                    Some(0) | None => eprintln!("(item carries no custom fields)"),
+                    Some(n) => eprintln!("({n} custom field(s) present but none decrypted)"),
+                }
             }
             Ok(())
         }
@@ -383,6 +449,7 @@ fn main() -> Result<()> {
             set_user,
             uri,
             totp,
+            clear_totp,
             notes,
             folder,
             password,
@@ -396,7 +463,7 @@ fn main() -> Result<()> {
                 &json!({
                     "op": "edit", "name": name, "user": user,
                     "rename": rename, "set_user": set_user, "uri": uri,
-                    "totp": totp, "notes": notes, "folder": folder,
+                    "totp": totp, "clear_totp": clear_totp, "notes": notes, "folder": folder,
                     "password": password,
                     "generate": generate, "length": length, "symbols": !no_symbols,
                 }),

@@ -112,6 +112,10 @@ pub struct CipherEdit {
     pub uri: Option<String>,
     pub notes: Option<String>,
     pub folder_id: Option<String>,
+    /// Clear the item's authenticator secret (set `login.totp` to null). Unlike
+    /// the value fields, this REMOVES rather than replaces — the one thing the
+    /// "no empty value" rule cannot express. Mutually exclusive with `totp`.
+    pub clear_totp: bool,
 }
 
 impl CipherEdit {
@@ -123,6 +127,7 @@ impl CipherEdit {
             && self.uri.is_none()
             && self.notes.is_none()
             && self.folder_id.is_none()
+            && !self.clear_totp
     }
 
     /// Whether the edit touches a field that only exists on a login cipher.
@@ -130,6 +135,7 @@ impl CipherEdit {
         self.username.is_some()
             || self.password.is_some()
             || self.totp.is_some()
+            || self.clear_totp
             || self.uri.is_some()
     }
 }
@@ -144,6 +150,8 @@ pub enum EditError {
     NotALogin(String),
     #[error("refusing to set a field to the empty string; clearing a field is not supported")]
     EmptyValue,
+    #[error("cannot set and clear the totp in one edit; pass either --totp or --clear-totp")]
+    ClearAndSetTotp,
     #[error(transparent)]
     Crypto(#[from] CryptoError),
 }
@@ -700,6 +708,9 @@ impl Vault {
         if edit.touches_login() && cipher.item_type != CIPHER_TYPE_LOGIN {
             return Err(EditError::NotALogin(id.to_string()));
         }
+        if edit.clear_totp && edit.totp.is_some() {
+            return Err(EditError::ClearAndSetTotp);
+        }
         for value in [
             &edit.name,
             &edit.username,
@@ -757,6 +768,12 @@ impl Vault {
         }
         if let Some(totp) = &edit.totp {
             set_ci(&mut login, "totp", encrypt(totp)?);
+        }
+        if edit.clear_totp {
+            // The server does `login.totp = data.login.totp`, so an explicit
+            // null wipes the authenticator secret; omitting the key would leave
+            // it untouched, hence we set null rather than remove.
+            set_ci(&mut login, "totp", Value::Null);
         }
         if let Some(uri) = &edit.uri {
             set_ci(
@@ -862,6 +879,57 @@ impl Vault {
             .ok()
     }
 
+    /// A specific item's custom fields, each decrypted on demand, returned as
+    /// `(name, value)` in stored order. A hidden field's value decrypts like any
+    /// other; a linked field (no stored value) yields `None`. Read straight off
+    /// the RAW record for the same reason as [`Vault::notes`] — `sync` never
+    /// parses custom fields into [`RawCipher`], which is exactly why they must be
+    /// preserved by patching the raw JSON in [`Vault::edit_body`]. Empty vec if
+    /// the item is unknown, undecryptable, or carries no fields. A field whose
+    /// name will not decrypt is dropped rather than failing the whole read.
+    pub fn fields(&self, id: &str) -> Vec<(String, Option<String>)> {
+        let Some(cipher) = self.find(id) else {
+            return Vec::new();
+        };
+        let Ok(key) = self.cipher_key(cipher) else {
+            return Vec::new();
+        };
+        let Some(raw) = cipher.raw.as_object() else {
+            return Vec::new();
+        };
+        let Some(fields) = get_ci(raw, "fields").and_then(|value| value.as_array()) else {
+            return Vec::new();
+        };
+        let decrypt = |field: &serde_json::Value, key_name: &str| -> Option<String> {
+            let encrypted = get_ci(field.as_object()?, key_name)?.as_str()?;
+            key.decrypt_to_string(&EncString::parse(encrypted).ok()?).ok()
+        };
+        // A field carries an optional name and an optional value; a hidden field
+        // the user never named still has a value, so a missing/undecryptable
+        // NAME must not drop the whole entry (that would hide exactly the secret
+        // we came for). Name defaults to the empty string in that case.
+        fields
+            .iter()
+            .map(|field| {
+                (
+                    decrypt(field, "name").unwrap_or_default(),
+                    decrypt(field, "value"),
+                )
+            })
+            .collect()
+    }
+
+    /// How many custom-field entries the RAW cipher carries, decrypted or not.
+    /// A diagnostic companion to [`Vault::fields`]: when `fields` comes back
+    /// empty, this says whether the item truly has no custom fields (`Some(0)`
+    /// or `None`) or has some that would not decrypt (`Some(n)` with `n` > the
+    /// decrypted count).
+    pub fn raw_field_count(&self, id: &str) -> Option<usize> {
+        let cipher = self.find(id)?;
+        let raw = cipher.raw.as_object()?;
+        Some(get_ci(raw, "fields")?.as_array()?.len())
+    }
+
     /// The current TOTP code for a specific item, with the seconds until it
     /// rolls. `None` if the item is unknown or carries no authenticator secret.
     pub fn totp_code(&self, id: &str) -> Option<(String, u64)> {
@@ -870,6 +938,19 @@ impl Vault {
         let key = self.cipher_key(cipher).ok()?;
         let secret = key.decrypt_to_string(enc).ok()?;
         Totp::parse(&secret).ok().map(|totp| totp.now())
+    }
+
+    /// The RAW authenticator-secret string stored in the item's TOTP slot,
+    /// decrypted but NOT parsed as an `otpauth`/base32 secret. `totp_code`
+    /// returns `None` whenever the stored text is not a valid authenticator
+    /// (e.g. a user pasted a 64-hex key into the TOTP field by mistake); this
+    /// surfaces that text verbatim so it can be recovered. `None` if the item is
+    /// unknown or its TOTP slot is empty.
+    pub fn totp_secret(&self, id: &str) -> Option<String> {
+        let cipher = self.find(id)?;
+        let enc = cipher.totp.as_ref()?;
+        let key = self.cipher_key(cipher).ok()?;
+        key.decrypt_to_string(enc).ok()
     }
 
     pub fn len(&self) -> usize {
@@ -1609,6 +1690,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(renamed["passwordHistory"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn edit_body_clears_the_totp() {
+        let key_bytes = [0x5au8; 64];
+        let vault = login_vault(&key_bytes);
+        let body = vault
+            .edit_body(
+                "c1",
+                &CipherEdit {
+                    clear_totp: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // The authenticator slot is nulled, not omitted (the server would keep
+        // an omitted field), and the rest of the login rides along untouched.
+        assert!(body["login"]["totp"].is_null());
+        assert_eq!(body["login"]["username"], "2.enc-user");
+        assert_eq!(body["login"]["password"], "2.enc-pass");
+    }
+
+    #[test]
+    fn edit_body_rejects_setting_and_clearing_the_totp_together() {
+        let vault = login_vault(&[0x5au8; 64]);
+        let error = vault.edit_body(
+            "c1",
+            &CipherEdit {
+                totp: Some("JBSWY3DPEHPK3PXP".into()),
+                clear_totp: true,
+                ..Default::default()
+            },
+        );
+        assert!(matches!(error, Err(EditError::ClearAndSetTotp)));
+    }
+
+    #[test]
+    fn clear_totp_alone_is_not_an_empty_edit() {
+        let edit = CipherEdit {
+            clear_totp: true,
+            ..Default::default()
+        };
+        assert!(!edit.is_empty());
     }
 
     #[test]
