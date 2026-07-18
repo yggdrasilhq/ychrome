@@ -1,10 +1,14 @@
 [workspace]
 # The browser (root package) plus ychrome's own crates. A libyggterm app owns
 # its capabilities: the vault client lives here, not in yggterm.
-members = ["crates/ychrome-vault"]
+#
+# `ychrome-vault` is the crypto-heavy Bitwarden client + agent. `ychrome-vault-proto`
+# is JUST the agent's unix-socket wire (no crypto, no http): the browser links it
+# to talk to the vault agent directly instead of spawning the `ychrome-vault` CLI.
+members = ["crates/ychrome-vault", "crates/ychrome-vault-proto"]
 # `cargo build` at the root builds only the browser (lean, strip+lto); the vault
 # crate is built explicitly (`-p ychrome-vault`) so its crypto/http deps don't
-# weigh on the browser build.
+# weigh on the browser build. The proto crate is tiny and rides with the browser.
 default-members = ["."]
 
 [package]
@@ -22,6 +26,10 @@ clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 dirs = "5"
 serde_json = "1"
+# The vault agent's client transport — crypto-free, so the browser stays lean.
+# The sidebar's vault pane and the passkey signer speak the agent socket through
+# this instead of shelling out to the `ychrome-vault` CLI.
+ychrome-vault-proto = { path = "crates/ychrome-vault-proto" }
 # SHA-256 for the WebAuthn clientDataHash the passkey signer computes before it
 # asks the vault agent to sign. The signing crypto itself lives in ychrome-vault.
 sha2 = "0.10"

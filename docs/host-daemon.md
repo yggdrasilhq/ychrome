@@ -5,9 +5,10 @@ envelope, and `ychrome status` ship in `src/daemon.rs`; the GUI half shipped in
 yggterm a7534bca). Design agreed 2026-07-18 (four open calls settled with the
 owner: route-on-profile-match, vault agent stays a peer process, the command
 envelope is a generic libyggterm primitive, the agent engine mounts inside this
-daemon). Two things are NOT built and stay spec-only, marked below: the vault
-agent PEER hop (`ychrome-vault-proto` — the pane still shells out to the CLI,
-which is already a peer, so nothing regressed) and the agent engine (§7).
+daemon). The vault agent PEER hop is now BUILT too (2026-07-18): the crate
+`ychrome-vault-proto` carries the crypto-free agent socket wire, and the daemon's
+vault pane speaks it directly — the `ychrome-vault` CLI shell-out is gone (§3).
+One thing stays spec-only, marked below: the agent engine (§7).
 
 **One implementation call the spec did not foresee (built as such):** the daemon
 serves ONE control listener PER registered session (a plain
@@ -93,11 +94,16 @@ ychrome daemon        (one per host per user; auto-spawned; supervised
 | Vault access from the pane | shell out to `ychrome-vault` CLI → agent socket | daemon speaks the agent socket directly via `ychrome-vault-proto` |
 | Routing ingress | none (the campaign's open problem) | registry + queue + ping-reply envelope |
 
-## 3. The vault agent stays a peer process (settled)
+## 3. The vault agent stays a peer process (BUILT 2026-07-18)
 
-The daemon is a **client** of the vault agent's unix socket through a new
-crate `ychrome-vault-proto`: op enums and the socket client only, no
-crypto, no API dependencies. Consequences:
+The daemon is a **client** of the vault agent's unix socket through the
+crate `ychrome-vault-proto`: the newline-JSON socket wire (connect / send one
+`{"op":…}` / read one `{"ok":…}`), autostart, stop and the lock/staleness
+`status` — the socket client only, no crypto, no API dependencies. The
+`ychrome-vault` agent (server) and CLI reuse the same wire from this crate, so
+it has one owner; `passkey.rs`'s fido2 client and the vault pane both go through
+it, and the sidebar's per-op `Command::new("ychrome-vault")` shell-out is gone.
+Consequences:
 
 - The lean-build decision is not reopened; the browser still links no
   crypto (campaign blocker a resolved).

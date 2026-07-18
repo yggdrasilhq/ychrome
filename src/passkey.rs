@@ -39,13 +39,11 @@
 //! the agent; the assertion (public bytes) is what reaches the page.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::io::{Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use base64::Engine;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -526,50 +524,18 @@ fn emit_fido2_request(
     let _ = stdout.flush();
 }
 
-/// Send one request to this host's `ychrome-vault` agent and return its reply.
+/// Send one request to this host's `ychrome-vault` agent and return its reply,
+/// through the shared crypto-free transport in [`ychrome_vault_proto`].
 ///
 /// The browser speaks the agent's unix socket directly rather than shelling out
 /// to a CLI verb, deliberately: there is NO `ychrome-vault fido2-assert`
 /// subcommand a script could run, so the only path to a signature is this
-/// module, behind the GUI dialog. Same newline-delimited-JSON framing the CLI
-/// uses; a locked or absent agent surfaces as an error the shim reports.
+/// module, behind the GUI dialog. A WebAuthn ceremony has a human in the loop,
+/// so it uses a shorter read budget than a full `sync`; a locked or absent agent
+/// surfaces as an error the shim reports.
 fn agent_request(request: &Value) -> Result<Value> {
-    let socket = agent_socket_path()?;
-    let stream = UnixStream::connect(&socket).with_context(|| {
-        format!(
-            "no vault agent on {} — unlock with `ychrome-vault unlock` on this host",
-            socket.display()
-        )
-    })?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    let mut writer = stream.try_clone()?;
-    writeln!(writer, "{request}")?;
-    writer.flush()?;
-
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
-    let response: Value =
-        serde_json::from_str(line.trim()).context("vault agent sent a malformed response")?;
-    if response.get("ok").and_then(Value::as_bool) == Some(true) {
-        return Ok(response);
-    }
-    bail!(
-        "{}",
-        response
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("vault agent refused the request")
-    );
-}
-
-/// `~/.yggterm/vault/agent.sock` — the `ychrome-vault` agent's socket, at the
-/// CLI's default `--dir`. Host-resident: this is the host ychrome runs on.
-fn agent_socket_path() -> Result<PathBuf> {
-    Ok(dirs::home_dir()
-        .context("no home dir")?
-        .join(".yggterm")
-        .join("vault")
-        .join("agent.sock"))
+    let dir = ychrome_vault_proto::default_dir()?;
+    ychrome_vault_proto::request_with_timeout(&dir, request, Duration::from_secs(30))
 }
 
 /// A hex token of `bytes` random bytes, from the OS CSPRNG. Used for the bearer
