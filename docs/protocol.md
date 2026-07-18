@@ -156,6 +156,25 @@ An agent can open a contributed pane without clicking:
 Implementation: `src/sidebar.rs`. Widget vocabulary and the GUI side:
 `yggterm/.agents/skills/libyggterm-surfaces/SKILL.md`.
 
+## Command envelope on ping replies — SPEC agreed 2026-07-18, NOT BUILT
+
+The app→GUI ingress primitive (design: `docs/host-daemon.md`; normative
+platform copy: yggterm's `libyggterm-surfaces` SKILL). Wire shape from the
+app's side:
+
+- The GUI pings `GET <control>/ping?session=<env_id>&ack=<batch_id>`. The
+  `session` param names which session the ping is about (the env id our
+  declare carried); its presence marks a routing-capable GUI. `ack` names
+  the last command batch the GUI executed.
+- Our /ping reply MAY carry
+  `commands: {batch_id, entries:[{id, kind, session, ...args}]}` with v1
+  kinds `open_tab {session, url, raise}` and `toast {title, body, tone}`.
+- At-least-once delivery: we retain a batch until acked; the GUI dedups by
+  entry id. We expire undeliverable entries after 60s with a journal line.
+- Commands enter the queue ONLY from an explicit CLI verb (`ychrome <url>`
+  routing). Heartbeat/ping logic never synthesizes one; a ping only ever
+  refreshes.
+
 ## Open questions (for the next libyggterm apps)
 
 1. Per-surface SOCKS egress (full network-identity borrowing) and verifying
