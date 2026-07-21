@@ -756,7 +756,7 @@ pub fn ensure() -> Result<()> {
 fn spawn_daemon() -> Result<()> {
     let exe = std::env::current_exe().context("locating the ychrome binary")?;
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-    Command::new(&exe)
+    let child = Command::new(&exe)
         .arg("--daemon")
         .current_dir(&home)
         .stdin(Stdio::null())
@@ -765,6 +765,27 @@ fn spawn_daemon() -> Result<()> {
         .process_group(0)
         .spawn()
         .context("spawning the ychrome daemon")?;
+    // REAP IT. `std::process::Child` does NOT reap on drop, and this spawn sits
+    // inside `ensure()`'s 0..40 retry loop whose callers themselves retry — so a
+    // `--daemon` that exits immediately (e.g. it cannot bind its socket, or a
+    // version-mismatch stop/respawn ping-pong) leaves a ZOMBIE every ~150ms and
+    // nothing ever collects them.
+    //
+    // This is not theoretical: two long-lived `ychrome --profile ...` instances
+    // once accumulated ~900k zombie children between them (one held 468,010),
+    // which exhausted the PID space (pid_max 4.19M — PIDs had WRAPPED) and
+    // bloated /proc so badly that every fork/ps/pgrep on that host crawled,
+    // starving every unrelated process running there.
+    //
+    // A detached waiter is the right shape here: the daemon is long-lived, so the
+    // thread normally parks for the process's whole life and costs nothing; if the
+    // daemon dies instantly the thread reaps it at once and exits. We deliberately
+    // do NOT use waitpid(-1)/SIG_IGN — this process is a WebKit UIProcess and must
+    // not steal or auto-discard WebKit's own child exit statuses.
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
     Ok(())
 }
 
@@ -827,6 +848,46 @@ pub fn status() -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // FORK-BOMB GUARD: `spawn_daemon` sits in `ensure()`'s 0..40 retry loop and
+    // `std::process::Child` does not reap on drop, so an un-waited spawn turns a
+    // failing daemon into a zombie every ~150ms. This once reached ~900k zombies
+    // across two instances, wrapped the PID space and took a whole host down.
+    // The child MUST be waited on.
+    #[test]
+    fn spawn_daemon_reaps_its_child_so_it_cannot_zombie() {
+        let source = include_str!("daemon.rs");
+        let body = source
+            .split("fn spawn_daemon() -> Result<()> {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n}").next())
+            .expect("spawn_daemon body present");
+        assert!(
+            body.contains("child.wait()"),
+            "spawn_daemon must reap the child it spawns (Child does NOT reap on \
+             drop); without this a restart-looping daemon fork-bombs the host"
+        );
+    }
+
+    // The reaping shape itself: a child that exits immediately is collected, so
+    // repeated spawns cannot accumulate. Uses /bin/true rather than the ychrome
+    // binary so the test stays hermetic.
+    #[test]
+    fn a_detached_waiter_collects_an_immediately_exiting_child() {
+        let child = Command::new("/bin/true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn /bin/true");
+        let pid = child.id();
+        let waiter = std::thread::spawn(move || {
+            let mut child = child;
+            child.wait()
+        });
+        let status = waiter.join().expect("waiter thread").expect("wait ok");
+        assert!(status.success(), "child {pid} should exit cleanly and be reaped");
+    }
 
     #[test]
     fn a_drained_batch_carries_the_entry_shape_the_gui_expects() {
