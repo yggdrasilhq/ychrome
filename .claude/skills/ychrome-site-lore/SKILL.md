@@ -33,6 +33,18 @@ logged here is one less hurdle next time.
   asked for "a sqlite file"; this is that idea made fleet-safe — the SQLite is the
   index, the Markdown is the record.
 
+## Automatic recall at launch (you cannot forget this)
+
+A skill an agent must remember to load is a skill an agent forgets. So the recall
+also lives in the **tool's own output**: `ychrome <url>` prints this site's lore to
+stderr the moment the surface opens (the `── site-lore for <domain> ──` banner),
+matching the host with `www.` stripped. If there is no lore yet, it prints the exact
+`lore.py log` command to record one. You will see it whether or not you loaded this
+skill — reading it before you drive is then automatic, and logging after is a
+one-line copy-paste. Override the lookup dir with `YCHROME_SITE_LORE_DIR` (defaults
+to this skill dir under `~/gh/ychrome`). The commands below are still how you query
+across sites and write entries.
+
 ## Use it
 
 ```sh
