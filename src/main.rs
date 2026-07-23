@@ -218,6 +218,54 @@ fn run_thin_client(session: &str, url: &str, title: &str, profile: &str) -> Resu
 ///
 /// `stop` is owned by the caller because `ctrlc::set_handler` may be installed
 /// only once per process; the picker path installs it before it knows the URL.
+/// Print any known site-lore for this URL's host to stderr at launch, so an agent
+/// co-browsing the page CANNOT miss the access methods a prior agent already
+/// proved. The lore is the git-tracked markdown under the ychrome-site-lore skill
+/// (one file per domain); this reads it directly — no python at launch, no runtime
+/// dependency. If no lore exists yet, it prints the one-line command to record one.
+/// The recall lives in the TOOL's own output on purpose: a skill an agent must
+/// remember to load is a skill an agent forgets; the launch banner is not.
+fn print_site_lore(url: &str) {
+    let host = match Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+    {
+        Some(h) => h,
+        None => return,
+    };
+    // Skill dir: env override (matches lore.py's own SKILL_DIR), else the
+    // fleet-standard repo path that git keeps in sync on every host.
+    let skill_dir = std::env::var("YCHROME_SITE_LORE_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                .join("gh/ychrome/.claude/skills/ychrome-site-lore")
+        });
+    let lore_dir = skill_dir.join("lore");
+    // Try the host as-is, then with a leading "www." stripped, so a page browsed
+    // as www.davaindia.com still matches lore filed under davaindia.com.
+    let mut candidates = vec![host.clone()];
+    if let Some(stripped) = host.strip_prefix("www.") {
+        candidates.push(stripped.to_string());
+    }
+    for dom in &candidates {
+        if let Ok(body) = std::fs::read_to_string(lore_dir.join(format!("{dom}.md"))) {
+            eprintln!("ychrome: ── site-lore for {dom} (proven methods from prior runs) ──");
+            for line in body.lines() {
+                eprintln!("ychrome:   {line}");
+            }
+            eprintln!("ychrome: ── end site-lore · add findings with lore.py log {dom} ──");
+            return;
+        }
+    }
+    eprintln!(
+        "ychrome: no site-lore yet for {host} — once you learn the access method, record it so \
+         the next agent inherits it: python3 {}/lore.py log {host} --slug <method> --status WORKS --body-file <f>",
+        skill_dir.display()
+    );
+}
+
 fn drive_surface(
     session: &str,
     url: &str,
@@ -256,6 +304,7 @@ fn drive_surface(
     eprintln!(
         "ychrome: web surface open — {url} [{profile}]  (Ctrl+C to close, Ctrl+Z / yggterm Zzz to suspend)"
     );
+    print_site_lore(url);
     let mut ticks: u32 = 0;
     let mut last_tick = std::time::Instant::now();
     // Re-declare with the CURRENT control url — it moves if the daemon respawned
