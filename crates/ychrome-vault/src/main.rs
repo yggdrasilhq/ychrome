@@ -58,6 +58,13 @@ enum Command {
     Unlock,
     /// Drop the agent's decrypted vault.
     Lock,
+    /// Show or set the idle-lock timeout (0 = never auto-lock, the default).
+    /// Takes effect on the running agent immediately and persists to the config;
+    /// it does NOT lock the vault.
+    LockTimeout {
+        /// Seconds of inactivity before the agent drops the vault. Omit to read.
+        seconds: Option<u64>,
+    },
     /// Re-pull the ciphers into the unlocked agent (no password needed).
     Sync,
     /// Report reused and weak passwords as JSON. The scan runs inside the
@@ -278,6 +285,38 @@ fn main() -> Result<()> {
         }
         Command::Diagnose => print_json(&agent::request(&dir, &json!({"op": "diagnose"}))?),
         Command::Lock => print_json(&agent::request(&dir, &json!({"op": "lock"}))?),
+        Command::LockTimeout { seconds } => match seconds {
+            Some(seconds) => {
+                // Route through the agent when one is running, so a LIVE unlocked
+                // vault picks the change up without being dropped. With no agent
+                // there is nothing to inform — just persist it. (Never autostart:
+                // spawning an agent to change a setting would be absurd.)
+                if agent::is_running(&dir) {
+                    print_json(&agent::request(
+                        &dir,
+                        &json!({"op": "set-lock-timeout", "seconds": seconds}),
+                    )?)
+                } else {
+                    let mut manager = VaultManager::load(&dir);
+                    manager
+                        .set_lock_timeout(seconds)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    print_json(&json!({
+                        "lock_timeout_secs": seconds,
+                        "auto_lock": seconds != 0,
+                        "agent_running": false,
+                    }))
+                }
+            }
+            None => {
+                let manager = VaultManager::load(&dir);
+                let secs = manager.lock_timeout_secs();
+                print_json(&json!({
+                    "lock_timeout_secs": secs,
+                    "auto_lock": secs != 0,
+                }))
+            }
+        },
         Command::Sync => print_json(&agent::request(&dir, &json!({"op": "sync"}))?),
         Command::Watchtower => print_json(&agent::request(&dir, &json!({"op": "watchtower"}))?),
         Command::List {

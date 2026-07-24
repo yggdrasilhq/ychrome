@@ -33,7 +33,14 @@ pub enum VaultError {
 
 /// How long an idle unlocked vault stays unlocked in the agent, when the
 /// config does not say otherwise. Zero means "never auto-lock".
-pub const DEFAULT_LOCK_TIMEOUT_SECS: u64 = 3_600;
+///
+/// The default is **never**, by the owner's explicit call (2026-07-24): these are
+/// single-owner machines, the unlock costs a master password typed by hand, and an
+/// hourly re-lock silently broke long unattended runs — an agent mid-task would
+/// find the vault locked with no one around to type it again. An unlock now lasts
+/// until `ychrome-vault lock`, a reboot, or `stop-agent`. Set a non-zero
+/// `lock-timeout` on any host where that trade is wrong.
+pub const DEFAULT_LOCK_TIMEOUT_SECS: u64 = 0;
 
 fn default_lock_timeout_secs() -> u64 {
     DEFAULT_LOCK_TIMEOUT_SECS
