@@ -201,6 +201,21 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             state.manager.lock();
             Ok(status_json(&state.manager))
         }
+        // Change the idle-lock timeout on the LIVE agent. Without this the only
+        // way to change it was to re-run `configure`, which locks the vault —
+        // so the setting nobody could change quietly stayed wrong on two hosts.
+        "set-lock-timeout" => {
+            let seconds = request
+                .get("seconds")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow!("set-lock-timeout needs `seconds`"))?;
+            state
+                .manager
+                .set_lock_timeout(seconds)
+                .map_err(|error| anyhow!(error.to_string()))?;
+            // Do not lock: this is a policy change, not a security event.
+            Ok(status_json(&state.manager))
+        }
         // Drop the keys, unlink the socket, and exit once the reply is out.
         // Unlinking here (rather than on the way down) means a client that
         // immediately re-spawns cannot race a socket we are about to remove.
@@ -816,9 +831,14 @@ pub fn status_json(manager: &VaultManager) -> Value {
             "item_count": item_count,
             "cipher_count": cipher_count,
             "undecryptable": cipher_count.saturating_sub(item_count),
-            "lock_timeout_secs": manager.lock_timeout_secs(),
         }),
     };
+    // Report the idle-lock policy in EVERY state, not just when unlocked. It is
+    // not a secret, and it was invisible precisely when someone would look —
+    // after an unexplained re-lock. 0 = never.
+    let lock_timeout_secs = manager.lock_timeout_secs();
+    status["lock_timeout_secs"] = json!(lock_timeout_secs);
+    status["auto_lock"] = json!(lock_timeout_secs != 0);
     status["version"] = json!(env!("CARGO_PKG_VERSION"));
     status["exe_stamp"] = json!(exe_stamp());
     status
