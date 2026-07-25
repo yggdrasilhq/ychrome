@@ -26,6 +26,8 @@ pub enum ApiError {
     BadCredentials,
     #[error("this account requires two-factor authentication, which is not supported yet")]
     TwoFactorRequired,
+    #[error("the refresh token was rejected — sign in again with `ychrome-vault unlock`")]
+    RefreshRejected,
     #[error("unexpected response: {0}")]
     Malformed(String),
     #[error(transparent)]
@@ -44,6 +46,14 @@ pub struct TokenResponse {
     pub refresh_token: Option<String>,
     /// The user's symmetric key, encrypted under the stretched master key.
     pub protected_user_key: EncString,
+}
+
+/// A refreshed bearer pair. Carries no user key: the refresh grant does not
+/// return one, and it does not need to — the vault is already open in memory.
+pub struct RefreshedToken {
+    pub access_token: String,
+    /// The server rotates this; store it or the NEXT refresh fails.
+    pub refresh_token: Option<String>,
 }
 
 /// Everything `sync` returns, still encrypted.
@@ -167,6 +177,65 @@ impl Client {
             access_token,
             refresh_token,
             protected_user_key,
+        })
+    }
+
+    /// `POST /identity/connect/token` (refresh grant) — trade the long-lived
+    /// refresh token for a fresh access token.
+    ///
+    /// This is what makes "unlocked until locked" true for WRITES. Reads are
+    /// served from the decrypted in-memory vault and never touch the server, so
+    /// an expired access token is invisible until the first write, which then
+    /// 401s. Before this existed the only recovery was a full `unlock` — i.e.
+    /// the user re-typing their master password because a bearer token aged out
+    /// (reported 2026-07-25: a credential had to be parked in a plaintext file
+    /// because the vault refused the write).
+    ///
+    /// The server ROTATES the refresh token on use, so the caller must store
+    /// the one that comes back; reusing the old one fails.
+    pub fn refresh(&self, refresh_token: &str) -> Result<RefreshedToken, ApiError> {
+        let url = format!("{}/identity/connect/token", self.base);
+        let body = form_urlencode(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", "web"),
+        ]);
+        let resp = self
+            .http
+            .post(&url)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(body)
+            .send()
+            .map_err(|error| ApiError::Network(error.to_string()))?;
+        let status = resp.status();
+        let value: Value = resp
+            .json()
+            .map_err(|error| ApiError::Malformed(error.to_string()))?;
+        if !status.is_success() {
+            // A refresh token can be revoked or rotated out from under us. That
+            // is not a bad master password — it means re-authentication is
+            // genuinely required, and the caller must say so rather than
+            // silently retrying forever.
+            if get_str(&value, "error")
+                .map(|error| error == "invalid_grant")
+                .unwrap_or(false)
+            {
+                return Err(ApiError::RefreshRejected);
+            }
+            return Err(ApiError::Http {
+                status: status.as_u16(),
+                body: value.to_string(),
+            });
+        }
+        let access_token = get_str(&value, "access_token")
+            .ok_or_else(|| ApiError::Malformed("refresh response has no access_token".into()))?
+            .to_string();
+        Ok(RefreshedToken {
+            access_token,
+            refresh_token: get_str(&value, "refresh_token").map(str::to_string),
         })
     }
 
