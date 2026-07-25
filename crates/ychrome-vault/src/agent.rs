@@ -35,6 +35,7 @@ use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use crate::matching::{auto_match_for_host, find_by_name};
+use crate::model::FieldValue;
 use crate::session::{SessionMaterial, VaultManager, VaultStatus};
 
 use ychrome_vault_proto::pid_path;
@@ -47,6 +48,18 @@ pub use ychrome_vault_proto::{is_running, request, request_autostart, socket_pat
 
 /// How often the idle-lock thread wakes to check the clock.
 const LOCK_TICK: Duration = Duration::from_secs(5);
+
+/// How many accepts may fail BACK TO BACK before the agent stops trying.
+///
+/// `incoming()` never ends, so a listener that cannot accept — an fd adopted
+/// from the wrong object, a process out of descriptors — fails instantly and
+/// forever. A bare `continue` there is a hot loop that burns a core and serves
+/// nobody. A success resets the count, so this bounds a PERSISTENT failure only.
+const MAX_CONSECUTIVE_ACCEPT_FAILURES: u32 = 10;
+
+/// The pause after the nth consecutive accept failure, growing to a ceiling.
+const ACCEPT_BACKOFF_STEP: Duration = Duration::from_millis(50);
+const ACCEPT_BACKOFF_CAP: Duration = Duration::from_millis(250);
 
 struct AgentState {
     manager: VaultManager,
@@ -68,11 +81,16 @@ struct AgentState {
 /// What `handover` leaves behind for the connection handler to perform after the
 /// reply is flushed. Both fds are already CLOEXEC-cleared; dropping this instead
 /// of exec'ing closes the payload, which destroys the key material.
-struct ExecPlan {
-    exe: PathBuf,
-    dir: PathBuf,
-    listener_fd: RawFd,
-    payload: OwnedFd,
+///
+/// Public because [`arm_handover`] is: the near side of the crossing has exactly
+/// one owner, and the test that covers the crossing has to go THROUGH it rather
+/// than hand-roll a second copy of the fd plumbing. It did, and that is how the
+/// listener half of the CLOEXEC clear went uncovered.
+pub struct ExecPlan {
+    pub exe: PathBuf,
+    pub dir: PathBuf,
+    pub listener_fd: RawFd,
+    pub payload: OwnedFd,
 }
 
 impl AgentState {
@@ -96,6 +114,12 @@ pub fn exe_stamp() -> String {
 /// Run the agent in the foreground, serving `dir/agent.sock` until killed.
 /// Fails fast if another agent already holds the socket.
 pub fn serve(dir: &Path) -> Result<()> {
+    let listener = bind_socket(dir)?;
+    serve_on(dir, listener, None)
+}
+
+/// Bind `dir/agent.sock`, reclaiming it from an agent that is provably dead.
+fn bind_socket(dir: &Path) -> Result<UnixListener> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("locking down {}", dir.display()))?;
@@ -114,7 +138,7 @@ pub fn serve(dir: &Path) -> Result<()> {
     let listener =
         UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
-    serve_on(dir, listener, None)
+    Ok(listener)
 }
 
 /// Serve on a listener and a session INHERITED from the agent this process just
@@ -124,14 +148,137 @@ pub fn serve(dir: &Path) -> Result<()> {
 /// exec, there is no unbind/rebind window at all: a client that connects during
 /// the swap is queued in the socket's backlog and answered by the successor,
 /// rather than told "no vault agent".
+///
+/// Every failure below is loud and none is fatal, because the alternative to a
+/// degraded agent is NO agent: an fd that is not what its flag promises costs
+/// the seamless socket, and a payload that will not read costs the unlock, but
+/// neither costs both and neither takes the process down.
 pub fn serve_adopted(dir: &Path, listener_fd: RawFd, payload_fd: RawFd) -> Result<()> {
-    // SAFETY: both fds were opened by this process (before the exec that
-    // replaced its image) and named on its own argv. Taking ownership here is
-    // what closes them: the payload is consumed and dropped immediately, and
-    // the listener lives as long as the agent.
-    let listener = unsafe { UnixListener::from_raw_fd(listener_fd) };
-    let payload = read_payload(payload_fd);
-    serve_on(dir, listener, Some(payload))
+    // `from_raw_fd` validates NOTHING, and both ways a number off argv can be
+    // wrong are fatal. If it is no longer open — the CLOEXEC clear regressed, or
+    // someone typed the flags by hand — the Rust runtime ABORTS this process
+    // ("IO Safety violation", SIGABRT) before any of our code runs. If instead
+    // it was REALLOCATED by this process's own startup, the call succeeds on the
+    // wrong object and every accept on it fails forever. So each number is
+    // checked against what it must BE before anything takes ownership of it.
+    let payload = check_adopted_fd(payload_fd, AdoptedFd::Payload)
+        // Ownership (and the close) transfers here, on the checked path only: an
+        // fd that is not ours to own must not be closed on the way out.
+        .and_then(|()| read_payload(payload_fd));
+
+    match check_adopted_fd(listener_fd, AdoptedFd::Listener) {
+        // SAFETY: checked above to be a live, listening AF_UNIX stream socket —
+        // which, in a process whose image was just replaced by `exec_successor`,
+        // is the listener it inherited. Owning it here is what closes it, and it
+        // lives as long as the agent.
+        Ok(()) => serve_on(
+            dir,
+            unsafe { UnixListener::from_raw_fd(listener_fd) },
+            Some(payload),
+        ),
+        Err(error) => {
+            // Loud, and NOT fatal — the same rule `serve_on` applies to a bad
+            // payload. Exiting would leave the user with no agent at all, and
+            // the SESSION is a separate thing from the socket: what a lost
+            // listener costs is the seamless swap (a client connecting in this
+            // window is told there is no agent), not necessarily the unlock. So
+            // bind a fresh socket and carry whatever the payload gave us.
+            eprintln!(
+                "ychrome-vault: the inherited listener is unusable ({error}) — binding a \
+                 fresh socket instead; a client that connected mid-swap saw one refusal"
+            );
+            serve_on(dir, bind_socket(dir)?, Some(payload))
+        }
+    }
+}
+
+/// The two fds a successor inherits, and what each must be for the handover to
+/// be real rather than a number that happens to parse.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AdoptedFd {
+    Listener,
+    Payload,
+}
+
+impl AdoptedFd {
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Listener => "--adopt-listener",
+            Self::Payload => "--adopt-payload",
+        }
+    }
+
+    fn expected(self) -> &'static str {
+        match self {
+            Self::Listener => "a listening AF_UNIX stream socket",
+            Self::Payload => "a pipe",
+        }
+    }
+
+    fn matches(self, fd: RawFd) -> bool {
+        match self {
+            // SO_ACCEPTCONN is the load-bearing one: a socket that is not
+            // LISTENING cannot be the socket this agent serves, however
+            // socket-shaped it looks. Together these three also make the two
+            // kinds mutually exclusive, so `--adopt-listener N --adopt-payload N`
+            // cannot pass both checks and double-own one fd.
+            Self::Listener => {
+                socket_option(fd, libc::SO_DOMAIN) == Some(libc::AF_UNIX)
+                    && socket_option(fd, libc::SO_TYPE) == Some(libc::SOCK_STREAM)
+                    && socket_option(fd, libc::SO_ACCEPTCONN) == Some(1)
+            }
+            Self::Payload => fd_is_pipe(fd),
+        }
+    }
+}
+
+/// Refuse an inherited fd that is not open, or is open onto the wrong kind of
+/// object. Cheap, and it turns two silent deaths into one sentence.
+fn check_adopted_fd(fd: RawFd, kind: AdoptedFd) -> Result<()> {
+    // SAFETY: F_GETFD only reads the descriptor flags; on a number that is not
+    // open it returns -1/EBADF rather than doing anything.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("{} {fd} is not an open file descriptor", kind.flag()));
+    }
+    if !kind.matches(fd) {
+        bail!(
+            "{} {fd} is not {} — refusing to adopt it",
+            kind.flag(),
+            kind.expected()
+        );
+    }
+    Ok(())
+}
+
+/// One integer `SOL_SOCKET` option, or `None` if the fd is not a socket.
+fn socket_option(fd: RawFd, name: libc::c_int) -> Option<libc::c_int> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `value` and `len` are live locals of exactly the type and size
+    // getsockopt is told to write; a non-socket fd returns -1/ENOTSOCK.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            name,
+            (&raw mut value).cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    (rc == 0).then_some(value)
+}
+
+fn fd_is_pipe(fd: RawFd) -> bool {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat writes one `libc::stat` into the buffer we just reserved,
+    // and only on success (rc == 0) is it read back.
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: fstat returned 0, so the buffer is initialised.
+    let stat = unsafe { stat.assume_init() };
+    (stat.st_mode & libc::S_IFMT) == libc::S_IFIFO
 }
 
 /// The serve loop both entry points share, so a handed-over agent and a freshly
@@ -194,16 +341,50 @@ fn serve_on(
         "ychrome-vault: agent listening on {}",
         socket_path(dir).display()
     );
+    accept_loop(listener, state)
+}
+
+/// Serve every connection the listener hands over, until it stops handing any
+/// over at all.
+///
+/// The error arm is the whole point of splitting this out. `incoming()` is
+/// infinite and an unusable listener fails it INSTANTLY, so a bare `continue`
+/// there is an unbounded hot loop: a core at 100% and not one request served.
+/// Back off, then give up loudly — an agent that exits with a reason is strictly
+/// better than one that spins in silence, and the unlock behind it was already
+/// unreachable the moment nothing could connect.
+fn accept_loop(listener: UnixListener, state: Arc<Mutex<AgentState>>) -> Result<()> {
+    let mut consecutive: u32 = 0;
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                consecutive = 0;
                 let state = state.clone();
                 std::thread::spawn(move || serve_connection(stream, &state));
             }
-            Err(error) => eprintln!("ychrome-vault: accept failed: {error}"),
+            Err(error) => {
+                consecutive += 1;
+                eprintln!(
+                    "ychrome-vault: accept failed \
+                     ({consecutive}/{MAX_CONSECUTIVE_ACCEPT_FAILURES}): {error}"
+                );
+                if consecutive >= MAX_CONSECUTIVE_ACCEPT_FAILURES {
+                    bail!(
+                        "accept failed {consecutive} times in a row ({error}) — this listener \
+                         is unusable, so the agent is exiting rather than spinning on it"
+                    );
+                }
+                std::thread::sleep(accept_backoff(consecutive));
+            }
         }
     }
     Ok(())
+}
+
+/// How long to wait after `consecutive` accept failures. Never zero: a zero here
+/// is the hot loop this exists to prevent.
+fn accept_backoff(consecutive: u32) -> Duration {
+    (ACCEPT_BACKOFF_STEP * consecutive).min(ACCEPT_BACKOFF_CAP)
 }
 
 /// Drop the unlocked vault once it has gone untouched for `lock_timeout_secs`.
@@ -383,15 +564,14 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
                 material,
                 idle_secs: state.last_activity.elapsed().as_secs(),
             };
-            let pipe = payload_pipe(&payload.encode())?;
-            clear_cloexec(listener_fd)?;
-            let stamp = ychrome_vault_proto::exe_stamp_of(&successor);
-            state.handover = Some(ExecPlan {
-                exe: successor.clone(),
-                dir: state.dir.clone(),
+            let plan = arm_handover(
+                successor.clone(),
+                state.dir.clone(),
                 listener_fd,
-                payload: pipe,
-            });
+                &payload.encode(),
+            )?;
+            let stamp = ychrome_vault_proto::exe_stamp_of(&successor);
+            state.handover = Some(plan);
             // "accepted", not "done": the exec happens after this reply is
             // flushed, so only a SECOND round trip can prove it worked. The CLI
             // verb does exactly that.
@@ -532,7 +712,18 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             let fields: Vec<Value> = vault
                 .fields(&item.id)
                 .into_iter()
-                .map(|(name, value)| json!({ "name": name, "value": value }))
+                // A bare `value: null` cannot say WHY there is nothing to show,
+                // and the two reasons send the reader to different places, so
+                // the wire carries the one the vault actually determined.
+                .map(|(name, value)| match value {
+                    FieldValue::Value(value) => json!({ "name": name, "value": value }),
+                    FieldValue::Linked => {
+                        json!({ "name": name, "value": null, "absent": "linked" })
+                    }
+                    FieldValue::Unreadable => {
+                        json!({ "name": name, "value": null, "absent": "unreadable" })
+                    }
+                })
                 .collect();
             let raw_field_count = vault.raw_field_count(&item.id);
             let name = item.name.clone();
@@ -1099,6 +1290,30 @@ fn payload_pipe(bytes: &[u8]) -> Result<OwnedFd> {
     drop(writer);
     clear_cloexec(read.as_raw_fd())?;
     Ok(read)
+}
+
+/// Prepare the crossing: put the session on a pipe and make BOTH fds survive the
+/// `execve` that is about to replace this process.
+///
+/// The one owner of that preparation, and public for exactly that reason. The
+/// listener's CLOEXEC clear is the guard the whole design rests on — it is why
+/// there is no unbind window, and why a client connecting mid-swap is queued in
+/// the backlog rather than told "no vault agent". Nothing else may clear it, and
+/// nothing else may build an [`ExecPlan`].
+pub fn arm_handover(
+    exe: PathBuf,
+    dir: PathBuf,
+    listener_fd: RawFd,
+    payload: &[u8],
+) -> Result<ExecPlan> {
+    let pipe = payload_pipe(payload)?;
+    clear_cloexec(listener_fd)?;
+    Ok(ExecPlan {
+        exe,
+        dir,
+        listener_fd,
+        payload: pipe,
+    })
 }
 
 /// Read a payload written by [`payload_pipe`] and close the fd.
@@ -1909,6 +2124,153 @@ mod tests {
         let huge = vec![0u8; MAX_HANDOVER_PAYLOAD + 1];
         let error = payload_pipe(&huge).unwrap_err().to_string();
         assert!(error.contains("ceiling"), "{error}");
+    }
+
+    /// Is this fd set to close on exec?
+    fn cloexec_set(fd: RawFd) -> bool {
+        // SAFETY: reading the descriptor flags of an fd this test owns.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD failed on fd {fd}");
+        flags & libc::FD_CLOEXEC != 0
+    }
+
+    /// An fd number that CANNOT be open: the kernel never allocates one at or
+    /// above `RLIMIT_NOFILE`. Picking "some big number" instead would race the
+    /// other test threads in this binary, which is exactly the kind of
+    /// timing-dependent test this project refuses.
+    fn never_open_fd() -> RawFd {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes one `rlimit` into a live local.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        limit.rlim_cur.min(1_000_000) as RawFd
+    }
+
+    // The listener's CLOEXEC clear is the guard the whole handover rests on: it
+    // is why there is no unbind window. Lose it and the successor inherits a
+    // CLOSED fd — dead pid, unbound socket, master password retyped on every
+    // host. It had NO coverage, because the one test that crossed an exec
+    // cleared the bit ITSELF and so never ran the production call. This pins the
+    // production call, for both fds.
+    #[test]
+    fn arming_a_handover_clears_cloexec_on_the_listener_and_the_payload() {
+        let dir = temp_dir("handover-arm");
+        let listener = UnixListener::bind(socket_path(&dir)).unwrap();
+        // Rust sets FD_CLOEXEC on everything it opens. That default is right,
+        // and opting out of it for exactly these two fds is the whole job.
+        assert!(
+            cloexec_set(listener.as_raw_fd()),
+            "a Rust-opened listener starts CLOEXEC"
+        );
+
+        let plan = arm_handover(
+            PathBuf::from("/usr/local/bin/ychrome-vault"),
+            dir.clone(),
+            listener.as_raw_fd(),
+            b"a payload",
+        )
+        .unwrap();
+
+        assert!(
+            !cloexec_set(plan.listener_fd),
+            "the LISTENER must survive the exec: a successor that inherits a closed fd \
+             cannot serve the socket at all, and the unlock dies with it"
+        );
+        assert!(
+            !cloexec_set(plan.payload.as_raw_fd()),
+            "the PAYLOAD must survive the exec, or the successor comes up locked"
+        );
+        assert_eq!(plan.listener_fd, listener.as_raw_fd());
+        assert_eq!(plan.dir, dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // `from_raw_fd` validates nothing: on a closed number the runtime aborts the
+    // process, and on a REALLOCATED one it succeeds on the wrong object and
+    // never accepts again. Both are one-way-door deaths, so an inherited fd is
+    // checked against what the flag promises before anything owns it.
+    #[test]
+    fn an_adopted_fd_must_be_the_object_its_flag_promises() {
+        let dir = temp_dir("adopt-fd");
+        let listener = UnixListener::bind(socket_path(&dir)).unwrap();
+        let pipe = payload_pipe(b"payload").unwrap();
+        let (connected, _peer) = UnixStream::pair().unwrap();
+
+        // The two real things pass, each as itself.
+        check_adopted_fd(listener.as_raw_fd(), AdoptedFd::Listener).unwrap();
+        check_adopted_fd(pipe.as_raw_fd(), AdoptedFd::Payload).unwrap();
+
+        // ...and are refused as each other, which is also what makes
+        // `--adopt-listener N --adopt-payload N` impossible to double-own.
+        for (fd, kind, wanted) in [
+            (pipe.as_raw_fd(), AdoptedFd::Listener, "listening"),
+            (listener.as_raw_fd(), AdoptedFd::Payload, "pipe"),
+            // A CONNECTED socket is socket-shaped but not listening — the exact
+            // shape of an fd number that got reallocated to something live.
+            (connected.as_raw_fd(), AdoptedFd::Listener, "listening"),
+            (
+                never_open_fd(),
+                AdoptedFd::Listener,
+                "not an open file descriptor",
+            ),
+            (
+                never_open_fd(),
+                AdoptedFd::Payload,
+                "not an open file descriptor",
+            ),
+        ] {
+            let error = check_adopted_fd(fd, kind)
+                .expect_err(&format!("{kind:?} accepted fd {fd}"))
+                .to_string();
+            assert!(error.contains(wanted), "{kind:?}: {error}");
+            assert!(error.contains(kind.flag()), "{kind:?}: {error}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // `incoming()` never ends, and a listener that cannot accept fails it
+    // INSTANTLY and forever. The old bare `continue` there was an unbounded hot
+    // loop: a core at 100%, not one request served, nothing in the log but the
+    // same line a million times.
+    #[test]
+    fn a_listener_that_cannot_accept_gives_up_instead_of_spinning() {
+        // A connected socket is not a listening one: accept on it fails EINVAL
+        // every time, which is how an adopted-from-the-wrong-object fd behaves.
+        let (connected, _peer) = UnixStream::pair().unwrap();
+        // SAFETY: the fd is live and released by `into_raw_fd`, so the listener
+        // below is its only owner.
+        let listener =
+            unsafe { UnixListener::from_raw_fd(std::os::fd::IntoRawFd::into_raw_fd(connected)) };
+        let dir = temp_dir("accept-spin");
+        let state = test_state(VaultManager::load(&dir), dir.clone());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let _ = tx.send(accept_loop(listener, state).map_err(|error| error.to_string()));
+        });
+
+        let outcome = rx.recv_timeout(Duration::from_secs(30)).expect(
+            "the accept loop must give up on a listener that will never accept — \
+             a bare `continue` there spins a core forever",
+        );
+        let error = outcome.expect_err("a listener that never accepts is not a clean exit");
+        assert!(error.contains("accept failed"), "{error}");
+        assert!(error.contains("exiting"), "{error}");
+        // And it must have SLEPT between the tries: with no backoff the whole
+        // budget burns through in microseconds, which is the same hot loop with
+        // a bound on it.
+        assert!(
+            started.elapsed() >= ACCEPT_BACKOFF_STEP * 4,
+            "the loop must back off between failures, not spin: {:?}",
+            started.elapsed()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // A dead socket file must not wedge the agent forever: serve() detects that
