@@ -144,6 +144,7 @@ read -rs PW; echo "$PW" | ychrome-vault unlock
 ychrome-vault list                     # name<TAB>user<TAB>folder   (--json for exact bytes)
 ychrome-vault get NAME [USER]          # --field password|username|totp|totp-secret|notes
 ychrome-vault totp NAME [USER]         # 6-digit code
+ychrome-vault card NAME [USER]         # brand<TAB>holder<TAB>expM<TAB>expY<TAB>last4
 ychrome-vault match HOST               # strict: the ONE entry an auto-fill may use
 ychrome-vault suggest HOST             # loose: rows the sidebar floats up (secret-free)
 ychrome-vault add NAME [USER] --generate --uri https://...
@@ -165,6 +166,13 @@ ychrome-vault sync | lock | stop-agent | ping | status | diagnose | check
   selects by `organizationId`.
 - `--field notes` reads notes off the **raw** record, because `sync` never parses
   them into `RawCipher`. It is also the read that proves an edit preserved them.
+- **Cards** (`type` 3) have no password, so `get` refuses them however you spell
+  `--field` — 130 of 1113 items. `card NAME` prints their metadata; `list --json`
+  now carries `item_type` so a listing can say WHY an item refuses. **There is no
+  CLI verb for the number or the CVV, and adding one is not an oversight to fix**:
+  a PAN in scrollback or an agent transcript is durable and cannot be rotated. The
+  number reaches a page only through the sidebar's `card-fill` injector
+  (`card-secret` op), whose script returns field names, never values.
 - **Absent is not empty.** A field the item does not have exits non-zero with the
   reason on stderr; a field it stores as an empty string prints an empty line and
   exits 0. `USER=$(ychrome-vault get X --field username)` used to capture "" and

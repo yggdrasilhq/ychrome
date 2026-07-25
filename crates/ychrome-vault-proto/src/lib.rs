@@ -26,6 +26,20 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
+/// Bitwarden's cipher `type` discriminants, as they cross this wire in a
+/// `VaultItem`'s `item_type`.
+///
+/// They live here, in the wire crate, because BOTH ends read them: the vault's
+/// model sets `item_type` off the sync record, and the browser's sidebar decides
+/// from the same number which fill button a row gets. Spelled twice, the two
+/// ends could drift on what "3" means.
+///
+/// A login is also the only type whose login fields this client can edit.
+pub const CIPHER_TYPE_LOGIN: u8 = 1;
+/// A payment card: no password at all, which is why `get` refuses it and the
+/// sidebar must offer a different fill.
+pub const CIPHER_TYPE_CARD: u8 = 3;
+
 /// Default read budget for a request. Matches the agent's own client: a `sync`
 /// or `unlock` re-pulls the whole vault from the server, which is slow.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -286,8 +300,8 @@ pub fn status(dir: &Path) -> Result<Value> {
     if is_running(dir) {
         let mut response = request(dir, &json!({"op": "status"}))?;
         response["agent"] = json!(true);
-        let stale = response.get("exe_stamp").and_then(Value::as_str)
-            != Some(&installed_vault_exe_stamp());
+        let stale =
+            response.get("exe_stamp").and_then(Value::as_str) != Some(&installed_vault_exe_stamp());
         response["agent_stale"] = json!(stale);
         Ok(response)
     } else {

@@ -8,8 +8,11 @@
 
 use std::collections::HashMap;
 
+use zeroize::Zeroizing;
+
 use crate::crypto::{CryptoError, EncString, SymmetricKey};
 use crate::totp::Totp;
+use ychrome_vault_proto::{CIPHER_TYPE_CARD, CIPHER_TYPE_LOGIN};
 
 /// A cipher as it arrives from `sync`, with its fields still encrypted.
 #[derive(Debug, Clone, Default)]
@@ -63,9 +66,10 @@ pub struct RawFido2Credential {
     pub creation_date: Option<String>,
 }
 
-/// The `type` value of a login cipher. The only type this client can edit's
-/// login fields on.
-const CIPHER_TYPE_LOGIN: u8 = 1;
+// The cipher `type` discriminants are imported at the top of this file from the
+// wire crate: they cross the agent socket in `VaultItem::item_type`, and the
+// browser's sidebar decides which fill button a row gets from the SAME numbers.
+// One owner, or both ends would spell "3 means card" and could drift.
 
 /// Keys the SERVER owns. They are read-only projections in a `sync` record and
 /// must not be echoed back in an update: `id` is in the URL, and the rest are
@@ -197,6 +201,40 @@ pub struct VaultItem {
     /// The item stores at least one passkey. Like `has_totp`, this is a boolean
     /// so a listing can badge it without decrypting anything secret.
     pub has_passkey: bool,
+    /// Bitwarden's cipher type: 1 login, 2 secure note, 3 card, 4 identity.
+    /// Secret-free, and the answer to a question the list could not previously
+    /// be asked: 130 of this user's 1113 items are not logins, so `get` refuses
+    /// them ("has no password") with nothing in the listing to explain why.
+    pub item_type: u8,
+}
+
+/// Secret-free metadata for a card cipher: what a human needs to tell two cards
+/// apart. The full number and the CVV are NOT here and cannot be — see
+/// [`CardSecret`]. Same posture as [`PasskeyInfo`], whose no-leak property is a
+/// test, not a convention.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CardInfo {
+    pub brand: Option<String>,
+    pub cardholder: Option<String>,
+    pub exp_month: Option<String>,
+    pub exp_year: Option<String>,
+    /// The last four digits of the stored number, derived once inside
+    /// [`Vault::card`] from a decrypted PAN that is dropped in the same
+    /// expression. Four digits identify a card to its owner and are not the
+    /// credential.
+    pub last4: Option<String>,
+}
+
+/// A card's actual secrets: the full number and the CVV.
+///
+/// Deliberately NOT `Serialize` and deliberately NOT `Debug` — a PAN reaching a
+/// log line, a `{:?}`, or a schema is exactly the failure this split prevents.
+/// The only reader is the agent's `card-secret` op, which hands them to the
+/// sidebar's fill injector, mirroring how the passkey private key is reachable
+/// from `fido2_assert` alone and never from `passkeys()`.
+pub struct CardSecret {
+    pub number: Option<Zeroizing<String>>,
+    pub code: Option<Zeroizing<String>>,
 }
 
 /// Secret-free metadata for one stored passkey. Carries what a picker or a
@@ -414,6 +452,7 @@ impl Vault {
                     has_password: cipher.password.is_some(),
                     has_totp: cipher.totp.is_some(),
                     has_passkey: !cipher.fido2.is_empty(),
+                    item_type: cipher.item_type,
                 })
             })
             .collect()
@@ -879,6 +918,67 @@ impl Vault {
             .ok()
     }
 
+    /// The cipher's `card` object and the key its sub-fields are sealed under.
+    ///
+    /// Read off the RAW record for the same reason as [`Vault::notes`]: `sync`
+    /// never parses a card into [`RawCipher`], and adding a parsed `card` field
+    /// there would be a second encoding of the same data that `edit_body`'s raw
+    /// patching could silently diverge from. `None` when the item is unknown,
+    /// undecryptable, or is not a card.
+    fn card_object(&self, id: &str) -> Option<(SymmetricKey, &JsonMap)> {
+        let cipher = self.find(id)?;
+        // The record's own `type` is what makes an item a card. Reading a stray
+        // `card` object off a login would let the two disagree about what an
+        // item IS, and `VaultItem::item_type` (which the sidebar draws its fill
+        // button from) reports that same field.
+        if cipher.item_type != CIPHER_TYPE_CARD {
+            return None;
+        }
+        let card = get_ci(cipher.raw.as_object()?, "card")?.as_object()?;
+        let key = self.cipher_key(cipher).ok()?;
+        Some((key, card))
+    }
+
+    /// A card item's SECRET-FREE metadata: brand, cardholder, expiry, last four.
+    ///
+    /// The 130 items in this user's vault that carry no password are mostly
+    /// these — `get` refuses them all, so before this read they were reachable
+    /// only through `notes`. The full number and the CVV are not here by
+    /// construction; [`Vault::card_secret`] is the only path to those.
+    pub fn card(&self, id: &str) -> Option<CardInfo> {
+        let (key, card) = self.card_object(id)?;
+        let read = |name: &str| get_ci(card, name).and_then(|value| decrypt_or_plain(&key, value));
+        // The PAN is decrypted here and lives exactly as long as this binding:
+        // last4 is taken from it and the rest is zeroized on drop.
+        let number = read("number").map(Zeroizing::new);
+        Some(CardInfo {
+            brand: read("brand"),
+            cardholder: read("cardholderName"),
+            exp_month: read("expMonth"),
+            exp_year: read("expYear"),
+            last4: number.as_ref().and_then(|number| last_four(number)),
+        })
+    }
+
+    /// A card's full number and CVV, decrypted on demand.
+    ///
+    /// The one reader is the agent's `card-secret` op, which exists for the
+    /// sidebar's fill injector. There is deliberately no CLI verb: a PAN printed
+    /// to a terminal is durable — scrollback, shell history, an agent CLI's
+    /// JSONL transcript — and unlike a password it cannot be rotated on demand.
+    pub fn card_secret(&self, id: &str) -> Option<CardSecret> {
+        let (key, card) = self.card_object(id)?;
+        let read = |name: &str| {
+            get_ci(card, name)
+                .and_then(|value| decrypt_or_plain(&key, value))
+                .map(Zeroizing::new)
+        };
+        Some(CardSecret {
+            number: read("number"),
+            code: read("code"),
+        })
+    }
+
     /// A specific item's custom fields, each decrypted on demand, returned as
     /// `(name, value)` in stored order. A hidden field's value decrypts like any
     /// other; a linked field (no stored value) yields `None`. Read straight off
@@ -902,7 +1002,8 @@ impl Vault {
         };
         let decrypt = |field: &serde_json::Value, key_name: &str| -> Option<String> {
             let encrypted = get_ci(field.as_object()?, key_name)?.as_str()?;
-            key.decrypt_to_string(&EncString::parse(encrypted).ok()?).ok()
+            key.decrypt_to_string(&EncString::parse(encrypted).ok()?)
+                .ok()
         };
         // A field carries an optional name and an optional value; a hidden field
         // the user never named still has a value, so a missing/undecryptable
@@ -968,6 +1069,30 @@ type JsonMap = serde_json::Map<String, serde_json::Value>;
 // a raw record's keys cannot be matched exactly. Reads, removals and writes all
 // go through these: match any casing, write camelCase, and never leave a
 // case-variant twin behind that the server might read instead of our patch.
+
+/// Decrypt a raw-record string under `key`, tolerating one stored in the clear.
+///
+/// Bitwarden encrypts every card sub-field, but a record written by an older or
+/// third-party client can carry a plaintext `brand` ("Visa"), exactly as a
+/// passkey's `creationDate` is plaintext in the sync record. The rule is
+/// deliberate and one-way: a value that PARSES as an EncString must decrypt or
+/// it is dropped (`None`), so ciphertext can never be surfaced as if it were the
+/// plaintext; only a value that is not an EncString at all is taken verbatim.
+fn decrypt_or_plain(key: &SymmetricKey, value: &serde_json::Value) -> Option<String> {
+    let text = value.as_str()?;
+    match EncString::parse(text) {
+        Ok(enc) => key.decrypt_to_string(&enc).ok(),
+        Err(_) => Some(text.to_string()),
+    }
+}
+
+/// The last four DIGITS of a stored card number. People type separators, so
+/// non-digits are ignored rather than counted; fewer than four digits is not a
+/// card number and yields `None` rather than a partial one.
+fn last_four(number: &str) -> Option<String> {
+    let digits: String = number.chars().filter(char::is_ascii_digit).collect();
+    (digits.len() >= 4).then(|| digits[digits.len() - 4..].to_string())
+}
 
 fn get_ci<'a>(object: &'a JsonMap, key: &str) -> Option<&'a serde_json::Value> {
     object
@@ -2056,6 +2181,193 @@ mod tests {
         let carried = EncString::parse(body["notes"].as_str().unwrap()).unwrap();
         let key = SymmetricKey::from_bytes(&key_bytes).unwrap();
         assert_eq!(key.decrypt_to_string(&carried).unwrap(), "remember me");
+    }
+
+    /// A card cipher as `sync` really sends one: type 3, every card sub-field an
+    /// EncString, and no login block at all — which is why `get` refuses it.
+    fn card_vault(key_bytes: &[u8; 64], keys: &[(&str, &str)]) -> Vault {
+        let user_key = SymmetricKey::from_bytes(key_bytes).unwrap();
+        let card: serde_json::Map<String, serde_json::Value> = keys
+            .iter()
+            .map(|(name, value)| (name.to_string(), json_str(seal(key_bytes, value))))
+            .collect();
+        let cipher = RawCipher {
+            raw: serde_json::json!({
+                "object": "cipherDetails",
+                "id": "card1",
+                "type": 3,
+                "name": "2.enc-name",
+                "card": card,
+            }),
+            id: "card1".into(),
+            item_type: 3,
+            name: Some(seal(key_bytes, "HDFC Regalia")),
+            ..Default::default()
+        };
+        Vault::new(
+            user_key,
+            HashMap::new(),
+            vec![cipher],
+            vec![],
+            HashMap::new(),
+        )
+    }
+
+    fn json_str(enc: EncString) -> serde_json::Value {
+        serde_json::json!(enc.to_string())
+    }
+
+    // A card is read off the RAW record like notes are, and the split is the
+    // whole point: the metadata view carries the last four and CANNOT carry the
+    // number or the CVV, which come out of a separate, unserializable reader.
+    #[test]
+    fn a_card_reads_its_metadata_without_carrying_the_number() {
+        let key_bytes = [0x5au8; 64];
+        let vault = card_vault(
+            &key_bytes,
+            &[
+                ("cardholderName", "AVIKALPA KUNDU"),
+                ("brand", "Visa"),
+                ("number", "4111 1111 1111 4242"),
+                ("expMonth", "11"),
+                ("expYear", "2029"),
+                ("code", "737"),
+            ],
+        );
+
+        let card = vault.card("card1").expect("a type-3 cipher is a card");
+        assert_eq!(card.brand.as_deref(), Some("Visa"));
+        assert_eq!(card.cardholder.as_deref(), Some("AVIKALPA KUNDU"));
+        assert_eq!(card.exp_month.as_deref(), Some("11"));
+        assert_eq!(card.exp_year.as_deref(), Some("2029"));
+        // Separators are not digits: the last four are 4242, not "4242" with a
+        // space, and not the last four CHARACTERS.
+        assert_eq!(card.last4.as_deref(), Some("4242"));
+
+        // THE security property, the same one locked for the passkey private
+        // key: serialize the metadata view and prove the PAN and the CVV are
+        // absent, and that it has no field that could ever carry them.
+        let wire = serde_json::to_string(&card).unwrap();
+        assert!(
+            !wire.contains("4111"),
+            "PAN leaked into the metadata: {wire}"
+        );
+        assert!(
+            !wire.contains("737"),
+            "CVV leaked into the metadata: {wire}"
+        );
+        assert!(!wire.contains("number") && !wire.contains("code"), "{wire}");
+
+        // The secrets have exactly one reader, and it is not serializable.
+        let secret = vault.card_secret("card1").unwrap();
+        assert_eq!(
+            secret.number.as_deref().map(String::as_str),
+            Some("4111 1111 1111 4242")
+        );
+        assert_eq!(secret.code.as_deref().map(String::as_str), Some("737"));
+
+        // A cipher that is not a card is not readable as one, and neither is an
+        // item that does not exist. The record's own `type` decides that, not
+        // the presence of a `card` object: a LOGIN carrying one (a stray key, a
+        // future Bitwarden field, a hand-edited record) must stay a login, or
+        // the sidebar's fill button and this reader would disagree about what
+        // the item IS.
+        let key_bytes = [0x42u8; 64];
+        let mut raw = raw_login_record();
+        raw["card"] = serde_json::json!({"number": json_str(seal(&key_bytes, "4111111111114242"))});
+        let login = RawCipher {
+            raw,
+            id: "c1".into(),
+            item_type: 1,
+            name: Some(seal(&key_bytes, "GitHub")),
+            ..Default::default()
+        };
+        let logins = Vault::new(
+            SymmetricKey::from_bytes(&key_bytes).unwrap(),
+            HashMap::new(),
+            vec![login],
+            vec![],
+            HashMap::new(),
+        );
+        assert!(logins.card("c1").is_none(), "a login is not a card");
+        assert!(logins.card_secret("c1").is_none());
+        assert!(vault.card("nope").is_none());
+    }
+
+    // Vaultwarden has drifted PascalCase↔camelCase across versions, which is why
+    // every raw read goes through `get_ci`. A card written by a drifted server
+    // must read identically — without this the whole object would be invisible.
+    #[test]
+    fn a_card_survives_pascal_case_drift_and_a_plaintext_brand() {
+        let key_bytes = [0x11u8; 64];
+        let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
+        let cipher = RawCipher {
+            raw: serde_json::json!({
+                "id": "card1",
+                "Type": 3,
+                "Card": {
+                    "Number": json_str(seal(&key_bytes, "5500 0000 0000 0004")),
+                    "CardholderName": json_str(seal(&key_bytes, "A KUNDU")),
+                    // Not an EncString at all: an older client stored it in the
+                    // clear. Taken verbatim rather than dropped.
+                    "Brand": "Mastercard",
+                    // An EncString sealed under a DIFFERENT key: it parses but
+                    // will not decrypt, so it must be dropped, never surfaced
+                    // as ciphertext.
+                    "Code": json_str(seal(&[0x99u8; 64], "999")),
+                },
+            }),
+            id: "card1".into(),
+            item_type: 3,
+            name: Some(seal(&key_bytes, "Mastercard")),
+            ..Default::default()
+        };
+        let vault = Vault::new(
+            user_key,
+            HashMap::new(),
+            vec![cipher],
+            vec![],
+            HashMap::new(),
+        );
+
+        let card = vault.card("card1").expect("PascalCase is still a card");
+        assert_eq!(card.brand.as_deref(), Some("Mastercard"));
+        assert_eq!(card.cardholder.as_deref(), Some("A KUNDU"));
+        assert_eq!(card.last4.as_deref(), Some("0004"));
+        let secret = vault.card_secret("card1").unwrap();
+        assert_eq!(
+            secret.number.as_deref().map(String::as_str),
+            Some("5500 0000 0000 0004")
+        );
+        assert!(
+            secret.code.is_none(),
+            "an undecryptable field must be dropped, never surfaced as ciphertext"
+        );
+    }
+
+    // `last4` is derived, so its rules are worth pinning: digits only, and a
+    // value too short to be a card number yields nothing rather than a fragment.
+    #[test]
+    fn last_four_counts_digits_not_characters() {
+        assert_eq!(last_four("4111-1111-1111-4242").as_deref(), Some("4242"));
+        assert_eq!(last_four("4242").as_deref(), Some("4242"));
+        assert_eq!(last_four("42 42").as_deref(), Some("4242"));
+        assert_eq!(last_four("424"), None);
+        assert_eq!(last_four(""), None);
+        assert_eq!(last_four("no digits here"), None);
+    }
+
+    // The list can finally say WHY an item refuses `get`: it is not a login.
+    #[test]
+    fn the_item_list_reports_the_cipher_type() {
+        let key_bytes = [0x5au8; 64];
+        let card = card_vault(&key_bytes, &[("number", "4111111111114242")]);
+        assert_eq!(card.items()[0].item_type, CIPHER_TYPE_CARD);
+        assert!(!card.items()[0].has_password);
+        assert_eq!(
+            login_vault(&[0x42u8; 64]).items()[0].item_type,
+            CIPHER_TYPE_LOGIN
+        );
     }
 
     #[test]

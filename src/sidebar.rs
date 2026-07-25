@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use serde_json::{Value, json};
+use ychrome_vault_proto::CIPHER_TYPE_CARD;
 
 /// The pane ids ychrome declares. yggterm only ever echoes them back.
 const VAULT_PANE: &str = "vault";
@@ -511,11 +512,25 @@ fn item_row(item: &Value) -> Value {
         (true, false) => folder.to_string(),
         (true, true) => String::new(),
     };
-    let mut actions = vec![json!({
-        "action": "fill",
-        "label": "⧉",
-        "title": "Fill this login into the page",
-    })];
+    // A card carries no password at all, so the login fill would fail on it —
+    // the agent's `get` resolves the password before it looks at anything else
+    // and refuses. Cards get their own injector instead of a button that cannot
+    // work. The type comes from the agent's secret-free metadata; the number
+    // does not (see `card-fill` in `run_vault_action`).
+    let is_card = item["item_type"].as_u64() == Some(u64::from(CIPHER_TYPE_CARD));
+    let mut actions = vec![if is_card {
+        json!({
+            "action": "card-fill",
+            "label": "▤",
+            "title": "Fill this card into the page",
+        })
+    } else {
+        json!({
+            "action": "fill",
+            "label": "⧉",
+            "title": "Fill this login into the page",
+        })
+    }];
     // rbw's `list` could not say whether an item had an authenticator secret,
     // so the old pane drew the button on every row. Ours knows.
     if item["has_totp"].as_bool().unwrap_or(false) {
@@ -1040,6 +1055,32 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                     let password = reply["entry"]["password"].as_str().unwrap_or_default();
                     json!({
                         "eval": fill_script(&user, password),
+                        "toast": format!("Filled {name}."),
+                    })
+                }
+                Err(error) => json!({ "toast": error.to_string() }),
+            }
+        }
+        // A card's number and CVV reach the page the same way a password does
+        // and by the SAME rule: computed on this host, embedded in the eval
+        // script, dropped. What makes a card stricter is that it has no CLI
+        // verb at all — `ychrome-vault card` prints metadata only, because a PAN
+        // in a scrollback or an agent transcript is durable and, unlike a
+        // password, cannot be rotated on demand. The toast names the item and
+        // the script's return value names FIELDS, never values.
+        "card-fill" => {
+            let (name, user) = split_row_id(&value);
+            match vault_op(json!({"op": "card-secret", "name": name, "user": opt_field(&user)})) {
+                Ok(reply) => {
+                    let field = |key: &str| reply[key].as_str().unwrap_or_default();
+                    json!({
+                        "eval": card_fill_script(
+                            field("number"),
+                            field("code"),
+                            field("exp_month"),
+                            field("exp_year"),
+                            field("cardholder"),
+                        ),
                         "toast": format!("Filled {name}."),
                     })
                 }
@@ -1672,6 +1713,47 @@ fn fill_script(username: &str, password: &str) -> String {
     )
 }
 
+/// Type a card into a payment form. The autocomplete tokens are the WHATWG
+/// names every payment form is supposed to carry; the name/id heuristics behind
+/// them catch the ones that do not.
+///
+/// The script returns the list of FIELD NAMES it filled, never a value — that
+/// return string is what lands in the GUI's action log, and a PAN must not.
+fn card_fill_script(
+    number: &str,
+    code: &str,
+    exp_month: &str,
+    exp_year: &str,
+    cardholder: &str,
+) -> String {
+    format!(
+        r#"(function() {{
+{SET_FIELD}
+  const pick = (...sel) => sel.map((s) => document.querySelector(s)).find((el) => el && !el.disabled) || null;
+  const filled = [];
+  const put = (label, el, value) => {{
+    if (value && ychromeSet(el, value)) {{ filled.push(label); }}
+  }};
+  put('cc-number', pick('input[autocomplete="cc-number"]', 'input[name*=cardnumber i]',
+    'input[name*=card_number i]', 'input[id*=cardnumber i]', 'input[name*=cardno i]'), {number});
+  put('cc-csc', pick('input[autocomplete="cc-csc"]', 'input[name*=cvv i]', 'input[name*=cvc i]',
+    'input[name*=csc i]', 'input[name*=securitycode i]', 'input[id*=cvv i]'), {code});
+  put('cc-exp-month', pick('[autocomplete="cc-exp-month"]', 'select[name*=expmonth i]',
+    'input[name*=expmonth i]', '[name*=exp_month i]'), {exp_month});
+  put('cc-exp-year', pick('[autocomplete="cc-exp-year"]', 'select[name*=expyear i]',
+    'input[name*=expyear i]', '[name*=exp_year i]'), {exp_year});
+  put('cc-name', pick('input[autocomplete="cc-name"]', 'input[name*=cardholder i]',
+    'input[name*=nameoncard i]'), {cardholder});
+  return filled.length ? filled.join(',') : 'no-card-fields';
+}})()"#,
+        number = js_string(number),
+        code = js_string(code),
+        exp_month = js_string(exp_month),
+        exp_year = js_string(exp_year),
+        cardholder = js_string(cardholder),
+    )
+}
+
 fn totp_script(code: &str) -> String {
     format!(
         r#"(function() {{
@@ -2071,6 +2153,76 @@ mod tests {
         assert!(
             !script.contains("\"; alert(1); //\";"),
             "escaped out of the literal"
+        );
+    }
+
+    // A card cipher has no password, so the login fill would refuse it before it
+    // reached the page ("has no password"). The row must offer the injector that
+    // CAN work, and must still carry no secret — the type is metadata, the
+    // number never travels with it.
+    #[test]
+    fn a_card_row_offers_the_card_injector_and_still_carries_no_secret() {
+        let card = item_row(&json!({
+            "name": "HDFC Regalia",
+            "username": "",
+            "folder": "Cards",
+            "item_type": 3,
+            "has_password": false,
+            "has_totp": false,
+            // Even if the agent ever handed these over, a row must not echo them.
+            "number": "4111111111114242",
+            "code": "737",
+        }));
+        let actions: Vec<&str> = card["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|action| action["action"].as_str().unwrap())
+            .collect();
+        assert_eq!(actions, ["card-fill"], "a card cannot use the login fill");
+        let wire = card.to_string();
+        assert!(!wire.contains("4111111111114242"), "PAN leaked: {wire}");
+        assert!(!wire.contains("737"), "CVV leaked: {wire}");
+
+        // A login is untouched by any of this.
+        let login = item_row(&json!({
+            "name": "github.com", "username": "octocat", "item_type": 1, "has_totp": true,
+        }));
+        let actions: Vec<&str> = login["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|action| action["action"].as_str().unwrap())
+            .collect();
+        assert_eq!(actions, ["fill", "totp"]);
+    }
+
+    // The PAN rides the eval script (that is the design — the app computes, the
+    // GUI injects), so it must be escaped like any other injected secret. What
+    // the script RETURNS is the other half: the GUI logs that string, so it may
+    // name fields and never values.
+    #[test]
+    fn card_fill_script_escapes_the_pan_and_returns_field_names_only() {
+        let script = card_fill_script("4111\"; alert(1); //", "737", "11", "2029", "A \"Q\" K");
+        assert!(script.contains(r#""4111\"; alert(1); //""#));
+        assert!(
+            !script.contains("\"; alert(1); //\";"),
+            "escaped out of the literal"
+        );
+        assert!(script.contains(r#""A \"Q\" K""#));
+        // The return value is built from these labels alone.
+        for label in [
+            "cc-number",
+            "cc-csc",
+            "cc-exp-month",
+            "cc-exp-year",
+            "cc-name",
+        ] {
+            assert!(script.contains(label), "missing {label}");
+        }
+        assert!(
+            script.contains("filled.join(',')"),
+            "the result must be the field names it filled"
         );
     }
 

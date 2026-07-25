@@ -363,6 +363,56 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             state.touch();
             Ok(json!({ "fields": fields, "name": name, "raw_field_count": raw_field_count }))
         }
+        // A card's metadata: brand, cardholder, expiry, last four. The 130 items
+        // in this vault with no password are mostly these, and before this op
+        // they were reachable only through `notes`. No PAN and no CVV cross this
+        // socket here — `card-secret` below is the only path to those.
+        "card" => {
+            let name = string("name").ok_or_else(|| anyhow!("card needs a name"))?;
+            let vault = unlocked(&state)?;
+            let items = vault.items();
+            let item = resolve(&items, &name, string("user").as_deref())?;
+            let card = vault
+                .card(&item.id)
+                .ok_or_else(|| anyhow!("{} is not a card", item.name))?;
+            let name = item.name.clone();
+            state.touch();
+            Ok(json!({ "card": card, "name": name }))
+        }
+        // The card's FULL number and CVV, plus the rest of what a payment form
+        // asks for. This exists for ONE caller: the sidebar's fill injector,
+        // which puts the value into a form field and drops it. There is
+        // deliberately no `ychrome-vault` CLI verb, the same rule `fido2-assert`
+        // lives under.
+        //
+        // The boundary being defended is the TRANSCRIPT, not this socket: any
+        // same-uid process can already pull every password one `get` at a time,
+        // but a PAN printed to a terminal is durable — scrollback, shell
+        // history, an agent CLI's JSONL — and unlike a password it cannot be
+        // rotated on demand.
+        "card-secret" => {
+            let name = string("name").ok_or_else(|| anyhow!("card-secret needs a name"))?;
+            let vault = unlocked(&state)?;
+            let items = vault.items();
+            let item = resolve(&items, &name, string("user").as_deref())?;
+            let card = vault
+                .card(&item.id)
+                .ok_or_else(|| anyhow!("{} is not a card", item.name))?;
+            let secret = vault
+                .card_secret(&item.id)
+                .ok_or_else(|| anyhow!("{} is not a card", item.name))?;
+            state.touch();
+            Ok(json!({
+                "name": item.name,
+                "number": secret.number.as_deref(),
+                "code": secret.code.as_deref(),
+                // From the same reader as the metadata op, so a form fill and a
+                // listing can never disagree about the expiry.
+                "cardholder": card.cardholder,
+                "exp_month": card.exp_month,
+                "exp_year": card.exp_year,
+            }))
+        }
         "totp" => {
             let name = string("name").ok_or_else(|| anyhow!("totp needs a name"))?;
             let vault = unlocked(&state)?;
@@ -885,6 +935,8 @@ mod tests {
             "edit",
             "passkeys",
             "watchtower",
+            "card",
+            "card-secret",
         ] {
             let error = dispatch(
                 &json!({"op": op, "name": "x", "host": "example.com"}),
@@ -936,6 +988,27 @@ mod tests {
                 password: enc("hunter2"),
                 ..Default::default()
             },
+            // A CARD: type 3, no login block, so it has no password at all —
+            // the shape of the 130 items in the real vault that `get` refuses.
+            // Its fields live only in the raw record, like notes.
+            RawCipher {
+                id: "cc".to_string(),
+                item_type: 3,
+                name: enc("HDFC Regalia"),
+                raw: json!({
+                    "id": "cc",
+                    "type": 3,
+                    "card": {
+                        "brand": "Visa",
+                        "cardholderName": seal(&key_bytes, b"A KUNDU").to_string(),
+                        "number": seal(&key_bytes, b"4111111111114242").to_string(),
+                        "expMonth": seal(&key_bytes, b"11").to_string(),
+                        "expYear": seal(&key_bytes, b"2029").to_string(),
+                        "code": seal(&key_bytes, b"737").to_string(),
+                    },
+                }),
+                ..Default::default()
+            },
         ];
         // One soft-deleted item, so `list --trashed` and `restore` have a target.
         // It stays OUT of the live `ciphers` above — the live list must not see it.
@@ -977,7 +1050,7 @@ mod tests {
 
         let items = dispatch(&json!({"op": "list"}), &state).unwrap();
         let items = items["items"].as_array().unwrap();
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 3, "two logins and a card");
         assert_eq!(items[0]["name"], "GitHub", "sorted by lowercased name");
         assert!(items[0]["has_totp"].as_bool().unwrap());
         // Metadata must never carry the secret itself.
@@ -1000,7 +1073,11 @@ mod tests {
         // ...but a base-domain entry never auto-fills a subdomain.
         assert!(dispatch(&json!({"op": "match", "host": "chat.ygg.example"}), &state).is_err());
         // Loose rule: the sidebar still suggests it there, secret-free.
-        let suggested = dispatch(&json!({"op": "suggest", "host": "chat.ygg.example"}), &state).unwrap();
+        let suggested = dispatch(
+            &json!({"op": "suggest", "host": "chat.ygg.example"}),
+            &state,
+        )
+        .unwrap();
         let suggested = suggested["items"].as_array().unwrap();
         assert_eq!(suggested.len(), 1);
         assert_eq!(suggested[0]["name"], "ygg.example");
@@ -1040,6 +1117,54 @@ mod tests {
         // An item with no passkey answers with an empty list, not an error.
         let none = dispatch(&json!({"op": "passkeys", "name": "ygg.example"}), &state).unwrap();
         assert!(none["passkeys"].as_array().unwrap().is_empty());
+    }
+
+    // A card is metadata over the socket and a secret only through the op the
+    // injector uses. The 130 items in the real vault with no password are mostly
+    // cards, and `get` refuses every one of them before it looks at `--field`.
+    #[test]
+    fn agent_serves_card_metadata_without_the_number() {
+        let state = synthetic_state();
+
+        // `get` still refuses a card, and now the LIST says why: not a login.
+        let error = dispatch(&json!({"op": "get", "name": "HDFC"}), &state)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("has no password"), "{error}");
+        let list = dispatch(&json!({"op": "list"}), &state).unwrap();
+        let card_row = list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "HDFC Regalia")
+            .unwrap()
+            .clone();
+        assert_eq!(card_row["item_type"], 3);
+        assert_eq!(card_row["has_password"], false);
+
+        let response = dispatch(&json!({"op": "card", "name": "HDFC"}), &state).unwrap();
+        assert_eq!(response["card"]["brand"], "Visa");
+        assert_eq!(response["card"]["cardholder"], "A KUNDU");
+        assert_eq!(response["card"]["exp_month"], "11");
+        assert_eq!(response["card"]["last4"], "4242");
+        // THE property: the whole serialized reply carries neither the PAN nor
+        // the CVV, the same assertion the passkey private key lives under.
+        let wire = response.to_string();
+        assert!(!wire.contains("4111111111114242"), "PAN leaked: {wire}");
+        assert!(!wire.contains("737"), "CVV leaked: {wire}");
+
+        // The injector's op is the only path to those, and it carries the whole
+        // form so a fill needs one round trip.
+        let secret = dispatch(&json!({"op": "card-secret", "name": "HDFC"}), &state).unwrap();
+        assert_eq!(secret["number"], "4111111111114242");
+        assert_eq!(secret["code"], "737");
+        assert_eq!(secret["exp_year"], "2029");
+
+        // A login is not a card, and says so rather than answering emptily.
+        let error = dispatch(&json!({"op": "card", "name": "github"}), &state)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is not a card"), "{error}");
     }
 
     // The `get()` ceremony over the agent socket, end to end with a REAL P-256
@@ -1157,7 +1282,7 @@ mod tests {
         // The live list never shows the trashed item...
         let live = dispatch(&json!({"op": "list"}), &state).unwrap();
         let live = live["items"].as_array().unwrap();
-        assert_eq!(live.len(), 2);
+        assert_eq!(live.len(), 3, "two logins and a card, none of them trashed");
         assert!(
             live.iter()
                 .all(|item| item["name"] != "deleted-site.example")
