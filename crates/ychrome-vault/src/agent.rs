@@ -22,7 +22,8 @@
 //! Host-resident, like every libyggterm app's state: the agent runs on the
 //! machine ychrome runs on, which over ssh is NOT the machine the GUI is on.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -31,9 +32,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 use crate::matching::{auto_match_for_host, find_by_name};
-use crate::session::{VaultManager, VaultStatus};
+use crate::session::{SessionMaterial, VaultManager, VaultStatus};
 
 use ychrome_vault_proto::pid_path;
 /// The agent's client transport — connect/send/read, autostart, stop, and the
@@ -53,6 +55,24 @@ struct AgentState {
     dir: PathBuf,
     /// Set by the `stop` op; the connection handler exits once it has replied.
     stop: Arc<std::sync::atomic::AtomicBool>,
+    /// The bound listener's fd, so `handover` can pass the LIVE socket to its
+    /// successor instead of unbinding and rebinding it. `None` in unit tests,
+    /// which dispatch ops without ever serving a socket — and a handover with no
+    /// socket to pass is refused rather than silently degraded.
+    listener_fd: Option<RawFd>,
+    /// Set by the `handover` op; the connection handler execs once it has
+    /// replied, exactly as `stop` exits once it has replied.
+    handover: Option<ExecPlan>,
+}
+
+/// What `handover` leaves behind for the connection handler to perform after the
+/// reply is flushed. Both fds are already CLOEXEC-cleared; dropping this instead
+/// of exec'ing closes the payload, which destroys the key material.
+struct ExecPlan {
+    exe: PathBuf,
+    dir: PathBuf,
+    listener_fd: RawFd,
+    payload: OwnedFd,
 }
 
 impl AgentState {
@@ -94,20 +114,86 @@ pub fn serve(dir: &Path) -> Result<()> {
     let listener =
         UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    serve_on(dir, listener, None)
+}
+
+/// Serve on a listener and a session INHERITED from the agent this process just
+/// replaced — the far side of the `handover` op's `execve`.
+///
+/// Same pid, same bound socket, new code. Because the listener fd survived the
+/// exec, there is no unbind/rebind window at all: a client that connects during
+/// the swap is queued in the socket's backlog and answered by the successor,
+/// rather than told "no vault agent".
+pub fn serve_adopted(dir: &Path, listener_fd: RawFd, payload_fd: RawFd) -> Result<()> {
+    // SAFETY: both fds were opened by this process (before the exec that
+    // replaced its image) and named on its own argv. Taking ownership here is
+    // what closes them: the payload is consumed and dropped immediately, and
+    // the listener lives as long as the agent.
+    let listener = unsafe { UnixListener::from_raw_fd(listener_fd) };
+    let payload = read_payload(payload_fd);
+    serve_on(dir, listener, Some(payload))
+}
+
+/// The serve loop both entry points share, so a handed-over agent and a freshly
+/// spawned one differ in exactly one thing: whether a session was adopted.
+fn serve_on(
+    dir: &Path,
+    listener: UnixListener,
+    adopted: Option<Result<HandoverPayload>>,
+) -> Result<()> {
     std::fs::write(pid_path(dir), std::process::id().to_string())
         .with_context(|| format!("writing {}", pid_path(dir).display()))?;
     std::fs::set_permissions(pid_path(dir), std::fs::Permissions::from_mode(0o600))?;
 
+    let mut manager = VaultManager::load(dir);
+    let mut last_activity = Instant::now();
+    if let Some(payload) = adopted {
+        // Every failure here is loud and NONE of them is fatal. A successor that
+        // exits would leave the user with no agent at all; one that serves
+        // locked costs them a master password; one that serves unlocked with an
+        // empty vault costs them a `sync`. Cheapest recoverable outcome wins,
+        // and it is printed rather than inferred from an item count.
+        match payload {
+            Ok(payload) => {
+                // Restoring the idle clock is not cosmetic: dropping it would
+                // silently extend an unlock past the timeout the user set, and
+                // a handover must not change when the vault locks.
+                last_activity = Instant::now()
+                    .checked_sub(Duration::from_secs(payload.idle_secs))
+                    .unwrap_or_else(Instant::now);
+                match manager.adopt_session(payload.material) {
+                    Ok(count) => eprintln!(
+                        "ychrome-vault: adopted an unlocked session ({count} items, idle {}s)",
+                        payload.idle_secs
+                    ),
+                    Err(error) => eprintln!(
+                        "ychrome-vault: adopted the keys but could not re-pull the ciphers \
+                         ({error}) — the vault is unlocked and EMPTY; run `ychrome-vault sync`"
+                    ),
+                }
+            }
+            Err(error) => eprintln!(
+                "ychrome-vault: the handover payload was unreadable ({error}) — \
+                 the vault is LOCKED and must be unlocked again"
+            ),
+        }
+    }
+
     let state = Arc::new(Mutex::new(AgentState {
-        manager: VaultManager::load(dir),
-        last_activity: Instant::now(),
+        manager,
+        last_activity,
         dir: dir.to_path_buf(),
         stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        listener_fd: Some(listener.as_raw_fd()),
+        handover: None,
     }));
 
     spawn_idle_lock_thread(state.clone());
 
-    eprintln!("ychrome-vault: agent listening on {}", socket.display());
+    eprintln!(
+        "ychrome-vault: agent listening on {}",
+        socket_path(dir).display()
+    );
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -177,6 +263,24 @@ fn serve_connection(stream: UnixStream, state: &Arc<Mutex<AgentState>>) {
         if stopping {
             std::process::exit(0);
         }
+        // `handover` replies first for the same reason, then REPLACES this
+        // process image with the newly installed binary. Same pid, same bound
+        // socket, new code, unlock intact.
+        let plan = state
+            .lock()
+            .ok()
+            .and_then(|mut state| state.handover.take());
+        if let Some(plan) = plan {
+            let error = exec_successor(&plan);
+            // `exec` only returns on failure, and the failure is survivable: the
+            // keys, the socket and this loop are all still here, so keep
+            // serving the old code rather than dying with the vault. Dropping
+            // the plan closes the payload pipe, destroying the copy of the key.
+            eprintln!(
+                "ychrome-vault: handover to {} failed ({error}) — still serving the old binary",
+                plan.exe.display()
+            );
+        }
     }
 }
 
@@ -225,6 +329,78 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             let _ = std::fs::remove_file(pid_path(&state.dir));
             state.stop.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(json!({ "stopped": true }))
+        }
+        // Hand the unlocked session to the freshly installed binary WITHOUT
+        // re-locking: `execve` the successor in place, keeping this pid and the
+        // bound listener fd. Everything else about the process is replaced.
+        //
+        // The honest framing, because the obvious one is wrong: `execve` does
+        // NOT keep memory. It keeps the pid and the open file descriptors and
+        // throws the whole address space away, so the keys have to cross the
+        // boundary one way or another. argv is refused (world-readable in
+        // /proc), an environment variable is refused (same), a file is refused
+        // (it would outlive the writer), and a socket is refused (another
+        // process could connect). What is left is an anonymous pipe, whose
+        // buffer lives in the kernel and dies with the process if the exec never
+        // happens. See `payload_pipe`.
+        //
+        // The exec is a ONE-WAY DOOR — if the successor cannot come up, the
+        // unlock is gone and the user retypes their master password — so every
+        // guard below runs before the reply, and the successor is proved to run
+        // at all before we commit.
+        "handover" => {
+            let Some(listener_fd) = state.listener_fd else {
+                bail!("this agent is not serving a socket, so it has nothing to hand over");
+            };
+            if !state.manager.is_unlocked() {
+                bail!(
+                    "the vault is locked, so there is nothing to hand over — \
+                     `ychrome-vault stop-agent` retires this agent at no cost"
+                );
+            }
+            let successor = ychrome_vault_proto::installed_vault_exe();
+            // The successor is resolved by the AGENT, never named by the client:
+            // an exec target taken from a request would be privilege escalation
+            // by asking. This is the single most important guard here.
+            if let Some(refusal) = handover_refusal(&exe_stamp(), successor.as_deref()) {
+                bail!(refusal);
+            }
+            let successor = successor.expect("the refusal above covers the None case");
+            probe_successor(&successor)?;
+            // Prove the SESSION is still usable before crossing, and pick up a
+            // renewed bearer if this one had expired. The successor re-pulls the
+            // ciphers with that token and nothing else, so handing over a dead
+            // one would strand it holding keys it cannot use. This must come
+            // BEFORE the export, or the export carries the stale token.
+            state.manager.resync().map_err(|error| {
+                anyhow!("the session cannot be refreshed, so a handover would strand it: {error}")
+            })?;
+            let material = state
+                .manager
+                .export_session()
+                .ok_or_else(|| anyhow!("the session was dropped mid-handover"))?;
+            let payload = HandoverPayload {
+                material,
+                idle_secs: state.last_activity.elapsed().as_secs(),
+            };
+            let pipe = payload_pipe(&payload.encode())?;
+            clear_cloexec(listener_fd)?;
+            let stamp = ychrome_vault_proto::exe_stamp_of(&successor);
+            state.handover = Some(ExecPlan {
+                exe: successor.clone(),
+                dir: state.dir.clone(),
+                listener_fd,
+                payload: pipe,
+            });
+            // "accepted", not "done": the exec happens after this reply is
+            // flushed, so only a SECOND round trip can prove it worked. The CLI
+            // verb does exactly that.
+            Ok(json!({
+                "handover": "accepted",
+                "successor": successor.display().to_string(),
+                "successor_stamp": stamp,
+                "pid": std::process::id(),
+            }))
         }
         "unlock" => {
             let password = request
@@ -785,6 +961,246 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The handover: carrying one unlocked session across an execve.
+// ---------------------------------------------------------------------------
+
+/// Framing marker for the handover payload. Versioned, because a successor that
+/// does not recognise it must refuse loudly rather than misread key material as
+/// a token — the payload is raw bytes on a pipe, with no self-description.
+const HANDOVER_MAGIC: &[u8; 8] = b"YCHVHO01";
+
+/// Refuse a payload larger than this. A pipe with no reader blocks once its
+/// buffer (64 KiB by default) fills, and the reader here does not exist until
+/// after the exec — so a payload that could fill it would deadlock the agent
+/// while holding the state lock. The real one is a few hundred bytes; anything
+/// near this ceiling means something is wrong.
+const MAX_HANDOVER_PAYLOAD: usize = 32 * 1024;
+
+/// How long the successor gets to prove it runs before we commit to exec'ing it.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One unlocked session, reduced to what has to cross the exec boundary.
+struct HandoverPayload {
+    material: SessionMaterial,
+    /// Seconds since the outgoing agent's last activity, so the successor
+    /// restores the idle-lock clock instead of silently extending the unlock.
+    idle_secs: u64,
+}
+
+impl HandoverPayload {
+    fn encode(&self) -> Zeroizing<Vec<u8>> {
+        let mut out = Zeroizing::new(Vec::with_capacity(256));
+        out.extend_from_slice(HANDOVER_MAGIC);
+        out.extend_from_slice(&self.material.user_key[..]);
+        push_bytes(&mut out, self.material.access_token.as_bytes());
+        match &self.material.refresh_token {
+            Some(token) => {
+                out.push(1);
+                push_bytes(&mut out, token.as_bytes());
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(&self.idle_secs.to_le_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut cursor = Cursor { bytes, at: 0 };
+        if cursor.take(HANDOVER_MAGIC.len())? != HANDOVER_MAGIC {
+            bail!("the handover payload is not one this binary understands");
+        }
+        let mut user_key = Zeroizing::new([0u8; 64]);
+        user_key.copy_from_slice(cursor.take(64)?);
+        let access_token = Zeroizing::new(cursor.take_string()?);
+        let refresh_token = match cursor.take(1)?[0] {
+            0 => None,
+            1 => Some(Zeroizing::new(cursor.take_string()?)),
+            other => bail!("the handover payload has a bad refresh-token flag {other}"),
+        };
+        let idle_secs = u64::from_le_bytes(
+            cursor
+                .take(8)?
+                .try_into()
+                .expect("take(8) yields eight bytes"),
+        );
+        Ok(HandoverPayload {
+            material: SessionMaterial {
+                user_key,
+                access_token,
+                refresh_token,
+            },
+            idle_secs,
+        })
+    }
+}
+
+fn push_bytes(out: &mut Zeroizing<Vec<u8>>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// A bounds-checked reader over the payload. Every read is fallible: a truncated
+/// payload must be an error, never a silently short key.
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+        let end = self
+            .at
+            .checked_add(len)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(|| anyhow!("the handover payload is truncated"))?;
+        let slice = &self.bytes[self.at..end];
+        self.at = end;
+        Ok(slice)
+    }
+
+    fn take_string(&mut self) -> Result<String> {
+        let len = u32::from_le_bytes(self.take(4)?.try_into().expect("take(4) yields four bytes"))
+            as usize;
+        String::from_utf8(self.take(len)?.to_vec())
+            .map_err(|_| anyhow!("the handover payload holds a non-UTF-8 token"))
+    }
+}
+
+/// Put the payload on an anonymous pipe and hand back the READ end, ready to
+/// survive an exec.
+///
+/// Not argv and not an environment variable: both are world-readable through
+/// `/proc`. Not a file: it would outlive the process that wrote it. Not a
+/// socket: another process could connect to it. A pipe's buffer lives in the
+/// kernel, is reachable only through its two fds, and is destroyed with the
+/// process if the exec never happens. The write end closes here, so the
+/// successor reads to a clean EOF.
+fn payload_pipe(bytes: &[u8]) -> Result<OwnedFd> {
+    if bytes.len() > MAX_HANDOVER_PAYLOAD {
+        bail!(
+            "the handover payload is {} bytes, over the {MAX_HANDOVER_PAYLOAD}-byte ceiling \
+             a reader-less pipe can hold",
+            bytes.len()
+        );
+    }
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: `pipe` either fills both slots or returns non-zero; nothing is
+    // read out of the array unless it succeeded.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("creating the handover pipe");
+    }
+    // SAFETY: both fds come from the successful `pipe` above and are owned here.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let mut writer = std::fs::File::from(write);
+    writer
+        .write_all(bytes)
+        .context("writing the handover payload")?;
+    drop(writer);
+    clear_cloexec(read.as_raw_fd())?;
+    Ok(read)
+}
+
+/// Read a payload written by [`payload_pipe`] and close the fd.
+fn read_payload(fd: RawFd) -> Result<HandoverPayload> {
+    // SAFETY: the fd was created by this process before the exec that replaced
+    // its image, and named on its own argv. Owning it here is what closes it.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.read_to_end(&mut bytes)
+        .context("reading the handover payload")?;
+    HandoverPayload::decode(&bytes)
+}
+
+/// Let an fd survive an `execve`. Rust sets `FD_CLOEXEC` on everything it opens,
+/// which is the right default and exactly what has to be opted out of here — for
+/// the payload pipe AND for the listener, so the socket is never unbound.
+fn clear_cloexec(fd: RawFd) -> Result<()> {
+    // SAFETY: plain fcntl on an fd this process owns.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error()).context("reading fd flags");
+    }
+    // SAFETY: as above; the value written is the flags we just read, minus one bit.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("clearing FD_CLOEXEC");
+    }
+    Ok(())
+}
+
+/// Why a handover must not happen, or `None` when it may.
+///
+/// Pure, because the live inputs are not testable: `exe_stamp()` describes
+/// wherever this binary was built and `installed_vault_exe()` whatever the box
+/// has installed, and a test that depended on either would pass or fail by
+/// accident of the machine.
+fn handover_refusal(running_stamp: &str, successor: Option<&Path>) -> Option<String> {
+    let Some(successor) = successor else {
+        return Some(
+            "no installed `ychrome-vault` on PATH to hand over to — install the new binary first"
+                .to_string(),
+        );
+    };
+    if ychrome_vault_proto::exe_stamp_of(successor) == running_stamp {
+        return Some(format!(
+            "{} is the binary this agent is ALREADY running — nothing to hand over",
+            successor.display()
+        ));
+    }
+    None
+}
+
+/// Require the successor to run and exit cleanly before we commit to it.
+///
+/// A truncated `scp`, a binary for the wrong architecture or one whose libc is
+/// too new all fail here, cheaply, while the unlock is still recoverable. After
+/// the exec there is no going back.
+fn probe_successor(exe: &Path) -> Result<()> {
+    let mut child = std::process::Command::new(exe)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("the successor {} will not start", exe.display()))?;
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait()? {
+            Some(status) if status.success() => return Ok(()),
+            Some(status) => bail!("the successor {} exited {status}", exe.display()),
+            None if Instant::now() >= deadline => {
+                // A hung probe would otherwise hang the agent, which is holding
+                // the state lock for the whole dispatch.
+                let _ = child.kill();
+                bail!(
+                    "the successor {} did not answer --version within {}s",
+                    exe.display(),
+                    PROBE_TIMEOUT.as_secs()
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+/// Replace this process with the successor. Returns only on failure.
+///
+/// The fd NUMBERS ride on argv, and only the numbers: they are not secret (a
+/// same-uid process could already read `/proc/<pid>/fd`), and the alternative —
+/// a fixed fd number — would collide with whatever else the process has open.
+fn exec_successor(plan: &ExecPlan) -> std::io::Error {
+    use std::os::unix::process::CommandExt as _;
+    std::process::Command::new(&plan.exe)
+        .arg("agent")
+        .arg("--dir")
+        .arg(&plan.dir)
+        .arg("--adopt-listener")
+        .arg(plan.listener_fd.to_string())
+        .arg("--adopt-payload")
+        .arg(plan.payload.as_raw_fd().to_string())
+        .exec()
+}
+
 /// Decode base64, accepting either standard or URL-safe-no-pad — the shim sends
 /// URL-safe, but a hand-run probe may paste standard.
 fn b64_standard_or_url(text: &str) -> Option<Vec<u8>> {
@@ -1038,6 +1454,10 @@ mod tests {
             last_activity: Instant::now(),
             dir,
             stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // No socket: a dispatch test serves no listener, and a handover
+            // with no socket to pass must refuse rather than half-work.
+            listener_fd: None,
+            handover: None,
         }))
     }
 
@@ -1345,6 +1765,150 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("locked"), "{error}");
+    }
+
+    // The handover is a ONE-WAY DOOR: after the exec there is no going back to
+    // the unlocked session, so every refusal has to happen before the reply.
+    // The two that can be tested without a real exec are tested here; the
+    // stamp-equality guard is exercised through `handover_refusal` below,
+    // because the live inputs (`exe_stamp`, the installed binary) differ on
+    // every machine and a test may not depend on either.
+    #[test]
+    fn handover_refuses_a_locked_vault_and_an_agent_with_no_socket() {
+        let dir = temp_dir("handover-locked");
+        let locked = test_state(VaultManager::load(&dir), dir.clone());
+        let error = dispatch(&json!({"op": "handover"}), &locked)
+            .unwrap_err()
+            .to_string();
+        // A dispatch test holds no listener, so this is the refusal that fires
+        // first — and it must fire, because a handover that cannot pass the
+        // bound socket would leave the successor with nothing to serve on.
+        assert!(error.contains("nothing to hand over"), "{error}");
+        std::fs::remove_dir_all(&dir).ok();
+
+        // With a socket but a LOCKED vault, the remedy named must be the free
+        // one: stop-agent costs nothing when there are no keys to lose.
+        let dir = temp_dir("handover-locked-socket");
+        let state = test_state(VaultManager::load(&dir), dir.clone());
+        state.lock().unwrap().listener_fd = Some(0);
+        let error = dispatch(&json!({"op": "handover"}), &state)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("locked"), "{error}");
+        assert!(error.contains("stop-agent"), "{error}");
+        // Nothing was armed: a refused handover must leave no exec behind.
+        assert!(state.lock().unwrap().handover.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A successor that is the binary already running would exec into itself
+    // forever, and a missing one has nothing to exec at all.
+    #[test]
+    fn handover_refuses_a_missing_or_identical_successor() {
+        let dir = temp_dir("handover-stamp");
+        let exe = dir.join("ychrome-vault");
+        std::fs::write(&exe, b"#!/bin/true\n").unwrap();
+        let stamp = ychrome_vault_proto::exe_stamp_of(&exe);
+
+        assert!(
+            handover_refusal(&stamp, None)
+                .unwrap()
+                .contains("no installed")
+        );
+        let same = handover_refusal(&stamp, Some(&exe)).expect("an identical stamp refuses");
+        assert!(same.contains("ALREADY running"), "{same}");
+        // A different binary is what a handover is FOR.
+        assert!(handover_refusal("/somewhere/else@1", Some(&exe)).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The payload is the only thing that survives the exec, so its framing is
+    // load-bearing: this drives it through a REAL pipe, fd handling and all —
+    // everything the live handover does except the `execve` itself.
+    #[test]
+    fn the_handover_payload_survives_a_real_pipe() {
+        let payload = HandoverPayload {
+            material: SessionMaterial {
+                user_key: Zeroizing::new([0x5au8; 64]),
+                access_token: Zeroizing::new("bearer-abc".to_string()),
+                refresh_token: Some(Zeroizing::new("refresh-xyz".to_string())),
+            },
+            idle_secs: 1234,
+        };
+        let bytes = payload.encode();
+        let pipe = payload_pipe(&bytes).unwrap();
+        // The read end must survive an exec, or the successor inherits nothing.
+        // SAFETY: reading flags off an fd this test owns.
+        let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFD) };
+        assert_eq!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "the payload fd would not survive exec"
+        );
+
+        let back = read_payload(std::os::fd::IntoRawFd::into_raw_fd(pipe)).unwrap();
+        assert_eq!(&back.material.user_key[..], &[0x5au8; 64]);
+        assert_eq!(back.material.access_token.as_str(), "bearer-abc");
+        assert_eq!(
+            back.material.refresh_token.as_deref().map(String::as_str),
+            Some("refresh-xyz")
+        );
+        // Dropping the idle clock would silently extend the unlock past the
+        // timeout the user set.
+        assert_eq!(back.idle_secs, 1234);
+
+        // An account with no refresh token round-trips too (the flag byte).
+        let payload = HandoverPayload {
+            material: SessionMaterial {
+                user_key: Zeroizing::new([0u8; 64]),
+                access_token: Zeroizing::new(String::new()),
+                refresh_token: None,
+            },
+            idle_secs: 0,
+        };
+        let back = HandoverPayload::decode(&payload.encode()).unwrap();
+        assert!(back.material.refresh_token.is_none());
+    }
+
+    // A truncated or foreign payload must be an error, never a silently short
+    // key: the successor would come up "unlocked" with garbage and every
+    // decrypt would fail its MAC check for no visible reason.
+    #[test]
+    fn a_malformed_handover_payload_is_refused() {
+        let good = HandoverPayload {
+            material: SessionMaterial {
+                user_key: Zeroizing::new([7u8; 64]),
+                access_token: Zeroizing::new("t".to_string()),
+                refresh_token: None,
+            },
+            idle_secs: 5,
+        }
+        .encode();
+
+        assert!(HandoverPayload::decode(b"").is_err());
+        assert!(HandoverPayload::decode(b"not-a-payload-at-all").is_err());
+        // Right length, wrong magic — a payload from a future framing.
+        let mut wrong_magic = good.to_vec();
+        wrong_magic[..8].copy_from_slice(b"YCHVHO99");
+        assert!(HandoverPayload::decode(&wrong_magic).is_err());
+        // Every truncation is caught, not just the obvious one.
+        for cut in 1..good.len() {
+            assert!(
+                HandoverPayload::decode(&good[..cut]).is_err(),
+                "a payload cut to {cut} bytes decoded"
+            );
+        }
+        assert!(HandoverPayload::decode(&good).is_ok());
+    }
+
+    // The pipe's buffer is finite and the reader does not exist until after the
+    // exec, so an oversized payload would deadlock the agent while it holds the
+    // state lock. Refuse it instead.
+    #[test]
+    fn an_oversized_payload_is_refused_rather_than_deadlocking() {
+        let huge = vec![0u8; MAX_HANDOVER_PAYLOAD + 1];
+        let error = payload_pipe(&huge).unwrap_err().to_string();
+        assert!(error.contains("ceiling"), "{error}");
     }
 
     // A dead socket file must not wedge the agent forever: serve() detects that

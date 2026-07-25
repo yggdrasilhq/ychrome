@@ -107,16 +107,29 @@ The agent is a daemon holding the decrypted vault in memory. **It outlives the
 binary.** After any rebuild it keeps serving the OLD code:
 
 ```sh
-ychrome-vault stop-agent      # after EVERY rebuild
+ychrome-vault handover        # after EVERY rebuild — keeps the vault unlocked
+ychrome-vault stop-agent      # the fallback, which RE-LOCKS the vault
 ```
 
 `status` reports `agent_stale: true` by comparing `exe_stamp` to the on-disk
-binary — trust it. An unknown op answers with its own remedy
-(`unknown op "notes" — the running agent predates this binary; run 'ychrome-vault stop-agent'`).
+binary — trust it. An unknown op answers with its own remedy.
 
 **`stop-agent` drops the keys, so the vault RE-LOCKS and the user must type the
 master password again.** Consequence for planning: **install the new binary
 BEFORE asking the user to unlock**, or you will ask twice.
+
+`handover` is the way to avoid that entirely: the agent `execve`s the newly
+installed binary in place — same pid, same bound socket, unlock intact — and the
+keys cross on an anonymous pipe (never argv, never an env var, never a file).
+Verify with a SECOND round trip, not the reply: same pid, a NEW
+`/proc/<pid>/exe`, `agent_stale: false`, `state: unlocked`, item count intact.
+That signature is one only exec-in-place can produce.
+
+**The one deploy that still costs an unlock is the one that installs `handover`
+itself** — an agent that predates the op cannot perform it, which is why a
+`handover` request that comes back `unknown op` is pointed at `stop-agent` and
+not at itself. Land vault changes on ONE branch and deploy ONCE; three deploys
+would be three master passwords on each of two hosts.
 
 ## Unlock, and what agents may not do
 
@@ -185,17 +198,44 @@ Five hosts: **dev(=pi), the GUI host, oc, practice, jyas-webapp** — all x86_64
 **`pi` and `dev` are the SAME MACHINE** (machine-id `<machine-id>`; `ssh dev`
 loops back). the GUI host is the live desktop (yggterm GUI + daemon).
 
+**There is no deploy script.** `scripts/deploy-fleet.sh` does not exist and never
+did (a memory note claims otherwise — it is wrong). The fleet-binary-sync hook
+does not cover this either: its roster is `(yedit ychrome)` over `~/.local/bin`,
+and `ychrome-vault` lives in **`/usr/local/bin`**, root-owned, which an rsync
+running as `pi` cannot write. Deploy is manual, per host, in this order:
+
 ```sh
+# 1. build ONCE (all five hosts are x86_64 Debian)
 cargo test -p ychrome-vault && cargo build --release -p ychrome-vault
+
+# 2. install locally
 sudo install -m 0755 target/release/ychrome-vault /usr/local/bin/ychrome-vault
-ychrome-vault stop-agent            # remember: this re-locks the vault
+
+# 3. and on each remote host: /tmp first, because scp cannot write /usr/local/bin
+scp target/release/ychrome-vault HOST:/tmp/ychrome-vault
+ssh -t HOST 'sudo install -m 0755 /tmp/ychrome-vault /usr/local/bin/ychrome-vault && rm /tmp/ychrome-vault'
+
+# 4. retire the OLD agent on each host — it is still serving the old code
+ssh HOST 'ychrome-vault handover'     # keeps the unlock; needs an agent that KNOWS the op
+ssh HOST 'ychrome-vault stop-agent'   # the fallback, which RE-LOCKS the vault
 ```
 
-Deploy to a remote host: `scp` to `/tmp`, then `sudo install` there. The GUI
-resolves the binary via `which_binary("ychrome-vault")` → `/usr/local/bin`.
+Order matters and costs the user real time: **install the binary before asking
+for an unlock**, or you will ask twice. Deploy the host with **no agent running**
+first (it costs nothing and rehearses the install), then the others.
+
+`ychrome-vault handover` execs the newly installed binary in place — same pid,
+same socket, unlock intact. An agent that predates the op cannot perform it, so
+the deploy that first installs `handover` still costs one `stop-agent` per host;
+every deploy after that is free. Verify with `ychrome-vault status`:
+`agent_stale` must be `false` and `exe_stamp` must name the binary you just
+installed.
+
+The GUI resolves the binary via `which_binary("ychrome-vault")` → `/usr/local/bin`.
 `cargo fmt --check` is **not** clean on this crate (it predates rustfmt
-settings); do not reformat the whole crate to satisfy it. `cargo clippy` has 3
-pre-existing warnings — add none.
+settings); do not reformat the whole crate to satisfy it — `rustfmt <file>` on
+what you touched. `cargo clippy` has 3 pre-existing warnings and one pre-existing
+`never_loop` error in `session.rs`'s test code — add none.
 
 ## Verification recipes
 
@@ -207,6 +247,29 @@ read -rs PW; echo "$PW" | ychrome-vault check
 ychrome-vault edit ITEM --notes "stamp"
 ychrome-vault edit ITEM --generate          # a PASSWORD-ONLY edit
 ychrome-vault get ITEM --field notes        # must still print "stamp"
+
+# Prove a card reads without ever printing a number (11.7% of the vault):
+ychrome-vault list --json | jq -r '.[] | select(.item_type == 3) | .name' | head
+ychrome-vault card "<that name>"            # brand/holder/expiry/last4 only
+ychrome-vault card "<that name>" | grep -cE '[0-9]{13,}'   # MUST print 0
+```
+
+**Proving a `handover` really happened.** The reply says "accepted"; only a
+second round trip proves it, and the signature below is one that no other
+mechanism produces — socket takeover and keyring adoption both change the pid.
+
+```sh
+PID=$(cat ~/.yggterm/vault/agent.pid)
+ps -o pid,lstart -p $PID; readlink /proc/$PID/exe   # BEFORE
+sudo install -m 0755 target/release/ychrome-vault /usr/local/bin/ychrome-vault
+ychrome-vault status | jq .agent_stale              # must flip to true,
+                                                    # and exe_stamp gains " (deleted)"
+ychrome-vault handover                              # -> handed_over: true
+ps -o pid,lstart -p $PID; readlink /proc/$PID/exe   # SAME pid, SAME start time,
+                                                    # DIFFERENT exe, no " (deleted)"
+ychrome-vault status | jq '{agent_stale,state,item_count}'
+# state must still be "unlocked" and item_count intact — and no master password
+# was typed. Run it on a host with NO agent first (free), then dev, then the GUI host.
 ```
 
 **Opening a contributed pane in the live GUI.** `server app right-panel
