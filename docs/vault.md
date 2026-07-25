@@ -133,6 +133,23 @@ The master password is read from **stdin only** — never a flag, never an
 environment variable — and is dropped the moment the keys are derived. A
 terminal on stdin is refused rather than echoed into the user's scrollback.
 
+### Absent is not empty
+
+`get --field FIELD` fails (non-zero, reason on stderr, nothing on stdout) when
+the item does not carry that field, and succeeds when the item stores it as an
+empty string. Those are different facts and a script has to be able to tell them
+apart: `USER=$(ychrome-vault get ITEM --field username)` used to capture `""` and
+exit 0 for both, because the printer was `as_str().unwrap_or_default()`. The same
+rule now covers `fields --field-name` on a **linked** field, which stores no value
+of its own (it points at the item's username or password).
+
+The accepted `--field` values have one owner, the `GetField` enum: clap derives
+the flag's help text, its accepted values and its "invalid value" error from it,
+and the match is exhaustive over the same variants. The list had drifted across
+four places — the flag's doc named four fields, the match accepted five, and the
+error message named a different four, which is how `totp-secret` ended up working
+but undocumented.
+
 `rbw` parity, so existing scripts keep working:
 
 | rbw | ychrome-vault |
