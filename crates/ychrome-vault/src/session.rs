@@ -101,6 +101,11 @@ pub struct VaultManager {
     /// cipher writes) never need the master password a second time. Dropped
     /// by `lock` together with the vault.
     access_token: Option<Zeroizing<String>>,
+    /// The long-lived refresh token from the same unlock. The access token
+    /// above expires on the server's schedule; this is what buys a new one
+    /// WITHOUT the master password, which is what makes "unlocked until
+    /// locked" true for writes as well as reads.
+    refresh_token: Option<Zeroizing<String>>,
 }
 
 impl VaultManager {
@@ -116,6 +121,7 @@ impl VaultManager {
             config,
             vault: None,
             access_token: None,
+            refresh_token: None,
         }
     }
 
@@ -246,6 +252,7 @@ impl VaultManager {
         let count = vault.items().len();
         self.vault = Some(vault);
         self.access_token = Some(Zeroizing::new(token.access_token));
+        self.refresh_token = token.refresh_token.map(Zeroizing::new);
         Ok(count)
     }
 
@@ -261,18 +268,63 @@ impl VaultManager {
     pub fn lock(&mut self) {
         self.vault = None;
         self.access_token = None;
+        self.refresh_token = None;
+    }
+
+    /// Run an authenticated server call, renewing the bearer ONCE if the server
+    /// says it has expired.
+    ///
+    /// Every write used to fail permanently when the access token aged out,
+    /// because reads are served from the decrypted in-memory vault and never
+    /// touch the server — so nothing noticed until a write 401'd, and the only
+    /// recovery was re-typing the master password. Reported 2026-07-25, with a
+    /// credential parked in a plaintext file as the workaround.
+    ///
+    /// Retry is exactly once: a second 401 means the fresh token is not the
+    /// problem, and looping would turn an auth failure into a hang.
+    fn authenticated<T>(
+        &mut self,
+        call: impl Fn(&Client, &str) -> Result<T, ApiError>,
+    ) -> Result<T, VaultError> {
+        let config = self.config.clone().ok_or(VaultError::NotConfigured)?;
+        let client = Client::new(&config.server_url)?;
+        let token = self.access_token.clone().ok_or(VaultError::Locked)?;
+        match call(&client, &token) {
+            Err(ApiError::Http { status: 401, .. }) => {
+                self.renew_access_token(&client)?;
+                let token = self.access_token.clone().ok_or(VaultError::Locked)?;
+                call(&client, &token).map_err(VaultError::from)
+            }
+            other => other.map_err(VaultError::from),
+        }
+    }
+
+    /// Trade the stored refresh token for a fresh access token, in place.
+    ///
+    /// No refresh token (an unlock against a server that issued none) is
+    /// reported as `Locked`: from the caller's point of view the session can no
+    /// longer act, and the fix is the same — unlock again.
+    fn renew_access_token(&mut self, client: &Client) -> Result<(), VaultError> {
+        let refresh = self.refresh_token.clone().ok_or(VaultError::Locked)?;
+        let renewed = client.refresh(&refresh)?;
+        self.access_token = Some(Zeroizing::new(renewed.access_token));
+        // The server ROTATES the refresh token; keeping the old one would make
+        // the next renewal fail. Absent means "keep using the one we have".
+        if let Some(rotated) = renewed.refresh_token {
+            self.refresh_token = Some(Zeroizing::new(rotated));
+        }
+        Ok(())
     }
 
     /// Create a login in the vault and re-sync so the new item is immediately
     /// visible. Encryption happens locally under the user key; the server only
     /// ever sees EncStrings. Returns the new cipher's id.
     pub fn add_login(&mut self, login: &crate::model::NewLogin) -> Result<String, VaultError> {
-        let config = self.config.clone().ok_or(VaultError::NotConfigured)?;
-        let token = self.access_token.clone().ok_or(VaultError::Locked)?;
-        let vault = self.vault.as_ref().ok_or(VaultError::Locked)?;
-        let body = vault.new_login_body(login)?;
-        let client = Client::new(&config.server_url)?;
-        let id = client.create_cipher(&token, &body)?;
+        let body = {
+            let vault = self.vault.as_ref().ok_or(VaultError::Locked)?;
+            vault.new_login_body(login)?
+        };
+        let id = self.authenticated(|client, token| client.create_cipher(token, &body))?;
         self.resync()?;
         Ok(id)
     }
@@ -286,12 +338,11 @@ impl VaultManager {
         &mut self,
         passkey: &crate::model::NewPasskey,
     ) -> Result<String, VaultError> {
-        let config = self.config.clone().ok_or(VaultError::NotConfigured)?;
-        let token = self.access_token.clone().ok_or(VaultError::Locked)?;
-        let vault = self.vault.as_ref().ok_or(VaultError::Locked)?;
-        let body = vault.new_passkey_login_body(passkey)?;
-        let client = Client::new(&config.server_url)?;
-        let id = client.create_cipher(&token, &body)?;
+        let body = {
+            let vault = self.vault.as_ref().ok_or(VaultError::Locked)?;
+            vault.new_passkey_login_body(passkey)?
+        };
+        let id = self.authenticated(|client, token| client.create_cipher(token, &body))?;
         self.resync()?;
         Ok(id)
     }
@@ -310,12 +361,11 @@ impl VaultManager {
         id: &str,
         edit: &crate::model::CipherEdit,
     ) -> Result<(), VaultError> {
-        let config = self.config.clone().ok_or(VaultError::NotConfigured)?;
-        let token = self.access_token.clone().ok_or(VaultError::Locked)?;
-        let vault = self.vault.as_ref().ok_or(VaultError::Locked)?;
-        let body = vault.edit_body(id, edit)?;
-        let client = Client::new(&config.server_url)?;
-        client.update_cipher(&token, id, &body)?;
+        let body = {
+            let vault = self.vault.as_ref().ok_or(VaultError::Locked)?;
+            vault.edit_body(id, edit)?
+        };
+        self.authenticated(|client, token| client.update_cipher(token, id, &body))?;
         self.resync()?;
         Ok(())
     }
@@ -326,13 +376,10 @@ impl VaultManager {
     /// vault's trash, where any Bitwarden client can restore it. `permanent ==
     /// true` destroys it outright, with no trash copy and no undo.
     pub fn remove_item(&mut self, id: &str, permanent: bool) -> Result<(), VaultError> {
-        let config = self.config.clone().ok_or(VaultError::NotConfigured)?;
-        let token = self.access_token.clone().ok_or(VaultError::Locked)?;
         if self.vault.is_none() {
             return Err(VaultError::Locked);
         }
-        let client = Client::new(&config.server_url)?;
-        client.delete_cipher(&token, id, permanent)?;
+        self.authenticated(|client, token| client.delete_cipher(token, id, permanent))?;
         self.resync()?;
         Ok(())
     }
@@ -344,13 +391,10 @@ impl VaultManager {
     ///
     /// [`remove_item`]: VaultManager::remove_item
     pub fn restore_item(&mut self, id: &str) -> Result<(), VaultError> {
-        let config = self.config.clone().ok_or(VaultError::NotConfigured)?;
-        let token = self.access_token.clone().ok_or(VaultError::Locked)?;
         if self.vault.is_none() {
             return Err(VaultError::Locked);
         }
-        let client = Client::new(&config.server_url)?;
-        client.restore_cipher(&token, id)?;
+        self.authenticated(|client, token| client.restore_cipher(token, id))?;
         self.resync()?;
         Ok(())
     }
@@ -359,13 +403,10 @@ impl VaultManager {
     /// user key. The master password is NOT needed — that is the whole point
     /// of holding the token: an agent can refresh a long-lived unlock.
     pub fn resync(&mut self) -> Result<usize, VaultError> {
-        let config = self.config.clone().ok_or(VaultError::NotConfigured)?;
-        let token = self.access_token.clone().ok_or(VaultError::Locked)?;
         if self.vault.is_none() {
             return Err(VaultError::Locked);
         }
-        let client = Client::new(&config.server_url)?;
-        let sync = client.sync(&token)?;
+        let sync = self.authenticated(|client, token| client.sync(token))?;
         // Org membership can change between syncs, so the org keys are
         // re-unwrapped rather than carried over.
         let user_key = self.vault.as_ref().expect("checked").user_key().clone();
@@ -438,6 +479,162 @@ fn new_device_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-shot loopback stand-in for the identity endpoint. Returns the
+    /// captured request body so the test can assert the GRANT we actually send,
+    /// not just that something was sent.
+    fn spawn_refresh_server(
+        response: &'static str,
+        status: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buffer = [0u8; 4096];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buffer[..read]).into_owned());
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                        response.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.flush();
+                return;
+            }
+        });
+        (url, rx)
+    }
+
+    fn manager_with_tokens(server_url: String, access: &str, refresh: Option<&str>) -> VaultManager {
+        let dir = std::env::temp_dir().join(format!("yggvault-auth-{}", new_device_id()));
+        let mut manager = VaultManager::load(&dir);
+        manager.config = Some(VaultConfig {
+            server_url,
+            email: "someone@example.com".into(),
+            kdf_type: 0,
+            kdf_iterations: 600_000,
+            kdf_memory: None,
+            kdf_parallelism: None,
+            device_id: new_device_id(),
+            lock_timeout_secs: 0,
+        });
+        manager.access_token = Some(Zeroizing::new(access.to_string()));
+        manager.refresh_token = refresh.map(|token| Zeroizing::new(token.to_string()));
+        manager
+    }
+
+    /// THE BUG THIS FIXES: writes died permanently when the access token aged
+    /// out, because reads never touch the server and so nothing noticed. The
+    /// only recovery was re-typing the master password — which is why a
+    /// credential ended up in a plaintext file on 2026-07-25.
+    #[test]
+    fn an_expired_access_token_is_renewed_and_the_call_retried_once() {
+        let (url, requests) = spawn_refresh_server(
+            r#"{"access_token":"fresh-access","refresh_token":"rotated-refresh"}"#,
+            "200 OK",
+        );
+        let mut manager = manager_with_tokens(url, "stale-access", Some("old-refresh"));
+
+        let calls = std::cell::RefCell::new(Vec::<String>::new());
+        let result: Result<&str, VaultError> = manager.authenticated(|_client, token| {
+            calls.borrow_mut().push(token.to_string());
+            if token == "stale-access" {
+                return Err(ApiError::Http {
+                    status: 401,
+                    body: "expired".into(),
+                });
+            }
+            Ok("wrote")
+        });
+
+        assert_eq!(result.unwrap(), "wrote");
+        assert_eq!(
+            calls.into_inner(),
+            vec!["stale-access".to_string(), "fresh-access".to_string()],
+            "the call must be retried with the RENEWED token, not the stale one"
+        );
+        // The server rotates the refresh token; keeping the old one would make
+        // the NEXT renewal fail.
+        assert_eq!(
+            manager.refresh_token.as_deref().map(String::as_str),
+            Some("rotated-refresh")
+        );
+
+        let body = requests.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(body.contains("grant_type=refresh_token"), "sent: {body}");
+        assert!(body.contains("old-refresh"), "must spend the STORED refresh token: {body}");
+    }
+
+    /// One retry, not a loop: a second 401 means the fresh token is not the
+    /// problem, and retrying forever would turn an auth failure into a hang.
+    #[test]
+    fn a_call_that_401s_again_after_renewal_gives_up() {
+        let (url, _requests) = spawn_refresh_server(
+            r#"{"access_token":"fresh-access","refresh_token":"rotated"}"#,
+            "200 OK",
+        );
+        let mut manager = manager_with_tokens(url, "stale", Some("refresh"));
+        let attempts = std::cell::Cell::new(0usize);
+        let result: Result<(), VaultError> = manager.authenticated(|_client, _token| {
+            attempts.set(attempts.get() + 1);
+            Err(ApiError::Http {
+                status: 401,
+                body: "still expired".into(),
+            })
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), 2, "exactly one retry");
+    }
+
+    /// A revoked refresh token is a genuine "sign in again", and must say so
+    /// rather than surfacing as a bare HTTP error.
+    #[test]
+    fn a_rejected_refresh_token_reports_that_re_authentication_is_needed() {
+        let (url, _requests) =
+            spawn_refresh_server(r#"{"error":"invalid_grant"}"#, "400 Bad Request");
+        let mut manager = manager_with_tokens(url, "stale", Some("revoked"));
+        let result: Result<(), VaultError> = manager.authenticated(|_client, _token| {
+            Err(ApiError::Http {
+                status: 401,
+                body: "expired".into(),
+            })
+        });
+        match result {
+            Err(VaultError::Api(ApiError::RefreshRejected)) => {}
+            other => panic!("expected RefreshRejected, got {other:?}"),
+        }
+    }
+
+    /// An unlock against a server that issued no refresh token cannot renew.
+    /// Reported as `Locked` because the remedy is the same: unlock again.
+    #[test]
+    fn without_a_refresh_token_the_session_reports_locked() {
+        let (url, _requests) = spawn_refresh_server("{}", "200 OK");
+        let mut manager = manager_with_tokens(url, "stale", None);
+        let result: Result<(), VaultError> = manager.authenticated(|_client, _token| {
+            Err(ApiError::Http {
+                status: 401,
+                body: "expired".into(),
+            })
+        });
+        assert!(matches!(result, Err(VaultError::Locked)));
+    }
+
+    /// Locking must drop BOTH bearers. A refresh token outliving `lock` would
+    /// let a later call silently re-open the session.
+    #[test]
+    fn lock_drops_the_refresh_token_too() {
+        let mut manager = manager_with_tokens("http://127.0.0.1:1".into(), "a", Some("r"));
+        manager.lock();
+        assert!(manager.access_token.is_none());
+        assert!(manager.refresh_token.is_none(), "a surviving refresh token re-opens the vault");
+    }
 
     #[test]
     fn device_id_is_uuid_v4_shaped() {
