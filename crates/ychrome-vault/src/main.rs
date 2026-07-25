@@ -21,7 +21,7 @@ use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use ychrome_vault::VaultManager;
 use ychrome_vault::agent;
@@ -85,9 +85,9 @@ enum Command {
     Get {
         name: String,
         user: Option<String>,
-        /// One of: password, username, totp, notes.
+        /// Which field to print.
         #[arg(long, default_value = "password")]
-        field: String,
+        field: GetField,
     },
     /// Print an item's current TOTP code — `rbw code` parity.
     #[command(alias = "code")]
@@ -210,6 +210,27 @@ enum Command {
     Agent,
     /// Unlock in-process and print a summary — validates the client end to end.
     Check,
+}
+
+/// The fields `get` can print. ONE list owns this: clap derives the accepted
+/// values, the `--help` text and the "invalid value" error from these variants,
+/// and the match in `Command::Get` is exhaustive over them.
+///
+/// It was spelled in four places that had already drifted apart — the flag's
+/// doc comment promised four fields, the match accepted five, and the error
+/// message named a different four. A whitelist that disagrees with its own help
+/// is how `totp-secret` came to be undocumented but working.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum GetField {
+    Password,
+    Username,
+    /// The current authenticator code.
+    Totp,
+    /// The verbatim text in the TOTP slot, even when it is not a valid
+    /// authenticator (a key pasted there by mistake) — `totp` rejects that,
+    /// this recovers it.
+    TotpSecret,
+    Notes,
 }
 
 fn main() -> Result<()> {
@@ -349,47 +370,35 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Get { name, user, field } => {
-            let entry = match field.as_str() {
-                "totp" => {
-                    let response =
-                        agent::request(&dir, &json!({"op": "totp", "name": name, "user": user}))?;
-                    println!("{}", string_field(&response, "code"));
-                    return Ok(());
+            let named = |op: &str| json!({"op": op, "name": &name, "user": &user});
+            // Which agent op answers, and which key of its reply carries the
+            // value. Notes and the raw TOTP secret are not in the parsed cipher
+            // at all — the agent reads those off the raw record.
+            let (reply, key) = match field {
+                GetField::Totp => (agent::request(&dir, &named("totp"))?, "code"),
+                GetField::Notes => (agent::request(&dir, &named("notes"))?, "notes"),
+                GetField::TotpSecret => {
+                    (agent::request(&dir, &named("totp-secret"))?, "totp_secret")
                 }
-                // Notes are not in the parsed cipher at all — the agent reads
-                // them off the raw record.
-                "notes" => {
-                    let response =
-                        agent::request(&dir, &json!({"op": "notes", "name": name, "user": user}))?;
-                    println!("{}", string_field(&response, "notes"));
-                    return Ok(());
+                // One round trip answers both: the `get` op returns the whole
+                // entry.
+                GetField::Password | GetField::Username => {
+                    let mut reply = agent::request(&dir, &named("get"))?;
+                    let key = if field == GetField::Password {
+                        "password"
+                    } else {
+                        "username"
+                    };
+                    (reply["entry"].take(), key)
                 }
-                // The verbatim text in the TOTP slot, even when it is not a valid
-                // authenticator (a key pasted there by mistake) — `totp` would
-                // reject it, this recovers it.
-                "totp-secret" => {
-                    let response = agent::request(
-                        &dir,
-                        &json!({"op": "totp-secret", "name": name, "user": user}),
-                    )?;
-                    println!("{}", string_field(&response, "totp_secret"));
-                    return Ok(());
-                }
-                "password" | "username" => {
-                    agent::request(&dir, &json!({"op": "get", "name": name, "user": user}))?
-                }
-                other => bail!(
-                    "unknown --field {other:?} (password | username | totp | notes); \
-                     for custom fields use `fields`"
-                ),
             };
-            println!("{}", string_field(&entry["entry"], &field));
+            println!("{}", required_field(&reply, key, &name)?);
             Ok(())
         }
         Command::Totp { name, user } => {
             let response =
                 agent::request(&dir, &json!({"op": "totp", "name": name, "user": user}))?;
-            println!("{}", string_field(&response, "code"));
+            println!("{}", required_field(&response, "code", &name)?);
             Ok(())
         }
         Command::Passkeys { name, user } => {
@@ -424,7 +433,18 @@ fn main() -> Result<()> {
                         .as_str()
                         .is_some_and(|got| got.eq_ignore_ascii_case(&want))
                     {
-                        println!("{}", field["value"].as_str().unwrap_or(""));
+                        // A LINKED field stores no value of its own (it points at
+                        // the item's username or password), so its value comes
+                        // over as null. Printing an empty line would tell a
+                        // script the field is blank when it is unreadable — the
+                        // same absent-vs-empty confusion `required_field` exists
+                        // to end.
+                        let Some(value) = field["value"].as_str() else {
+                            bail!(
+                                "custom field {want:?} is a linked field and has no stored value"
+                            );
+                        };
+                        println!("{value}");
                         return Ok(());
                     }
                 }
@@ -618,8 +638,21 @@ fn tsv_field(value: &Value) -> String {
         .collect()
 }
 
-fn string_field(value: &Value, key: &str) -> String {
-    value[key].as_str().unwrap_or_default().to_string()
+/// The ONE owner of "the field is not there, so this command failed".
+///
+/// This used to be `as_str().unwrap_or_default()`, which printed a bare newline
+/// and exited 0 for a value the agent sent as JSON null. `USER=$(ychrome-vault
+/// get ITEM --field username)` then captured "" and reported success, so a
+/// script could not tell an item with NO username from one whose username is an
+/// empty string. An absent field is now a non-zero exit with the reason on
+/// stderr, like every other failure here; a stored empty string still prints and
+/// still succeeds.
+fn required_field<'a>(reply: &'a Value, key: &str, item: &str) -> Result<&'a str> {
+    match reply.get(key) {
+        Some(Value::String(value)) => Ok(value),
+        // The wire is snake_case; the user speaks the CLI's kebab-case.
+        _ => bail!("{item:?} has no {}", key.replace('_', "-")),
+    }
 }
 
 fn print_json(value: &Value) -> Result<()> {

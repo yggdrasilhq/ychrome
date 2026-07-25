@@ -142,7 +142,7 @@ attacker. Never print a real password into a transcript.
 ychrome-vault configure --server https://vault.example.com --email you@example.com
 read -rs PW; echo "$PW" | ychrome-vault unlock
 ychrome-vault list                     # name<TAB>user<TAB>folder   (--json for exact bytes)
-ychrome-vault get NAME [USER]          # password; --field username|totp|notes
+ychrome-vault get NAME [USER]          # --field password|username|totp|totp-secret|notes
 ychrome-vault totp NAME [USER]         # 6-digit code
 ychrome-vault match HOST               # strict: the ONE entry an auto-fill may use
 ychrome-vault suggest HOST             # loose: rows the sidebar floats up (secret-free)
@@ -165,6 +165,11 @@ ychrome-vault sync | lock | stop-agent | ping | status | diagnose | check
   selects by `organizationId`.
 - `--field notes` reads notes off the **raw** record, because `sync` never parses
   them into `RawCipher`. It is also the read that proves an edit preserved them.
+- **Absent is not empty.** A field the item does not have exits non-zero with the
+  reason on stderr; a field it stores as an empty string prints an empty line and
+  exits 0. `USER=$(ychrome-vault get X --field username)` used to capture "" and
+  report success either way, so scripts could not tell the two apart. Same rule
+  for `fields --field-name` on a *linked* field, which stores no value of its own.
 
 ## Fleet, build, deploy
 
