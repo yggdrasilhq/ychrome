@@ -97,6 +97,15 @@ enum Command {
     /// Metadata only — the passkey private key is never printed, and a listing
     /// can never trigger a WebAuthn ceremony.
     Passkeys { name: String, user: Option<String> },
+    /// Print a card item's metadata as
+    /// `brand<TAB>cardholder<TAB>expMonth<TAB>expYear<TAB>last4`.
+    ///
+    /// Metadata only. The full number and the CVV are deliberately unreachable
+    /// from the CLI: a PAN printed to a terminal is durable — scrollback, shell
+    /// history, an agent CLI's transcript — and unlike a password it cannot be
+    /// rotated on demand. The number reaches a page through the sidebar's fill
+    /// injector instead, which never prints it.
+    Card { name: String, user: Option<String> },
     /// Print an item's custom fields as `name<TAB>value`, one per line — the read
     /// `get --field` cannot do (it only models password/username/totp/notes).
     /// With `--field-name NAME`, print just that field's value, unadorned.
@@ -417,6 +426,24 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Card { name, user } => {
+            let response =
+                agent::request(&dir, &json!({"op": "card", "name": name, "user": user}))?;
+            let card = &response["card"];
+            // One column per stored field, no joining — same TSV discipline as
+            // `passkeys`. An absent sub-field is an empty column: unlike `get`,
+            // a card row is a record, and a card with no cardholder name is
+            // ordinary rather than a failure.
+            println!(
+                "{}\t{}\t{}\t{}\t{}",
+                tsv_field(&card["brand"]),
+                tsv_field(&card["cardholder"]),
+                tsv_field(&card["exp_month"]),
+                tsv_field(&card["exp_year"]),
+                tsv_field(&card["last4"]),
+            );
+            Ok(())
+        }
         Command::Fields {
             name,
             user,
@@ -452,7 +479,11 @@ fn main() -> Result<()> {
             }
             // name<TAB>value — same TSV discipline as `list`/`passkeys`.
             for field in &fields {
-                println!("{}\t{}", tsv_field(&field["name"]), tsv_field(&field["value"]));
+                println!(
+                    "{}\t{}",
+                    tsv_field(&field["name"]),
+                    tsv_field(&field["value"])
+                );
             }
             // When nothing prints, say whether the item truly has no custom
             // fields or has some that would not decrypt — on stderr, so a script

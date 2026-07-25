@@ -44,7 +44,8 @@ Requests and responses are one JSON object per line:
 ```
 
 Ops: `ping`, `status`, `unlock`, `lock`, `stop`, `sync`, `list` (`trashed:true`
-for the trash), `get`, `totp`, `passkeys`, `match`, `suggest`, `add`, `edit`,
+for the trash), `get`, `notes`, `fields`, `card`, `card-secret`, `totp`,
+`totp-secret`, `passkeys`, `match`, `suggest`, `add`, `edit`,
 `rm`, `restore`, `generate`. The agent auto-starts on `unlock` (and on
 `ping`) and detaches into its own process group, so the shell that first needed
 it can go away. A socket left behind by a SIGKILLed agent is detected (nobody
@@ -117,6 +118,7 @@ read -rs PW; echo "$PW" | ychrome-vault unlock   # once
 ychrome-vault get github.com                     # password on stdout
 ychrome-vault totp github.com                    # 6-digit code
 ychrome-vault passkeys github.com                # rpId<TAB>user<TAB>credId<TAB>created
+ychrome-vault card "HDFC Regalia"                # brand<TAB>holder<TAB>month<TAB>year<TAB>last4
 ychrome-vault list                               # name<TAB>user<TAB>folder
 ychrome-vault match chat.example.com                  # what an auto-fill may use
 ychrome-vault generate 24                        # local dice, no vault touched
@@ -166,6 +168,42 @@ but undocumented.
 | — (rbw has none) | `ychrome-vault edit NAME [USER]` |
 | — (rbw has none) | `ychrome-vault restore NAME [USER]` (undo a soft `rm`) |
 | — (rbw has none) | `ychrome-vault list --trashed` (show the trash) |
+
+## Cards: metadata on the CLI, the number only through the injector
+
+A card cipher (`type` 3) has no login block at all, so it carries no password —
+and the `get` op resolves the password *first*, which is why every one of them
+answered "has no password" whatever `--field` asked for. 130 of this vault's 1113
+items are in that state; before `card` they were reachable only through `notes`.
+
+Like notes and custom fields, a card is **read off the raw record**: `sync` never
+parses one into `RawCipher`, and adding a parsed `card` field there would be a
+second encoding that `edit_body`'s raw patching could silently diverge from. The
+record's own `type` is what makes an item a card, so a stray `card` object on a
+login is not readable as one — otherwise `VaultItem::item_type` (which the
+sidebar draws its fill button from) and this reader could disagree about what an
+item is.
+
+The reader is split in two, and the split is enforced by the type system rather
+than by discipline:
+
+| | carries | shape |
+| --- | --- | --- |
+| `Vault::card` → `CardInfo` | brand, cardholder, expiry, **last four** | `Serialize`; a test proves the PAN and CVV cannot appear |
+| `Vault::card_secret` → `CardSecret` | the full number, the CVV | **not** `Serialize`, **not** `Debug`, `Zeroizing` |
+
+`ychrome-vault card NAME` prints the metadata row and there is deliberately **no
+CLI verb for the number**. The threat being answered is not the socket — any
+same-uid process can already pull every password one `get` at a time — it is the
+**transcript**: a PAN printed to a terminal persists in scrollback, shell
+history, and any agent CLI's JSONL, and unlike a password it cannot be rotated on
+demand. So the number reaches a page the way a password does, as an `eval` script
+the GUI injects (the sidebar's `card-fill` action → the `card-secret` op), and
+that script returns the list of field names it filled, never a value.
+
+`VaultItem` now carries `item_type` for the same reason the passkey badge exists:
+it is secret-free, and it is the only thing that can explain to a listing why an
+item refuses `get`.
 
 ## Writes
 
@@ -260,6 +298,14 @@ never bring back or touch a live entry that happens to share a name. A
   create → soft-`rm` → `list --trashed` → `restore` → verify loop needs one live
   unlock with this binary (installing a new binary re-locks the agent). That is
   the one owed proof, exactly as `edit`/`rm` owed theirs until a live unlock.
+- **Cards** — built and covered by `cargo test` against a sealed synthetic card
+  (decryption under the cipher key, PascalCase drift, a plaintext `brand`, an
+  undecryptable sub-field dropped rather than surfaced as ciphertext, and the
+  no-PAN/no-CVV property of `CardInfo` asserted on the serialized form). **Not
+  yet exercised against the real vault**: reading a real card needs a live
+  unlock with this binary, and the sidebar's `card-fill` injector has had no
+  faithful pixel. What is proven is the crypto and the shape; what is owed is one
+  `ychrome-vault card "<a real card>"` and one screenshot of a card row.
 - **Passkeys** (`fido2Credentials`) — **read layer + assertion signer built**:
   - *Read* (slice 1): `sync` parses `login.fido2Credentials[]` into
     `RawCipher::fido2`, `list` badges `has_passkey`, `passkeys NAME` returns
