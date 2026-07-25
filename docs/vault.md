@@ -101,6 +101,27 @@ listener fd crosses too, with `FD_CLOEXEC` cleared, so there is **no unbind
 window** — a client that connects mid-swap is queued in the socket's backlog and
 answered by the successor rather than told "no vault agent".
 
+Both fds are prepared in exactly one place, `agent::arm_handover`, and the test
+that crosses an exec goes through it rather than clearing the bits itself. That
+is not tidiness: while the test did its own fd preparation, the listener's
+CLOEXEC clear — the guard the whole no-unbind-window claim rests on — could be
+deleted outright with every test still green.
+
+**On the far side, an inherited fd number is checked before it is owned.**
+`UnixListener::from_raw_fd` validates nothing: on a number that is no longer open
+the Rust runtime aborts the process (SIGABRT, "IO Safety violation") before any
+of our code runs, and on a number the successor's own startup reallocated it
+succeeds on the *wrong object*, which then fails every `accept` forever. So the
+listener must be a live, listening `AF_UNIX` stream socket and the payload must
+be a pipe. Neither refusal is fatal, and neither costs more than it has to: the
+socket and the session are separate things, so a bad listener binds a fresh
+socket and **keeps the unlock** (what is lost is the seamless window, and the
+successor says so), while a bad payload keeps the inherited socket and serves
+**locked**, exactly as for a payload that will not decode. The accept loop is
+bounded for the same reason: repeated failures back off and then exit with a
+reason, because a listener nobody can connect to has already lost the unlock, and
+spinning on it just burns a core while saying nothing.
+
 The exec is a **one-way door**: if the successor cannot come up, the unlock is
 gone and the user retypes. So every guard runs before the reply:
 
@@ -138,12 +159,17 @@ deploy after. That is also why the unknown-op hint points a *`handover`* request
 at `stop-agent` instead of at itself.
 
 Proven so far: the payload framing (encoder against an independently written
-decoder, and every truncation of it), the fd handling through a real pipe, the
-refusals, and — in `tests/handover_adopt.rs` — a genuinely separate
+decoder, and every truncation of it), the fd handling through a real pipe
+*including the listener's CLOEXEC clear*, the refusal of an inherited fd that is
+not what its flag promises, the accept loop giving up instead of spinning, the
+guards above, and — in `tests/handover_adopt.rs` — a genuinely separate
 `ychrome-vault agent` process adopting an inherited listener and an inherited
-session and coming up **unlocked** with no master password. **Not yet proven:**
-the `execve` itself, whose signature is same-pid-new-image and which only a live
-agent can show. See the live recipe in `.claude/skills/ychrome/SKILL.md`.
+session, coming up **unlocked** with no master password and locking on the
+inherited idle clock rather than a fresh one. Each of those has been shown to go
+red when the guard it covers is removed; a lock nobody has watched fail is not a
+lock. **Not yet proven:** the `execve` itself, whose signature is
+same-pid-new-image and which only a live agent can show. See the live recipe in
+`.claude/skills/ychrome/SKILL.md`.
 
 ## Organization ciphers
 
@@ -215,8 +241,19 @@ the item does not carry that field, and succeeds when the item stores it as an
 empty string. Those are different facts and a script has to be able to tell them
 apart: `USER=$(ychrome-vault get ITEM --field username)` used to capture `""` and
 exit 0 for both, because the printer was `as_str().unwrap_or_default()`. The same
-rule now covers `fields --field-name` on a **linked** field, which stores no value
-of its own (it points at the item's username or password).
+rule now covers `fields --field-name` on a custom field with no readable value.
+
+There are **two** reasons a custom field has none, and the refusal names the one
+the vault actually determined rather than guessing: a **linked** field stores no
+value of its own (it points at the item's username or password, and there is
+nothing to go looking for), while an **unreadable** one has a value stored that
+this vault could not decrypt — the org-cipher case, where one organization key
+failing to unwrap is deliberately non-fatal and leaves exactly that shape behind.
+`Vault::fields` owns the distinction (`FieldValue::Linked` vs
+`FieldValue::Unreadable`) and the agent puts it on the wire as `absent`; nothing
+downstream re-derives it from a null. Telling a user with a key problem to go
+find a link that does not exist is a stale answer, which is the one thing a
+credential reader must never serve.
 
 The accepted `--field` values have one owner, the `GetField` enum: clap derives
 the flag's help text, its accepted values and its "invalid value" error from it,

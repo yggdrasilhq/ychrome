@@ -144,19 +144,51 @@ fn every_get_field_refuses_a_null_value() {
     }
 }
 
-// A LINKED custom field has no stored value of its own. `fields --field-name`
-// printed an empty line and exited 0, which reads to a script as "the field is
-// blank" rather than "this field cannot be read".
+// A custom field with no value must refuse — printing an empty line and exiting
+// 0 reads to a script as "the field is blank" rather than "this cannot be read".
+// And the refusal must name the reason the AGENT determined: a linked field
+// stores no value by design, while an unreadable one is a key this vault does
+// not hold. One message for both told a user with an org-key problem to go find
+// a link that does not exist.
 #[test]
-fn a_linked_custom_field_refuses_rather_than_printing_empty() {
+fn a_valueless_custom_field_says_which_reason_it_is() {
     let out = run(
         "linked",
-        r#"{"ok":true,"fields":[{"name":"Card","value":null}],"raw_field_count":1}"#,
+        r#"{"ok":true,"fields":[{"name":"Card","value":null,"absent":"linked"}],"raw_field_count":1}"#,
         &["fields", "x", "--field-name", "Card"],
     );
     assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
     assert_eq!(out.stdout, "");
     assert!(out.stderr.contains("linked field"), "{}", out.stderr);
+    assert!(
+        !out.stderr.contains("decrypt"),
+        "a linked field is not a key problem: {}",
+        out.stderr
+    );
+
+    let out = run(
+        "unreadable",
+        r#"{"ok":true,"fields":[{"name":"Card","value":null,"absent":"unreadable"}],"raw_field_count":1}"#,
+        &["fields", "x", "--field-name", "Card"],
+    );
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert_eq!(out.stdout, "");
+    assert!(out.stderr.contains("could not decrypt"), "{}", out.stderr);
+    assert!(
+        !out.stderr.contains("linked"),
+        "an unreadable value must not be reported as a link that does not exist: {}",
+        out.stderr
+    );
+
+    // An agent too old to say which names both and claims neither.
+    let out = run(
+        "no-reason",
+        r#"{"ok":true,"fields":[{"name":"Card","value":null}],"raw_field_count":1}"#,
+        &["fields", "x", "--field-name", "Card"],
+    );
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("linked"), "{}", out.stderr);
+    assert!(out.stderr.contains("decrypt"), "{}", out.stderr);
 
     // A field that really holds a value still prints it, unadorned.
     let out = run(

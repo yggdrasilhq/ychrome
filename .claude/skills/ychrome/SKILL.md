@@ -190,7 +190,10 @@ ychrome-vault sync | lock | stop-agent | ping | status | diagnose | check
   reason on stderr; a field it stores as an empty string prints an empty line and
   exits 0. `USER=$(ychrome-vault get X --field username)` used to capture "" and
   report success either way, so scripts could not tell the two apart. Same rule
-  for `fields --field-name` on a *linked* field, which stores no value of its own.
+  for `fields --field-name` with no readable value — and it says WHICH of the two
+  reasons: a *linked* field stores none of its own, while an *unreadable* one has
+  a value this vault could not decrypt (the org-key case). One message for both
+  sent a key problem off looking for a link that does not exist.
 
 ## Fleet, build, deploy
 
