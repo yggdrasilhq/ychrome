@@ -197,6 +197,26 @@ impl SymmetricKey {
         }
     }
 
+    /// The key's 64 raw bytes, `enc || mac` — the exact inverse of
+    /// [`SymmetricKey::from_bytes`].
+    ///
+    /// This is the ONLY way key material can leave this struct, and it exists
+    /// for exactly one caller: `agent::handover`, which carries the user key
+    /// across an `execve` on an anonymous pipe so a rebuilt binary does not cost
+    /// the user a re-typed master password. `pub(crate)` and deliberately absent
+    /// from `lib.rs`'s re-exports, so nothing outside this crate can reach it.
+    ///
+    /// It is a real widening of the attack surface and worth saying plainly: the
+    /// bytes exist unsealed in a `Zeroizing` buffer for the length of one write
+    /// to a private fd. Nothing else may call it — a getter here would make the
+    /// whole `Zeroizing` discipline decorative.
+    pub(crate) fn to_bytes(&self) -> Zeroizing<[u8; 64]> {
+        let mut out = Zeroizing::new([0u8; 64]);
+        out[..32].copy_from_slice(&self.enc[..]);
+        out[32..].copy_from_slice(&self.mac[..]);
+        out
+    }
+
     /// Decrypt an [`EncString`] to raw bytes with encrypt-then-MAC checking.
     pub fn decrypt(&self, enc: &EncString) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
         // Encrypt-then-MAC: authenticate iv||ct BEFORE touching the cipher.
@@ -672,5 +692,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a, mk2.password_hash_b64("hunter2"));
+    }
+
+    // `to_bytes` is the only way key material leaves `SymmetricKey`, and it has
+    // exactly one caller: the handover, which carries the user key across an
+    // `execve` so a rebuilt binary does not cost a re-typed master password. A
+    // key that came back subtly wrong would look like a working unlock in which
+    // every single decrypt fails its MAC check.
+    #[test]
+    fn to_bytes_round_trips_into_a_working_key() {
+        // Every byte distinct, because a uniform key hides the failure that
+        // matters: `enc` and `mac` swapped on the way out would round-trip
+        // perfectly through our own `from_bytes` and still decrypt nothing the
+        // real vault sealed. A round trip against ourselves is not a proof.
+        let bytes: [u8; 64] = std::array::from_fn(|i| i as u8);
+        let original = SymmetricKey::from_bytes(&bytes).unwrap();
+        let exported = original.to_bytes();
+        assert_eq!(&exported[..], &bytes[..], "enc || mac, in that order");
+
+        let sealed = crate::model::seal(&bytes, b"handed over");
+        let rebuilt = SymmetricKey::from_bytes(&exported[..]).unwrap();
+        assert_eq!(rebuilt.decrypt_to_string(&sealed).unwrap(), "handed over");
+
+        // A legacy 32-byte key is STRETCHED on the way in, so what has to cross
+        // the boundary is the stretched form — handing over the 32 bytes it came
+        // from would rebuild a different key on the far side. The expected bytes
+        // are computed HERE, straight from HKDF, rather than by asking the same
+        // code twice.
+        let stretched = SymmetricKey::from_bytes(&[0x11u8; 32]).unwrap();
+        let hkdf = Hkdf::<Sha256>::from_prk(&[0x11u8; 32]).unwrap();
+        let mut expected = [0u8; 64];
+        hkdf.expand(b"enc", &mut expected[..32]).unwrap();
+        hkdf.expand(b"mac", &mut expected[32..]).unwrap();
+        assert_eq!(&stretched.to_bytes()[..], &expected[..]);
+        assert_ne!(&expected[..32], &[0x11u8; 32], "the key must be stretched");
     }
 }
