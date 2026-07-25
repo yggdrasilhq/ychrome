@@ -43,7 +43,7 @@ Requests and responses are one JSON object per line:
 {"ok":true,"entry":{"name":"github.com","username":"octocat","password":"…"}}
 ```
 
-Ops: `ping`, `status`, `unlock`, `lock`, `stop`, `sync`, `list` (`trashed:true`
+Ops: `ping`, `status`, `unlock`, `lock`, `stop`, `handover`, `sync`, `list` (`trashed:true`
 for the trash), `get`, `notes`, `fields`, `card`, `card-secret`, `totp`,
 `totp-secret`, `passkeys`, `match`, `suggest`, `add`, `edit`,
 `rm`, `restore`, `generate`. The agent auto-starts on `unlock` (and on
@@ -71,7 +71,79 @@ make it visible:
   never survive a `stop`). An agent older than the pid file says so plainly
   rather than pretending to have worked.
 
-**After rebuilding, run `ychrome-vault stop-agent`.**
+**After rebuilding, hand the agent over — or, failing that, stop it.**
+
+### `handover`: a rebuild that does not cost an unlock
+
+`stop-agent` drops the keys, so every rebuild used to cost a master password
+typed by hand on every host. `ychrome-vault handover` is the cheap route: the
+running agent `execve`s the newly installed binary **in place**, keeping its pid
+and its bound listener fd. Same process, same socket, new code, vault still
+unlocked.
+
+The framing that matters, because the obvious one is wrong: **`execve` does not
+keep memory.** It keeps the pid and the open file descriptors and throws the
+whole address space away. The keys have to cross the boundary one way or
+another, and the only question is on what.
+
+| channel | verdict |
+| --- | --- |
+| argv | refused — world-readable in `/proc/<pid>/cmdline` |
+| environment variable | refused — same |
+| a file | refused — it outlives the process that wrote it |
+| a socket | refused — another process could connect to it |
+| **an anonymous pipe** | used — its buffer lives in the kernel, is reachable only through its two fds, and dies with the process if the exec never happens |
+
+What crosses is small, and that is the whole argument: 64 bytes of user key, the
+two bearer tokens, and the idle clock. Ciphers, org keys and folder names are all
+re-derived by `resync`, which needs the user key and the bearer alone. The
+listener fd crosses too, with `FD_CLOEXEC` cleared, so there is **no unbind
+window** — a client that connects mid-swap is queued in the socket's backlog and
+answered by the successor rather than told "no vault agent".
+
+The exec is a **one-way door**: if the successor cannot come up, the unlock is
+gone and the user retypes. So every guard runs before the reply:
+
+1. the agent must be serving a socket, and the vault must be **unlocked**
+   (locked means there is nothing to carry, and `stop-agent` is free then);
+2. the successor is resolved **by the agent** (`installed_vault_exe`), never
+   named by the client — an exec target taken from a request would be privilege
+   escalation by asking;
+3. it must not be the binary already running, or the agent would exec into
+   itself forever;
+4. it must answer `--version` cleanly, which catches a truncated `scp`, a wrong
+   architecture, or a libc that is too new — cheaply, while the unlock is still
+   recoverable;
+5. the **session** must still work: the agent `resync`s first (renewing the
+   bearer if it had expired), because the successor re-pulls the ciphers with
+   that token and nothing else.
+
+If the exec still fails, the old process keeps serving and says so on stderr: a
+failed handover costs nothing. If the successor comes up but cannot reach the
+server, it keeps the keys, serves with an empty vault, and prints the remedy
+(`ychrome-vault sync`) rather than throwing an unlock away.
+
+**The honest cost.** This creates the first path by which the user key can leave
+`SymmetricKey` at all (`to_bytes`, `pub(crate)`, one caller). The bytes exist
+unsealed in a `Zeroizing` buffer for the length of one write to a private fd,
+read by a process that is about to be this same pid. That is a real widening of
+the surface, and it is not free — it is just far cheaper than the alternative it
+replaces, and strictly narrower than a keyring or a second live process, either
+of which would create a durable second owner of the key where today there is
+none.
+
+**The sequencing trap.** `handover` is itself an op the OLD agent does not know,
+so installing it costs one final `stop-agent` on each host. It pays from the
+deploy after. That is also why the unknown-op hint points a *`handover`* request
+at `stop-agent` instead of at itself.
+
+Proven so far: the payload framing (encoder against an independently written
+decoder, and every truncation of it), the fd handling through a real pipe, the
+refusals, and — in `tests/handover_adopt.rs` — a genuinely separate
+`ychrome-vault agent` process adopting an inherited listener and an inherited
+session and coming up **unlocked** with no master password. **Not yet proven:**
+the `execve` itself, whose signature is same-pid-new-image and which only a live
+agent can show. See the live recipe in `.claude/skills/ychrome/SKILL.md`.
 
 ## Organization ciphers
 
@@ -128,7 +200,8 @@ ychrome-vault rm example.com alice                # to the trash, restorable
 ychrome-vault list --trashed                      # show the trash
 ychrome-vault restore example.com alice           # bring it back from the trash
 ychrome-vault lock
-ychrome-vault stop-agent                          # after every rebuild
+ychrome-vault handover                            # after a rebuild, keeps the unlock
+ychrome-vault stop-agent                          # the fallback, which RE-LOCKS
 ```
 
 The master password is read from **stdin only** — never a flag, never an

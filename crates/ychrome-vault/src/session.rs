@@ -92,6 +92,19 @@ pub enum VaultStatus {
     },
 }
 
+/// The unlocked session, reduced to what survives an `execve`: the user key and
+/// the two bearer tokens. Carried by `agent::handover` from one generation of
+/// the agent to the next so a rebuilt binary does not cost a re-typed master
+/// password.
+///
+/// Deliberately not `Serialize`, not `Debug` and not `Clone`. It exists for one
+/// hop between two generations of the SAME pid, and every field zeroizes.
+pub(crate) struct SessionMaterial {
+    pub(crate) user_key: Zeroizing<[u8; 64]>,
+    pub(crate) access_token: Zeroizing<String>,
+    pub(crate) refresh_token: Option<Zeroizing<String>>,
+}
+
 /// Owns the vault config and the unlocked session. One per agent process.
 pub struct VaultManager {
     dir: PathBuf,
@@ -261,6 +274,49 @@ impl VaultManager {
     #[cfg(test)]
     pub(crate) fn install_vault_for_test(&mut self, vault: Vault) {
         self.vault = Some(vault);
+    }
+
+    /// Everything a successor process needs to keep THIS unlock alive: the user
+    /// key and the two bearer tokens. `None` when the vault is locked — there is
+    /// nothing to hand over then, and `stop-agent` is the right verb.
+    ///
+    /// Deliberately tiny, and that is the whole argument for the handover: the
+    /// ciphers, the org keys and the folder names are all re-derived by
+    /// [`VaultManager::resync`] from the user key and the bearer alone, so the
+    /// payload is a few hundred bytes rather than the ~7 MB of encrypted
+    /// ciphers this agent is holding.
+    pub(crate) fn export_session(&self) -> Option<SessionMaterial> {
+        Some(SessionMaterial {
+            user_key: self.vault.as_ref()?.user_key().to_bytes(),
+            access_token: self.access_token.clone()?,
+            refresh_token: self.refresh_token.clone(),
+        })
+    }
+
+    /// Restore a session exported by the process this one replaced, then re-pull
+    /// the ciphers. Returns the item count, exactly like `unlock`.
+    ///
+    /// The ciphers are NOT carried across: `resync` fetches them with the bearer
+    /// token, which is what keeps the handover payload small enough to fit in a
+    /// pipe. That does mean a successor needs the network for one call — the
+    /// outgoing agent proves the token still works before it execs, so this
+    /// failing means the network went away between the two.
+    ///
+    /// The keys are installed BEFORE the resync on purpose. A failed resync then
+    /// leaves the vault unlocked and empty, recoverable with `ychrome-vault
+    /// sync`, rather than throwing away an unlock the user would have to retype.
+    pub(crate) fn adopt_session(&mut self, material: SessionMaterial) -> Result<usize, VaultError> {
+        let user_key = crate::crypto::SymmetricKey::from_bytes(&material.user_key[..])?;
+        self.vault = Some(Vault::new(
+            user_key,
+            Default::default(),
+            Vec::new(),
+            Vec::new(),
+            Default::default(),
+        ));
+        self.access_token = Some(material.access_token);
+        self.refresh_token = material.refresh_token;
+        self.resync()
     }
 
     /// Drop the in-memory vault and its bearer token (keys zeroize). Config
@@ -511,7 +567,11 @@ mod tests {
         (url, rx)
     }
 
-    fn manager_with_tokens(server_url: String, access: &str, refresh: Option<&str>) -> VaultManager {
+    fn manager_with_tokens(
+        server_url: String,
+        access: &str,
+        refresh: Option<&str>,
+    ) -> VaultManager {
         let dir = std::env::temp_dir().join(format!("yggvault-auth-{}", new_device_id()));
         let mut manager = VaultManager::load(&dir);
         manager.config = Some(VaultConfig {
@@ -566,9 +626,14 @@ mod tests {
             Some("rotated-refresh")
         );
 
-        let body = requests.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let body = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         assert!(body.contains("grant_type=refresh_token"), "sent: {body}");
-        assert!(body.contains("old-refresh"), "must spend the STORED refresh token: {body}");
+        assert!(
+            body.contains("old-refresh"),
+            "must spend the STORED refresh token: {body}"
+        );
     }
 
     /// One retry, not a loop: a second 401 means the fresh token is not the
@@ -633,7 +698,10 @@ mod tests {
         let mut manager = manager_with_tokens("http://127.0.0.1:1".into(), "a", Some("r"));
         manager.lock();
         assert!(manager.access_token.is_none());
-        assert!(manager.refresh_token.is_none(), "a surviving refresh token re-opens the vault");
+        assert!(
+            manager.refresh_token.is_none(),
+            "a surviving refresh token re-opens the vault"
+        );
     }
 
     #[test]

@@ -215,8 +215,24 @@ enum Command {
     /// Stop the agent (drops its keys and exits). Needed after a rebuild: the
     /// agent outlives the binary, so it keeps serving the old code.
     StopAgent,
+    /// Hand the running agent's unlocked session to the newly installed binary,
+    /// WITHOUT re-locking the vault — the cheap alternative to `stop-agent`.
+    ///
+    /// The agent execs the installed `ychrome-vault` in place: same pid, same
+    /// bound socket, new code, unlock intact. The successor is chosen by the
+    /// agent (the installed binary), never named here.
+    Handover,
     /// Run the agent in the foreground (normally auto-started on demand).
-    Agent,
+    Agent {
+        /// Internal: serve on an inherited, already-bound listener fd instead of
+        /// binding one. Set by the `handover` exec; not for hand use.
+        #[arg(long, hide = true, requires = "adopt_payload")]
+        adopt_listener: Option<std::os::fd::RawFd>,
+        /// Internal: read the inherited session from this fd. Set by the
+        /// `handover` exec; not for hand use.
+        #[arg(long, hide = true, requires = "adopt_listener")]
+        adopt_payload: Option<std::os::fd::RawFd>,
+    },
     /// Unlock in-process and print a summary — validates the client end to end.
     Check,
 }
@@ -253,7 +269,42 @@ fn main() -> Result<()> {
     };
 
     match cli.command.unwrap_or(Command::Status) {
-        Command::Agent => agent::serve(&dir),
+        Command::Agent {
+            adopt_listener,
+            adopt_payload,
+        } => match (adopt_listener, adopt_payload) {
+            // clap's `requires` makes the half-given case unreachable from a
+            // command line; the match is exhaustive because an unreachable arm
+            // that panics is worse than one that explains itself.
+            (Some(listener), Some(payload)) => agent::serve_adopted(&dir, listener, payload),
+            _ => agent::serve(&dir),
+        },
+        Command::Handover => {
+            // The agent replies BEFORE it execs, so "accepted" is not proof. The
+            // proof is a SECOND round trip: ask the agent on that socket who it
+            // is now. A connection that lands mid-exec is queued on the
+            // inherited listener rather than refused, which is the whole reason
+            // the listener fd crosses the boundary.
+            let accepted = agent::request(&dir, &json!({"op": "handover"}))?;
+            let after = agent::request(&dir, &json!({"op": "status"}))?;
+            let now = after["exe_stamp"].as_str().unwrap_or_default();
+            let handed_over = !now.is_empty() && Some(now) == accepted["successor_stamp"].as_str();
+            print_json(&json!({
+                "handed_over": handed_over,
+                "successor": accepted["successor"],
+                "pid": accepted["pid"],
+                "exe_stamp": now,
+                "state": after["state"],
+                "item_count": after["item_count"],
+            }))?;
+            if !handed_over {
+                bail!(
+                    "the agent is still running its old binary — its stderr says why, \
+                     and the vault is untouched"
+                );
+            }
+            Ok(())
+        }
         Command::Ping => {
             agent::request_autostart(&dir, &json!({"op": "ping"}))?;
             print_json(&agent::request(&dir, &json!({"op": "status"}))?)

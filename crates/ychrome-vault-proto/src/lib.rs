@@ -113,12 +113,22 @@ pub fn request_with_timeout(dir: &Path, request: &Value, timeout: Duration) -> R
         .unwrap_or("vault agent refused the request");
     // The agent outlives the binary that spawned it. An op this build knows but
     // the agent does not means the running agent predates the last rebuild — say
-    // so, instead of leaving the caller staring at "unknown op". `stop` is
-    // exempt: it is the remedy, and `stop` has its own fallback for an agent too
-    // old to perform it.
-    let stopping = request.get("op").and_then(Value::as_str) == Some("stop");
-    if error.starts_with("unknown op") && !stopping {
-        bail!("{error} — the running agent predates this binary; run `ychrome-vault stop-agent`");
+    // so, instead of leaving the caller staring at "unknown op".
+    //
+    // `stop` and `handover` are both exempt: they ARE the remedies. An agent too
+    // old to know `handover` cannot be handed over, and saying "run handover"
+    // there would be a loop — the only way out is `stop-agent`, which costs the
+    // master password. That cost is the reason `handover` exists, and it is
+    // owed exactly once, on the deploy that installs it.
+    let op = request.get("op").and_then(Value::as_str);
+    if error.starts_with("unknown op") && op != Some("stop") {
+        let remedy = if op == Some("handover") {
+            "run `ychrome-vault stop-agent` (which re-locks the vault — this is the \
+             one handover the old agent cannot perform for you)"
+        } else {
+            "run `ychrome-vault handover`, or `stop-agent` if it refuses"
+        };
+        bail!("{error} — the running agent predates this binary; {remedy}");
     }
     Err(anyhow!(error.to_string()))
 }
@@ -140,20 +150,45 @@ pub fn request_autostart(dir: &Path, req: &Value) -> Result<Value> {
 /// used; otherwise — the browser/daemon, whose `current_exe` is `ychrome` — the
 /// name is resolved on `PATH`, so `Command::new` finds the installed agent.
 fn resolve_vault_exe() -> PathBuf {
-    which_vault_exe().unwrap_or_else(|| PathBuf::from("ychrome-vault"))
+    installed_vault_exe().unwrap_or_else(|| PathBuf::from("ychrome-vault"))
 }
 
 /// The installed `ychrome-vault` binary's path (canonicalised, so it matches the
 /// agent's own `/proc/self/exe` stamp). `current_exe` wins when this process IS
 /// `ychrome-vault`; otherwise the first `ychrome-vault` on `PATH`.
-fn which_vault_exe() -> Option<PathBuf> {
+///
+/// This is also the SUCCESSOR a running agent execs into on `handover`, and it
+/// is resolved by the agent itself, never supplied by the client: a
+/// client-chosen exec target would be privilege escalation by request.
+pub fn installed_vault_exe() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe()
-        && exe.file_name().and_then(|name| name.to_str()) == Some("ychrome-vault")
+        && is_live_vault_exe(&exe)
     {
         return exe.canonicalize().ok().or(Some(exe));
     }
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
+    vault_exe_on_path(&std::env::var_os("PATH")?)
+}
+
+/// Is this `current_exe` result the vault binary itself, or a stale name for a
+/// binary that has since been replaced?
+///
+/// `/proc/self/exe` gains a literal " (deleted)" suffix once the inode it names
+/// is unlinked, which is exactly what `sudo install` does to a running agent's
+/// binary — dev's 25-hour-old agent reports
+/// `/usr/local/bin/ychrome-vault (deleted)` right now. That path cannot be
+/// opened, so it is NOT a successor, and the resolver must fall through to PATH
+/// to find the replacement. It already did, by accident of this name
+/// comparison; `handover` depends on it, so it is a named predicate with a test
+/// rather than luck.
+fn is_live_vault_exe(exe: &Path) -> bool {
+    exe.file_name().and_then(|name| name.to_str()) == Some("ychrome-vault")
+}
+
+/// The first `ychrome-vault` in a PATH-shaped list of directories. Takes the
+/// list rather than reading the environment, so it is testable without mutating
+/// a process-wide variable other threads are reading.
+fn vault_exe_on_path(path: &std::ffi::OsStr) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path) {
         let candidate = dir.join("ychrome-vault");
         if candidate.is_file() {
             return candidate.canonicalize().ok().or(Some(candidate));
@@ -269,7 +304,7 @@ pub fn exe_stamp_of(path: &Path) -> String {
 /// equals the agent's, so a missing binary reads as "stale", which is the safe
 /// side (it offers the restart-agent remedy rather than hiding it).
 pub fn installed_vault_exe_stamp() -> String {
-    which_vault_exe()
+    installed_vault_exe()
         .map(|path| exe_stamp_of(&path))
         .unwrap_or_default()
 }
@@ -398,8 +433,68 @@ mod tests {
         let served = fake_agent(&dir, json!({"ok": false, "error": "unknown op \"route\""}));
         let err = request(&dir, &json!({"op": "route"})).unwrap_err();
         assert!(err.to_string().contains("predates this binary"), "{err}");
+        assert!(err.to_string().contains("handover"), "{err}");
         served.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The remedy an agent too old to know `handover` is offered must NOT be
+    // `handover` — that is the one case where the cheap route does not exist and
+    // the user has to pay a master password. Pointing them at the op that just
+    // failed would be a loop.
+    #[test]
+    fn an_agent_too_old_for_handover_is_pointed_at_stop_agent() {
+        let dir = temp_dir("nohandover");
+        std::fs::remove_file(socket_path(&dir)).ok();
+        let served = fake_agent(
+            &dir,
+            json!({"ok": false, "error": "unknown op \"handover\""}),
+        );
+        let err = request(&dir, &json!({"op": "handover"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stop-agent"), "{err}");
+        assert!(err.contains("re-locks"), "{err}");
+        assert!(
+            !err.contains("run `ychrome-vault handover`"),
+            "pointed at the op that just failed: {err}"
+        );
+        served.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The successor a `handover` execs into is resolved HERE, and the rules are
+    // load-bearing: a running agent whose binary was replaced by `sudo install`
+    // reports its own exe as "… (deleted)", which cannot be executed. Falling
+    // through to PATH is what finds the replacement, and until now that happened
+    // by accident of a string comparison.
+    #[test]
+    fn the_successor_resolver_refuses_a_deleted_exe_and_finds_the_path_one() {
+        assert!(is_live_vault_exe(Path::new("/usr/local/bin/ychrome-vault")));
+        assert!(
+            !is_live_vault_exe(Path::new("/usr/local/bin/ychrome-vault (deleted)")),
+            "a replaced binary is not a successor"
+        );
+        assert!(!is_live_vault_exe(Path::new("/usr/local/bin/ychrome")));
+
+        let dir = temp_dir("successor");
+        let empty = temp_dir("successor-empty");
+        assert_eq!(vault_exe_on_path(empty.as_os_str()), None);
+
+        // A DIRECTORY of that name is not a binary.
+        std::fs::create_dir_all(dir.join("ychrome-vault")).unwrap();
+        assert_eq!(vault_exe_on_path(dir.as_os_str()), None);
+        std::fs::remove_dir(dir.join("ychrome-vault")).unwrap();
+
+        std::fs::write(dir.join("ychrome-vault"), b"#!/bin/true\n").unwrap();
+        let found = vault_exe_on_path(dir.as_os_str()).expect("found on the path");
+        assert_eq!(found.file_name().unwrap(), "ychrome-vault");
+        // The earlier directory wins, so a search order change is visible.
+        let both = std::env::join_paths([empty.as_path(), dir.as_path()]).unwrap();
+        assert_eq!(vault_exe_on_path(&both), Some(found));
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&empty).ok();
     }
 
     #[test]
