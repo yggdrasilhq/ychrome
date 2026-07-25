@@ -237,6 +237,44 @@ pub struct CardSecret {
     pub code: Option<Zeroizing<String>>,
 }
 
+/// What one custom field holds — or, when it holds nothing readable, WHY.
+///
+/// The two reasons are not interchangeable to whoever asked. A linked field
+/// stores no value by design and there is nothing to go looking for; an
+/// unreadable one is a key this vault does not hold, which is a real problem
+/// with a real fix. Collapsing both into a bare `None` (and then naming one of
+/// them in the error) sent the user hunting for a link that does not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldValue {
+    /// Decrypted.
+    Value(String),
+    /// A LINKED field: it points at the item's own username or password and
+    /// carries no value of its own (the server sends `null`, or omits the key).
+    Linked,
+    /// A value IS stored and this vault could not read it: not an `EncString`,
+    /// not a string at all, or sealed under a key we do not have.
+    Unreadable,
+}
+
+/// Classify one raw custom-field entry's value under the cipher's key.
+///
+/// The single owner of the linked-vs-unreadable distinction; every surface that
+/// reports it reads this and does not re-derive it from a null.
+fn field_value(field: &serde_json::Value, key: &SymmetricKey) -> FieldValue {
+    let Some(object) = field.as_object() else {
+        // Not even an object: a record we cannot read, not a link.
+        return FieldValue::Unreadable;
+    };
+    match get_ci(object, "value") {
+        None | Some(serde_json::Value::Null) => FieldValue::Linked,
+        Some(stored) => stored
+            .as_str()
+            .and_then(|text| EncString::parse(text).ok())
+            .and_then(|encrypted| key.decrypt_to_string(&encrypted).ok())
+            .map_or(FieldValue::Unreadable, FieldValue::Value),
+    }
+}
+
 /// Secret-free metadata for one stored passkey. Carries what a picker or a
 /// listing shows — never the private key (`key_value`) and never the raw
 /// account handle. Serializable because the agent hands it to clients.
@@ -981,13 +1019,13 @@ impl Vault {
 
     /// A specific item's custom fields, each decrypted on demand, returned as
     /// `(name, value)` in stored order. A hidden field's value decrypts like any
-    /// other; a linked field (no stored value) yields `None`. Read straight off
-    /// the RAW record for the same reason as [`Vault::notes`] — `sync` never
-    /// parses custom fields into [`RawCipher`], which is exactly why they must be
-    /// preserved by patching the raw JSON in [`Vault::edit_body`]. Empty vec if
-    /// the item is unknown, undecryptable, or carries no fields. A field whose
-    /// name will not decrypt is dropped rather than failing the whole read.
-    pub fn fields(&self, id: &str) -> Vec<(String, Option<String>)> {
+    /// other. Read straight off the RAW record for the same reason as
+    /// [`Vault::notes`] — `sync` never parses custom fields into [`RawCipher`],
+    /// which is exactly why they must be preserved by patching the raw JSON in
+    /// [`Vault::edit_body`]. Empty vec if the item is unknown, undecryptable, or
+    /// carries no fields. A field whose name will not decrypt is dropped rather
+    /// than failing the whole read.
+    pub fn fields(&self, id: &str) -> Vec<(String, FieldValue)> {
         let Some(cipher) = self.find(id) else {
             return Vec::new();
         };
@@ -1000,8 +1038,8 @@ impl Vault {
         let Some(fields) = get_ci(raw, "fields").and_then(|value| value.as_array()) else {
             return Vec::new();
         };
-        let decrypt = |field: &serde_json::Value, key_name: &str| -> Option<String> {
-            let encrypted = get_ci(field.as_object()?, key_name)?.as_str()?;
+        let name_of = |field: &serde_json::Value| -> Option<String> {
+            let encrypted = get_ci(field.as_object()?, "name")?.as_str()?;
             key.decrypt_to_string(&EncString::parse(encrypted).ok()?)
                 .ok()
         };
@@ -1011,12 +1049,7 @@ impl Vault {
         // we came for). Name defaults to the empty string in that case.
         fields
             .iter()
-            .map(|field| {
-                (
-                    decrypt(field, "name").unwrap_or_default(),
-                    decrypt(field, "value"),
-                )
-            })
+            .map(|field| (name_of(field).unwrap_or_default(), field_value(field, &key)))
             .collect()
     }
 
@@ -2292,6 +2325,63 @@ mod tests {
         assert!(logins.card("c1").is_none(), "a login is not a card");
         assert!(logins.card_secret("c1").is_none());
         assert!(vault.card("nope").is_none());
+    }
+
+    // A custom field with nothing to show says WHICH of the two reasons it is.
+    // Both used to come back as a bare `None`, and the CLI then named one of
+    // them for both: a value sealed under a key we do not have was reported as
+    // "a linked field", sending the user to look for a link that is not there.
+    #[test]
+    fn a_custom_field_reports_linked_and_unreadable_as_different_facts() {
+        let key_bytes = [0x63u8; 64];
+        let other_key = [0x64u8; 64];
+        let cipher = RawCipher {
+            raw: serde_json::json!({
+                "id": "c1",
+                "type": 1,
+                "fields": [
+                    // Readable: a hidden field's value decrypts like any other.
+                    {"name": json_str(seal(&key_bytes, "PAN")),
+                     "value": json_str(seal(&key_bytes, "4242")), "type": 1},
+                    // LINKED: the server sends an explicit null...
+                    {"name": json_str(seal(&key_bytes, "User")), "value": null, "type": 3},
+                    // ...or omits the key entirely. Same fact.
+                    {"name": json_str(seal(&key_bytes, "Pass")), "type": 3},
+                    // Stored, and sealed under a key this vault does not hold —
+                    // the org-key case, which is deliberately non-fatal and so
+                    // leaves exactly this shape behind.
+                    {"name": json_str(seal(&key_bytes, "Org")),
+                     "value": json_str(seal(&other_key, "secret")), "type": 1},
+                    // Stored, and not an EncString at all.
+                    {"name": json_str(seal(&key_bytes, "Junk")), "value": "not-an-encstring"},
+                    // Stored, and not even a string.
+                    {"name": json_str(seal(&key_bytes, "Number")), "value": 42},
+                ],
+            }),
+            id: "c1".into(),
+            item_type: 1,
+            name: Some(seal(&key_bytes, "GitHub")),
+            ..Default::default()
+        };
+        let vault = Vault::new(
+            SymmetricKey::from_bytes(&key_bytes).unwrap(),
+            HashMap::new(),
+            vec![cipher],
+            vec![],
+            HashMap::new(),
+        );
+
+        assert_eq!(
+            vault.fields("c1"),
+            vec![
+                ("PAN".to_string(), FieldValue::Value("4242".to_string())),
+                ("User".to_string(), FieldValue::Linked),
+                ("Pass".to_string(), FieldValue::Linked),
+                ("Org".to_string(), FieldValue::Unreadable),
+                ("Junk".to_string(), FieldValue::Unreadable),
+                ("Number".to_string(), FieldValue::Unreadable),
+            ]
+        );
     }
 
     // Vaultwarden has drifted PascalCase↔camelCase across versions, which is why

@@ -511,16 +511,32 @@ fn main() -> Result<()> {
                         .as_str()
                         .is_some_and(|got| got.eq_ignore_ascii_case(&want))
                     {
-                        // A LINKED field stores no value of its own (it points at
-                        // the item's username or password), so its value comes
-                        // over as null. Printing an empty line would tell a
-                        // script the field is blank when it is unreadable — the
-                        // same absent-vs-empty confusion `required_field` exists
-                        // to end.
+                        // A field can come over with no value for two different
+                        // reasons, and they send the reader to two different
+                        // places: a LINKED field stores none by design (it points
+                        // at the item's username or password) and there is
+                        // nothing to chase, while an unreadable one is a key this
+                        // vault does not hold. The agent says which; naming one
+                        // cause for both is how a key problem got reported as a
+                        // link that does not exist. Printing an empty line would
+                        // be worse still — the same absent-vs-empty confusion
+                        // `required_field` exists to end.
                         let Some(value) = field["value"].as_str() else {
-                            bail!(
-                                "custom field {want:?} is a linked field and has no stored value"
-                            );
+                            match field["absent"].as_str() {
+                                Some("linked") => bail!(
+                                    "custom field {want:?} is a linked field and has no stored value"
+                                ),
+                                Some("unreadable") => bail!(
+                                    "custom field {want:?} holds a value this vault could not decrypt"
+                                ),
+                                // An agent too old to say which. Name both and
+                                // claim neither.
+                                _ => bail!(
+                                    "custom field {want:?} has no readable value: it is either a \
+                                     linked field, which stores none, or one this vault could not \
+                                     decrypt"
+                                ),
+                            }
                         };
                         println!("{value}");
                         return Ok(());
