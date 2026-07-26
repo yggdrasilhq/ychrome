@@ -319,14 +319,25 @@ item refuses `get`.
 
 The user's call, verbatim intent: **card is the preferred payment route for
 agent-driven statutory fees; netbanking is the fallback** ("ancient even by
-Indian standards"). The 2026-07-26 RTI run paid via netbanking because the
-agent probed `ychrome-vault card`, saw metadata only, and concluded card
-payment impossible — **that was a misread of this very design**: the PAN/CVV
-already reach a page transcript-free through the injector
-(`card-fill` → `card-secret`), and yggterm's verb plane already exposes it as
-`web fill-card --item <name> --field number|expiry|code|holder <target>`. Add
-a line to the CLI's `card` output pointing at `fill-card` so the next agent
-does not repeat the misread.
+Indian standards").
+
+**⛔ CORRECTION (2026-07-26, later the same day — the paragraph that stood here
+was WRONG and cost a live payment attempt).** It claimed the agent plane could
+already reach the PAN via `web fill-card`. Live truth: the credential plane
+REFUSES the card op for agents (`vault_cli_no_card_op`) — the injector is
+wired to the SIDEBAR (human-driven) only, exactly as this section's design
+paragraphs above specify. yggterm's `web fill-card` verb ADVERTISES
+`--field number|expiry|code|holder` while this plane forbids it: one tool
+promises what the other refuses, and an agent discovers it only at the
+gateway's card form. That contradiction is filed in yggterm's pending-bugs.
+An agent respecting the boundary (correctly) cannot pay by card today.
+
+**So card-first needs a deliberate boundary decision, not a wiring fix:** an
+AUDITED agent PAN-injection path — the injector serves the page directly (no
+value ever in a transcript, same as today), gated per-use or per-session by an
+explicit user grant, every use traced with item + target host + who asked.
+Until the user makes that call, agents CANNOT pay by card; the sidebar remains
+human-only.
 
 The genuine gap is the **3DS OTP hop**, and the settled mechanism is
 **KDE Connect + script automation**: the SMS lands on the phone, KDE Connect
