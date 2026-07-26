@@ -1225,10 +1225,16 @@ fn user_agent_widgets() -> Vec<Value> {
     let mut widgets = vec![json!({"kind": "section", "text": "Browser identity"})];
     for preset in crate::useragent::Preset::ALL {
         let selected = preset == current;
+        // "This is the one in use" is SELECTION, not a status dot — yggterm
+        // tints the selected row, which is the vocabulary every other row list
+        // already speaks. It used to be a literal `●` glued onto the title,
+        // which painted in the row's text colour (a black dot in the light
+        // theme) and shifted the label one character right.
         widgets.push(json!({
             "kind": "list-row",
             "id": format!("ua-{}", preset.id()),
-            "title": if selected { format!("● {}", preset.label()) } else { preset.label().to_string() },
+            "title": preset.label(),
+            "selected": selected,
             "subtitle": preset.description(),
             "actions": if selected {
                 json!([])
@@ -1772,6 +1778,42 @@ fn totp_script(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The active User-Agent preset is marked by SELECTION, the row vocabulary
+    // yggterm already draws — never by a glyph smuggled into the title. The
+    // `●` prefix painted in the row's text colour (black in the light theme)
+    // and shoved the label one character right, and it only existed because
+    // the schema had no way to say "this row is the current one".
+    #[test]
+    fn the_active_user_agent_row_is_marked_by_selection_not_a_glyph_in_its_title() {
+        let widgets = user_agent_widgets();
+        let rows: Vec<&Value> = widgets.iter().filter(|w| w["kind"] == "list-row").collect();
+        assert!(
+            rows.len() > 1,
+            "there is more than one preset to choose from"
+        );
+        for row in &rows {
+            let title = row["title"].as_str().expect("every row has a title");
+            assert!(
+                !title.contains('\u{25cf}'),
+                "status must not live in the title: {title:?}"
+            );
+        }
+        let selected: Vec<&&Value> = rows
+            .iter()
+            .filter(|row| row["selected"] == json!(true))
+            .collect();
+        assert_eq!(
+            selected.len(),
+            1,
+            "exactly one preset is in use, and the row says so"
+        );
+        assert_eq!(
+            selected[0]["title"].as_str(),
+            Some(crate::useragent::preset().label()),
+            "the selected row is the preset actually in use"
+        );
+    }
 
     // An action is routed by the pane it came from, not by its name. Without
     // this, a settings click would be answered with the VAULT's schema and the
