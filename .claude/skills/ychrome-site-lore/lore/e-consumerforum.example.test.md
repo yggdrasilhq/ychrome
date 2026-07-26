@@ -254,3 +254,133 @@ heartbeat, but `web ensure` refuses it: the declare-rebuild path only accepts `h
 - `kdeconnect-sms.py` puts `--device` / `--json` **before** the subcommand
   (`kdeconnect-sms.py --device a386d568 --json watch --match … -t 120`). The data-fabric
   skill's example has them after `watch`, which exits 2.
+
+## consumer-complaint-FILED-end-to-end · WORKS
+task: 
+model: claude-opus-5
+date: 2026-07-26
+tags: 
+
+A consumer complaint was **filed end to end, invisibly, with no human in the loop**
+on 2026-07-26 (~15:35-16:35 IST) on yggterm 2.12.15. Filing/diary reference
+`<filing-reference>`, District Commission Kolkata-III(South), stage
+"APPLICATION IS SUBMITTED, PENDING FOR SCRUTINY", `finalSubmission` -> 200
+`{"message":"success","data":true}`. Court fee NIL. **Two earlier entries here are
+now WRONG - fix your plan before you start.**
+
+## SUPERSEDED #1 - the MUI async Autocompletes ARE drivable
+The `consumer-complaint-filing` entry says profile/wizard Autocompletes
+"could not be populated/selected via synthetic events". FALSE on 2.12.15.
+`web do click --selector '#<inputId>'` (or on the `.MuiAutocomplete-popupIndicator`
+button) opens them with options loaded, and a `do click` on the `li[role=option]`
+commits. Driven this way this run: AddressType, District, PostOffice,
+identityproof, CaseType, caseCategory, subCategory, stateOfCauseOfAction,
+districtOfCauseOfAction, commission. That was the last thing blocking a full filing.
+
+## SUPERSEDED #2 - the native file chooser is NOT needed
+Uploads go in headless:
+```js
+var inp=document.querySelectorAll("input[type=file]")[N];
+var bin=atob(B64); var arr=new Uint8Array(bin.length);
+for(var i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
+var dt=new DataTransfer(); dt.items.add(new File([arr],NAME,{type:"application/pdf"}));
+inp.files=dt.files;
+var rep={n:inp.files.length,name:inp.files[0].name};   // READ BEFORE dispatching
+inp.dispatchEvent(new Event("change",{bubbles:true}));
+```
+WebKitGTK has `DataTransfer`. A 821 KB PDF went through one `web eval --stdin`
+(1.1 MB script); 16 documents totalling ~2.1 MB were uploaded this way.
+⚠ **Read `inp.files[0]` BEFORE the `change` dispatch** - React clears it inside the
+handler, so a post-dispatch read throws and looks like a failed upload when the
+upload actually worked. ⚠ Uploads AUTO-SAVE (`updateCaseFilingDocumentDetails`
+200); `SAVE DOCUMENT` is only for a changed document *name*, and it needs a
+trusted `web do click` (an eval `.click()` does nothing on that button).
+
+## LOGIN: use the PASSWORD tab - there is no OTP on it
+The whole 3-minute OTP economics problem in `consumer-complaint-login-otp-window`
+is avoidable. `/login` opens on "Login With Password" already selected:
+`#username` = mobile -> CONTINUE -> `#password` + `#captcha` appear -> LOGIN.
+Inject the password with `web fill-vault --item e-consumerforum.example.test --field password
+--selector '#password'` (never a literal). One captcha, one shot, no SMS at all.
+- A dialog **"This user is already login. Do you want to logout from other
+  devices?" -> YES** appears if a previous run's session is still open. Benign.
+- ⚠ **Completing the profile logs you straight back out** - `logout?userId=` fires
+  immediately after `userRegistration` succeeds. Budget for logging in twice.
+- Captcha: still read it from the blob, not a screenshot (`web await` +
+  `fetch(img.src) -> blob -> readAsDataURL`, then `convert -resize 600%`). Two
+  captchas this run, both read correctly first try.
+
+## THE TRAP THAT COSTS THE MOST TIME: `web do fill` corrupts React inputs here
+`do fill --selector '#street' --text "Example Fixture Road"` reported
+`chars:19, delivered:true, is_trusted:true, cleared_verified:[true]` and the field
+held **"Ja"**. A fill of the mobile number left **"0000000000hg"** - two characters
+that were in no `--text` passed - which then poisoned the API call
+(`checkUserBlock?loginUserId=0000000000hg` -> 404, and the portal shows NO error).
+It also aborts on an EMPTY field with
+`clear_failed (box(es) [0] of 1 still hold text after two clear attempts)`.
+**Fill plain text inputs with an eval native-setter instead** (descriptor `.set` +
+input/change/blur); MUI + RHF register it. Keep `web do` for what genuinely needs
+trusted input: dropdown arrows, listbox options, checkboxes, SAVE/SUBMIT buttons.
+
+## DUPLICATE DOM ids - this will silently drive the wrong party
+Step 2 renders the complainant block and the opposite-party block with the SAME
+ids (`#Name`, `#AddressType`, `#District`, `#PinCode`...). `getElementById` and any
+`#id` selector hit the FIRST one, so an agent tagging "the OP's arrow" and clicking
+it drives the COMPLAINANT's field. Address by
+`document.querySelectorAll("[id='X']")[n]`, and **strip your injected tag id from
+every previous holder before re-tagging**, or `do click --selector` resolves to a
+stale element.
+
+## STALE POPPER - Escape before every pick
+After a failed pick the previous MUI listbox stays mounted, so `li[role=option]`
+returns the OLD options and the next selection silently matches the wrong list
+(asked for districts, got BUSINESS/PERMANENT/PRESENT). `web do key --key Escape`
+before each pick fixes it. Also: **`--role option --label X` mis-resolves in a
+SCROLLED listbox** - it answered `accepted/delivered/is_trusted: true` and did
+nothing. Reliable recipe: tag the `li` with an id + `scrollIntoView({block:"center"})`,
+then `do click --selector '#thatId'`.
+
+## MUI MODALS DO NOT APPEAR IN `web screenshot`
+The full-document snapshot renders the document, and a fixed-position
+`.MuiDialog-root` is missing from it (you see only the dim overlay). To capture an
+acknowledgement dialog: set `d.style.position="absolute"; d.style.top="0";
+d.style.zIndex="99999"`, `window.scrollTo(0,0)`, then screenshot.
+
+## THE WIZARD, AS IT ACTUALLY RUNS
+`/consumer/case-filing` -> Case Type (Autocomplete, "Consumer Complaint") -> NEXT ->
+modal "Select Filing Type" (Normal Filing preselected) -> SUBMIT ->
+`/consumer/case-filing/new-case-form`, six steps:
+1. **Case Details** - paidConsideration, claimConsideration, date `DD/MM/YYYY`,
+   stateOfCauseOfAction, districtOfCauseOfAction, caseCategory, subCategory.
+   NEXT here mints the draft: toast *"Draft saved with reference number NNNN"*.
+2. **Complainant / Opposite Party** - complainant prefilled from the profile; the
+   OP block is the duplicate-id one. ⚠ The name field rejects special characters
+   ("Must contain alphabet. Remove any special characters or extra spaces"), so
+   parentheses in a trading name have to go. ⚠ "Please add advocate to proceed
+   further" does **NOT** block a party-in-person filing - NEXT accepts it.
+3. / 4. Additional Complainant / Opposite Party - NEXT straight through.
+5. **Document Upload** - SIX named slots, five mandatory: Index, **Proforma for
+   Filing Consumer Complaint**, **Synopsis with List of Dates and Events**, Memo of
+   Parties, Consumer Complaint with Notarised affidavit, Vakalatnama (optional).
+   Plus `ADD ANNEXURES / DOCUMENTS`, which appends a row with a free-text document
+   name + its own file input. **Have the proforma and the synopsis ready before you
+   start** - a pleading bundle that lacks them cannot be filed. PDF only, 25 MB/file.
+6. **Final Submission & Checkout** - `#commission` Autocomplete (options come from
+   BOTH the cause-of-action district and the OP district), a declaration checkbox,
+   then PREVIEW -> FINAL SUBMIT -> a confirm dialog -> YES.
+`getLocations` carries `feeAmount` - it read `0.00` for a Rs24,799 claim, which is
+how to confirm NIL fee without guessing.
+
+## PROFILE COMPLETION (required before filing, and it is 3 steps)
+Personal Information -> Address Information -> Upload Documents. The last needs an
+`identityproof` Autocomplete (**no Aadhaar option**; PASSPORT, INCOME TAX PAN CARD,
+ELECTION COMMISSION ID CARD, DRIVING LICENSE and ~17 others), an ID number, and a
+**PDF** of the document. PIN entry auto-fills State and Post Office via
+`findByPinCode`; District must still be picked by hand.
+
+## Surface lifecycle
+`terminal new --no-activate` + `web ensure --session` was fully invisible again -
+one `ensure` at the start (`healed:true, rebuilt_from_daemon_declare:true`), no
+reveal at any point across a ~60-minute session, and the owner's
+`active_session_path` never moved. No deploy interference this run (the GUI host daemon
+2.12.15 pid stable throughout).
