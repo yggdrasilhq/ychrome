@@ -534,3 +534,200 @@ With that fix the strip resolved a genuinely ambiguous glyph on the first read.
    restarted rather than proceeding on a fallback that can drop a whole family.
 2. Prove the card rail on injected inputs (above). Cheap, no gateway.
 3. Only then stage, and pay inside the same live session.
+
+## filed-end-to-end-transerror-lies-captcha-one-shot · WORKS
+task: 
+model: claude-opus-5
+date: 2026-07-26
+tags: 
+
+Fourth run (2026-07-26 night). **Applications were FILED end to end for the first
+time — staged, paid by card, 3DS passed, registration numbers received.** The card
+rail and the payment leg are no longer the hard part. What now costs a session is
+(a) the portal's lying failure page, (b) a one-shot captcha at the staging hop, and
+(c) the phone reader dying mid-run.
+
+## ✅ CONFIRMED: the whole chain works, unattended
+
+`curl` for the application, cookie-jar bridge to a ychrome surface for the gateway,
+`web fill-card` for the card, SMS for the bank code. Three applications completed
+this way in about 35 minutes, three debits, three registration numbers, no human
+touched anything. The previous entry's card-rail findings all held.
+
+Timings worth budgeting: bank debit lands **~114 s after the Pay click**, so the
+gateway's 5-minute countdown is not the binding constraint it looks like. The
+registration e-mail arrives **~3 minutes** after that.
+
+## ⛔⛔ THE ONE THAT WILL MAKE YOU FILE A DUPLICATE: `transerror.php` LIES
+
+After the 3DS the browser sits on *"Please wait while your transaction is being
+processed"* for about two minutes and then lands on **`/transerror.php`**, which
+says in terms:
+
+> RTI Request filing failed! Sorry, your RTI Request could not be filed!!!
+
+**It was already filed.** The confirmation e-mail carrying the registration number
+arrived about three minutes later, with `Transaction Status : Completed
+Successfully`. That page also tells you the number will come in 24-48 hours after
+reconciliation; in practice it came in three minutes.
+
+⇒ **Never conclude anything from the portal's own page.** The success criteria, in
+this order, are: **the bank debit SMS**, then **the confirmation e-mail with the
+registration number**. Both are independent of the portal. If the page says failure
+and either of those says success, the filing SUCCEEDED. **Never re-file on the
+strength of `transerror.php`** — that is how you get a duplicate application and a
+second debit. A payment whose outcome you cannot yet determine is **UNKNOWN**, not
+failed: wait and re-check.
+
+Reconcile at the end of every session: **count of debits must equal count of
+registration numbers.**
+
+## ⛔ The staging captcha is ONE-SHOT PER PORTAL SESSION
+
+This is the most expensive discovery of the run and it is not documented anywhere
+above. On the request-form POST (the staging hop), **a single rejected captcha
+poisons that portal session permanently** — every subsequent captcha in the same
+session is rejected no matter how correct, while the page keeps re-rendering with
+all fields retained and the `Captcha code does not match` element present.
+
+It was proven not to be a reading problem and not a payload problem:
+
+- the identical reading method was **8 for 8** on the earlier hops (undertaking,
+  e-mail/mobile, OTP) in the same sessions;
+- a **negative control** with a deliberately wrong code produced exactly the
+  expected error page, so the field is being read by the server;
+- the **PHPSESSID is byte-identical** across the captcha fetch and the POST;
+- **six consecutive clean six-glyph reads** were all rejected in the wedged
+  session, after which a FRESH session accepted its first read immediately.
+
+⇒ Treat the staging captcha as one attempt. On a rejection, **abandon the portal
+session and restart from `/guidelines.php?request`** rather than retrying. The
+retry is not merely useless, it is what convinces you your captcha reading has
+broken when it has not. Cost of a restart is one fresh OTP, so read that one
+captcha carefully.
+
+## Captcha reading: the render matters more than the segmentation
+
+The previous entry's advice to segment by ink columns is fine but secondary. The
+thing that actually moved accuracy was **how the image is rendered**:
+
+1. **Median filter (radius 3) to kill the speckle, then autocontrast, then upscale
+   ~14x LANCZOS.** Read the whole strip. This is dramatically better than a raw
+   upscale.
+2. **Do NOT hard-threshold.** A `point(v < 140 -> 0 else 255)` binarisation was
+   tried and it *thickened strokes into blobs* and made glyphs unreadable. Gentle
+   beats aggressive.
+3. Per-glyph crops at ~34x are the tie-breaker for a confusable pair, and the
+   segmentation prints the runs so you can see when two glyphs merged.
+
+**Codes are not always 6 characters** — a 5-glyph code was observed (a genuine
+18 px ink-free gap, verified by column profile, not a faint glyph). Do not force a
+6-character reading by splitting a wide run.
+
+Confusable pairs that actually matter here, with the discriminator:
+`4` has an open apex and a stem that continues BELOW the crossbar; `A` has a closed
+apex and no descender. `B` has a straight left stem, `8` does not. `Z` has flat top
+and bottom strokes, `2` has a curved top. `1` carries a top-left flag AND a foot
+serif; `7` carries a full horizontal top bar; `I` has neither and is often slanted.
+A chevron glyph (`>` or `<`) is a rotated **V** — both rotations occur.
+
+## The OTP channels, corrected AGAIN — and the correction matters
+
+The previous entry called e-mail an unreliable fallback that "did not deliver in
+time". **That was wrong, and it was our own timeout.** In this run e-mail was the
+*more* reliable channel:
+
+- Portal OTPs arrived by e-mail **within about a minute**, every time.
+- The previous run's failure was a short timeout killing `tb ... --refresh`
+  mid-sync. **Budget ~500 s for a refresh.** (`--refresh` is the flag; `--sync`
+  does not exist.)
+- The OTP mail lands in the **outlook** account, not gmail — though one arrived in
+  gmail, so search both rather than pinning a folder.
+
+**SMS dispatch for the portal is THROTTLED after a few codes**: three arrived early
+in the session, then the portal stopped sending SMS entirely while continuing to
+e-mail every code. A missing portal SMS therefore proves nothing.
+
+**The portal reuses the SAME code until it is CONSUMED.** Three separate requests
+were served the identical code; once one application consumed it, the next request
+got a new one and the old one answered `OTP does not match`. So a cached code is
+worth trying once, but expect a fresh one after every successful filing.
+
+⚠⚠ **The split that decides session planning: e-mail covers the PORTAL OTP only.
+The bank's 3DS code is SMS-ONLY.** So the phone reader is mandatory for payment
+even though it is optional for the application. **Canary the SMS reader immediately
+before staging** — an unpaid application evaporates, so staging into a dead SMS
+channel burns the application.
+
+The bank's own 3DS code can be **slow** (>100 s) rather than missing; a 100-second
+poll window timed out once on a code that then arrived. The 3DS page carries a
+**Resend** control which is legitimate — it re-requests the code for the SAME
+in-flight transaction and is not a payment retry. Using it recovered that payment.
+
+## Two handset failure modes, and they are DIFFERENT
+
+Both killed a stretch of this run, and they need different responses:
+
+| Signature | Meaning |
+|---|---|
+| `tailscale ping` **pongs**, port 8022 **refused** | the phone is on the network but Android froze the sshd. Doze. |
+| `tailscale ping` **no reply**, port 8022 **times out** | the phone is off the tailnet entirely. |
+
+Refused and timed-out are not interchangeable, and neither is fixable from the
+desktop — there is no run-command plugin on the KDE Connect link. Probe the PORT,
+never the peer.
+
+**KDE Connect is NOT a usable fallback for this.** Its link was repairable in
+seconds with `forceOnNetworkChange`, but the store served was an hour stale and
+missing the sender family entirely; requesting a refresh (`requestAllConversationThreads`,
+note the name — `requestAllConversations` does not exist) **emptied the cache to
+zero threads** and it did not rebuild. Its `watch` mode is also broken for this
+device: it drives a `.../sms` object path that does not exist here, so it errors
+forever while looking like it is waiting.
+
+## Portal mechanics: three corrections to the recorded flow
+
+- **Parse the RIGHT form.** The pages carry a language form FIRST; a naive
+  "first form on the page" parser silently posts the wrong fields. Select by name:
+  `FrmStatus` (e-mail/mobile), `FrmFirstAppeal` (OTP), `frmRequest` (the request).
+- **A byte-identical re-render means YOUR POST was malformed, not that the server
+  rejected your credential.** An OTP POST that omitted the `Submit` key was
+  discarded silently, and the response differed from the original page only in the
+  captcha nonce. A genuinely wrong OTP renders a visible `OTP does not match`.
+  Diff normalised responses before theorising.
+- **Never post the `resend` field.** It is a submit button rendered **disabled for
+  the first 300 s**, so a browser never sends it; posting it makes the server branch
+  to a resend. And **two resends in quick succession returned 403 -> `/forbidden.php`,
+  which killed the session outright.** One resend, then wait.
+
+Also: a staged `payment.php` expires in roughly 20 minutes and then answers
+`/forbidden.php`; the application evaporates unpaid, at zero cost. That is the safe
+failure mode — losing a staged application is free, paying twice is not.
+
+## Cookie bridge and surface hygiene
+
+The `curl -> browser` bridge works exactly as recorded, with one snag: **`curl`
+writes an EMPTY expires field for a session cookie and the import rejects the jar**
+with `bad_jar: line N: bad expires field ""`. Rewrite that column to `0` before
+importing. (Strip the malformed `NGINX_cache` pseudo-cookie as before.)
+
+Two yggterm issues hit this run and both are filed there rather than here:
+`web fill-card` and every other verb began refusing with `reason: preempted` on a
+surface nobody had touched, and the only cure was a new surface generation; and an
+unrevealed surface reports itself **visible** to the web engine, so a gateway page
+with a spinner burns real CPU on the GUI host. **Park the surface at `about:blank`
+between payments** — never mid-transaction, and never while a 3DS or processing page
+is live.
+
+## The shape of a session that finishes
+
+1. Canary the SMS reader. If it refuses, STOP — do not stage.
+2. Application hops in `curl`. Read each captcha from a median-filtered, autocontrast,
+   14x render.
+3. Read the portal OTP from **e-mail** (budget ~500 s for the refresh); do not wait on SMS.
+4. Stage — **one captcha attempt only**. On rejection, restart the session.
+5. Pay immediately. Card fields, then normalise the PAN in place and assert 16 digits.
+6. 3DS code from SMS; use the page's Resend if it is slow.
+7. **Ignore whatever the portal page says.** Confirm from the debit SMS and the
+   registration e-mail. Reconcile debits against registration numbers before
+   declaring the session done.
