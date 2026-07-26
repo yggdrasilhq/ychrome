@@ -1070,7 +1070,17 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
         // the script's return value names FIELDS, never values.
         "card-fill" => {
             let (name, user) = split_row_id(&value);
-            match vault_op(json!({"op": "card-secret", "name": name, "user": opt_field(&user)})) {
+            // `host` and `client` are for the agent's audit line and nothing
+            // else — no decision is taken on either. They travel because the
+            // vault's only durable record of a card fill is that line, and a
+            // line that cannot say WHERE the number went is half a record.
+            match vault_op(json!({
+                "op": "card-secret",
+                "name": name,
+                "user": opt_field(&user),
+                "host": host,
+                "client": "ychrome sidebar",
+            })) {
                 Ok(reply) => {
                     let field = |key: &str| reply[key].as_str().unwrap_or_default();
                     json!({

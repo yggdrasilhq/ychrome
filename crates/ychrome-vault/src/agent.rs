@@ -24,7 +24,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -60,6 +60,13 @@ const MAX_CONSECUTIVE_ACCEPT_FAILURES: u32 = 10;
 /// The pause after the nth consecutive accept failure, growing to a ceiling.
 const ACCEPT_BACKOFF_STEP: Duration = Duration::from_millis(50);
 const ACCEPT_BACKOFF_CAP: Duration = Duration::from_millis(250);
+
+/// Where the agent records every release of a card secret, in the vault's own
+/// `0700` directory and `0600` like the socket. One JSON object per line.
+///
+/// This is a TRAIL, not a gate. Nothing consults it and nothing is refused
+/// because of it — see `card-secret` for the boundary, which is the unlock.
+const AUDIT_LOG: &str = "audit.log";
 
 struct AgentState {
     manager: VaultManager,
@@ -747,16 +754,28 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             Ok(json!({ "card": card, "name": name }))
         }
         // The card's FULL number and CVV, plus the rest of what a payment form
-        // asks for. This exists for ONE caller: the sidebar's fill injector,
-        // which puts the value into a form field and drops it. There is
-        // deliberately no `ychrome-vault` CLI verb, the same rule `fido2-assert`
-        // lives under.
+        // asks for. Two callers: the sidebar's fill injector, and yggterm's
+        // `web fill-card` verb. Both put the value into a form field and drop
+        // it; neither prints it.
         //
-        // The boundary being defended is the TRANSCRIPT, not this socket: any
-        // same-uid process can already pull every password one `get` at a time,
-        // but a PAN printed to a terminal is durable — scrollback, shell
-        // history, an agent CLI's JSONL — and unlike a password it cannot be
-        // rotated on demand.
+        // **The unlock is the boundary, and it is the only one.** Settled by the
+        // user, 2026-07-26: every Bitwarden client — including third-party ones
+        // — can read a card cipher and fill it, `ychrome-vault` is a Bitwarden
+        // client, and it does the same. An extra per-use consent here would be a
+        // second gate that only this client imposes, on a socket that already
+        // hands out every password one `get` at a time. So an unlocked vault
+        // serves this op to whoever can reach the socket, and a locked one
+        // refuses with the remedy (`unlocked` below names `ychrome-vault
+        // unlock`) — that refusal is the whole policy.
+        //
+        // What is still defended is the TRANSCRIPT: there is deliberately no
+        // `ychrome-vault` CLI verb for a PAN, because a number printed to a
+        // terminal is durable — scrollback, shell history, an agent CLI's JSONL
+        // — and unlike a password it cannot be rotated on demand. The value goes
+        // socket → injector → form field and nowhere else.
+        //
+        // Every release appends ONE audit line (`audit.log`), naming the item,
+        // where it was going and which FIELDS were released. Never a value.
         "card-secret" => {
             let name = string("name").ok_or_else(|| anyhow!("card-secret needs a name"))?;
             let vault = unlocked(&state)?;
@@ -768,6 +787,28 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             let secret = vault
                 .card_secret(&item.id)
                 .ok_or_else(|| anyhow!("{} is not a card", item.name))?;
+            // WHICH fields this release actually carried, read off the SAME
+            // values the reply is built from — an audit line that named a field
+            // the caller did not get would be worse than none.
+            let released: Vec<&str> = [
+                ("number", secret.number.is_some()),
+                ("code", secret.code.is_some()),
+                ("cardholder", card.cardholder.is_some()),
+                ("exp_month", card.exp_month.is_some()),
+                ("exp_year", card.exp_year.is_some()),
+            ]
+            .into_iter()
+            .filter(|(_, present)| *present)
+            .map(|(field, _)| field)
+            .collect();
+            let line = card_audit_line(
+                &iso8601_now(),
+                &item.name,
+                string("host").as_deref(),
+                string("client").as_deref(),
+                &released,
+            );
+            append_audit(&state.dir, &line);
             state.touch();
             Ok(json!({
                 "name": item.name,
@@ -1469,6 +1510,66 @@ fn unlocked(state: &AgentState) -> Result<&crate::model::Vault> {
         .ok_or_else(|| anyhow!("vault locked: run `ychrome-vault unlock` first"))
 }
 
+/// One audit record for a card secret leaving the vault.
+///
+/// PURE, so the property that matters — it names FIELDS and never carries a
+/// value — is provable without a filesystem, and the writer below is left with
+/// nothing to decide.
+///
+/// The two halves of the line are not equally trustworthy and the field names
+/// say so. `item` and `fields` are what the VAULT determined: the resolved item
+/// and the sub-fields that were actually released. `host` and `client` are what
+/// the CALLER said about itself; this socket cannot verify either on a
+/// single-uid host, exactly as it cannot verify who is asking for a password.
+/// A trail worth having records both and confuses neither for the other.
+fn card_audit_line(
+    at: &str,
+    item: &str,
+    host: Option<&str>,
+    client: Option<&str>,
+    fields: &[&str],
+) -> Value {
+    json!({
+        "at": at,
+        "op": "card-secret",
+        // Determined here.
+        "item": item,
+        "fields": fields,
+        // Claimed by the caller.
+        "host": host,
+        "client": client,
+    })
+}
+
+/// Append one line to the vault's audit log. Best effort, and loud when it
+/// fails.
+///
+/// Best effort ON PURPOSE. The user's ruling is that the unlock is the only
+/// hassle this path may impose; refusing to fill a payment form because a log
+/// file could not be written would be a second one, arriving at the worst
+/// possible moment. A failure goes to stderr, where the agent's other
+/// operational failures already go.
+fn append_audit(dir: &Path, line: &Value) {
+    let path = dir.join(AUDIT_LOG);
+    let write = || -> std::io::Result<()> {
+        // `mode` applies at creation only, which is enough: the directory
+        // around it is already 0700, so this narrows the file rather than
+        // carrying the whole defence.
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)?;
+        writeln!(file, "{line}")
+    };
+    if let Err(error) = write() {
+        eprintln!(
+            "ychrome-vault: could not append to {}: {error}",
+            path.display()
+        );
+    }
+}
+
 /// Resolve a name to one item, turning the ambiguous case into an error that
 /// names the candidates (so the user knows which `--user` to pass).
 fn resolve<'a>(
@@ -1582,10 +1683,28 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The card fixture's number and CVV.
+    ///
+    /// OBVIOUSLY FAKE and deliberately so: `4111…` is the reserved Visa test
+    /// prefix and `…4242` the Stripe test tail, a pair no issuer ever assigns.
+    /// Nothing in this repository — fixture, assertion, log, doc or report —
+    /// may carry a real PAN, and these constants exist so the no-leak
+    /// assertions below have ONE needle to point at rather than a literal
+    /// copied into four places.
+    const FIXTURE_PAN: &str = "4111111111114242";
+    const FIXTURE_CVV: &str = "737";
+
     /// A genuinely sealed two-item vault: one login on github.com with a TOTP
     /// secret, one on a base domain. No network, no server, no password — the
     /// user key is handed straight in.
     fn synthetic_state() -> Arc<Mutex<AgentState>> {
+        synthetic_state_tagged("synthetic")
+    }
+
+    /// As [`synthetic_state`], but in a directory of its own — for the tests
+    /// that assert on what the agent WROTE there, which cannot share a
+    /// directory with the tests running beside them.
+    fn synthetic_state_tagged(tag: &str) -> Arc<Mutex<AgentState>> {
         use crate::crypto::SymmetricKey;
         use crate::model::{RawCipher, RawFido2Credential, Vault, seal};
 
@@ -1632,10 +1751,10 @@ mod tests {
                     "card": {
                         "brand": "Visa",
                         "cardholderName": seal(&key_bytes, b"A KUNDU").to_string(),
-                        "number": seal(&key_bytes, b"4111111111114242").to_string(),
+                        "number": seal(&key_bytes, FIXTURE_PAN.as_bytes()).to_string(),
                         "expMonth": seal(&key_bytes, b"11").to_string(),
                         "expYear": seal(&key_bytes, b"2029").to_string(),
-                        "code": seal(&key_bytes, b"737").to_string(),
+                        "code": seal(&key_bytes, FIXTURE_CVV.as_bytes()).to_string(),
                     },
                 }),
                 ..Default::default()
@@ -1651,7 +1770,7 @@ mod tests {
             password: enc("was-here"),
             ..Default::default()
         }];
-        let dir = temp_dir("synthetic");
+        let dir = temp_dir(tag);
         let mut manager = VaultManager::load(&dir);
         manager.install_vault_for_test(Vault::new(
             user_key,
@@ -1785,14 +1904,14 @@ mod tests {
         // THE property: the whole serialized reply carries neither the PAN nor
         // the CVV, the same assertion the passkey private key lives under.
         let wire = response.to_string();
-        assert!(!wire.contains("4111111111114242"), "PAN leaked: {wire}");
-        assert!(!wire.contains("737"), "CVV leaked: {wire}");
+        assert!(!wire.contains(FIXTURE_PAN), "PAN leaked: {wire}");
+        assert!(!wire.contains(FIXTURE_CVV), "CVV leaked: {wire}");
 
         // The injector's op is the only path to those, and it carries the whole
         // form so a fill needs one round trip.
         let secret = dispatch(&json!({"op": "card-secret", "name": "HDFC"}), &state).unwrap();
-        assert_eq!(secret["number"], "4111111111114242");
-        assert_eq!(secret["code"], "737");
+        assert_eq!(secret["number"], FIXTURE_PAN);
+        assert_eq!(secret["code"], FIXTURE_CVV);
         assert_eq!(secret["exp_year"], "2029");
 
         // A login is not a card, and says so rather than answering emptily.
@@ -1800,6 +1919,123 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("is not a card"), "{error}");
+    }
+
+    // The card path has ONE policy and this is it: the unlock. A locked vault
+    // refuses and NAMES the verb that fixes it; an unlocked vault serves the op
+    // to whoever reached the socket, with no second consent to obtain — every
+    // Bitwarden client can read a card cipher, and this is one (the user's
+    // ruling, 2026-07-26). A gate that existed here and nowhere else would be a
+    // hassle only this client imposed, on a socket that already hands out every
+    // password one `get` at a time.
+    #[test]
+    fn a_card_secret_is_gated_by_the_unlock_alone_and_the_refusal_names_the_remedy() {
+        let dir = temp_dir("card-locked");
+        let state = test_state(VaultManager::load(&dir), dir.clone());
+
+        let refusal = dispatch(&json!({"op": "card-secret", "name": "HDFC"}), &state)
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("locked"), "{refusal}");
+        assert!(
+            refusal.contains("ychrome-vault unlock"),
+            "a refusal that does not name its remedy sends the caller hunting \
+             at exactly the moment they cannot afford it: {refusal}"
+        );
+        // The lock is checked BEFORE anything is resolved, so a real item and a
+        // nonexistent one get the same answer. That is what "the unlock is the
+        // whole policy" means, and it is also why a refused caller learns
+        // nothing about the vault's contents.
+        let for_a_stranger = dispatch(
+            &json!({"op": "card-secret", "name": "no-such-item"}),
+            &state,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(refusal, for_a_stranger);
+
+        // Unlocked, the SAME request is served — no grant, no per-use consent,
+        // no plane check. If a gate is ever reintroduced here, this is the
+        // assertion that must be argued with first.
+        let unlocked = synthetic_state_tagged("card-unlocked");
+        let secret = dispatch(&json!({"op": "card-secret", "name": "HDFC"}), &unlocked).unwrap();
+        assert_eq!(secret["number"], FIXTURE_PAN);
+        assert_eq!(secret["code"], FIXTURE_CVV);
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(unlocked.lock().unwrap().dir.clone()).ok();
+    }
+
+    // Every release leaves ONE line behind, and that line is the only durable
+    // record of a card fill anywhere — the transcript deliberately keeps none.
+    // It records what left, where it was going and who said they were asking,
+    // by FIELD NAME. Never a value: the log is a file on disk, so a PAN in it
+    // would be exactly the durable artefact this whole design exists to avoid.
+    #[test]
+    fn a_card_secret_release_is_audited_by_field_name_and_never_by_value() {
+        let state = synthetic_state_tagged("card-audit");
+        let dir = state.lock().unwrap().dir.clone();
+        let log = dir.join(AUDIT_LOG);
+        std::fs::remove_file(&log).ok();
+
+        let secret = dispatch(
+            &json!({
+                "op": "card-secret",
+                "name": "HDFC",
+                "host": "checkout.example.com",
+                "client": "yggterm web fill-card",
+            }),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(secret["number"], FIXTURE_PAN, "the caller still gets it");
+
+        let text = std::fs::read_to_string(&log).expect("the release wrote an audit line");
+        // THE property, asserted on the RAW TEXT and asserted FIRST: the log
+        // may name a field, it may never carry one. On a durable artefact this
+        // outranks every structural expectation below, so it is checked before
+        // any of them can fail on a leak's shape instead of on the leak.
+        assert!(!text.contains(FIXTURE_PAN), "PAN in the audit log: {text}");
+        assert!(!text.contains(FIXTURE_CVV), "CVV in the audit log: {text}");
+
+        assert_eq!(text.lines().count(), 1, "one release, one line: {text}");
+        let line: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(line["op"], "card-secret");
+        // The RESOLVED item, not the abbreviation the caller typed — a trail
+        // that recorded the query rather than the answer could not tell you
+        // afterwards which card was spent.
+        assert_eq!(line["item"], "HDFC Regalia");
+        assert_eq!(line["host"], "checkout.example.com");
+        assert_eq!(line["client"], "yggterm web fill-card");
+        let fields: Vec<&str> = line["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            fields,
+            ["number", "code", "cardholder", "exp_month", "exp_year"],
+        );
+        assert!(
+            line["at"].as_str().is_some_and(|at| at.ends_with('Z')),
+            "{line}"
+        );
+
+        // A second release APPENDS. A trail that overwrote itself would answer
+        // "was this card used tonight" with only the last answer.
+        dispatch(&json!({"op": "card-secret", "name": "HDFC"}), &state).unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        // A caller that named neither host nor client is recorded as having
+        // named neither — never as something the agent made up on its behalf.
+        let second: Value = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
+        assert!(
+            second["host"].is_null() && second["client"].is_null(),
+            "{second}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // The `get()` ceremony over the agent socket, end to end with a REAL P-256
