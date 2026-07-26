@@ -315,45 +315,27 @@ that script returns the list of field names it filled, never a value.
 it is secret-free, and it is the only thing that can explain to a listing why an
 item refuses `get`.
 
-### TODO — card-first payments (user-settled doctrine, 2026-07-26)
+### TODO — an audited agent card path (end-to-end)
 
-The user's call, verbatim intent: **card is the preferred payment route for
-agent-driven statutory fees; netbanking is the fallback** ("ancient even by
-Indian standards").
+Today's boundary: metadata via the CLI, PAN/CVV only through the human-driven
+sidebar injector. A live run (2026-07-26) proved the gap the hard way: the
+yggterm verb plane advertises `web fill-card --field number|expiry|code|holder`
+while this plane refuses the op (`vault_cli_no_card_op`) — one tool promises
+what the other forbids, and an agent discovers it only at a real gateway's
+card form. Filed in yggterm's pending-bugs.
 
-**⛔ CORRECTION (2026-07-26, later the same day — the paragraph that stood here
-was WRONG and cost a live payment attempt).** It claimed the agent plane could
-already reach the PAN via `web fill-card`. Live truth: the credential plane
-REFUSES the card op for agents (`vault_cli_no_card_op`) — the injector is
-wired to the SIDEBAR (human-driven) only, exactly as this section's design
-paragraphs above specify. yggterm's `web fill-card` verb ADVERTISES
-`--field number|expiry|code|holder` while this plane forbids it: one tool
-promises what the other refuses, and an agent discovers it only at the
-gateway's card form. That contradiction is filed in yggterm's pending-bugs.
-An agent respecting the boundary (correctly) cannot pay by card today.
+The settled direction is to make the agent path real rather than widen the
+leak surface:
 
-**So card-first needs a deliberate boundary decision, not a wiring fix:** an
-AUDITED agent PAN-injection path — the injector serves the page directly (no
-value ever in a transcript, same as today), gated per-use or per-session by an
-explicit user grant, every use traced with item + target host + who asked.
-Until the user makes that call, agents CANNOT pay by card; the sidebar remains
-human-only.
-
-The genuine gap is the **3DS OTP hop**, and the settled mechanism is
-**KDE Connect + script automation**: the SMS lands on the phone, KDE Connect
-mirrors it to the desktop (D-Bus notifications / SMS access), a small watcher
-extracts the OTP inside the 3-minute window and hands it to the agent, which
-fills it with the ordinary verbs. Pieces:
-
-1. A `kdeconnect` OTP watcher (D-Bus subscribe, sender+pattern filter,
-   returns the code once, never logs it) — likely a small ychrome-side tool so
-   every agent shares one proven implementation.
-2. An agent recipe in site-lore: fill-card → gateway redirect → watcher →
-   `web do fill` the OTP → confirm. Netbanking stays documented as the
-   OTP-free fallback when the phone is unreachable.
-3. CVV presence is per-cipher: the schema carries it (`CardSecret`), but
-   whether a given card item holds it is the user's data-entry choice — the
-   watcher work does not depend on it.
+1. An AUDITED injection op: the injector serves the page directly (no value in
+   any transcript, exactly as the sidebar path already works), gated per-use
+   or per-session by an explicit user grant, every use traced (item, target
+   host, requesting agent).
+2. A phone-bridge OTP watcher for 3DS: one shared implementation, returns a
+   code once, never logs it — and its store must prove itself LIVE with a
+   triggered canary before any absence-of-a-message conclusion is drawn.
+3. Until built: agents cannot pay by card, the sidebar remains human-only, and
+   the yggterm verb should refuse at parse time with the policy reason.
 
 #### ⛔ FIELD CORRECTION, 2026-07-26 18:19 IST — `web fill-card` DOES NOT WORK TODAY
 
