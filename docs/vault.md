@@ -6,7 +6,8 @@ and its state. Everything here lives on the host ychrome **runs** on, which over
 ssh is not the host the yggterm GUI is on.
 
 Crate: `crates/ychrome-vault` (lib + `ychrome-vault` binary).
-State: `~/.yggterm/vault/` — `config.json` (secret-free) and `agent.sock`.
+State: `~/.yggterm/vault/` — `config.json` (secret-free), `agent.sock`, and
+`audit.log` (one line per card-secret release; field names, never values).
 
 ## The pieces
 
@@ -308,84 +309,116 @@ same-uid process can already pull every password one `get` at a time — it is t
 **transcript**: a PAN printed to a terminal persists in scrollback, shell
 history, and any agent CLI's JSONL, and unlike a password it cannot be rotated on
 demand. So the number reaches a page the way a password does, as an `eval` script
-the GUI injects (the sidebar's `card-fill` action → the `card-secret` op), and
-that script returns the list of field names it filled, never a value.
+a GUI injects (the sidebar's `card-fill` action, or yggterm's `web fill-card`
+verb → the `card-secret` op), and that script returns the list of field names it
+filled, never a value. Every release leaves an audit line; see below.
 
 `VaultItem` now carries `item_type` for the same reason the passkey badge exists:
 it is secret-free, and it is the only thing that can explain to a listing why an
 item refuses `get`.
 
-### TODO — an audited agent card path (end-to-end)
+### The agent card path: the unlock is the boundary
 
-Today's boundary: metadata via the CLI, PAN/CVV only through the human-driven
-sidebar injector. A live run (2026-07-26) proved the gap the hard way: the
-yggterm verb plane advertises `web fill-card --field number|expiry|code|holder`
-while this plane refuses the op (`vault_cli_no_card_op`) — one tool promises
-what the other forbids, and an agent discovers it only at a real gateway's
-card form. Filed in yggterm's pending-bugs.
+**Settled by the user, 2026-07-26.** Every Bitwarden client — the official apps,
+the browser extension, and every third-party one — can read a card cipher and
+fill it into a form. `ychrome-vault` is a Bitwarden client and does the same.
+**The unlock is the security boundary and the only hassle this path imposes.**
+No grant, no per-use consent, no per-caller plane check: an unlocked vault
+serves `card-secret` to whoever can reach the socket, and a locked one refuses
+with the remedy in the message.
 
-The settled direction is to make the agent path real rather than widen the
-leak surface:
+That is not a widening. This socket already hands out every password one `get`
+at a time, and it is `0600` in a `0700` directory, so a same-uid process that
+wanted a card could always have taken one. A gate here and nowhere else would
+have cost the user a step at the worst possible moment — mid-checkout — while
+buying nothing a `get` does not already give away. It is written down because a
+grant layer was designed for exactly this spot and was refused.
 
-1. An AUDITED injection op: the injector serves the page directly (no value in
-   any transcript, exactly as the sidebar path already works), gated per-use
-   or per-session by an explicit user grant, every use traced (item, target
-   host, requesting agent).
-2. A phone-bridge OTP watcher for 3DS: one shared implementation, returns a
+What IS still defended is the **transcript**, and none of that changed:
+
+- There is deliberately **no CLI verb for a PAN**. `ychrome-vault card` prints
+  metadata only. A number printed to a terminal is durable — scrollback, shell
+  history, an agent CLI's JSONL — and unlike a password it cannot be rotated on
+  demand.
+- The number reaches a page as an **injection**: socket → fill script → form
+  field. The script's return value is the list of FIELD NAMES it filled.
+- yggterm's `web fill-card` answers `{item, field, chars, matched}` — a name, a
+  length and a page-side boolean. The value appears in `data`, in `error` and in
+  the trace event **nowhere**.
+
+#### The audit line
+
+Every release of a card secret appends ONE JSON line to
+`~/.yggterm/vault/audit.log` (`0600`, inside the `0700` vault directory). It is
+the only durable record of a card fill anywhere, precisely because the
+transcript deliberately keeps none:
+
+```text
+{"at":"2026-07-26T13:46:36.000Z","client":"ychrome sidebar",
+ "fields":["number","code","cardholder","exp_month","exp_year"],
+ "host":"checkout.example.com","item":"HDFC Regalia","op":"card-secret"}
+```
+
+Two halves, and the field names say which is which. `item` and `fields` are what
+the **vault determined**: the resolved item — not the abbreviation the caller
+typed, so the line can still answer "which card was spent" — and the sub-fields
+actually released. `host` and `client` are what the **caller said** about
+itself; this socket cannot verify either on a single-uid host, exactly as it
+cannot verify who is asking for a password.
+
+It records fields **by name, never by value**. A PAN in a log file is the
+durable artefact this whole design exists to avoid, so that property is asserted
+on the raw file text ahead of every structural expectation in the test — a leak
+must fail on the leak, not on its shape.
+
+The write is **best effort, loud on failure**: refusing to fill a payment form
+because a log file could not be written would be a second hassle arriving
+exactly when the user can least afford it. Nothing reads this file and nothing
+is refused because of it. It is a trail, not a gate.
+
+#### The two callers
+
+| caller | reaches the op via | `client` label |
+| --- | --- | --- |
+| the sidebar's `card-fill` action | in-process, `ychrome-vault-proto` | `ychrome sidebar` |
+| yggterm `server app web fill-card` | the socket wire, re-encoded | `yggterm web fill-card` |
+
+yggterm cannot link `ychrome-vault-proto`, so it re-encodes both the wire and
+the socket path — the seam every cross-repo protocol has. `ychrome-vault status`
+reports `socket` so the binary that OWNS the layout is the one that answers
+where it is, rather than yggterm re-deriving `~/.yggterm/vault` from a home
+directory a `--dir` may have moved.
+
+#### Still owed
+
+1. **A phone-bridge OTP watcher for 3DS**: one shared implementation, returns a
    code once, never logs it — and its store must prove itself LIVE with a
    triggered canary before any absence-of-a-message conclusion is drawn.
-3. Until built: agents cannot pay by card, the sidebar remains human-only, and
-   the yggterm verb should refuse at parse time with the policy reason.
+   ⚠ The canary must be against the SAME SENDER FAMILY as the awaited code:
+   store staleness has been observed PER-THREAD (fresh messages arriving in one
+   thread while another sat frozen for six hours), so a store-level canary
+   passes while the thread that matters is dead.
+2. **A live run.** The path is built and unit-proven; no PAN has yet crossed it
+   into a real gateway form, and no `audit.log` exists on a real host. Until one
+   does, this section describes a mechanism, not a receipt.
 
-#### ⛔ FIELD CORRECTION, 2026-07-26 18:19 IST — `web fill-card` DOES NOT WORK TODAY
+#### The history, so it is not re-derived
 
-The block above says the earlier agent "misread this very design" and that the
-verb plane "already exposes" card filling. Half of that is right and the
-operative half is wrong. Tested live on the GUI host against a real gateway card form
+A live run on 2026-07-26 walked into this the hard way. `web fill-card`
+advertised `--field number|expiry|code|holder` while every call came back
+`vault_cli_no_card_op`, because yggterm reached the vault through the **CLI**,
+which deliberately has no card op — while `card-secret` existed as an
+**agent-socket** op the sidebar had been using all along. One tool promised what
+the other forbade, and the agent found out at a real gateway's card form
 (`areionsbi.wibmo.com/cardcapture/`, fields `nameOnCard` / `pan` /
-`expiryDateYYYY` / `cvv2`), all four calls were refused identically:
+`expiryDateYYYY` / `cvv2`) after burning a staged filing and an OTP. The error's
+own wording said where to look: *vault_**cli**_no_card_op*.
 
-```
-yggterm server app web fill-card --item 'IDFC WOW AVIKALPA' --field number --selector '#cr_no'
-  -> {"accepted": false, "reason": "vault_cli_no_card_op"}
-```
-
-**Why, precisely.** `card-secret` exists as an **agent-socket op**
-(`crates/ychrome-vault/src/agent.rs:760`) and the **sidebar** uses it
-(`src/sidebar.rs:1073` sends `{"op":"card-secret",...}` over the socket). It is
-**not a CLI subcommand** — `ychrome-vault card-fill`, `card-secret` and
-`cardfill` are all `unrecognized subcommand`, and `ychrome-vault card` is
-metadata-only on purpose. yggterm's `fill-card` reaches the vault **through the
-CLI**, so it looks for a card op that the CLI deliberately does not expose and
-refuses. Hence the error's own wording: *vault_**cli**_no_card_op*.
-
-So the earlier agent's CONCLUSION — an agent cannot pay by card — was CORRECT
-for the deployed stack; only their reasoning was incomplete. Please do not
-re-invert this without running the verb: the doctrine block above sent this run
-down the card path after netbanking had already been closed off, and both routes
-were dead.
-
-**The fix is small and specific, and it is NOT the OTP watcher.** The OTP hop is
-the *second* gap; the first is that `fill-card` never reaches the secret.
-Either:
-- point yggterm's `fill-card` at the **vault agent socket** with
-  `{"op":"card-secret"}` — the same door the sidebar already uses, keeping the
-  PAN off every transcript exactly as designed; or
-- add a CLI op that injects without printing, if the socket must stay
-  sidebar-only.
-
-Until one of those ships, `web fill-card --help` advertises
-`--field number|expiry|code|holder`, which promises what the credential plane
-refuses — a verb that can only fail. Worth a parse-time refusal with a pointer
-to this note, so the next agent finds out before staging a filing and burning an
-OTP rather than after.
-
-**Also correct the netbanking half:** this run did NOT pay via netbanking. It
+Also correct, from that same run: **netbanking is not an OTP-free fallback.**
+The login is OTP-free; the *transaction* demands a 5-minute OTP. That run
 reached the IDFC transaction-OTP screen, the OTP never arrived, the bank session
 timed out, and a later re-login with a verified-correct credential was refused
-("Please enter valid credentials"). Netbanking is therefore **not** the
-"OTP-free fallback" this doc describes — login is OTP-free, but the *transaction*
-demands a 5-minute OTP. Nothing was paid by any route.
+("Please enter valid credentials"). Nothing was paid by any route.
 
 ## Writes
 
@@ -483,11 +516,20 @@ never bring back or touch a live entry that happens to share a name. A
 - **Cards** — built and covered by `cargo test` against a sealed synthetic card
   (decryption under the cipher key, PascalCase drift, a plaintext `brand`, an
   undecryptable sub-field dropped rather than surfaced as ciphertext, and the
-  no-PAN/no-CVV property of `CardInfo` asserted on the serialized form). **Not
-  yet exercised against the real vault**: reading a real card needs a live
-  unlock with this binary, and the sidebar's `card-fill` injector has had no
-  faithful pixel. What is proven is the crypto and the shape; what is owed is one
-  `ychrome-vault card "<a real card>"` and one screenshot of a card row.
+  no-PAN/no-CVV property of `CardInfo` asserted on the serialized form). The
+  agent path adds two more, each shown red by mutating the production call site:
+  `card-secret` is gated by the **unlock alone** and its refusal names
+  `ychrome-vault unlock` (proven red by stripping the remedy from the message,
+  and by resolving the item before the lock check), and every release writes one
+  audit line carrying **field names only** (proven red by deleting the
+  `append_audit` call, and by passing the number where the field names go — the
+  fixture PAN, `4111…4242`, showed up in the log and the test failed on it).
+  **Not yet exercised against the real vault**: reading a real card needs a live
+  unlock with this binary, and neither injector — the sidebar's `card-fill` nor
+  yggterm's `web fill-card` — has had a faithful pixel. What is proven is the
+  crypto, the shape and the policy; what is owed is one
+  `ychrome-vault card "<a real card>"`, one screenshot of a card row, and one
+  real `audit.log`.
 - **Passkeys** (`fido2Credentials`) — **read layer + assertion signer built**:
   - *Read* (slice 1): `sync` parses `login.fido2Credentials[]` into
     `RawCipher::fido2`, `list` badges `has_passkey`, `passkeys NAME` returns

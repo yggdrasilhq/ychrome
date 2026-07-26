@@ -184,8 +184,16 @@ ychrome-vault sync | lock | stop-agent | ping | status | diagnose | check
   now carries `item_type` so a listing can say WHY an item refuses. **There is no
   CLI verb for the number or the CVV, and adding one is not an oversight to fix**:
   a PAN in scrollback or an agent transcript is durable and cannot be rotated. The
-  number reaches a page only through the sidebar's `card-fill` injector
-  (`card-secret` op), whose script returns field names, never values.
+  number reaches a page only through an INJECTOR — the sidebar's `card-fill`
+  action, or yggterm's `web fill-card` verb, both on the `card-secret` socket op
+  — whose script returns field names, never values.
+- **The unlock is the card path's ONLY gate** (user's ruling, 2026-07-26). Every
+  Bitwarden client can read a card cipher; this is one, so an unlocked vault
+  serves `card-secret` to whoever reaches the socket and a locked one refuses
+  naming `ychrome-vault unlock`. Do NOT re-propose a grant/consent layer here —
+  one was designed for this exact spot and refused. Every release appends one
+  line to `~/.yggterm/vault/audit.log`: item, host, client, and the FIELD NAMES
+  released. Never a value; nothing reads it; it is a trail, not a gate.
 - **Absent is not empty.** A field the item does not have exits non-zero with the
   reason on stderr; a field it stores as an empty string prints an empty line and
   exits 0. `USER=$(ychrome-vault get X --field username)` used to capture "" and
