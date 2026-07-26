@@ -355,6 +355,56 @@ fills it with the ordinary verbs. Pieces:
    whether a given card item holds it is the user's data-entry choice — the
    watcher work does not depend on it.
 
+#### ⛔ FIELD CORRECTION, 2026-07-26 18:19 IST — `web fill-card` DOES NOT WORK TODAY
+
+The block above says the earlier agent "misread this very design" and that the
+verb plane "already exposes" card filling. Half of that is right and the
+operative half is wrong. Tested live on the GUI host against a real gateway card form
+(`areionsbi.wibmo.com/cardcapture/`, fields `nameOnCard` / `pan` /
+`expiryDateYYYY` / `cvv2`), all four calls were refused identically:
+
+```
+yggterm server app web fill-card --item 'IDFC WOW AVIKALPA' --field number --selector '#cr_no'
+  -> {"accepted": false, "reason": "vault_cli_no_card_op"}
+```
+
+**Why, precisely.** `card-secret` exists as an **agent-socket op**
+(`crates/ychrome-vault/src/agent.rs:760`) and the **sidebar** uses it
+(`src/sidebar.rs:1073` sends `{"op":"card-secret",...}` over the socket). It is
+**not a CLI subcommand** — `ychrome-vault card-fill`, `card-secret` and
+`cardfill` are all `unrecognized subcommand`, and `ychrome-vault card` is
+metadata-only on purpose. yggterm's `fill-card` reaches the vault **through the
+CLI**, so it looks for a card op that the CLI deliberately does not expose and
+refuses. Hence the error's own wording: *vault_**cli**_no_card_op*.
+
+So the earlier agent's CONCLUSION — an agent cannot pay by card — was CORRECT
+for the deployed stack; only their reasoning was incomplete. Please do not
+re-invert this without running the verb: the doctrine block above sent this run
+down the card path after netbanking had already been closed off, and both routes
+were dead.
+
+**The fix is small and specific, and it is NOT the OTP watcher.** The OTP hop is
+the *second* gap; the first is that `fill-card` never reaches the secret.
+Either:
+- point yggterm's `fill-card` at the **vault agent socket** with
+  `{"op":"card-secret"}` — the same door the sidebar already uses, keeping the
+  PAN off every transcript exactly as designed; or
+- add a CLI op that injects without printing, if the socket must stay
+  sidebar-only.
+
+Until one of those ships, `web fill-card --help` advertises
+`--field number|expiry|code|holder`, which promises what the credential plane
+refuses — a verb that can only fail. Worth a parse-time refusal with a pointer
+to this note, so the next agent finds out before staging a filing and burning an
+OTP rather than after.
+
+**Also correct the netbanking half:** this run did NOT pay via netbanking. It
+reached the IDFC transaction-OTP screen, the OTP never arrived, the bank session
+timed out, and a later re-login with a verified-correct credential was refused
+("Please enter valid credentials"). Netbanking is therefore **not** the
+"OTP-free fallback" this doc describes — login is OTP-free, but the *transaction*
+demands a 5-minute OTP. Nothing was paid by any route.
+
 ## Writes
 
 `add` encrypts every field under the user key locally and `POST`s the
