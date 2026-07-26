@@ -363,3 +363,174 @@ named `Path`; `grep -v NGINX_cache` is enough. Import then reports
 `count: 1, domains: [rtionline.gov.in]` and the browser lands on the staged
 payment page fully authenticated. Use a per-agent profile — an unqualified
 surface writes the user's own cookie jar.
+
+## card-rail-works-otp-readers-are-the-blocker · PARTIAL
+task: 
+model: claude-opus-5
+date: 2026-07-26
+tags: 
+
+Third run (2026-07-26 night). **The card rail is FIXED and PROVEN; the run was
+stopped by the OTP READERS, not by the portal and not by the payment instrument.**
+Nothing was staged, nothing was submitted, zero rupees moved.
+
+## ✅ SUPERSEDES the previous entry: `web fill-card` WORKS as of yggterm 2.12.16
+
+The previous entry recorded `web fill-card -> vault_cli_no_card_op` as deliberate
+policy and concluded "an agent cannot pay an RTI fee today". **The first half was
+right about the mechanism and wrong about the verdict.** yggterm 2.12.16 points
+`fill-card` at the vault AGENT SOCKET (`op: card-secret`) — the same door the
+sidebar injector always used — instead of the CLI, which deliberately has no card
+op. The boundary is unchanged (no verb prints a PAN); only the door moved.
+
+Proven live against the deployed build, all four gateway fields:
+
+```
+yggterm server app web fill-card --session <s> --item <vault-card-item> \
+    --field number|code|holder|expiry|exp-month|exp-year --selector <css>
+```
+
+The answer is `{item, field, chars, matched}` — a name and a LENGTH, never a
+value — and every fill leaves one line in `~/.yggterm/vault/audit.log` recording
+`op: card-secret`, the item, the field list and the host. Character counts came
+back consistent with the stored record (holder / number / expiry / code). Needs
+only that the vault is UNLOCKED; a locked one refuses `vault_locked` and names
+`ychrome-vault unlock`.
+
+⇒ **Do not plan a session around "the card is a human instrument" any more.**
+Re-read the payment section of the older entry with that correction applied.
+
+### ⚠ The stored PAN carries SEPARATORS — normalise before submit
+
+The vault record holds the number with embedded spaces, and `fill-card` types
+what is stored, verbatim. A gateway field with `maxlength=16` will therefore
+TRUNCATE it and the payment fails with a wrong number that looks like a typo.
+After filling `#cr_no`, normalise **in place** and never read the value out:
+
+```js
+var el=document.querySelector('#cr_no');
+el.value=el.value.replace(/\D/g,'');
+el.dispatchEvent(new Event('input',{bubbles:true}));
+el.dispatchEvent(new Event('change',{bubbles:true}));
+```
+
+Verify by asserting a DIGIT COUNT, not by printing: return
+`(el.value.match(/[0-9]/g)||[]).length` and check it equals the expected length.
+
+### Smoke-testing a card fill without a live gateway
+
+`file://` navigation is refused on the surface (a `location.href` eval to a local
+file silently no-ops and you stay on the current page — check `location.href`
+before concluding the fill target is missing). To prove the rail before staging
+anything, INJECT throwaway inputs into the current document and wipe them after:
+
+```js
+var d=document.createElement('div'); d.id='t';
+d.innerHTML='<input id=a><input id=b>'; document.body.appendChild(d);
+// ... fill-card into #a / #b, read only lengths ...
+d.querySelectorAll('input').forEach(function(i){i.value=''}); d.remove();
+```
+
+This costs nothing, touches no gateway, and is the correct way to satisfy the
+standing rule *"do not stage an application until you know your payment
+instrument works"*.
+
+## ⛔⛔ THE RUN-KILLER: the OTP readers. Read this before planning any filing.
+
+Both agent-facing SMS readers for the handset were unusable, and the mail channel
+did not deliver either. This is now the #1 risk to an RTI session — above the
+captcha, above the WAF, above the payment gateway.
+
+**1. Termux sshd — the PRIMARY reader — was simply OFF.** Every port refused
+(`Connection refused` on the ssh port, and on the obvious alternates). The
+critical trap: **the phone was a perfectly healthy tailnet peer at the same
+time** — `tailscale ping` returned a pong in well under 100 ms via a direct
+path. So a successful tailnet ping proves the NETWORK, and proves NOTHING about
+the reader. Probe the actual port, never the peer.
+
+There is also **no way to start it from the desktop side**: the handset exposes
+only `device` and `device.conversations` over KDE Connect — no `remotecommands`
+plugin — so the run-command route does not exist. Restoring it needs a human at
+the phone. Confirm the reader answers BEFORE the session, as its own pre-flight.
+
+**2. KDE Connect: the link was fixable, the STORE was not trustworthy.** The
+device showed `paired` with no IP and not reachable; a single D-Bus call restored
+it to `paired and reachable` in seconds, with NO daemon restart:
+
+```
+gdbus call --session --dest org.kde.kdeconnect --object-path /modules/kdeconnect \
+  --method org.kde.kdeconnect.daemon.forceOnNetworkChange
+```
+
+That is worth knowing and it worked. But the store it then served was **missing
+an entire sender family**:
+
+> 40 threads, spanning 25 days, newest 16 minutes old — and **not one message
+> from the portal's OTP sender family**, on a day that family had demonstrably
+> delivered four codes (the same codes were sitting in the mailbox).
+
+⇒ **The previous entry's rule is not strong enough.** It said staleness can be
+PER-THREAD and told you to canary the same sender family. The failure here is
+worse: **the family had no thread at all**, so there was nothing to canary and
+nothing to look stale. A missing thread is indistinguishable from a sender that
+has never written. **Never treat "the sender is absent from the thread list" as
+"no message arrived."** Bank-family threads were fresh to the minute in the same
+read, which is exactly what makes this seductive — a canary on the family you
+*can* see tells you nothing about the family you cannot.
+
+**3. The mail channel did not deliver in time.** Four codes reached the mailbox
+earlier the same day, so the path works in general; the code for a request made
+at T0 had still not arrived **35 minutes later**, after a fully completed sync.
+Suspect per-day rate limiting on OTP dispatch after several requests, and do not
+assume mail is the safe fallback.
+
+### `tb` timing — budget MINUTES, and the flag is `--refresh`
+
+- **The flag is `--refresh`, not `--sync`.** `--sync` is rejected as an unknown
+  flag and the command exits non-zero having written nothing.
+- A `--refresh` search launches the mail client to sync and takes **4-8 minutes**
+  on a cold cache. A 170-second timeout kills it EVERY time, before it writes a
+  single byte — which reads exactly like "no results". One completed run needs a
+  ~500 s budget. Do not build an OTP poll loop out of short-timeout refreshes;
+  it will spin forever producing empty files.
+- Reading the mbox tail directly is fast but only sees what the client has
+  already synced, so it cannot beat the sync — it is a cheap confirmation, not a
+  substitute.
+
+## Recipe points re-confirmed live (unchanged, still correct)
+
+- Hops 1-3 drive cleanly in `curl` with the documented Chrome header set and
+  `--http1.1`. The undertaking POST -> the email/mobile page -> the OTP page all
+  behaved exactly as recorded.
+- **Read the `action="..."` attribute; do not reconstruct the URL.** The
+  `pageid` rotates. Extract it with a real parser — a shell regex over the raw
+  HTML silently returned empty here and cost a hop.
+- The email/mobile form posts `Email`, `cell`, `6_letters_code`, `Submit=Submit`
+  to `/request/request_email_check.php` and redirects to `Request_Check_Otp.php`
+  with `emailchk` / `cellchk` / `urletoken` query parameters on success.
+- Captcha acceptance is unambiguous: a good code redirects, a bad one re-renders
+  with `Captcha code does not match` and keeps every other field.
+- The OTP page stayed alive and re-fetchable well past the ~20-minute figure
+  quoted for a staged payment page, so the OTP gate itself is not tightly timed.
+
+### Captcha segmentation — one concrete fix to the recorded method
+
+Ink-column segmentation is right, but the published split rule under-splits.
+Rounding a 32 px run at ~22 px per glyph gives `round(1.45) = 1`, so two touching
+glyphs stay merged and the strip reads one character short. Force at least two:
+
+```python
+if width > 26:
+    n = max(2, round(width / 22))
+```
+
+With that fix the strip resolved a genuinely ambiguous glyph on the first read.
+
+## The shape of a session that can actually finish
+
+1. **Pre-flight the OTP reader first, before anything else** — probe the port,
+   read a recent message, confirm the specific sender family you will need is
+   present in the thread list at all. If the primary reader is down, STOP: get it
+   restarted rather than proceeding on a fallback that can drop a whole family.
+2. Prove the card rail on injected inputs (above). Cheap, no gateway.
+3. Only then stage, and pay inside the same live session.
