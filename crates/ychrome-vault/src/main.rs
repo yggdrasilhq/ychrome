@@ -328,6 +328,14 @@ fn main() -> Result<()> {
                 status["agent"] = json!(false);
                 status
             };
+            // Where this vault's socket is, whether or not anything is
+            // listening on it. A client outside this workspace (yggterm's
+            // `web fill-card`, which speaks the wire but cannot link the proto
+            // crate) has to find the socket somehow, and asking the binary that
+            // owns the layout beats re-deriving `~/.yggterm/vault` from a home
+            // directory that the caller's own `--dir` may have moved.
+            let mut status = status;
+            status["socket"] = json!(agent::socket_path(&dir).display().to_string());
             print_json(&status)
         }
         Command::Configure {
