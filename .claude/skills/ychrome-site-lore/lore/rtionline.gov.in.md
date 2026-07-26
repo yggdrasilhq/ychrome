@@ -295,14 +295,46 @@ generous once a bank OTP is involved.
   this surface"). `--new-batch` clears it, and the refusal is clean — no partial
   state is applied.
 - ⛔ **The old claim "no OTP was required" for IDFC netbanking is FALSE.** Login
-  needs no OTP, but after Pay -> Confirm the bank demands a **transaction OTP,
-  5-minute validity**. The earlier run never saw it only because it stopped at
-  the Pay button. Today that OTP never arrived at all and the bank session timed
-  out ("Your Session has timed out ... your request could not be processed"),
-  and a later re-login with the same verified-correct vault credential was
-  refused with "Please enter valid credentials" — consistent with a soft block
-  after the failed transaction. **Stop at one failed bank login; a lockout costs
-  far more than the fee.**
+  needs no OTP, but after Pay -> Confirm the bank demands a **transaction OTP with
+  5-minute validity**. The earlier run never saw it only because it stopped at the
+  Pay button. Budget for it: SBIePay's own 5-minute countdown is running at the
+  same time, so the OTP must be read and entered fast.
+- ✅ **The netbanking layer itself WORKS.** This run failed to complete it, but
+  NOT because of the bank: the OTP had in fact been delivered to the handset and
+  our READER did not show it (see the canary rule below). Do not record netbanking
+  as broken. A later re-login in the same session was refused once with "Please
+  enter valid credentials" using a credential verified correct minutes earlier -
+  that is an **unexplained single instance**, not a lockout and not a credential
+  fault. Still: stop at one failed bank login and escalate, because the cost of
+  being wrong about a lockout is far above the fee.
+
+## ⚠⚠ PROVE THE SMS READER IS LIVE BEFORE YOU BELIEVE AN ABSENCE
+
+The single most expensive mistake of this run, and it was OURS, not the portal's.
+KDE Connect's SMS sync on the desktop was malfunctioning, and it served a
+**partially stale store**. Every conclusion drawn from "the code did not arrive"
+was an artefact of a broken reader: the bank's OTPs were on the phone the whole
+time. A throttle theory and a wrong-registered-number theory were both built on
+that hole, and both were wrong.
+
+**The rule: never conclude anything from an SMS that is NOT there until you have
+proven the store is live, with a canary you TRIGGER and then OBSERVE within about
+60 seconds.**
+
+⚠ And the refinement that actually bit here, because it defeats a naive canary:
+**staleness can be PER-THREAD.** During the failure window a triggered rtionline
+OTP appeared in its own thread within ~40 s (three times over), while the bank's
+thread stayed frozen on a six-hour-old message. So a canary in thread A does NOT
+prove thread B is current. Canary the **same sender family** you are waiting on,
+or treat the absence as unknown rather than negative. After a `kdeconnectd`
+restart the cache cold-starts and is briefly WORSE - it served months-old threads
+and dropped messages it had previously shown - so a restart is not an instant fix
+and must itself be re-canaried.
+
+When the reader is in doubt, use the second channel: rtionline sends its OTP to
+**e-mail as well as SMS**, and a human watching the handset can relay. (Mail is
+read with `ssh dev 'tb ...'` - dev is the mail host; never run a mail client on
+the desktop host, it opens a window in the user's face.)
 
 **Card (`paySubmitForCard('CreditCard')`) -> CONFIRM -> button `#Go` ->
 `areionsbi.wibmo.com/cardcapture/`** with clean named fields `nameOnCard`,
