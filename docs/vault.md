@@ -315,6 +315,35 @@ that script returns the list of field names it filled, never a value.
 it is secret-free, and it is the only thing that can explain to a listing why an
 item refuses `get`.
 
+### TODO — card-first payments (user-settled doctrine, 2026-07-26)
+
+The user's call, verbatim intent: **card is the preferred payment route for
+agent-driven statutory fees; netbanking is the fallback** ("ancient even by
+Indian standards"). The 2026-07-26 RTI run paid via netbanking because the
+agent probed `ychrome-vault card`, saw metadata only, and concluded card
+payment impossible — **that was a misread of this very design**: the PAN/CVV
+already reach a page transcript-free through the injector
+(`card-fill` → `card-secret`), and yggterm's verb plane already exposes it as
+`web fill-card --item <name> --field number|expiry|code|holder <target>`. Add
+a line to the CLI's `card` output pointing at `fill-card` so the next agent
+does not repeat the misread.
+
+The genuine gap is the **3DS OTP hop**, and the settled mechanism is
+**KDE Connect + script automation**: the SMS lands on the phone, KDE Connect
+mirrors it to the desktop (D-Bus notifications / SMS access), a small watcher
+extracts the OTP inside the 3-minute window and hands it to the agent, which
+fills it with the ordinary verbs. Pieces:
+
+1. A `kdeconnect` OTP watcher (D-Bus subscribe, sender+pattern filter,
+   returns the code once, never logs it) — likely a small ychrome-side tool so
+   every agent shares one proven implementation.
+2. An agent recipe in site-lore: fill-card → gateway redirect → watcher →
+   `web do fill` the OTP → confirm. Netbanking stays documented as the
+   OTP-free fallback when the phone is unreachable.
+3. CVV presence is per-cipher: the schema carries it (`CardSecret`), but
+   whether a given card item holds it is the user's data-entry choice — the
+   watcher work does not depend on it.
+
 ## Writes
 
 `add` encrypts every field under the user key locally and `POST`s the
