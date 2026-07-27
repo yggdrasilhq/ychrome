@@ -12,8 +12,16 @@
 //! fill: the app computes, the GUI injects.
 //!
 //! ```text
-//! yggterm --GET <control>/policy--> ychrome   {adblock_rules, userscripts}
+//! yggterm --GET <control>/policy--> ychrome
+//!     {adblock_rules, userscripts, userscripts_v2, user_agent}
 //! ```
+//!
+//! `userscripts` and `userscripts_v2` are the SAME scripts in two shapes, both
+//! derived from one list (see [`Policy::to_json`]). The flat array of bodies is
+//! what a GUI older than the scriptlet plane reads and must never change; the
+//! rich array adds the `@match`/`@world`/`@all-frames` placement a newer GUI
+//! applies. A GUI that understands the rich array uses it OUTRIGHT — the two are
+//! never merged, or every script would inject twice.
 //!
 //! The enabled/disabled decision lives HERE, not in yggterm. `adblock_rules` is
 //! `None` when the master switch is off, the profile opted out, or no ruleset is
@@ -23,6 +31,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
+
+use crate::userscript::Userscript;
 
 /// `~/.yggterm` on the host ychrome runs on. Deliberately NOT the GUI's home:
 /// over ssh those are different machines, and the app's host owns its config.
@@ -58,7 +68,11 @@ pub struct Policy {
     /// Injected at document-start, shared scripts first then per-profile, each
     /// directory sorted by filename. Deterministic: the same host state always
     /// produces the same order.
-    pub userscripts: Vec<String>,
+    ///
+    /// THE one owner of "what scripts this surface runs and where". The legacy
+    /// `userscripts` strings on the wire are DERIVED from this list in
+    /// [`Policy::to_json`], never maintained beside it.
+    pub userscripts: Vec<Userscript>,
     /// The UA the surface identifies as; `None` leaves WebKitGTK's default,
     /// which UA-allowlisting edges refuse. Owned by [`crate::useragent`] and
     /// carried here because /policy is the one channel the GUI applies at
@@ -67,10 +81,42 @@ pub struct Policy {
 }
 
 impl Policy {
+    /// Put a script ychrome itself supplies at the FRONT of the list — the
+    /// passkey shim, which has to patch `navigator.credentials` before any page
+    /// script can reach for it.
+    ///
+    /// It goes through the same list as everything else on purpose. When the
+    /// shim was spliced into the JSON after the fact, "what scripts ship" had
+    /// two owners, and the second one only knew about the legacy string array:
+    /// the moment a richer array existed beside it, the shim would have been
+    /// dropped from it silently.
+    pub fn prepend(&mut self, script: Userscript) {
+        self.userscripts.insert(0, script);
+    }
+
+    /// Both wire shapes, from one list.
+    ///
+    /// `userscripts` stays EXACTLY what it always was — a flat array of script
+    /// bodies — because a GUI older than this change deserializes the policy
+    /// with that field name and ignores every field it does not know. Drop it
+    /// or rename it and those GUIs silently stop running userscripts at all.
+    /// `userscripts_v2` carries the placement facts; a GUI that understands it
+    /// prefers it outright and never merges the two.
     pub fn to_json(&self) -> Value {
+        let legacy: Vec<&str> = self
+            .userscripts
+            .iter()
+            .map(|script| script.body.as_str())
+            .collect();
+        let rich: Vec<Value> = self
+            .userscripts
+            .iter()
+            .map(|script| script.to_json())
+            .collect();
         json!({
             "adblock_rules": self.adblock_rules,
-            "userscripts": self.userscripts,
+            "userscripts": legacy,
+            "userscripts_v2": rich,
             "user_agent": self.user_agent,
         })
     }
@@ -142,10 +188,14 @@ pub fn policy(profile: &str) -> Policy {
         .filter(|_| adblock_enabled(&config) && !adblock_profile_disabled(&config, profile))
         .and_then(|path| std::fs::read_to_string(path).ok());
 
+    // Each body carries its own placement in a metadata block; see
+    // `crate::userscript`. Parsed HERE, once, on the host that owns the files —
+    // the GUI never re-derives a `@match` and so can never disagree about one.
     let userscripts = userscript_dirs(profile)
         .iter()
         .flat_map(|dir| enabled_scripts(dir))
         .filter_map(|path| std::fs::read_to_string(path).ok())
+        .map(|body| crate::userscript::parse(&body))
         .collect();
 
     Policy {
@@ -449,16 +499,75 @@ mod tests {
         assert!(set_userscript_enabled("", true).is_err());
     }
 
+    fn demo_policy() -> Policy {
+        Policy {
+            adblock_rules: Some("[]".to_string()),
+            userscripts: vec![crate::userscript::parse(
+                "// ==UserScript==\n// @match https://*.youtube.com/*\n// @world main\n// ==/UserScript==\nx\n",
+            )],
+            user_agent: Some("UA/1".to_string()),
+        }
+    }
+
     #[test]
     fn the_policy_json_names_the_fields_yggterm_deserializes() {
-        let policy = Policy {
-            adblock_rules: Some("[]".to_string()),
-            userscripts: vec!["x".to_string()],
-            user_agent: Some("UA/1".to_string()),
-        };
-        let value = policy.to_json();
+        let value = demo_policy().to_json();
         assert_eq!(value["adblock_rules"], "[]");
-        assert_eq!(value["userscripts"][0], "x");
         assert_eq!(value["user_agent"], "UA/1");
+    }
+
+    // MIXED-VERSION FLEET. A GUI older than the scriptlet plane deserializes
+    // `userscripts` as a flat array of bodies and has never heard of
+    // `userscripts_v2`. Both halves have to hold: the legacy array must still be
+    // there, and it must still be STRINGS — turning its elements into objects
+    // would fail that GUI's deserialize and take the whole policy down with it,
+    // including the adblock ruleset.
+    #[test]
+    fn the_legacy_userscripts_array_is_still_a_flat_list_of_bodies() {
+        let value = demo_policy().to_json();
+        let legacy = value["userscripts"]
+            .as_array()
+            .expect("`userscripts` must stay an array for pre-scriptlet GUIs");
+        assert_eq!(legacy.len(), 1);
+        let body = legacy[0]
+            .as_str()
+            .expect("`userscripts` elements must stay STRINGS, not objects");
+        assert!(body.contains("@match"));
+    }
+
+    // The rich array carries the placement facts a new GUI applies, derived from
+    // the same list — so a script can never appear in one array and not the
+    // other.
+    #[test]
+    fn the_v2_array_carries_the_placement_facts_for_the_same_scripts() {
+        let value = demo_policy().to_json();
+        let rich = value["userscripts_v2"]
+            .as_array()
+            .expect("`userscripts_v2` must be present");
+        assert_eq!(rich.len(), value["userscripts"].as_array().unwrap().len());
+        assert_eq!(rich[0]["world"], "main");
+        assert_eq!(rich[0]["matches"][0], "https://*.youtube.com/*");
+        assert_eq!(rich[0]["all_frames"], false);
+        assert_eq!(rich[0]["body"], value["userscripts"][0]);
+    }
+
+    // The passkey shim patches `navigator.credentials` for the PAGE to call, so
+    // it must land in the page's own world and it must land FIRST. Isolated
+    // would make the patch invisible to every page that needs it; late would let
+    // a page grab the real API before the shim replaced it.
+    #[test]
+    fn a_prepended_shim_lands_first_and_in_the_main_world() {
+        let mut policy = demo_policy();
+        policy.prepend(crate::userscript::Userscript::new("SHIM").in_main_world());
+        let value = policy.to_json();
+        assert_eq!(value["userscripts"][0], "SHIM");
+        assert_eq!(value["userscripts_v2"][0]["body"], "SHIM");
+        assert_eq!(value["userscripts_v2"][0]["world"], "main");
+        assert!(
+            value["userscripts_v2"][0]["matches"]
+                .as_array()
+                .is_some_and(|list| list.is_empty()),
+            "the shim must apply to every URL"
+        );
     }
 }
