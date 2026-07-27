@@ -451,6 +451,31 @@ extension** (the `extensions.rs` catalog, filtered to what is not installed).
   persists `web-zoom.json` and returns `refetch_zoom`; a list-row toggle renames
   the file; delete removes it.
 
+### The bundled catalog (`src/extensions.rs` + `assets/web-userscripts/`)
+
+Four entries: `sponsorblock`, `youtube-adblock`, `idcac`, `unblock-select`. The
+catalog is the ONLY roster — nothing else enumerates them, so add here and every
+surface inherits. Every script self-guards by hostname, because the injection
+plane has no matching: document-start, top frame, MAIN world, every page.
+
+- **`youtube-adblock` rots on YouTube's schedule, and that is expected.** YouTube
+  ads are FIRST-PARTY, so no URL-matching filter can reach them; the script
+  deletes the ad fields out of the `/youtubei/v1/player` response before the
+  player reads it. The load-bearing shape is the `AD_FIELDS` list —
+  `adPlacements`, `adSlots`, `playerAds`, `adBreakHeartbeatParams` — hooked into
+  `window.fetch`, `XMLHttpRequest.prototype.open/send`, and a setter on
+  `window.ytInitialPlayerResponse` for the inline copy a cold load ships. When
+  ads come back, read a live `/youtubei/v1/player` response and update that list
+  FIRST; the DOM skip-button layer below it is a belt, not the mechanism.
+- The lock that matters is `youtube_adblock_actually_prunes_a_player_response`:
+  it runs the body the CATALOG serves under node against a fixture player
+  response (`tests/fixtures/youtube-adblock-harness.js`), so a prune that stops
+  pruning fails even when every source needle still matches. node is a test-time
+  dependency; `YCHROME_ALLOW_NO_NODE=1` is the explicit opt-out.
+- `idcac` was deployed by hand to `~/.yggterm/web-userscripts/` on dev and the GUI host
+  long before it was in this repo. The asset is that file, byte-identical, so
+  `install` on those hosts correctly refuses to clobber an identical script.
+
 ## Still open
 - **`restore`** (`PUT /api/ciphers/{id}/restore`) — `rm` has no undo, and because
   `sync` filters `deletedDate` items this client cannot even *show* the trash.
