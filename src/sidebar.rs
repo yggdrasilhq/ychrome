@@ -190,6 +190,23 @@ impl PaneState {
 pub(crate) struct ControlState {
     pub(crate) pane: Mutex<PaneState>,
     pub(crate) signer: Arc<crate::passkey::Signer>,
+    /// The GUI's bearer token for this session's control endpoint, presented as
+    /// `X-Ychrome-Control` on every [`RouteAccess::GuiOnly`] route.
+    ///
+    /// **Why a second token when the signer already has one.** The signer's
+    /// token is baked into the shim userscript, so every PAGE in the profile
+    /// holds it by construction — reusing it here would gate nothing. This one
+    /// travels the other way: the daemon mints it, the register reply hands it
+    /// to the client, and the client puts it in the `sidebar ; declare` OSC,
+    /// which reaches the GUI over the PTY stream. A page cannot read a PTY, and
+    /// the GUI's bridge (`yggterm-appctl://`) forwards only the signer's header,
+    /// so a page has no path to this value. Same provenance as the passkey
+    /// `request_id` that authenticates `/fido2/grant`: an OSC-delivered secret.
+    ///
+    /// The boundary this enforces is the WEB one, exactly as in
+    /// [`crate::passkey`]: a same-uid process on this host can read the daemon's
+    /// memory or the vault socket anyway, so it was never the threat model.
+    pub(crate) control_token: String,
 }
 
 impl ControlState {
@@ -202,7 +219,103 @@ impl ControlState {
         ControlState {
             pane: Mutex::new(PaneState::new(profile)),
             signer: crate::passkey::Signer::new(port, session.to_string()),
+            control_token: crate::passkey::hex_token(32),
         }
+    }
+
+    /// Does this request carry the GUI's control token? One owner for the
+    /// question every [`RouteAccess::GuiOnly`] route asks.
+    fn gui_authorized(&self, req: &ParsedRequest) -> bool {
+        req.control_token.as_deref() == Some(self.control_token.as_str())
+    }
+}
+
+/// Who may call a control route — the ONE table both the gate and the CORS
+/// headers read, so "is this route page-reachable" cannot be answered two ways.
+///
+/// The default is [`RouteAccess::GuiOnly`]: a route added later is gated unless
+/// it says otherwise. That is the whole point of naming this — the hole this
+/// enum closes existed because `POST /action` was simply never considered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteAccess {
+    /// Read-only, no secrets, no state change: `GET /policy`, `GET /zoom`,
+    /// `GET /ping`. **These stay open deliberately.** A policy body is the
+    /// profile's adblock ruleset + userscripts — the very content the GUI is
+    /// about to inject into the page, so the page can already see all of it;
+    /// the zoom map is a host→percent table; `/ping` is liveness stamps. None
+    /// of the three is a capability or a secret, and keeping them open is what
+    /// lets an OLDER GUI keep its rail alive and its surfaces ad-blocked across
+    /// a mixed-version deploy. (`/ping`'s command DRAIN is a different fact and
+    /// is gated separately — see [`crate::daemon`]'s `ping_reply`.)
+    Open,
+    /// Page-origin by design: the signer routes the shim calls
+    /// (`POST /fido2/get`, `POST /fido2/create`). Gated by the signer's OWN
+    /// bearer token, which every page holds; the cross-page boundary is the
+    /// origin↔rpId check. These are the only routes that get a CORS wildcard.
+    PageSigner,
+    /// GUI dialog → app, authenticated by the unguessable per-ceremony
+    /// `request_id` (`POST /fido2/grant`, `POST /fido2/deny`). Not page
+    /// reachable, so no CORS — but NOT control-token gated either: the
+    /// request_id already is the credential and `/fido2` is deliberately
+    /// unchanged by this gate.
+    Ceremony,
+    /// Everything else: `POST /action` (which can unlock the vault, fill a
+    /// credential into the page, disable ad blocking, delete a userscript) and
+    /// `GET /pane/<id>` (which lists vault item names and seeds the Add draft).
+    /// Only the GUI may call these, proven by the control token.
+    GuiOnly,
+}
+
+/// Classify a route. Path-first, because a CORS preflight arrives as `OPTIONS`
+/// on the path it is asking about and must be classified identically.
+pub(crate) fn route_access(path: &str) -> RouteAccess {
+    match path {
+        "/policy" | "/zoom" | "/ping" => RouteAccess::Open,
+        "/fido2/get" | "/fido2/create" => RouteAccess::PageSigner,
+        "/fido2/grant" | "/fido2/deny" => RouteAccess::Ceremony,
+        _ => RouteAccess::GuiOnly,
+    }
+}
+
+/// A refused request, as a value: what to journal and what to answer. Pure, so
+/// the audit line can be asserted without a filesystem.
+pub(crate) struct Refusal {
+    pub(crate) event: &'static str,
+    pub(crate) data: Value,
+    pub(crate) body: Value,
+}
+
+/// The refusal for a GUI-only route reached without the control token. Names
+/// the route and the reason.
+///
+/// `presented` is what the caller sent, and only its PRESENCE is recorded — a
+/// refusal is exactly the moment an attacker's guess would be written down, and
+/// an audit line that echoes the credential it is protecting (into a file that
+/// outlives the request, and that a support paste would carry) is worse than no
+/// audit line at all.
+pub(crate) fn gui_only_refusal(method: &str, path: &str, presented: Option<&str>) -> Refusal {
+    let reason = if presented.is_some() {
+        "the X-Ychrome-Control token did not match this session"
+    } else {
+        "no X-Ychrome-Control token was presented"
+    };
+    Refusal {
+        event: "control_refused",
+        data: json!({
+            "method": method,
+            "path": path,
+            "reason": reason,
+            "token_presented": presented.is_some(),
+        }),
+        body: json!({
+            "error": format!(
+                "forbidden: {path} is GUI-only and {reason}. This endpoint is \
+                 reachable from a page through the yggterm-appctl bridge, so \
+                 mutating routes require the control token ychrome declares to \
+                 the GUI over OSC 7717."
+            ),
+            "route": path,
+        }),
     }
 }
 
@@ -217,6 +330,11 @@ pub(crate) struct ParsedRequest {
     pub(crate) query: String,
     /// The `X-Ychrome-Fido2` bearer token, if the request carried one.
     pub(crate) fido2_token: Option<String>,
+    /// The `X-Ychrome-Control` bearer token, if the request carried one — the
+    /// GUI's credential for [`RouteAccess::GuiOnly`] routes. Kept apart from
+    /// `fido2_token` on purpose: the two are different secrets with different
+    /// provenance, and a page holds the fido2 one.
+    pub(crate) control_token: Option<String>,
     /// The POST body parsed as JSON (`Value::Null` for a bodyless GET).
     pub(crate) body: Value,
 }
@@ -238,10 +356,12 @@ pub(crate) fn read_request(stream: &TcpStream) -> Option<ParsedRequest> {
     let path = path.to_string();
     let query = query.to_string();
 
-    // Drain headers; capture Content-Length so a POST body can be read, and the
-    // passkey bearer token so a `/fido2/*` route can gate on it.
+    // Drain headers; capture Content-Length so a POST body can be read, the
+    // passkey bearer token so a `/fido2/*` route can gate on it, and the GUI's
+    // control token so a mutating route can.
     let mut content_length = 0usize;
     let mut fido2_token: Option<String> = None;
+    let mut control_token: Option<String> = None;
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
@@ -253,6 +373,8 @@ pub(crate) fn read_request(stream: &TcpStream) -> Option<ParsedRequest> {
                 content_length = value.parse().unwrap_or(0);
             } else if name.eq_ignore_ascii_case("x-ychrome-fido2") {
                 fido2_token = Some(value.to_string());
+            } else if name.eq_ignore_ascii_case("x-ychrome-control") {
+                control_token = Some(value.to_string());
             }
         }
     }
@@ -270,6 +392,7 @@ pub(crate) fn read_request(stream: &TcpStream) -> Option<ParsedRequest> {
         path,
         query,
         fido2_token,
+        control_token,
         body,
     })
 }
@@ -284,9 +407,36 @@ pub(crate) fn read_request(stream: &TcpStream) -> Option<ParsedRequest> {
 /// [`crate::webzoom`]). `app_name` is the display name yggterm shows on the main
 /// zoom control ("Ychrome Global Zoom") — the app names itself, yggterm never
 /// hardcodes it.
-pub fn emit_declare(session: &str, control: &str, policy_version: &str, zoom_version: &str) {
-    let payload = json!({
+///
+/// `control_token` is the ONE exception to "never a secret in a declaration",
+/// and it is deliberate: the OSC stream is precisely the channel a page cannot
+/// read, which is what makes it the right courier for the GUI's credential.
+/// Without it the GUI could not prove it is the GUI, and `POST /action` — vault
+/// unlock, credential fill, ad blocking off — would stay callable by any page
+/// in the surface. See [`ControlState::control_token`].
+pub fn emit_declare(
+    session: &str,
+    control: &str,
+    control_token: &str,
+    policy_version: &str,
+    zoom_version: &str,
+) {
+    let payload = declare_payload(session, control, control_token, policy_version, zoom_version);
+    emit_osc("declare", &payload.to_string());
+}
+
+/// The declare's payload, split out from the write so the contract it carries
+/// can be asserted without a terminal.
+fn declare_payload(
+    session: &str,
+    control: &str,
+    control_token: &str,
+    policy_version: &str,
+    zoom_version: &str,
+) -> Value {
+    json!({
         "session": session,
+        "control_token": control_token,
         // The routing identity the GUI stamps on this contribution (Phase 5):
         // a host daemon targets commands at `env_id`, the GUI reverses it to the
         // session path. It IS `YGGTERM_SESSION_ID` — the same value as `session`
@@ -313,8 +463,7 @@ pub fn emit_declare(session: &str, control: &str, policy_version: &str, zoom_ver
                 "title": "ychrome settings (ad blocking, userscripts)",
             },
         ],
-    });
-    emit_osc("declare", &payload.to_string());
+    })
 }
 
 pub fn emit_close(session: &str) {
@@ -336,6 +485,16 @@ fn emit_osc(action: &str, payload: &str) {
 /// lives on the daemon, not here. Everything else (panes, policy, zoom,
 /// appearance, actions, the WebAuthn signer) is the app's, and answers here.
 pub(crate) fn dispatch(state: &ControlState, req: &ParsedRequest) -> (u16, Value) {
+    // THE GATE. Nothing below this line may run for a GUI-only route reached
+    // without the GUI's token — the next arms unlock the vault, fill a
+    // credential into the page and rewrite the profile's content policy, and the
+    // control port is page-reachable through yggterm's `yggterm-appctl://`
+    // bridge. Before 2026-07-27 `POST /action` had no gate at all.
+    if route_access(&req.path) == RouteAccess::GuiOnly && !state.gui_authorized(req) {
+        let refusal = gui_only_refusal(&req.method, &req.path, req.control_token.as_deref());
+        crate::daemon::journal(refusal.event, refusal.data);
+        return (403, refusal.body);
+    }
     let query = req.query.as_str();
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", p) if p == format!("/pane/{VAULT_PANE}") => {
@@ -441,12 +600,17 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-pub(crate) fn respond_json(mut stream: TcpStream, status: u16, body: &Value) {
+pub(crate) fn respond_json(stream: TcpStream, status: u16, body: &Value, path: &str) {
+    write_json(stream, status, body, cors_headers(route_access(path)));
+}
+
+fn write_json(mut stream: TcpStream, status: u16, body: &Value, cors: &str) {
     let body = body.to_string();
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         _ => "OK",
     };
@@ -455,34 +619,68 @@ pub(crate) fn respond_json(mut stream: TcpStream, status: u16, body: &Value) {
          Content-Length: {len}\r\nCache-Control: no-store\r\nConnection: close\r\n\
          {cors}\r\n{body}",
         len = body.len(),
-        cors = cors_headers(),
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
 }
 
-/// CORS headers on EVERY control response.
+/// CORS headers for a route, by its [`RouteAccess`] class.
 ///
-/// The signer's page routes (`/fido2/get`, `/fido2/create`) are fetched by a
-/// userscript running in the RP's page — a cross-origin request (webauthn.io →
-/// `127.0.0.1:<port>`) that WebKit refuses without these. `*` is safe: CORS is
-/// not our security boundary — the bearer token (page routes) and the unguessable
-/// request_id (grant routes) are — and the shim never sends credentials, so a
-/// wildcard origin is allowed. The custom `X-Ychrome-Fido2` header forces a
-/// preflight `OPTIONS`, which [`handle_conn`] answers.
-fn cors_headers() -> &'static str {
-    "Access-Control-Allow-Origin: *\r\n\
-     Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-     Access-Control-Allow-Headers: Content-Type, X-Ychrome-Fido2\r\n\
-     Access-Control-Max-Age: 600\r\n"
+/// The signer's page routes are fetched by a userscript running in the RP's page
+/// — a cross-origin request (webauthn.io → `127.0.0.1:<port>`) that WebKit
+/// refuses without these, and the custom `X-Ychrome-Fido2` header forces a
+/// preflight `OPTIONS`. The wildcard is safe THERE: the shim sends no
+/// credentials and the real boundary is the signer's bearer token plus the
+/// origin↔rpId check.
+///
+/// Everywhere else the answer is NO CORS AT ALL. It used to be `*` on every
+/// response, which told any page in the surface that reading `/action`'s and
+/// `/pane/<id>`'s replies was fine. The token gate is what actually stops the
+/// call, but advertising a wildcard on a GUI-only route is a standing invitation
+/// and it is withdrawn here. `X-Ychrome-Control` is deliberately NOT in
+/// `Allow-Headers`: no page is ever meant to send it.
+fn cors_headers(access: RouteAccess) -> &'static str {
+    match access {
+        RouteAccess::PageSigner => {
+            "Access-Control-Allow-Origin: *\r\n\
+             Access-Control-Allow-Methods: POST, OPTIONS\r\n\
+             Access-Control-Allow-Headers: Content-Type, X-Ychrome-Fido2\r\n\
+             Access-Control-Max-Age: 600\r\n"
+        }
+        RouteAccess::Open | RouteAccess::Ceremony | RouteAccess::GuiOnly => "",
+    }
 }
 
-/// Answer a CORS preflight: 204, the CORS headers, no body. Without this the
-/// browser never sends the real `/fido2/*` POST.
-pub(crate) fn respond_preflight(mut stream: TcpStream) {
+/// Answer a CORS preflight. For a signer page route: 204 + the CORS headers,
+/// without which the browser never sends the real `/fido2/*` POST. For anything
+/// else: the same 403 the real request would get, named — a preflight for
+/// `/action` is a page asking whether it may drive the settings pane, and the
+/// honest answer is no, said out loud rather than by silent omission.
+pub(crate) fn respond_preflight(mut stream: TcpStream, path: &str) {
+    let access = route_access(path);
+    if access != RouteAccess::PageSigner {
+        if access == RouteAccess::GuiOnly {
+            let refusal = gui_only_refusal("OPTIONS", path, None);
+            crate::daemon::journal(refusal.event, refusal.data);
+            write_json(stream, 403, &refusal.body, "");
+            return;
+        }
+        // Open and Ceremony routes: no page is meant to reach them from a page
+        // origin either, but they are not capabilities — refuse the preflight
+        // without an audit line, so a stray probe cannot flood the journal.
+        let body = json!({
+            "error": format!(
+                "forbidden: {path} is not a page route; only /fido2/get and \
+                 /fido2/create answer a cross-origin preflight"
+            ),
+            "route": path,
+        });
+        write_json(stream, 403, &body, "");
+        return;
+    }
     let response = format!(
         "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n{cors}\r\n",
-        cors = cors_headers(),
+        cors = cors_headers(access),
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
@@ -2519,5 +2717,289 @@ mod tests {
             Some("a.b")
         );
         assert_eq!(query_value("a=1", "host"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // THE CONTROL-TOKEN GATE
+    //
+    // The control endpoint is page-reachable: yggterm registers a
+    // `yggterm-appctl://` scheme in every surface's web context and proxies it
+    // to THIS server, so a `fetch('yggterm-appctl://x/action', {method:'POST'})`
+    // from any page in the profile used to land on `run_action` with no
+    // credential at all. That reaches vault unlock, `fill` (which returns an
+    // `eval` the GUI injects into the page — a credential handed to the
+    // attacker), ad blocking off and userscript deletion. These locks hold the
+    // gate that closed it.
+    // -----------------------------------------------------------------------
+
+    fn control_state() -> ControlState {
+        ControlState::new("default", "sess-1", 41234)
+    }
+
+    /// A request as a page would make it: whatever the page can set, and
+    /// nothing it cannot. The fido2 token is deliberately fillable — every page
+    /// in the profile holds it, baked into the shim userscript — which is
+    /// exactly why it cannot be the credential for a GUI-only route.
+    fn page_request(method: &str, path: &str, body: Value) -> ParsedRequest {
+        ParsedRequest {
+            method: method.to_string(),
+            path: path.to_string(),
+            query: String::new(),
+            fido2_token: None,
+            control_token: None,
+            body,
+        }
+    }
+
+    fn gui_request(state: &ControlState, method: &str, path: &str, body: Value) -> ParsedRequest {
+        ParsedRequest {
+            control_token: Some(state.control_token.clone()),
+            ..page_request(method, path, body)
+        }
+    }
+
+    #[test]
+    fn an_untokened_action_post_is_refused_and_the_refusal_names_the_route() {
+        let state = control_state();
+        let (status, body) = dispatch(
+            &state,
+            &page_request(
+                "POST",
+                "/action",
+                json!({"pane": SETTINGS_PANE, "action": "reload-surface", "values": {}}),
+            ),
+        );
+        assert_eq!(status, 403, "an untokened /action must be refused: {body:?}");
+        assert_eq!(body["route"], "/action");
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("GUI-only") && error.contains("no X-Ychrome-Control token"),
+            "the refusal must name itself, got {error:?}"
+        );
+        assert!(
+            body["reload_surface"].is_null(),
+            "a refused action must not have run: {body:?}"
+        );
+    }
+
+    /// A page holds the SIGNER's token (it is in its own userscript). Presenting
+    /// it must buy nothing on a GUI-only route — the whole reason the control
+    /// token is a second, differently-sourced secret.
+    #[test]
+    fn the_signers_token_does_not_open_the_gui_only_routes() {
+        let state = control_state();
+        let stolen = ParsedRequest {
+            fido2_token: Some(state.signer.token.clone()),
+            control_token: Some(state.signer.token.clone()),
+            ..page_request("POST", "/action", json!({"pane": SETTINGS_PANE, "action": "x"}))
+        };
+        let (status, body) = dispatch(&state, &stolen);
+        assert_eq!(
+            status, 403,
+            "the shim's token must not gate /action: {body:?}"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("did not match this session"),
+            "a WRONG token must be named as wrong, got {body:?}"
+        );
+    }
+
+    /// The legitimate caller: the GUI's settings pane, presenting the token the
+    /// declare handed it. This must drive the REAL dispatch, not a stub — the
+    /// reply is `run_settings_action`'s own `reload_surface`.
+    #[test]
+    fn the_guis_tokened_action_reaches_the_real_dispatch() {
+        let state = control_state();
+        let (status, body) = dispatch(
+            &state,
+            &gui_request(
+                &state,
+                "POST",
+                "/action",
+                json!({"pane": SETTINGS_PANE, "action": "reload-surface", "values": {}}),
+            ),
+        );
+        assert_eq!(status, 200, "the pane's tokened action must work: {body:?}");
+        assert_eq!(
+            body["reload_surface"], true,
+            "the reply must be the settings pane's own, got {body:?}"
+        );
+    }
+
+    /// `GET /pane/<id>` is a read, but it lists the user's vault item names and
+    /// seeds the Add draft — page-reachable disclosure plus a mutation. Gated
+    /// with the same token, and the GUI's fetch still answers.
+    #[test]
+    fn the_pane_schema_is_gui_only_but_still_answers_the_gui() {
+        let state = control_state();
+        let (status, _) = dispatch(&state, &page_request("GET", "/pane/settings", Value::Null));
+        assert_eq!(status, 403, "an untokened pane fetch must be refused");
+        let (status, body) = dispatch(
+            &state,
+            &gui_request(&state, "GET", "/pane/settings", Value::Null),
+        );
+        assert_eq!(status, 200);
+        assert!(
+            !body["widgets"].is_null(),
+            "the GUI's pane fetch must still return a schema, got {body:?}"
+        );
+    }
+
+    /// The reads that stay open, on purpose: a policy body is the very content
+    /// the GUI is about to inject into the page, the zoom map is a host→percent
+    /// table, and both must keep answering an OLDER GUI that has no token at
+    /// all — otherwise a mixed-version deploy silently drops ad blocking.
+    #[test]
+    fn policy_and_zoom_reads_stay_open_to_an_untokened_caller() {
+        let state = control_state();
+        for path in ["/policy", "/zoom"] {
+            let (status, body) = dispatch(&state, &page_request("GET", path, Value::Null));
+            assert_eq!(status, 200, "{path} must stay open, got {status} {body:?}");
+        }
+        assert_eq!(route_access("/policy"), RouteAccess::Open);
+        assert_eq!(route_access("/zoom"), RouteAccess::Open);
+        assert_eq!(route_access("/ping"), RouteAccess::Open);
+    }
+
+    /// `/fido2` is UNCHANGED by this gate: the page routes keep answering on the
+    /// signer's own bearer token (and keep 401ing without it), and the grant
+    /// routes keep authenticating on the per-ceremony request_id.
+    #[test]
+    fn the_gate_leaves_fido2_alone() {
+        let state = control_state();
+        let unauthorized = dispatch(
+            &state,
+            &page_request("POST", "/fido2/get", json!({"rpId": "example.com"})),
+        );
+        assert_eq!(
+            unauthorized.0, 401,
+            "a shim call with no signer token is the signer's 401, not the gate's 403: \
+             {unauthorized:?}"
+        );
+        let shimmed = ParsedRequest {
+            fido2_token: Some(state.signer.token.clone()),
+            ..page_request("POST", "/fido2/get", Value::Null)
+        };
+        let (status, _) = dispatch(&state, &shimmed);
+        assert_eq!(
+            status, 400,
+            "a signer-tokened page route must reach the signer (400 = its own bad-request), \
+             not be refused by the control gate"
+        );
+        let grant = page_request("POST", "/fido2/deny", json!({"request_id": "nope"}));
+        assert_ne!(
+            dispatch(&state, &grant).0,
+            403,
+            "grant/deny authenticate on the request_id and must not need the control token"
+        );
+        assert_eq!(route_access("/fido2/get"), RouteAccess::PageSigner);
+        assert_eq!(route_access("/fido2/grant"), RouteAccess::Ceremony);
+    }
+
+    /// The gate fails CLOSED. The hole existed because nobody classified
+    /// `/action` when it was added; a route added tomorrow is GUI-only until
+    /// someone deliberately writes it into the open list.
+    #[test]
+    fn an_unclassified_route_is_gui_only_by_default() {
+        assert_eq!(route_access("/some-route-added-later"), RouteAccess::GuiOnly);
+        assert_eq!(route_access("/action"), RouteAccess::GuiOnly);
+        assert_eq!(route_access("/pane/vault"), RouteAccess::GuiOnly);
+        let state = control_state();
+        assert_eq!(
+            dispatch(
+                &state,
+                &page_request("POST", "/some-route-added-later", json!({}))
+            )
+            .0,
+            403,
+            "an unknown route must be refused, not 404'd, for an untokened caller"
+        );
+    }
+
+    /// A refused request must leave an honest line, and that line must not leak
+    /// the credential it is protecting.
+    #[test]
+    fn a_refusal_is_journalled_and_carries_no_token() {
+        let presented = "s3cr3t-guess-the-attacker-sent";
+        let refusal = gui_only_refusal("POST", "/action", Some(presented));
+        assert_eq!(refusal.event, "control_refused");
+        assert_eq!(refusal.data["path"], "/action");
+        assert_eq!(refusal.data["method"], "POST");
+        assert_eq!(refusal.data["token_presented"], true);
+        assert!(
+            refusal.data["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("did not match")
+        );
+        let wire = refusal.data.to_string();
+        let state = control_state();
+        assert!(
+            !wire.contains(presented)
+                && !wire.contains(&state.control_token)
+                && !wire.contains(&state.signer.token),
+            "an audit line must never carry a token — not ours, and not the one \
+             the caller guessed: {wire}"
+        );
+
+        // ANCHOR: the refusal arm must actually WRITE the line. The value above
+        // is only honest if dispatch journals it.
+        let source = include_str!("sidebar.rs");
+        let gate = source
+            .split("pub(crate) fn dispatch(")
+            .nth(1)
+            .and_then(|rest| rest.split("let query = req.query.as_str();").next())
+            .expect("the gate sits at the top of dispatch");
+        assert!(
+            gate.contains("crate::daemon::journal(refusal.event, refusal.data)"),
+            "a refused control request must be journalled, not silently dropped"
+        );
+    }
+
+    /// CORS stops advertising `*` on anything but the signer's page routes. The
+    /// wildcard never let a call through by itself — the gate does that — but a
+    /// GUI-only route telling every origin "read my replies" is an invitation
+    /// that no longer stands.
+    #[test]
+    fn only_the_signers_page_routes_reflect_a_cors_wildcard() {
+        assert!(cors_headers(RouteAccess::PageSigner).contains("Access-Control-Allow-Origin: *"));
+        for access in [
+            RouteAccess::Open,
+            RouteAccess::Ceremony,
+            RouteAccess::GuiOnly,
+        ] {
+            assert!(
+                !cors_headers(access).contains("Access-Control-Allow-Origin"),
+                "{access:?} must not reflect an origin"
+            );
+        }
+        assert!(
+            !cors_headers(RouteAccess::PageSigner).contains("X-Ychrome-Control"),
+            "no page is ever meant to send the control header, so it is not allow-listed"
+        );
+    }
+
+    /// The GUI's credential travels on the declare — the one channel a page
+    /// cannot read. Without this the GUI has no way to prove it is the GUI.
+    #[test]
+    fn the_declare_carries_the_control_token() {
+        let payload = declare_payload("sess-1", "http://127.0.0.1:41234", "tok-abc", "p1", "z1");
+        assert_eq!(payload["control_token"], "tok-abc");
+        assert_eq!(payload["control"], "http://127.0.0.1:41234");
+    }
+
+    /// Each session's endpoint gets its OWN token: one surface's page must not
+    /// be able to drive another surface's pane even if it somehow learned a
+    /// token, and the signer's token is a different secret again.
+    #[test]
+    fn every_session_mints_its_own_control_token() {
+        let a = control_state();
+        let b = control_state();
+        assert_ne!(a.control_token, b.control_token);
+        assert_ne!(a.control_token, a.signer.token);
+        assert_eq!(a.control_token.len(), 64, "32 CSPRNG bytes, hex");
     }
 }

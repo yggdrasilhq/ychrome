@@ -60,7 +60,7 @@ ychrome contributes its vault and settings panes rather than yggterm hardcoding
 them. `RightPanelMode::Vault` and `::AppSidebar` are both deleted from yggterm.
 
 ```
-ESC ] 7717 ; sidebar ; declare ; <base64 {"session","control","app_name","panes":[{id,icon,title}],"policy_version","zoom_version"}> BEL
+ESC ] 7717 ; sidebar ; declare ; <base64 {"session","control","control_token","app_name","panes":[{id,icon,title}],"policy_version","zoom_version"}> BEL
 ESC ] 7717 ; sidebar ; close   ; <base64 {"session"}> BEL
 ```
 
@@ -68,23 +68,80 @@ ESC ] 7717 ; sidebar ; close   ; <base64 {"session"}> BEL
 web surface — that IS the contribution's liveness signal, and the GUI expires a
 contribution whose declares stop, so a SIGKILLed ychrome leaves no phantom
 buttons. It carries **no schema and no secret**: only a loopback control
-endpoint, the pane buttons, and a stamp over this host's web-content policy.
+endpoint, the pane buttons, a stamp over this host's web-content policy — and
+`control_token`, the one secret a declare carries (see below).
 
 The GUI then talks to the control endpoint itself, over a plain socket (through
 an `ssh -L` forward when ychrome runs remotely):
 
 ```
-GET  <control>/pane/vault?host=<page host>            -> the schema
-GET  <control>/pane/settings?host=<host>&zoom=<pct>   -> the schema
+GET  <control>/pane/vault?host=<page host>            -> the schema          [GUI-only]
+GET  <control>/pane/settings?host=<host>&zoom=<pct>   -> the schema          [GUI-only]
 GET  <control>/policy                                 -> {adblock_rules, userscripts}
 GET  <control>/zoom                                   -> {sites:{host:percent}}
-POST <control>/action  {pane, action, values}         -> {schema?, toast?, eval?, reload_surface?, refetch_zoom?}
+GET  <control>/ping                                   -> stamps (+ commands  [GUI-only])
+POST <control>/action  {pane, action, values}         -> {schema?, toast?, eval?, reload_surface?, refetch_zoom?}  [GUI-only]
 ```
 
 An action is routed by the `pane` it came from, not by its name: the two panes
 return different schemas. The GUI injects the active surface's page host as
 `values.host` and its live effective zoom as `values.zoom` on every action, so a
 pane control can act relative to what is on screen.
+
+### `control_token` — who may drive the endpoint
+
+The control endpoint is **page-reachable**. yggterm registers a
+`yggterm-appctl://` scheme in every surface's web context and proxies it to this
+very server, so page JS can address any route on it. Until 2026-07-27 only
+`/fido2/get|create` were gated, which meant any page in an ychrome surface could
+`fetch('yggterm-appctl://x/action', {method:'POST', ...})` and drive the settings
+pane: disable ad blocking, delete a userscript, switch the User-Agent identity —
+or run a vault `fill`, whose reply is an `eval` script the GUI injects into the
+requesting page, handing it a plaintext credential.
+
+The fix is a second bearer token with a different courier:
+
+- the daemon mints one per registered session (32 CSPRNG bytes, hex) and returns
+  it in the register reply;
+- the client puts it in the `sidebar ; declare` OSC — **the PTY stream, which a
+  page cannot read**, the same provenance as the passkey `request_id` that
+  authenticates `/fido2/grant`;
+- the GUI presents it as `X-Ychrome-Control` on every request to this app's
+  control endpoint;
+- the appctl bridge forwards a closed allow-list of page headers
+  (`X-Ychrome-Fido2`, `Content-Type`) and refuses a request target containing a
+  control character, so a page can neither send nor smuggle the header.
+
+Routes are classified in ONE table (`sidebar::route_access`), read by both the
+gate and the CORS headers, and the default is GUI-only — a route added later is
+gated until someone deliberately opens it. A refused request gets `403` naming
+itself and lands in the daemon journal as `control_refused` (never with a token
+in it).
+
+**The signer's token cannot substitute.** It is baked into the shim userscript,
+so every page in the profile holds it by construction.
+
+**Reads that stay open, on purpose:** `/policy` and `/zoom`. A policy body is the
+ruleset and userscripts the GUI is about to inject into the page — the page can
+already see all of it — and the zoom map is a host→percent table. `/ping`'s
+liveness stamps are open too, so an OLDER GUI keeps its rail and its surfaces'
+ad blocking across a mixed-version deploy; its command DRAIN is gated, because
+draining is a mutation and a page could otherwise swallow a routed `open_tab`.
+
+CORS reflects `*` **only** on `/fido2/get|create`, the two routes a page is meant
+to call. Everything else answers with no `Access-Control-Allow-Origin` at all,
+and a preflight for a GUI-only route is refused with the same named 403.
+
+**Threat model, stated plainly:** this closes the WEB boundary. A same-uid
+process on the app's host can read the daemon's memory and the vault socket
+anyway, exactly as `crate::passkey` already documents — it was never the threat
+this endpoint could defend against.
+
+**Mixed versions.** An old GUI + a new ychrome keeps its rail, its policy and its
+zoom, but its pane fetches and actions are refused (it has no token to present)
+and its ping stops draining commands — visible in the journal, not silent. A new
+GUI + an old ychrome is unaffected: the header is ignored by a server with no
+gate. ychrome and yggterm deploy as a fleet, so the matched pair is the norm.
 
 ### `app_name`
 
