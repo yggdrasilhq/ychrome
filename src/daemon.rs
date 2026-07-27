@@ -33,7 +33,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,8 +42,10 @@ use serde_json::{Value, json};
 
 use crate::sidebar::{self, ControlState};
 
-/// The daemon's compiled version. A client whose own version is newer stops the
-/// running daemon and respawns it, so a fleet deploy self-heals on next use.
+/// The daemon's compiled version. It is one of the two inputs to "is the running
+/// daemon serving old code" (`daemon_is_outdated`), and the weaker one: it has
+/// been `0.1.0` since the daemon existed, so the exe-stamp drift is what
+/// actually catches a rebuild. Do not make this the only check again.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// A session is reaped this long after its last client heartbeat. The client
@@ -282,6 +284,30 @@ impl Daemon {
         !self.startup_exe_stamp.is_empty() && exe_stamp() != self.startup_exe_stamp
     }
 
+    /// The env ids of every session a client is still heartbeating for, sorted.
+    ///
+    /// This is the daemon's own accounting of what is ATTACHED to it, and the
+    /// only honest answer to "can this process leave without taking something
+    /// with it". Each id names a live surface whose control endpoint, sidebar
+    /// pane draft, command queue and passkey signer live in THIS process: none
+    /// of that survives our exit, and the surface itself has no way to ask for
+    /// it back (the client re-registers and re-declares, but a half-typed Add
+    /// draft, a queued open and a signature in flight are simply gone).
+    ///
+    /// A session past `SESSION_EXPIRE` is a client that already went away and
+    /// the reaper has not swept yet, so it holds nothing and must not hold a
+    /// handover back either.
+    fn live_session_ids(&self) -> Vec<String> {
+        let sessions = self.sessions.lock().unwrap();
+        let mut ids: Vec<String> = sessions
+            .values()
+            .filter(|entry| entry.meta.lock().unwrap().last_heartbeat.elapsed() <= SESSION_EXPIRE)
+            .map(|entry| entry.env_id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     /// Register (or heartbeat) a session. New env_id ⇒ bind its control listener
     /// and spawn its accept loop; existing ⇒ refresh profile/pid/heartbeat and
     /// hand back the same control url (idempotent, so the client's ~4s heartbeat
@@ -434,13 +460,15 @@ impl Daemon {
             })
             .collect();
         rows.sort_by(|a, b| a["env_id"].as_str().cmp(&b["env_id"].as_str()));
+        // `pid`, `stale` and `live_sessions` are NOT built here: every reply on
+        // this socket carries them (see `handle_unix_conn`), so there is one
+        // owner of "which daemon answered and is it serving old code" rather
+        // than one per verb that remembered to say so.
         json!({
             "ok": true,
             "version": VERSION,
-            "pid": std::process::id(),
             "uptime_secs": self.started.elapsed().as_secs(),
             "exe_stamp": self.startup_exe_stamp,
-            "stale": self.is_stale(),
             "vault_agent_reachable": vault_agent_reachable(),
             "sessions": rows,
         })
@@ -557,7 +585,7 @@ fn handle_unix_conn(daemon: &Arc<Daemon>, stream: UnixStream) -> bool {
     let op = request.get("op").and_then(Value::as_str).unwrap_or("");
     let mut should_exit = false;
     let reply = match op {
-        "ping" => json!({ "ok": true, "version": VERSION, "pid": std::process::id(), "stale": daemon.is_stale() }),
+        "ping" => json!({ "ok": true, "version": VERSION }),
         "register" => {
             let env_id = request.get("env_id").and_then(Value::as_str).unwrap_or("");
             let profile = request.get("profile").and_then(Value::as_str).unwrap_or("default");
@@ -587,12 +615,57 @@ fn handle_unix_conn(daemon: &Arc<Daemon>, stream: UnixStream) -> bool {
             }
         }
         "status" => daemon.status(),
+        // The handover decision, made HERE and under this process's own lock,
+        // because only this process knows what is attached to it. A client that
+        // asked "are you idle?" and then said "stop" would be deciding on a fact
+        // that could change between the two round trips; this cannot.
+        //
+        // It reaps first so a client that already went away cannot pin an
+        // outdated daemon in place for the length of its expiry window.
+        "retire_if_idle" => {
+            daemon.reap();
+            let held = daemon.live_session_ids();
+            if held.is_empty() {
+                should_exit = true;
+                json!({ "ok": true, "retiring": true })
+            } else {
+                json!({ "ok": true, "retiring": false, "held_by": held })
+            }
+        }
+        // The deliberate form (`ychrome daemon restart`): retire whatever is
+        // attached, because a person asked for it in as many words.
         "stop" => {
             should_exit = true;
             json!({ "ok": true, "stopping": true })
         }
         other => json!({ "ok": false, "error": format!("unknown op {other:?}") }),
     };
+    // Every reply carries who answered and whether it is serving old code,
+    // whatever was asked. A client cannot forget to look, and a verb added later
+    // cannot answer without saying it: staleness that is invisible on some paths
+    // is how an old daemon serves for days (this one ran 6.7 days stale).
+    let mut reply = reply;
+    if let Some(object) = reply.as_object_mut() {
+        object.insert("pid".to_string(), json!(std::process::id()));
+        object.insert("stale".to_string(), json!(daemon.is_stale()));
+        object.insert(
+            "live_sessions".to_string(),
+            json!(daemon.live_session_ids().len()),
+        );
+    }
+    if should_exit {
+        // Unlink BEFORE answering, so the reply is itself the client's proof
+        // that the path is free. Removing it after the reply meant a successor
+        // could bind the path and then have THIS process delete the successor's
+        // socket on its way out, stranding a live daemon nothing could reach.
+        if let Ok(sock) = sock_path() {
+            let _ = std::fs::remove_file(&sock);
+        }
+        journal(
+            "retire",
+            json!({ "pid": std::process::id(), "op": op, "stale": daemon.is_stale() }),
+        );
+    }
     let mut stream = stream;
     let _ = writeln!(stream, "{reply}");
     let _ = stream.flush();
@@ -679,7 +752,9 @@ pub fn run() -> Result<()> {
             Err(_) => continue,
         }
     }
-    let _ = std::fs::remove_file(&sock);
+    // The socket was already unlinked by the op that asked us to leave, before
+    // it answered (see `handle_unix_conn`). Removing it here as well would let a
+    // retiring daemon delete its SUCCESSOR's socket.
     journal("daemon_stop", json!({ "pid": std::process::id() }));
     Ok(())
 }
@@ -705,7 +780,21 @@ fn write_daemon_json(daemon: &Daemon) -> Result<()> {
 
 /// One request/response against the daemon socket. `None` if no daemon is
 /// listening (or it died mid-exchange).
+///
+/// Every reply passes through here, which is why the staleness notice lives
+/// here: no caller can talk to an outdated daemon without the fact reaching the
+/// user, and no verb added later has to remember to check.
 fn socket_request(request: &Value) -> Option<Value> {
+    let reply = socket_request_silent(request)?;
+    note_daemon_reply(&reply);
+    Some(reply)
+}
+
+/// The same round trip without the notice, for the one caller that is already
+/// acting on the staleness: `ychrome daemon restart` would otherwise print "it
+/// was left running rather than retired underneath it" in the middle of
+/// retiring it.
+fn socket_request_silent(request: &Value) -> Option<Value> {
     let sock = sock_path().ok()?;
     let mut stream = UnixStream::connect(&sock).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -714,6 +803,82 @@ fn socket_request(request: &Value) -> Option<Value> {
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).ok()?;
     serde_json::from_str(line.trim()).ok()
+}
+
+/// Is the daemon that sent this reply serving code older than ours?
+///
+/// Two ways it can be, and they are the same failure: a DIFFERENT compiled
+/// version (a fleet deploy left it behind), or our own version with a binary
+/// that was replaced on disk after it started (`stale`, the exe-stamp drift).
+/// ychrome's version is a constant that almost never moves, so the second is the
+/// one that actually happens — and until this predicate counted it, every
+/// rebuild left the old daemon serving indefinitely because the version matched.
+///
+/// A reply with no `version` (most ops) is judged on `stale` alone. It must not
+/// read as outdated: a bare `{"ok":true}` ack that looked outdated would send
+/// every deregister into a handover.
+fn daemon_is_outdated(reply: &Value) -> bool {
+    let version = reply.get("version").and_then(Value::as_str).unwrap_or("");
+    let stale = reply.get("stale").and_then(Value::as_bool).unwrap_or(false);
+    (!version.is_empty() && version != VERSION) || stale
+}
+
+/// The daemon we have already announced as outdated. Announcing once per DAEMON
+/// rather than once per process is what lets a browser that has been open for
+/// days report the next deploy too, while a client heartbeating every 4s does
+/// not repeat itself forever — and a line that repeats forever is a line nobody
+/// reads.
+static ANNOUNCED_OUTDATED_PID: AtomicU64 = AtomicU64::new(0);
+
+fn already_announced(pid: u64) -> bool {
+    ANNOUNCED_OUTDATED_PID.load(Ordering::SeqCst) == pid
+}
+
+/// Say, on stderr, that the daemon is serving old code and that we did not kill
+/// it. Both halves matter: silence about the staleness is how old code serves
+/// for days, and silence about a kill is how a surface loses its rail, its pane
+/// draft and its passkey signature without anyone deciding that it should.
+fn warn_outdated_daemon(pid: u64, why: &str) {
+    if ANNOUNCED_OUTDATED_PID.swap(pid, Ordering::SeqCst) == pid {
+        return;
+    }
+    eprintln!(
+        "ychrome: the running daemon (pid {pid}) is serving OLD CODE: the ychrome binary on disk \
+         changed after it started."
+    );
+    eprintln!("ychrome: {why}, so it was left running rather than retired underneath it.");
+    eprintln!("ychrome: hand it over when you are ready:  ychrome daemon restart");
+}
+
+/// The notice every daemon reply gets checked for. Deliberately silent when
+/// nothing is attached: that daemon is replaced transparently by the next
+/// `ensure()`, and announcing a problem we are about to fix ourselves is noise.
+fn note_daemon_reply(reply: &Value) {
+    if !daemon_is_outdated(reply) {
+        return;
+    }
+    let held = reply
+        .get("live_sessions")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if held == 0 {
+        return;
+    }
+    let names = reply
+        .get("held_by")
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|names| !names.is_empty());
+    let why = match names {
+        Some(names) => format!("{held} live surface(s) are attached to it ({names})"),
+        None => format!("{held} live surface(s) are attached to it"),
+    };
+    warn_outdated_daemon(reply.get("pid").and_then(Value::as_u64).unwrap_or(0), &why);
 }
 
 fn socket_answers_ping(sock: &std::path::Path) -> bool {
@@ -728,33 +893,135 @@ fn socket_answers_ping(sock: &std::path::Path) -> bool {
     BufReader::new(stream).read_line(&mut line).is_ok() && line.contains("\"ok\":true")
 }
 
-/// Ensure a daemon of THIS binary's version is running, and return nothing but
-/// the guarantee. Spawns one if absent; if the running one is a different
-/// version (a fleet deploy left it behind), stops it and respawns — daemon death
-/// is self-healing, and the clients' re-register rebuilds the registry in one
-/// heartbeat.
+/// Ensure a daemon running THIS binary's code is serving, and return nothing but
+/// the guarantee that a daemon is up. Four outcomes, and the middle two are the
+/// point of the function:
+///
+///   - nothing listening: spawn one;
+///   - listening and current: leave it completely alone;
+///   - listening, OUTDATED (a different version, or the binary was replaced on
+///     disk after it started) and nothing attached: hand over transparently. An
+///     empty registry costs nobody anything to lose, and this is the case that
+///     used to never fire. The version has been `0.1.0` throughout, so comparing
+///     versions alone left every rebuild's daemon serving old code until
+///     something killed it by hand;
+///   - listening, outdated, and live surfaces are attached: LEAVE IT RUNNING and
+///     say so on stderr. It holds those surfaces' control endpoints, pane drafts
+///     and passkey signer; retiring it silently spends the user's work to save
+///     them one command. `ychrome daemon restart` is that command.
+///
+/// The idle-or-attached half of the decision belongs to the DAEMON
+/// (`retire_if_idle`), not to us: only it can count what is attached under its
+/// own lock, in one round trip that nothing can race.
 pub fn ensure() -> Result<()> {
     for _ in 0..40 {
-        if let Some(reply) = socket_request(&json!({ "op": "ping" })) {
-            let version = reply.get("version").and_then(Value::as_str).unwrap_or("");
-            if version == VERSION {
+        let Some(reply) = socket_request(&json!({ "op": "ping" })) else {
+            spawn_daemon()?;
+            std::thread::sleep(Duration::from_millis(150));
+            continue;
+        };
+        if !daemon_is_outdated(&reply) {
+            return Ok(());
+        }
+        match socket_request(&json!({ "op": "retire_if_idle" })) {
+            // It left, and unlinked its socket before answering, so our spawn
+            // wins the bind instead of racing its cleanup.
+            Some(answer) if answer.get("retiring").and_then(Value::as_bool) == Some(true) => {
+                spawn_daemon()?;
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            // A daemon older than this verb cannot tell us what it is holding.
+            // Assume it holds something: guessing wrong costs a live surface its
+            // rail, and the honest alternative is one deliberate command. This
+            // is the one-deploy cost of installing the handover itself.
+            Some(answer) if answer.get("ok").and_then(Value::as_bool) == Some(false) => {
+                warn_outdated_daemon(
+                    reply.get("pid").and_then(Value::as_u64).unwrap_or(0),
+                    "it predates the handover check and cannot say what is attached to it",
+                );
                 return Ok(());
             }
-            // A stale-version daemon: ask it to leave, then respawn ours.
-            let _ = socket_request(&json!({ "op": "stop" }));
-            std::thread::sleep(Duration::from_millis(200));
+            // It is holding live surfaces. Never ours to take; the reply already
+            // carried the notice out through `socket_request`.
+            Some(_) => return Ok(()),
+            // It vanished mid-exchange; the next pass finds no socket and spawns.
+            None => continue,
+        }
+    }
+    bail!("ychrome daemon did not come up");
+}
+
+/// The deliberate handover behind `ychrome daemon restart`: retire whatever is
+/// running, attached surfaces and all, and bring up a daemon on the binary that
+/// is on disk now. This is the ONLY path that retires a busy daemon, and it
+/// exists so that retiring one is something a person chooses rather than
+/// something that happens to them.
+///
+/// What comes back on its own: every attached client re-registers on its next
+/// heartbeat (~4s) and re-declares the new control url. What does not: pane
+/// drafts, queued opens, and any passkey signature in flight. The reply names
+/// the sessions, so the caller can say which surfaces paid for it.
+pub fn restart() -> Result<Value> {
+    let before = socket_request_silent(&json!({ "op": "status" }));
+    let old_pid = before.as_ref().and_then(|reply| reply["pid"].as_u64());
+    let reattaching: Vec<String> = before
+        .as_ref()
+        .and_then(|reply| reply["sessions"].as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row["env_id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if old_pid.is_some() {
+        let _ = socket_request_silent(&json!({ "op": "stop" }));
+    }
+    for _ in 0..40 {
+        if let Some(reply) = socket_request_silent(&json!({ "op": "ping" })) {
+            let pid = reply.get("pid").and_then(Value::as_u64);
+            // "Something is listening" is not proof the handover happened: the
+            // outgoing daemon answers pings right up to its exit, and reporting
+            // a restart that did not occur is the exact dishonesty this verb
+            // exists to remove. Only a NEW pid on CURRENT code counts.
+            if pid.is_some() && pid != old_pid && !daemon_is_outdated(&reply) {
+                return Ok(json!({
+                    "ok": true,
+                    "old_pid": old_pid,
+                    "pid": pid,
+                    "sessions_reattaching": reattaching,
+                }));
+            }
         }
         spawn_daemon()?;
         std::thread::sleep(Duration::from_millis(150));
     }
-    bail!("ychrome daemon did not come up");
+    bail!("the ychrome daemon did not come back up after the restart");
+}
+
+/// The path to spawn a daemon from. `current_exe()` reads `/proc/self/exe`,
+/// which keeps naming a REPLACED binary as `<path> (deleted)` — and that is
+/// exactly the state a long-lived client is in after a deploy, which is exactly
+/// when it needs to bring a daemon up on the NEW code. `Command::new` on the
+/// literal string fails with ENOENT, so without this a client whose binary was
+/// replaced could never respawn a daemon again: the staleness handover would
+/// hand over to nothing. The marker is stripped only when the real path is
+/// there; a genuinely missing binary must still fail loudly.
+fn spawnable_exe(exe: PathBuf) -> PathBuf {
+    match exe
+        .to_str()
+        .and_then(|raw| raw.strip_suffix(" (deleted)"))
+        .map(PathBuf::from)
+    {
+        Some(replaced) if replaced.is_file() => replaced,
+        _ => exe,
+    }
 }
 
 /// Launch `ychrome --daemon` detached (setsid, cwd=home, stdio to /dev/null), the
 /// yedit pattern. Best-effort: a lost race just means another spawn won, and the
 /// ensure loop finds the socket answering.
 fn spawn_daemon() -> Result<()> {
-    let exe = std::env::current_exe().context("locating the ychrome binary")?;
+    let exe = spawnable_exe(std::env::current_exe().context("locating the ychrome binary")?);
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     let child = Command::new(&exe)
         .arg("--daemon")
@@ -789,8 +1056,10 @@ fn spawn_daemon() -> Result<()> {
     Ok(())
 }
 
-/// Register (or heartbeat) a session with the daemon; returns its control url.
-pub fn register(env_id: &str, profile: &str) -> Result<String> {
+/// Register (or heartbeat) a session with the daemon; returns the whole reply,
+/// because the caller wants both the control url and the staleness stamps the
+/// transport put on it.
+fn register_reply(env_id: &str, profile: &str) -> Result<Value> {
     let reply = socket_request(&json!({
         "op": "register",
         "env_id": env_id,
@@ -804,11 +1073,21 @@ pub fn register(env_id: &str, profile: &str) -> Result<String> {
             reply.get("error").and_then(Value::as_str).unwrap_or("unknown")
         );
     }
+    Ok(reply)
+}
+
+/// The control url out of a register reply.
+fn control_url_of(reply: &Value) -> Result<String> {
     reply
         .get("control_url")
         .and_then(Value::as_str)
         .map(str::to_string)
         .context("daemon register reply had no control_url")
+}
+
+/// Register (or heartbeat) a session with the daemon; returns its control url.
+pub fn register(env_id: &str, profile: &str) -> Result<String> {
+    control_url_of(&register_reply(env_id, profile)?)
 }
 
 /// Heartbeat is a re-register — the same idempotent op keeps the entry alive.
@@ -817,8 +1096,19 @@ pub fn register(env_id: &str, profile: &str) -> Result<String> {
 /// which may CHANGE across a respawn (a fresh listener, a new port) — the caller
 /// re-declares when it moves. `None` only if the daemon cannot be brought up.
 pub fn register_supervised(env_id: &str, profile: &str) -> Option<String> {
-    if let Ok(url) = register(env_id, profile) {
-        return Some(url);
+    if let Ok(reply) = register_reply(env_id, profile) {
+        // A heartbeat is the FIRST thing that notices a deploy that landed while
+        // this browser was open, and for a user who will never type `ychrome
+        // status` it is the ONLY thing. Hand the ensure() decision the fact:
+        // either it retires an idle outdated daemon, or it says out loud that it
+        // will not, naming us as the reason. Once per daemon, because it is a
+        // notice, not a heartbeat.
+        if daemon_is_outdated(&reply)
+            && !already_announced(reply.get("pid").and_then(Value::as_u64).unwrap_or(0))
+        {
+            let _ = ensure();
+        }
+        return control_url_of(&reply).ok();
     }
     let _ = ensure();
     register(env_id, profile).ok()
@@ -949,5 +1239,104 @@ mod tests {
         queue.enqueue("e", 1, "toast", json!({ "title": "a" }));
         queue.ack("e#999"); // never minted
         assert_eq!(queue.pending.len(), 1);
+    }
+
+    /// Attach a session without going through `register`, which would bind a
+    /// listener and append to the real journal. Only the accounting is under
+    /// test here.
+    fn attach(daemon: &Daemon, env_id: &str, last_heartbeat: Instant) {
+        let entry = Arc::new(SessionEntry {
+            env_id: env_id.to_string(),
+            control: ControlState::new("default", env_id, 0),
+            control_url: "http://127.0.0.1:0".to_string(),
+            meta: Mutex::new(SessionMeta {
+                profile: "default".to_string(),
+                pid: 1,
+                last_heartbeat,
+                last_session_ping: None,
+                registered_seq: 0,
+            }),
+            queue: Mutex::new(Queue::default()),
+            stop: Arc::new(AtomicBool::new(false)),
+        });
+        daemon
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(env_id.to_string(), entry);
+    }
+
+    // The accounting the handover decision rests on. A session whose client is
+    // still heartbeating holds this daemon's control endpoint, pane draft and
+    // signer, so it must count; one that missed three beats is a client that
+    // already left, and counting it would pin an outdated daemon in place for
+    // the whole expiry window every time a browser was closed.
+    #[test]
+    fn live_sessions_are_the_ones_a_client_is_still_heartbeating_for() {
+        let daemon = Daemon::new();
+        assert!(daemon.live_session_ids().is_empty());
+        attach(&daemon, "env-b", Instant::now());
+        attach(&daemon, "env-a", Instant::now());
+        assert_eq!(daemon.live_session_ids(), vec!["env-a", "env-b"]);
+        attach(
+            &daemon,
+            "env-b",
+            Instant::now() - (SESSION_EXPIRE + Duration::from_secs(1)),
+        );
+        assert_eq!(
+            daemon.live_session_ids(),
+            vec!["env-a"],
+            "a client that stopped heartbeating holds nothing and must not hold a handover back"
+        );
+    }
+
+    // The predicate the whole fix turns on. ychrome's version has been 0.1.0
+    // since the daemon existed, so version equality alone declared every daemon
+    // current forever: the exe-stamp drift is the term that actually fires.
+    #[test]
+    fn a_daemon_is_outdated_when_its_version_moved_or_its_binary_did() {
+        let current = json!({ "ok": true, "version": VERSION, "stale": false });
+        assert!(!daemon_is_outdated(&current));
+
+        let replaced_binary = json!({ "ok": true, "version": VERSION, "stale": true });
+        assert!(
+            daemon_is_outdated(&replaced_binary),
+            "same version, new bytes on disk: this is the case that ships every rebuild"
+        );
+
+        let older_build = json!({ "ok": true, "version": "0.0.9", "stale": false });
+        assert!(daemon_is_outdated(&older_build));
+
+        // Most ops answer without a version. Judging those on `stale` alone is
+        // deliberate: a bare ack that read as outdated would send every
+        // deregister and every route into a handover.
+        let ack = json!({ "ok": true, "stale": false });
+        assert!(!daemon_is_outdated(&ack));
+        assert!(daemon_is_outdated(&json!({ "ok": true, "stale": true })));
+    }
+
+    // `/proc/self/exe` keeps naming a replaced binary as `<path> (deleted)`,
+    // which is precisely the state a client is in after a deploy — precisely
+    // when it must be able to spawn a daemon on the NEW code. Spawning the
+    // literal string is ENOENT, so the handover would hand over to nothing.
+    #[test]
+    fn a_replaced_binarys_deleted_marker_is_stripped_only_when_the_path_is_real() {
+        let dir = PathBuf::from(format!("/tmp/ych-exe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("ychrome");
+        std::fs::write(&real, b"#!/bin/true\n").unwrap();
+
+        let deleted = PathBuf::from(format!("{} (deleted)", real.display()));
+        assert_eq!(
+            spawnable_exe(deleted),
+            real,
+            "a client whose binary was replaced must still be able to spawn one"
+        );
+        // An ordinary path is untouched, and a marker over a path that really is
+        // gone stays as it is: failing loudly beats spawning something else.
+        assert_eq!(spawnable_exe(real.clone()), real);
+        let gone = PathBuf::from("/tmp/ych-exe-nonexistent (deleted)");
+        assert_eq!(spawnable_exe(gone.clone()), gone);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

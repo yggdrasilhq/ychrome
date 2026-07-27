@@ -831,15 +831,21 @@ fn run_status(as_json: bool) -> Result<()> {
     let pid = status["pid"].as_u64().unwrap_or(0);
     let uptime = status["uptime_secs"].as_u64().unwrap_or(0);
     let stale = status["stale"].as_bool().unwrap_or(false);
+    let held = status["live_sessions"].as_u64().unwrap_or(0);
     let vault = status["vault_agent_reachable"].as_bool().unwrap_or(false);
-    println!(
-        "ychrome daemon {version}  pid {pid}  up {uptime}s{}",
-        if stale {
-            "  [STALE — the binary on disk changed; restart the daemon]"
-        } else {
-            ""
+    println!("ychrome daemon {version}  pid {pid}  up {uptime}s");
+    // Reaching this line stale means `ensure()` already declined to retire it,
+    // which it only does when surfaces are attached. Say which of the two facts
+    // is keeping the old code alive, and name the verb that ends it.
+    if stale {
+        println!("  [STALE] this daemon is serving old code: the binary on disk changed after it started.");
+        if held > 0 {
+            println!(
+                "  [STALE] {held} live surface(s) are attached, so nothing retired it for you."
+            );
         }
-    );
+        println!("  [STALE] hand it over with:  ychrome daemon restart");
+    }
     println!(
         "vault agent: {}",
         if vault { "reachable" } else { "not reachable" }
@@ -863,11 +869,54 @@ fn run_status(as_json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `ychrome daemon restart` — the deliberate handover.
+///
+/// `ensure()` replaces an outdated daemon by itself only when nothing is
+/// attached to it. With live surfaces attached it refuses, because retiring it
+/// drops their sidebar rail, their pane drafts and any passkey signature in
+/// flight. This verb is the user saying "do it anyway, I am ready", and it
+/// reports what it cost rather than pretending it cost nothing.
+fn run_daemon_verb(sub: Option<&str>, as_json: bool) -> Result<()> {
+    match sub {
+        Some("restart") => {
+            let done = daemon::restart()?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&done)?);
+                return Ok(());
+            }
+            let new_pid = done["pid"].as_u64().unwrap_or(0);
+            match done["old_pid"].as_u64() {
+                Some(old) => println!("ychrome daemon restarted: pid {old} retired, pid {new_pid} now serving"),
+                None => println!("ychrome daemon started: pid {new_pid} now serving (none was running)"),
+            }
+            let rows = done["sessions_reattaching"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if rows.is_empty() {
+                println!("no surfaces were attached");
+            } else {
+                println!(
+                    "{} surface(s) re-register on their next heartbeat (~4s); pane drafts and \
+                     queued opens did not survive:",
+                    rows.len()
+                );
+                for row in &rows {
+                    println!("  {}", row.as_str().unwrap_or("?"));
+                }
+            }
+            Ok(())
+        }
+        Some(other) => bail!("unknown daemon verb {other:?} (known: restart)"),
+        None => bail!("usage: ychrome daemon restart"),
+    }
+}
+
 fn main() -> Result<()> {
-    // Two internal/agent entry points, dispatched off argv before clap so the
+    // Three internal/agent entry points, dispatched off argv before clap so the
     // open-a-url arg shape stays exactly as it was. `--daemon` is the host
     // daemon itself (spawned detached by the view client); `status` is the
-    // host-side truth for agents.
+    // host-side truth for agents; `daemon <verb>` supervises the running one.
     let raw: Vec<String> = std::env::args().collect();
     if raw.get(1).map(String::as_str) == Some("--daemon") {
         return daemon::run();
@@ -875,6 +924,10 @@ fn main() -> Result<()> {
     if raw.get(1).map(String::as_str) == Some("status") {
         let as_json = raw.iter().any(|arg| arg == "--json");
         return run_status(as_json);
+    }
+    if raw.get(1).map(String::as_str) == Some("daemon") {
+        let as_json = raw.iter().any(|arg| arg == "--json");
+        return run_daemon_verb(raw.get(2).map(String::as_str), as_json);
     }
 
     let args = Args::parse();
