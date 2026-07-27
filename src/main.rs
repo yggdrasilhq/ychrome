@@ -157,14 +157,26 @@ const TEMP_PROFILE: &str = "temp";
 /// The libyggterm web-surface control sequence (OSC 7717). Consumed by the
 /// yggterm GUI's terminal parser; invisible junk-free in plain terminals
 /// (unknown OSCs are ignored) — the degradation story is the channel itself.
-fn emit_web_surface_osc(action: &str, session: &str, url: &str, title: &str, profile: &str) {
+fn emit_web_surface_osc(
+    action: &str,
+    session: &str,
+    url: &str,
+    title: &str,
+    profile: &str,
+    start_page: bool,
+) {
     use base64::Engine as _;
+    // `start_page` tells the GUI this surface opened on the app's OWN start
+    // page rather than a user-chosen URL — which is what lets "continue tabs
+    // from last time" ADOPT the saved active page into this tab instead of
+    // parking it behind a fresh start page. Old GUIs ignore unknown keys.
     let payload = format!(
-        "{{\"session\":{},\"url\":{},\"title\":{},\"profile\":{}}}",
+        "{{\"session\":{},\"url\":{},\"title\":{},\"profile\":{},\"start_page\":{}}}",
         serde_json_string(session),
         serde_json_string(url),
         serde_json_string(title),
         serde_json_string(profile),
+        start_page,
     );
     let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
     let mut stdout = std::io::stdout().lock();
@@ -205,7 +217,7 @@ fn run_thin_client(session: &str, url: &str, title: &str, profile: &str) -> Resu
         })
         .context("installing Ctrl+C handler")?;
     }
-    drive_surface(session, url, title, profile, stop)
+    drive_surface(session, url, title, profile, false, stop)
 }
 
 /// The single owner of the web-surface loop: contribute the sidebar, open the
@@ -271,6 +283,7 @@ fn drive_surface(
     url: &str,
     title: &str,
     profile: &str,
+    start_page: bool,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     // ychrome CONTRIBUTES its vault and settings panes rather than yggterm
@@ -300,7 +313,7 @@ fn drive_surface(
             None
         }
     };
-    emit_web_surface_osc("open", session, url, title, profile);
+    emit_web_surface_osc("open", session, url, title, profile, start_page);
     eprintln!(
         "ychrome: web surface open — {url} [{profile}]  (Ctrl+C to close, Ctrl+Z / yggterm Zzz to suspend)"
     );
@@ -332,14 +345,14 @@ fn drive_surface(
         if last_tick.elapsed() > Duration::from_secs(3) {
             control_url = daemon::register_supervised(session, profile).or(control_url);
             redeclare(&control_url);
-            emit_web_surface_osc("open", session, url, title, profile);
+            emit_web_surface_osc("open", session, url, title, profile, start_page);
         }
         last_tick = std::time::Instant::now();
         ticks += 1;
         // Heartbeat every ~4s (20 × 200ms) — the GUI's liveness truth, and the
         // daemon re-register that keeps this session in the registry.
         if ticks.is_multiple_of(20) {
-            emit_web_surface_osc("heartbeat", session, url, title, profile);
+            emit_web_surface_osc("heartbeat", session, url, title, profile, start_page);
             // The daemon heartbeat: re-registering keeps the entry alive (the
             // reaper drops a session whose client goes quiet) and re-earns it
             // after a daemon respawn. A moved control url means a new listener —
@@ -353,7 +366,7 @@ fn drive_surface(
     }
     sidebar::emit_close(session);
     daemon::deregister(session);
-    emit_web_surface_osc("close", session, url, title, profile);
+    emit_web_surface_osc("close", session, url, title, profile, start_page);
     eprintln!("ychrome: web surface closed");
     Ok(())
 }
@@ -370,6 +383,9 @@ struct SurfaceTarget {
     /// OSC action for the current target: "pick" until the user chooses,
     /// "open" after.
     action: &'static str,
+    /// The chosen URL is the app's own start page (picker URL field left
+    /// empty), not a user-chosen destination.
+    start_page: bool,
 }
 
 /// Existing host-owned profiles, for the picker to list. Reads directory names
@@ -673,6 +689,7 @@ fn handle_picker_conn(stream: TcpStream, session: &str, target: &Arc<Mutex<Surfa
         "/" => respond_html(stream, 200, &picker_html(&enumerate_profiles())),
         "/open" => {
             let (raw_url, raw_profile) = parse_open_query(query);
+            let start_page = raw_url.trim().is_empty();
             let url = normalize_target_url(&raw_url);
             let profile = sanitize_profile(&raw_profile);
             let title = surface_title(&url, &profile);
@@ -683,6 +700,7 @@ fn handle_picker_conn(stream: TcpStream, session: &str, target: &Arc<Mutex<Surfa
                     title: title.clone(),
                     profile: profile.clone(),
                     action: "open",
+                    start_page,
                 };
             }
             eprintln!("ychrome: picker → {url} [{profile}]");
@@ -707,6 +725,7 @@ fn run_thin_client_picker(session: &str) -> Result<()> {
         title: "ychrome — choose a profile".to_string(),
         profile: "default".to_string(),
         action: "pick",
+        start_page: false,
     }));
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -736,7 +755,7 @@ fn run_thin_client_picker(session: &str) -> Result<()> {
     // `drive_surface`, the ONE loop that declares the sidebar before it opens.
     {
         let t = target.lock().unwrap();
-        emit_web_surface_osc(t.action, session, &t.url, &t.title, &t.profile);
+        emit_web_surface_osc(t.action, session, &t.url, &t.title, &t.profile, t.start_page);
         eprintln!("ychrome: profile picker open — {picker_url}  (Ctrl+C to close)");
     }
     let mut ticks: u32 = 0;
@@ -751,7 +770,7 @@ fn run_thin_client_picker(session: &str) -> Result<()> {
         {
             let t = target.lock().unwrap();
             if t.action == "open" {
-                break Some((t.url.clone(), t.title.clone(), t.profile.clone()));
+                break Some((t.url.clone(), t.title.clone(), t.profile.clone(), t.start_page));
             }
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -760,24 +779,26 @@ fn run_thin_client_picker(session: &str) -> Result<()> {
         // re-announce the picker.
         if last_tick.elapsed() > Duration::from_secs(3) {
             let t = target.lock().unwrap();
-            emit_web_surface_osc(t.action, session, &t.url, &t.title, &t.profile);
+            emit_web_surface_osc(t.action, session, &t.url, &t.title, &t.profile, t.start_page);
         }
         last_tick = std::time::Instant::now();
         ticks += 1;
         if ticks.is_multiple_of(20) {
             let t = target.lock().unwrap();
-            emit_web_surface_osc("pick", session, &t.url, &t.title, &t.profile);
+            emit_web_surface_osc("pick", session, &t.url, &t.title, &t.profile, t.start_page);
         }
     };
     match chosen {
         // Hand off to the shared loop: it declares the sidebar, emits the first
         // "open" (so DECLARE precedes OPEN), and heartbeats both. The detached
         // picker HTTP thread is orphaned but harmless — it dies with the process.
-        Some((url, title, profile)) => drive_surface(session, &url, &title, &profile, stop),
+        Some((url, title, profile, start_page)) => {
+            drive_surface(session, &url, &title, &profile, start_page, stop)
+        }
         // Ctrl+C during the picker phase: never opened a page, so just close.
         None => {
             let t = target.lock().unwrap();
-            emit_web_surface_osc("close", session, &t.url, &t.title, &t.profile);
+            emit_web_surface_osc("close", session, &t.url, &t.title, &t.profile, t.start_page);
             eprintln!("ychrome: web surface closed");
             Ok(())
         }
