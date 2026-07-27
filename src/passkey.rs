@@ -539,8 +539,9 @@ fn agent_request(request: &Value) -> Result<Value> {
 }
 
 /// A hex token of `bytes` random bytes, from the OS CSPRNG. Used for the bearer
-/// token and per-ceremony request ids — both must be unguessable.
-fn hex_token(bytes: usize) -> String {
+/// token, the per-ceremony request ids, and the sidebar's GUI control token —
+/// all three must be unguessable, and one minter is one place to get it right.
+pub(crate) fn hex_token(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     // /dev/urandom is the CSPRNG on the Linux hosts ychrome runs on. A short
     // read is impossible for a handful of bytes; treat any failure as fatal
