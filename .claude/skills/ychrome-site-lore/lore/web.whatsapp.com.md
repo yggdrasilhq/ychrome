@@ -85,3 +85,49 @@ the whole trick.
 - ychrome may print "the running daemon is serving OLD CODE ... N live surface(s)
   attached" at launch — a warning only; the new surface opens fine. Never
   `ychrome daemon restart` while another live surface is attached to it.
+
+
+## message-send-lexical-composer · WORKS
+task: send messages into a chat on the linked account, headless, with per-message verification
+model: claude-fable-5
+date: 2026-07-27
+tags: send, composer, lexical, react, keyboard, deep-link, preempted, surface-not-mapped
+
+**`web do type` and a `do click` on the Send button are both ACCEPTED but neither
+commits on this React/Lexical composer** — `accepted:true` means the synthetic event
+was delivered, not that the app took it. The working recipe is page-side:
+
+1. **Open the chat by deep link**, not by driving the search UI:
+   `web eval "location.href='https://web.whatsapp.com/send?phone=<E164>'; 'nav'"` —
+   full SPA reload (~10-15 s), login restores from the jar. Composer probe:
+   `footer div[contenteditable=true]` count = 1; also check body text does NOT
+   contain "invalid" (bad-number modal).
+2. **Insert text with `web await`** (async body): focus the composer, then
+   `document.execCommand('insertText', false, TEXT)` with TEXT **JSON-encoded into
+   the script file** (never hand-escape through ssh quoting). The commit is ASYNC —
+   read `innerText.length` only after ~500 ms or you'll read the empty state.
+3. **Send with a synthetic Enter**, not the button: dispatch
+   `keydown/keypress/keyup` KeyboardEvents (`key:'Enter', keyCode:13, bubbles:true`)
+   on the composer. Composer length back to ≤1 ⇒ sent. The Send button today is
+   `aria-label "Send"` / `data-icon "wds-ic-send-filled"` (the old
+   `span[data-icon=send]` selector is dead), and a synthetic click on it does NOT
+   fire its handler.
+4. **Verify without reading the chat**: prefix-match your own sent text against
+   `span.selectable-text` (booleans only), and `[data-icon="msg-time"]` count 0 =
+   nothing stuck pending. Keep every probe boolean/count-shaped — the page is a
+   real inbox now.
+
+### Traps that cost a round each
+
+- **Composer accumulation**: a failed send leaves the text in place and every retry
+  APPENDS. Read composer length before inserting; clear with
+  `execCommand selectAll` + `delete` (also async — re-read after ~300 ms).
+- **Reveal-then-leave kills the do plane twice over**: after the human co-browses
+  the surface (QR scan) and navigates away, `do` verbs refuse `preempted` (the
+  shared batch id is locked out), and `--new-batch` then hits `surface_not_mapped`
+  (the webview is fully hidden, not soft-stashed). Recovery that KEEPS the login:
+  `web close --session` → `web ensure --session` (rebuilds mapped-headless from the
+  daemon declare; `forget()` clears the preempt lane on recreate; the jar carries
+  the login). `web ensure` alone will not remap a live-but-hidden page.
+- The `web` verb plane lives in the **GUI binary** (`yggterm server app web …`);
+  `yggterm-headless` answers "unsupported app control command: web".
