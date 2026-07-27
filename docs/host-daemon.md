@@ -194,6 +194,51 @@ stale-daemon class ("2.10.3 running for 19h while the fix sat on disk")
 cannot silently recur in ychrome. The same staleness rides the /ping reply
 so the GUI settings pane can show "daemon outdated, restart".
 
+### 6.1 The staleness handover (BUILT 2026-07-27)
+
+A stamp nothing acts on is a stamp that watches the bug happen. `status` has
+reported `stale: true` since the daemon shipped, and dev's daemon still served
+6.7 days of old code behind it, because `ensure()` compared only the REPORTED
+VERSION and ychrome's version is the constant `0.1.0`. Two failure modes bound
+the fix, and neither may be traded for the other:
+
+- **No silent old-code serving.** "Different version" and "the binary on disk
+  changed after it started" are ONE condition to a client: outdated.
+- **No silent kills.** The daemon holds every attached surface's control
+  endpoint, its sidebar pane draft, its command queue and its passkey signer.
+  None of that survives its exit and the surface cannot ask for it back, so an
+  outdated daemon with a surface attached is not retired for the user's
+  convenience.
+
+Who owns which fact:
+
+| Fact | Owner |
+|---|---|
+| "is this daemon outdated" | the client (`daemon_is_outdated`: version, plus the daemon's own `stale`) |
+| "is anything attached to me" | the DAEMON (`live_session_ids`: sessions inside `SESSION_EXPIRE`) |
+| "may I retire, now" | the daemon, in ONE round trip (`retire_if_idle`) |
+
+`retire_if_idle` reaps first, counts under its own lock, and either exits
+(`retiring: true`) or names what holds it (`held_by`). A client that asked "are
+you idle?" and then said "stop" would be acting on a fact that could change
+between the two round trips; this cannot. A retiring daemon unlinks its socket
+BEFORE it answers, so a successor's bind cannot race the predecessor's cleanup:
+unlinking afterwards let an outgoing daemon delete the SUCCESSOR's socket and
+strand it, listening and unreachable.
+
+Every reply on the socket carries `pid`, `stale` and `live_sessions`, so no verb
+can answer without saying whether it is old code and no client has to remember
+to ask. An outdated daemon with surfaces attached is announced on stderr once
+per daemon (a client heartbeating every 4s would otherwise repeat it forever),
+naming the pid and the remedy. `ychrome daemon restart` is the ONLY path that
+retires a busy daemon; it reports which sessions re-register (~4s) and does not
+pretend the pane drafts and queued opens came back.
+
+**The one-deploy cost.** A daemon older than `retire_if_idle` cannot answer it,
+and so cannot be asked what it is holding. It is treated as busy: loud, never
+killed. Installing this change therefore leaves each host's running daemon in
+place until someone runs `ychrome daemon restart` there, once.
+
 ## 7. The agent engine mounts here (settled)
 
 `docs/agent-engine.md` §3 is amended: no separate `engine.sock`/token/
@@ -214,6 +259,12 @@ campaign inherits a home instead of building one.
 - **Mixed fleet mid-deploy**: old per-invocation ychrome processes keep
   declaring their own URLs; the GUI follows whatever a declare carries.
   No flag day.
+- **Daemon outdated after a rebuild**: idle ⇒ the next invocation hands it
+  over and nobody notices; attached ⇒ it keeps serving, every invocation
+  says so on stderr, and `ychrome daemon restart` ends it (§6.1). A client
+  whose own binary was replaced can still spawn the successor: the
+  `<path> (deleted)` that `/proc/self/exe` reports is stripped back to the
+  real path, or the spawn would fail with ENOENT exactly when it matters.
 
 ## 9. Security
 
