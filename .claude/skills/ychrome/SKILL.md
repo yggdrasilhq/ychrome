@@ -312,9 +312,24 @@ prerequisite).
   (the yedit pattern). `ychrome --daemon` runs it. Singleton via the unix-socket
   bind itself (`~/.yggterm/ychrome/daemon.sock`, 0600); a stale socket is
   reclaimed. `~/.yggterm/ychrome/journal.jsonl` audits every route/deliver/drop/
-  reap. **A fleet deploy self-heals:** the view client's `ensure()` stops a
-  running daemon whose version differs from its own and respawns it, so the next
-  `ychrome` invocation after a deploy rebuilds the registry in one heartbeat.
+  reap.
+- **⛔ The stale-daemon trap, ychrome's own version** (fixed 2026-07-27; dev's
+  daemon had served old code for 6.7 days before it was). `ensure()` used to
+  compare only the daemon's REPORTED VERSION, and ychrome's version is the
+  constant `0.1.0` — so every rebuild left the running daemon serving the old
+  code forever, with `status` printing `[STALE]` at nobody. Now:
+  - **idle** (no session heartbeating): the next `ychrome` invocation hands it
+    over by itself, new pid, new stamp, nothing to notice;
+  - **attached**: it is NOT retired. It holds those surfaces' control endpoints,
+    pane drafts, queues and passkey signer, and none of that survives its exit.
+    Every invocation says so on stderr, once per daemon, naming the pid;
+  - `ychrome daemon restart` is the deliberate handover, the only path that
+    retires a busy daemon. It names the sessions that re-register (~4s).
+  - The idle-or-attached call belongs to the DAEMON (`retire_if_idle`, one
+    round trip under its own lock), never to the client. Do not re-derive it
+    from `status` in a caller.
+  - A daemon older than that verb cannot answer it, so it is treated as busy:
+    installing this costs one `ychrome daemon restart` per host, once.
 - **It owns every session's control endpoint** — one plain
   `http://127.0.0.1:<port>` listener per registered session (NOT a single port;
   see docs/host-daemon.md for why the appctl proxy forces this). The view client
@@ -337,7 +352,9 @@ prerequisite).
 - **`ychrome status [--json]`** — host-side truth for agents: the registry, queue
   depths, vault-agent reachability, config stamps, the daemon version, and a
   self-staleness stamp (`path@mtime`, the vault agent's precedent) so an old
-  daemon running while the fix sits on disk cannot silently recur.
+  daemon running while the fix sits on disk cannot silently recur. Every reply on
+  the socket carries `pid`, `stale` and `live_sessions`, whatever the op, so a
+  verb cannot answer without saying whether it is old code.
 
 Proven end-to-end on dev via socket + curl (register → skew-honest refuse →
 `?session=` ping → route → envelope drain → at-least-once re-send → ack →
@@ -455,6 +472,9 @@ extension** (the `extensions.rs` catalog, filtered to what is not installed).
 - Encrypting an edited field under the user key. → use the **cipher's** key.
 - `DELETE /api/ciphers/{id}` when you meant "trash". → that is the HARD delete.
 - Trusting a running agent after a rebuild. → `stop-agent`.
+- Trusting a running ychrome DAEMON after a rebuild. → it hands itself over when
+  idle; when surfaces are attached it says so and waits for
+  `ychrome daemon restart`. Never kill it to save the command.
 - A secret in a sidebar schema, an OSC payload, a flag, or an env var.
 - Two implementations of one vault rule (yggterm had the host matchers; they were
   deleted when `matching.rs` took ownership). One owner per concept.
