@@ -363,11 +363,15 @@ pub(crate) fn dispatch(state: &ControlState, req: &ParsedRequest) -> (u16, Value
         // before the page can call it). yggterm applies it to the webview.
         ("GET", "/policy") => {
             let profile = state.pane.lock().unwrap().profile.clone();
-            let mut policy = crate::webpolicy::policy(&profile).to_json();
-            if let Some(scripts) = policy["userscripts"].as_array_mut() {
-                scripts.insert(0, json!(state.signer.shim_userscript()));
-            }
-            (200, policy)
+            let mut policy = crate::webpolicy::policy(&profile);
+            // MAIN world, not the isolated default every user script gets: the
+            // shim exists to be called BY THE PAGE (`navigator.credentials`),
+            // and a patch installed in an isolated world is invisible from the
+            // page that needs it.
+            policy.prepend(
+                crate::userscript::Userscript::new(state.signer.shim_userscript()).in_main_world(),
+            );
+            (200, policy.to_json())
         }
         ("POST", "/action") => {
             if req.body.is_null() {
@@ -1788,6 +1792,36 @@ fn totp_script(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The passkey shim is the ONE script ychrome injects that must live in the
+    // page's own world: it replaces `navigator.credentials` for the PAGE to
+    // call, and a replacement made in an isolated world is invisible from the
+    // page. Every other script defaults to isolated, so the `/policy` route has
+    // to say `in_main_world()` out loud — and it has to go through `prepend`, or
+    // it lands in the legacy array only and a new GUI drops it.
+    //
+    // Source-anchored on the route arm, not the file: a `.in_main_world()`
+    // anywhere else must not satisfy this.
+    #[test]
+    fn the_policy_route_puts_the_passkey_shim_first_and_in_the_page_world() {
+        let source = include_str!("sidebar.rs");
+        let arm = source
+            .split("(\"GET\", \"/policy\") => {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n        }").next())
+            .expect("the /policy route arm is present");
+        assert!(
+            arm.contains("policy.prepend("),
+            "the shim must go through `Policy::prepend`, which owns BOTH wire \
+             shapes; splicing it into the JSON afterwards puts it in the legacy \
+             array only",
+        );
+        assert!(
+            arm.contains(".in_main_world()"),
+            "the passkey shim was left on the isolated default, where its patch \
+             to `navigator.credentials` is invisible to every page that calls it",
+        );
+    }
 
     // The active User-Agent preset is marked by SELECTION, the row vocabulary
     // yggterm already draws — never by a glyph smuggled into the title. The

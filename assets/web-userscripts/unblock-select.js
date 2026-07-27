@@ -1,4 +1,15 @@
+// ==UserScript==
+// @name        Re-enable selection & right-click
+// @world       isolated
+// @all-frames
+// @run-at      document-start
+// ==/UserScript==
 // ychrome bundled userscript: re-enable text selection and right-click.
+//
+// No @match: this one applies to every page by design. @all-frames because the
+// text you are trying to copy is very often inside an iframe, and an isolated
+// world is enough — it only touches the DOM and the event path, both of which
+// are shared across worlds. It needs nothing from the page's own globals.
 // Many sites disable copy/select/context-menu to stop you saving text or
 // images. This restores them: it strips the CSS `user-select:none`, removes the
 // inline handlers that swallow selectstart/copy/contextmenu, and stops those

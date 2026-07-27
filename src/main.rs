@@ -27,6 +27,7 @@ mod manifest;
 mod passkey;
 mod sidebar;
 mod useragent;
+mod userscript;
 mod webpolicy;
 mod webzoom;
 use clap::Parser;
