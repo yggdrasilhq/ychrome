@@ -463,40 +463,23 @@ extension** (the `extensions.rs` catalog, filtered to what is not installed).
 - Chrome extensions are impossible on WebKitGTK — content filters + userscripts
   instead.
 
-## Passkeys — BUILT AND SHIPPED (do not read this as unavailable)
+## Passkeys — BUILT AND SHIPPED
 
-**Moved out of "Still open" 2026-07-28.** The browser slice shipped 2026-07-10
-(ychrome `718e0b2` + yggterm 2.10.5 `f52dcb53`; 74 ychrome + 1057 shell tests;
-the presence dialog live-proven on the GUI host). An earlier revision of this file still
-listed passkeys as unbuilt, and on 2026-07-28 an agent trusted that entry over
-`src/passkey.rs` sitting beside it and told the user a passkey login was
-impossible. It is not.
+Shipped 2026-07-10 (ychrome 718e0b2 + yggterm 2.10.5). An earlier revision of
+this file listed passkeys under "Still open"; that was stale and cost an agent
+a run on 2026-07-28.
 
-What exists:
+- `ychrome-vault passkeys <item>` lists stored `fido2Credentials` — metadata
+  only; the key never leaves the agent and a listing cannot start a ceremony.
+- `src/passkey.rs` runs the ceremony: page -> shim -> `/fido2/get` -> Signer
+  -> OSC 7717 -> native presence dialog -> `/fido2/grant` -> agent
+  `fido2-assert` -> assertion. ES256 + `UserPresence` live in ychrome-vault
+  (`fido2.rs`), KAT-proven.
 
-- `ychrome-vault passkeys <item> [user]` lists stored `fido2Credentials` as
-  `rpId<TAB>user<TAB>credentialId<TAB>created`. **Metadata only, by design** —
-  the private key is never printed and a listing can never trigger a ceremony.
-- `src/passkey.rs` (~859 lines) is the browser half of the ceremony:
-  page -> `navigator.credentials` shim -> `POST /fido2/get` over the surface's
-  SOCKS loopback (bearer-token + origin/rpId gated) -> Signer -> **OSC 7717** ->
-  yggterm's native presence dialog -> `POST /fido2/grant` over `ssh -L` ->
-  agent `fido2-assert` -> assertion back to the page.
-- The ES256 signing and the `UserPresence` type live in `ychrome-vault`
-  (`fido2.rs`, `Vault::fido2_assert`), KAT-proven. The key is decrypted, used
-  once and zeroized **inside the agent**; only public assertion bytes leave it.
+Shape: **agent drives, operator approves once at the GUI.** A page can only
+trigger a ceremony, never answer one. Do not propose an auto-consent path.
 
-The operating shape is **the agent drives everything and the operator approves
-once at the GUI dialog.** That human gate is deliberate and load-bearing: a page
-can only *trigger* a ceremony, never answer one — the `request_id` is 128 bits
-of CSPRNG never exposed to it, and `/fido2/grant` is a GUI->app call that page
-egress cannot reach. Never try to route around it, and never propose an
-auto-consent path.
-
-⚠ **Still owed: full crypto E2E against a real relying party.** Every layer is
-tested in isolation but the round trip has not been proven against a live RP
-(it was gated on a vault unlock when the slice landed). Until someone lands
-that, treat a first real-RP login as the proof run and record the result here.
+⚠ Still owed: full crypto E2E against a real relying party.
 
 ## Anti-patterns
 
