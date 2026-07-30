@@ -940,6 +940,100 @@ fn run_daemon_verb(sub: Option<&str>, as_json: bool) -> Result<()> {
     }
 }
 
+/// What a SECOND invocation (`ychrome <url>` typed while a surface may already
+/// be running) does, decided from the daemon's routing reply plus the
+/// registry's answer for THIS terminal's stream. Pure, so the hijack lock can
+/// hold it down without a daemon.
+///
+/// The contract (yggterm pending-bugs "AGENT CO-BROWSE" A4): a second
+/// invocation NEVER replaces a running page.
+///   - Routed ⇒ the url became a NEW TAB in the running session (the daemon
+///     enqueued `open_tab`, the GUI verb that MINTS a tab); this process only
+///     reports that and exits 0 — the running CLI stays the session owner.
+///   - Not routed ⇒ anchor a NEW surface in THIS terminal, saying so out loud.
+///   - Not routed AND this terminal's stream already carries another client's
+///     live surface ⇒ REFUSE by name. The GUI keys web surfaces by PTY stream,
+///     so an anchor here would not open beside that surface's page — it would
+///     retarget it. A refusal the user can read beats a page they silently
+///     lose.
+#[derive(Debug, PartialEq, Eq)]
+enum SecondInvocation {
+    /// Say what happened, exit 0. Never anchors.
+    OpenedAsTab { session: String },
+    /// Anchor here, with the act and its reason named (never silent).
+    AnchorHere { notice: String },
+    /// Anchoring would replace a live surface's page on this same stream:
+    /// refuse loudly, exit nonzero.
+    Refuse { error: String },
+}
+
+/// Why routing did not deliver, phrased for the refusal line.
+fn route_refusal_clause(route_reply: Option<&serde_json::Value>) -> &'static str {
+    match route_reply.and_then(|reply| reply["reason"].as_str()) {
+        Some("gui_not_routing_capable") => " (its GUI predates tab routing)",
+        Some(_) => " (the daemon found no routable match)",
+        None => " (the daemon did not answer)",
+    }
+}
+
+fn plan_second_invocation(
+    profile: &str,
+    route_reply: Option<&serde_json::Value>,
+    live_anchor: Option<&daemon::LiveAnchor>,
+) -> SecondInvocation {
+    if let Some(reply) = route_reply
+        && reply["routed"].as_bool() == Some(true)
+    {
+        return SecondInvocation::OpenedAsTab {
+            session: reply["session"]
+                .as_str()
+                .unwrap_or("a running surface")
+                .to_string(),
+        };
+    }
+    // Not routed. This arm is the one that kills the hijack: an anchor lands
+    // on THIS terminal's PTY stream, and if another live client already owns a
+    // surface on it, the GUI's upsert would retarget that surface's page — the
+    // exact silent kill A4 reported. Refuse, whatever profile was asked for
+    // (the stream conflict is per-stream, not per-profile).
+    if let Some(anchor) = live_anchor {
+        return SecondInvocation::Refuse {
+            error: format!(
+                "this terminal's stream already carries a live [{}] surface (pid {}), and the \
+                 url could not be routed into it as a tab{} — anchoring here would REPLACE that \
+                 surface's page, so ychrome refuses. Open from another terminal, or close the \
+                 running surface first (`ychrome status` lists it).",
+                anchor.profile,
+                anchor.pid,
+                route_refusal_clause(route_reply),
+            ),
+        };
+    }
+    let notice = match route_reply {
+        Some(reply) if reply["reason"].as_str() == Some("gui_not_routing_capable") => format!(
+            "a running [{profile}] surface exists but its GUI predates tab routing — anchoring \
+             a new surface in this terminal instead (the running page is untouched)"
+        ),
+        Some(_) => format!(
+            "no running [{profile}] session to open a tab in — anchoring a new surface in this \
+             terminal"
+        ),
+        None => format!(
+            "ychrome daemon unreachable, cannot see running [{profile}] sessions — anchoring a \
+             new surface in this terminal"
+        ),
+    };
+    SecondInvocation::AnchorHere { notice }
+}
+
+/// The honest one-liner for a routed open. It says WHAT HAPPENED — a new tab
+/// in the running session, not a navigation — because the old line ("opened
+/// <url> in session <id>") read exactly like the page replacement A4's
+/// reporter watched destroy a live logged-in page.
+fn opened_as_tab_line(url: &str, profile: &str, session: &str) -> String {
+    format!("ychrome: opened {url} as a new tab in the running [{profile}] session ({session})")
+}
+
 fn main() -> Result<()> {
     // Three internal/agent entry points, dispatched off argv before clap so the
     // open-a-url arg shape stays exactly as it was. `--daemon` is the host
@@ -985,28 +1079,48 @@ fn main() -> Result<()> {
         if args.url.is_none() {
             return run_thin_client_picker(&session);
         }
-        // A url typed in a terminal ROUTES into a matching surface if one is
-        // open (Chrome-like: raise the session, open the tab), unless --here
-        // forces a new anchor in THIS terminal. No match (or no daemon, or a
-        // GUI too old to route) falls through and anchors here, exactly as
-        // before — the queue-and-ping transport is the only fleet-correct one
-        // (docs/host-daemon.md §4).
+        // A url typed in a terminal ROUTES into a matching running surface as
+        // a NEW TAB (Chrome-like: raise the session, add the tab; the running
+        // CLI stays the anchor and the session owner), unless --here forces a
+        // new anchor in THIS terminal. Anything not routed anchors here —
+        // LOUDLY, never silently, and NEVER onto a stream that already carries
+        // another client's live surface: the GUI keys web surfaces by PTY
+        // stream, so a second anchor on one stream does not open beside the
+        // running page, it RETARGETS it (the A4 hijack — a live logged-in page
+        // was destroyed mid-job this way). The queue-and-ping transport is the
+        // only fleet-correct one (docs/host-daemon.md §4).
         if !args.here {
-            match daemon::route(&args.profile, &raw_url, None, false) {
-                Ok(reply) if reply["routed"].as_bool() == Some(true) => {
-                    let target = reply["session"].as_str().unwrap_or("a running surface");
-                    println!("ychrome: opened {raw_url} in session {target}");
+            let route_reply = daemon::route(&args.profile, &raw_url, None, false).ok();
+            let routed = route_reply
+                .as_ref()
+                .is_some_and(|reply| reply["routed"].as_bool() == Some(true));
+            // The registry probe matters only when we are about to anchor; a
+            // routed url never anchors.
+            let anchor = if routed {
+                None
+            } else {
+                daemon::live_anchor(&session, std::process::id())
+            };
+            match plan_second_invocation(&args.profile, route_reply.as_ref(), anchor.as_ref()) {
+                SecondInvocation::OpenedAsTab { session: target } => {
+                    println!("{}", opened_as_tab_line(&raw_url, &args.profile, &target));
                     return Ok(());
                 }
-                Ok(reply) if reply["reason"].as_str() == Some("gui_not_routing_capable") => {
-                    eprintln!(
-                        "ychrome: a matching surface is open but its GUI predates command routing \
-                         — opening here instead"
-                    );
-                }
-                // no_match / no_such_session / no daemon: anchor here.
-                _ => {}
+                SecondInvocation::Refuse { error } => bail!("{error}"),
+                SecondInvocation::AnchorHere { notice } => eprintln!("ychrome: {notice}"),
             }
+        } else if let Some(anchor) = daemon::live_anchor(&session, std::process::id()) {
+            // --here means "a second surface in THIS terminal", but one stream
+            // holds one surface: forcing it would retarget the live surface's
+            // page, not open beside it. Same hijack, same refusal.
+            bail!(
+                "--here cannot anchor: this terminal's stream already carries a live [{}] \
+                 surface (pid {}), and a second anchor on one stream replaces its page instead \
+                 of opening beside it. Run from another terminal, or close that surface first \
+                 (`ychrome status` lists it).",
+                anchor.profile,
+                anchor.pid
+            );
         }
         let title = args.title.clone().unwrap_or_else(|| {
             Url::parse(&raw_url)
@@ -1115,4 +1229,149 @@ fn main() -> Result<()> {
             *control_flow = ControlFlow::Exit;
         }
     });
+}
+
+#[cfg(test)]
+mod second_invocation_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn live(profile: &str, pid: i64) -> daemon::LiveAnchor {
+        daemon::LiveAnchor {
+            pid,
+            profile: profile.to_string(),
+        }
+    }
+
+    // The browser convention, locked: a routed url became a NEW TAB in the
+    // running session; this process reports exactly that and exits — it never
+    // reaches an anchor. The message must NAME the act, because the old
+    // phrasing ("opened <url> in session <id>") was indistinguishable from
+    // the navigation that destroyed A4's live page.
+    #[test]
+    fn a_routed_url_reports_a_new_tab_in_the_running_session_and_never_anchors() {
+        let reply = json!({ "ok": true, "routed": true, "session": "env-1" });
+        assert_eq!(
+            plan_second_invocation("health", Some(&reply), None),
+            SecondInvocation::OpenedAsTab {
+                session: "env-1".to_string()
+            }
+        );
+        let line = opened_as_tab_line("https://example.com", "health", "env-1");
+        assert!(
+            line.contains("as a new tab in the running"),
+            "the routed line must say a NEW TAB was opened, not read like a navigation: {line}"
+        );
+        assert!(line.contains("[health]") && line.contains("env-1"));
+    }
+
+    // THE HIJACK LOCK (yggterm pending-bugs "AGENT CO-BROWSE" A4). When the
+    // url could not be routed and THIS terminal's stream already carries
+    // another client's live surface, the second invocation must REFUSE — every
+    // unrouted shape (no match, a pre-routing GUI, no daemon answer) included.
+    // The GUI keys surfaces by stream: an anchor here would retarget the live
+    // surface's page, which is precisely the silent page replacement this
+    // change exists to kill. If this test turns red, the hijack is back.
+    #[test]
+    fn an_unrouted_url_on_a_stream_with_a_live_anchor_is_refused_never_anchored() {
+        let anchor = live("health", 4242);
+        let unrouted_shapes: Vec<Option<serde_json::Value>> = vec![
+            Some(json!({ "ok": true, "routed": false, "reason": "no_match" })),
+            Some(json!({ "ok": true, "routed": false, "reason": "gui_not_routing_capable" })),
+            Some(json!({ "ok": false, "error": "malformed" })),
+            None, // daemon unreachable (defense in depth: the probe shares its socket)
+        ];
+        for reply in &unrouted_shapes {
+            match plan_second_invocation("work", reply.as_ref(), Some(&anchor)) {
+                SecondInvocation::Refuse { error } => {
+                    assert!(
+                        error.contains("REPLACE") && error.contains("refuses"),
+                        "the refusal must name the hijack it prevents: {error}"
+                    );
+                    assert!(
+                        error.contains("[health]") && error.contains("4242"),
+                        "the refusal must name the surface it protects: {error}"
+                    );
+                }
+                other => panic!(
+                    "an unrouted url over a live anchor must refuse, got {other:?} for {reply:?}"
+                ),
+            }
+        }
+    }
+
+    // The fallback is kept (anchor a new surface HERE when nothing routable
+    // exists and this stream is free) but it may never be silent: each shape
+    // names what it is about to do and why.
+    #[test]
+    fn every_anchor_fallback_names_the_act_out_loud() {
+        let cases: Vec<(Option<serde_json::Value>, &str)> = vec![
+            (
+                Some(json!({ "ok": true, "routed": false, "reason": "no_match" })),
+                "no running [work] session",
+            ),
+            (
+                Some(json!({ "ok": true, "routed": false, "reason": "gui_not_routing_capable" })),
+                "predates tab routing",
+            ),
+            (None, "daemon unreachable"),
+        ];
+        for (reply, expected) in &cases {
+            match plan_second_invocation("work", reply.as_ref(), None) {
+                SecondInvocation::AnchorHere { notice } => {
+                    assert!(
+                        notice.contains(expected),
+                        "the notice must name its reason ({expected}): {notice}"
+                    );
+                    assert!(
+                        notice.contains("anchoring a new surface in this terminal"),
+                        "the notice must name the act: {notice}"
+                    );
+                }
+                other => panic!("a free stream anchors here, got {other:?} for {reply:?}"),
+            }
+        }
+    }
+
+    // ANCHOR: the wiring in main(). The plan is only a lock if the
+    // second-invocation block actually consults it, the routed arm returns
+    // BEFORE the anchor call, and the refusal arm bails. A refactor that
+    // reverted to calling `daemon::route` and anchoring inline would leave
+    // every test above green while re-opening the hijack.
+    #[test]
+    fn main_routes_the_second_invocation_through_the_plan_before_any_anchor() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main() -> Result<()> {")
+            .nth(1)
+            .expect("main body present");
+        let plan_at = body
+            .find("plan_second_invocation(&args.profile")
+            .expect("main's url path must consult plan_second_invocation");
+        let anchor_at = body
+            .find("run_thin_client(&session, &raw_url")
+            .expect("the thin-client anchor call is present");
+        assert!(
+            plan_at < anchor_at,
+            "the plan must be consulted before the thin-client anchor"
+        );
+        let routed_arm = body
+            .split("SecondInvocation::OpenedAsTab { session: target } => {")
+            .nth(1)
+            .and_then(|rest| rest.split("SecondInvocation::Refuse").next())
+            .expect("the routed arm exists in main");
+        assert!(
+            routed_arm.contains("return Ok(())"),
+            "the routed arm must exit without anchoring"
+        );
+        assert!(
+            body.contains("SecondInvocation::Refuse { error } => bail!"),
+            "the refusal arm must exit nonzero, not fall through to an anchor"
+        );
+        // --here has the same stream-conflict guard: one stream, one surface.
+        assert!(
+            body.contains("else if let Some(anchor) = daemon::live_anchor(&session"),
+            "--here must consult the live-anchor probe before anchoring"
+        );
+    }
 }

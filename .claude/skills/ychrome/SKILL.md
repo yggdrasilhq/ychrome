@@ -339,11 +339,21 @@ prerequisite).
   ychrome did not serve before — liveness used to ride the OSC re-declare only.
 - **Routing** (`ychrome [--profile P] [--here] <url>`): a live registered session
   with the requested profile → the daemon enqueues `open_tab {url, raise:true}`
-  into ITS queue, the GUI drains it on the next ping, `--here` forces a new
-  anchor, no match anchors as before. **Skew honesty:** the daemon marks a session
+  into ITS queue, the GUI drains it on the next ping and MINTS A NEW TAB
+  (never a navigation of an existing one), and the CLI prints "opened <url> as
+  a new tab in the running [<profile>] session" and exits 0 — the running CLI
+  stays the anchor. **Skew honesty:** the daemon marks a session
   routing-capable only once it has seen a `?session=` ping; without it /route
   refuses and the CLI anchors with a warning rather than claiming a success it
-  cannot deliver. The fleet router is `ssh <host> ychrome <url>` — zero code.
+  cannot deliver. **No silent hijack (A4):** every unrouted fallback names the
+  act out loud before anchoring here, and if THIS terminal's stream already
+  carries another client's live surface the CLI REFUSES (exit nonzero) instead
+  of anchoring — the GUI keys surfaces by stream, so a second anchor on one
+  stream replaces the running page rather than opening beside it. `--here` has
+  the same stream-conflict guard; it still forces a new anchor when a match is
+  open ELSEWHERE. The pre-anchor probe is `daemon::live_anchor` (op `status`,
+  another pid's row, heartbeat within expiry). The fleet router is
+  `ssh <host> ychrome <url>` — zero code.
 - **Liveness / no phantom:** the client re-registers on its ~4s heartbeat; the
   daemon reaps a session ~14s after the last heartbeat, closing its control
   listener so the GUI's ping fails and the contribution expires — a SIGKILLed

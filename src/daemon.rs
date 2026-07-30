@@ -1201,6 +1201,55 @@ pub fn route(profile: &str, url: &str, session: Option<&str>, here: bool) -> Res
     socket_request(&request).context("asking the ychrome daemon to route")
 }
 
+/// A LIVE view client — some process other than the asking one — that anchors a
+/// session's PTY stream right now. The second-invocation path consults this
+/// before anchoring: the GUI keys web surfaces by stream, so anchoring onto a
+/// stream that already carries someone's live surface does not open beside
+/// their page, it replaces it (yggterm pending-bugs "AGENT CO-BROWSE" A4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveAnchor {
+    pub pid: i64,
+    pub profile: String,
+}
+
+/// Does another live client already anchor `env_id`'s stream? Reads the
+/// daemon's registry (op `status`, no daemon spawned). `None` when no daemon
+/// answers — the caller then knows nothing and must say so, not guess. A
+/// registry row counts only while its client is still heartbeating (within
+/// `SESSION_EXPIRE`): an expired row is a client that already left, and
+/// refusing on it would block a legitimate re-anchor after a crash.
+pub fn live_anchor(env_id: &str, self_pid: u32) -> Option<LiveAnchor> {
+    let reply = socket_request(&json!({ "op": "status" }))?;
+    live_anchor_in(&reply, env_id, self_pid)
+}
+
+fn live_anchor_in(reply: &Value, env_id: &str, self_pid: u32) -> Option<LiveAnchor> {
+    reply.get("sessions")?.as_array()?.iter().find_map(|row| {
+        if row.get("env_id").and_then(Value::as_str) != Some(env_id) {
+            return None;
+        }
+        let pid = row.get("pid").and_then(Value::as_i64).unwrap_or(0);
+        if pid == i64::from(self_pid) {
+            return None;
+        }
+        let beat_ms = row
+            .get("last_heartbeat_ms_ago")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX);
+        if u128::from(beat_ms) > SESSION_EXPIRE.as_millis() {
+            return None;
+        }
+        Some(LiveAnchor {
+            pid,
+            profile: row
+                .get("profile")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string(),
+        })
+    })
+}
+
 /// Fetch the daemon's status (spawns one if absent — a status query should not
 /// need a browser already open).
 pub fn status() -> Result<Value> {
@@ -1337,6 +1386,69 @@ mod tests {
             .lock()
             .unwrap()
             .insert(env_id.to_string(), entry);
+    }
+
+    // THE SECOND-INVOCATION CONTRACT, daemon half (yggterm pending-bugs "AGENT
+    // CO-BROWSE" A4): a url routed into a running session is enqueued as
+    // `open_tab` — the GUI verb that MINTS A NEW TAB (`open_command_tab` →
+    // `web_surface_new_tab` in yggterm-shell) — and never any kind that
+    // navigates an existing tab. If a "navigate"/"open" kind ever replaces
+    // this, a second `ychrome <url>` is back to destroying the running page.
+    #[test]
+    fn a_routed_url_is_enqueued_as_open_tab_never_a_page_navigation() {
+        let daemon = Daemon::new();
+        attach(&daemon, "env-a", Instant::now());
+        {
+            // Mark the GUI routing-capable (it pinged with ?session= recently).
+            let sessions = daemon.sessions.lock().unwrap();
+            let entry = sessions.get("env-a").unwrap();
+            entry.meta.lock().unwrap().last_session_ping = Some(Instant::now());
+        }
+        let reply = daemon.route("default", "https://example.com", None, false);
+        assert_eq!(reply["routed"], json!(true));
+        assert_eq!(reply["session"], json!("env-a"));
+        let sessions = daemon.sessions.lock().unwrap();
+        let queue = sessions.get("env-a").unwrap().queue.lock().unwrap();
+        assert_eq!(queue.pending.len(), 1);
+        assert_eq!(
+            queue.pending[0].kind, "open_tab",
+            "a routed url must become a NEW TAB in the target surface, never a navigation \
+             of an existing one"
+        );
+        assert_eq!(queue.pending[0].args["url"], json!("https://example.com"));
+        assert_eq!(queue.pending[0].args["raise"], json!(true));
+    }
+
+    // The pre-anchor probe the CLI's hijack refusal rests on: only ANOTHER
+    // pid's still-heartbeating row is a conflict. Our own registration, an
+    // expired row (a client that already left), a different session, and a
+    // reply with no registry at all are not.
+    #[test]
+    fn the_live_anchor_probe_sees_only_another_pids_live_entry() {
+        let status = json!({ "sessions": [
+            { "env_id": "env-a", "pid": 111, "profile": "health", "last_heartbeat_ms_ago": 2000 },
+            { "env_id": "env-b", "pid": 333, "profile": "default", "last_heartbeat_ms_ago": 99000 },
+        ]});
+        assert_eq!(
+            live_anchor_in(&status, "env-a", 999),
+            Some(LiveAnchor {
+                pid: 111,
+                profile: "health".to_string()
+            })
+        );
+        assert_eq!(
+            live_anchor_in(&status, "env-a", 111),
+            None,
+            "our own registration is not a conflict"
+        );
+        assert_eq!(
+            live_anchor_in(&status, "env-b", 999),
+            None,
+            "an expired row is a client that already left; refusing on it would block a \
+             legitimate re-anchor after a crash"
+        );
+        assert_eq!(live_anchor_in(&status, "env-x", 999), None);
+        assert_eq!(live_anchor_in(&json!({ "ok": true }), "env-a", 999), None);
     }
 
     // The accounting the handover decision rests on. A session whose client is
