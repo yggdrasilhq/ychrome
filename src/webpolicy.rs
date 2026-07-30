@@ -210,11 +210,13 @@ pub fn policy(profile: &str) -> Policy {
 }
 
 /// The per-script ALL-OR-NOTHING promotion gate (integrator-settled): a script
-/// whose every `@include` translated promotes whole; a script with ANY
-/// untranslatable `@include` is refused whole, loudly, naming each offending
-/// glob verbatim on stderr. Promoting the translatable subset is forbidden —
-/// the script would run on fewer pages than it declares, the same
-/// silent-wrong class as feeding a glob to WebKit verbatim.
+/// whose every `@include`/`@exclude` translated promotes whole; a script with
+/// ANY untranslatable one is refused whole, loudly, naming each offending
+/// line verbatim on stderr. Promoting the translatable subset is forbidden —
+/// the script would run on pages other than the ones it declares: fewer for a
+/// dropped `@include`, and for a dropped `@exclude` the very pages its author
+/// ruled out — the same silent-wrong class as feeding a glob to WebKit
+/// verbatim.
 ///
 /// Refused means refused from BOTH wire shapes. The legacy array would run
 /// the raw body on every page in the page's world, which is even further from
@@ -307,10 +309,44 @@ pub struct PolicyState {
     pub adblock_rule_count: usize,
     pub adblock_enabled: bool,
     pub adblock_profile_disabled: bool,
-    /// `(file stem, enabled)` for the SHARED userscripts: `name.js` = on,
-    /// `name.js.disabled` = off. Per-profile scripts are applied but not
-    /// toggled here — one owner per control.
-    pub userscripts: Vec<(String, bool)>,
+    /// The SHARED userscripts, one entry per on-disk file. Per-profile scripts
+    /// are applied but not toggled here — one owner per control.
+    pub userscripts: Vec<UserscriptStatus>,
+}
+
+/// One shared userscript as the settings pane sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserscriptStatus {
+    /// The file stem: `<stem>.js` / `<stem>.js.disabled` on this host's disk.
+    pub stem: String,
+    /// `<stem>.js` = on, `<stem>.js.disabled` = off. The FILENAME's answer;
+    /// a refused script still reads `true` here because the file is enabled —
+    /// which is exactly why `refusal` must travel beside it.
+    pub enabled: bool,
+    /// `Some(one-line summary)` when the promotion gate refuses this script
+    /// whole: it is injected NOWHERE, whatever `enabled` says, and the pane
+    /// must not present it as running. Read off the same parse the gate reads
+    /// ([`crate::userscript::Userscript::untranslatable_includes`] is the one
+    /// owner of the decision). `None` for a script that promotes — and for a
+    /// disabled one, where nothing is claiming to run in the first place.
+    pub refusal: Option<String>,
+}
+
+/// The pane's half of the promotion gate's verdict for one on-disk script:
+/// `Some(summary)` when [`promote_or_refuse`] would refuse it whole. The same
+/// decision datum — the parse's `untranslatable_includes` — read without the
+/// gate's stderr report, because the pane redraws on every click and the
+/// report is the policy BUILD's loudness, not the pane's.
+fn userscript_refusal(path: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(path).ok()?;
+    let script = crate::userscript::parse(&body);
+    if script.untranslatable_includes.is_empty() {
+        None
+    } else {
+        Some(crate::userscript::refusal_summary(
+            &script.untranslatable_includes,
+        ))
+    }
 }
 
 pub fn state(profile: &str) -> PolicyState {
@@ -323,20 +359,33 @@ pub fn state(profile: &str) -> PolicyState {
         .and_then(|value| value.as_array().map(Vec::len))
         .unwrap_or(0);
 
-    let mut userscripts: Vec<(String, bool)> = Vec::new();
+    let mut userscripts: Vec<UserscriptStatus> = Vec::new();
     if let Ok(dir) = shared_userscript_dir()
         && let Ok(entries) = std::fs::read_dir(dir)
     {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if let Some(stem) = name.strip_suffix(".js") {
-                userscripts.push((stem.to_string(), true));
+                userscripts.push(UserscriptStatus {
+                    stem: stem.to_string(),
+                    enabled: true,
+                    // An enabled file is CLAIMING to run, so its claim is
+                    // checked against the gate's verdict here — the pane must
+                    // never present a refused script as merely "Enabled".
+                    refusal: userscript_refusal(&entry.path()),
+                });
             } else if let Some(stem) = name.strip_suffix(".js.disabled") {
-                userscripts.push((stem.to_string(), false));
+                userscripts.push(UserscriptStatus {
+                    stem: stem.to_string(),
+                    enabled: false,
+                    refusal: None,
+                });
             }
         }
     }
-    userscripts.sort();
+    // Same order the old `(stem, enabled)` tuples sorted into: by stem, then
+    // disabled before enabled — deterministic across renders.
+    userscripts.sort_by(|a, b| (a.stem.as_str(), a.enabled).cmp(&(b.stem.as_str(), b.enabled)));
 
     PolicyState {
         adblock_rules_present: rules.is_some(),
@@ -641,6 +690,160 @@ mod tests {
         assert!(
             !body.contains(".map(|body| crate::userscript::parse"),
             "policy() collects raw parse results, bypassing the promotion gate"
+        );
+    }
+
+    /// Set on the CHILD half of the end-to-end pipeline lock below: seeing it
+    /// means "$HOME is a scratch dir the parent owns — run the real pipeline
+    /// and print what it produced". The child-process split is how a test can
+    /// own $HOME: the environment is process-global and the suite runs many
+    /// tests in parallel.
+    const PIPELINE_PROBE_VAR: &str = "YCHROME_POLICY_PIPELINE_PROBE";
+
+    /// How the child's answer is picked out of libtest's own output.
+    const PIPELINE_PROBE_PREFIX: &str = "ychrome-policy-pipeline-probe: ";
+
+    // THE BEHAVIOURAL BACKSTOP for the promotion gate — the reason a
+    // source-anchor bypass cannot survive a release build. This drives the
+    // REAL disk→`policy()`→`to_json()` pipeline (and `state()`, the pane's
+    // view of the same files) over a scratch $HOME and asserts on what
+    // actually ships. A decoy call that satisfies the source anchor above —
+    // `let _ = promote_or_refuse(..)` beside a raw `parse` — ships the
+    // poisoned script anyway, and fails HERE in every build profile, because
+    // nothing below leans on `debug_assert`.
+    #[test]
+    fn the_shipped_policy_never_carries_a_refused_script() {
+        if std::env::var(PIPELINE_PROBE_VAR).is_ok() {
+            // CHILD: $HOME is the parent's scratch dir.
+            let policy = policy("default");
+            let pane: Vec<Value> = state("default")
+                .userscripts
+                .iter()
+                .map(|script| {
+                    json!({
+                        "stem": script.stem,
+                        "enabled": script.enabled,
+                        "refusal": script.refusal,
+                    })
+                })
+                .collect();
+            let facts = json!({ "wire": policy.to_json(), "pane": pane });
+            println!("{PIPELINE_PROBE_PREFIX}{facts}");
+            return;
+        }
+
+        // PARENT: a scratch home with one promotable script and one the gate
+        // refuses — the review's exact shape, an @exclude whose wildcard-host
+        // glob cannot be proven equivalent to a match pattern.
+        let home =
+            std::env::temp_dir().join(format!("ychrome-policy-pipeline-{}", std::process::id()));
+        let scripts = home.join(".yggterm").join("web-userscripts");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&scripts).expect("scratch userscript dir");
+        std::fs::write(
+            scripts.join("clean.js"),
+            "// ==UserScript==\n\
+             // @match https://*.youtube.com/*\n\
+             // @exclude-match https://*.youtube.com/embed/*\n\
+             // @exclude https://m.youtube.com/embed*\n\
+             // ==/UserScript==\n\
+             clean_body();\n",
+        )
+        .expect("clean.js");
+        std::fs::write(
+            scripts.join("poisoned.js"),
+            "// ==UserScript==\n\
+             // @match https://*.youtube.com/*\n\
+             // @exclude https://*.youtube.com/embed/*\n\
+             // ==/UserScript==\n\
+             poisoned_body();\n",
+        )
+        .expect("poisoned.js");
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "webpolicy::tests::the_shipped_policy_never_carries_a_refused_script",
+                "--nocapture",
+            ])
+            .env("HOME", &home)
+            .env(PIPELINE_PROBE_VAR, "1")
+            .output()
+            .expect("spawning the pipeline probe");
+        let _ = std::fs::remove_dir_all(&home);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "the pipeline probe child failed:\n{stdout}\n{stderr}"
+        );
+        let line = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(PIPELINE_PROBE_PREFIX))
+            .unwrap_or_else(|| panic!("no probe line in:\n{stdout}"));
+        let facts: Value = serde_json::from_str(line).expect("probe facts parse");
+
+        // THE WIRE: the clean script ships in BOTH shapes, with its block-list
+        // intact; the refused script ships in NEITHER.
+        let wire = &facts["wire"];
+        let legacy: Vec<&str> = wire["userscripts"]
+            .as_array()
+            .expect("legacy array")
+            .iter()
+            .map(|body| body.as_str().expect("legacy bodies are strings"))
+            .collect();
+        assert!(legacy.iter().any(|body| body.contains("clean_body")));
+        assert!(
+            !legacy.iter().any(|body| body.contains("poisoned_body")),
+            "a refused script shipped on the legacy wire, unscoped in the page world"
+        );
+        let rich = wire["userscripts_v2"].as_array().expect("v2 array");
+        let clean = rich
+            .iter()
+            .find(|entry| {
+                entry["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("clean_body"))
+            })
+            .expect("the clean script promotes");
+        assert_eq!(clean["matches"][0], "https://*.youtube.com/*");
+        assert_eq!(clean["exclude_matches"][0], "https://*.youtube.com/embed/*");
+        assert_eq!(clean["exclude_matches"][1], "https://m.youtube.com/embed*");
+        assert!(
+            !rich.iter().any(|entry| {
+                entry["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("poisoned_body"))
+            }),
+            "a refused script shipped half-scoped on the v2 wire"
+        );
+
+        // THE LOUD HALF: the child's stderr carries the refusal, naming the
+        // offending @exclude line verbatim.
+        assert!(
+            stderr.contains("REFUSING userscript"),
+            "no refusal report on stderr:\n{stderr}"
+        );
+        assert!(stderr.contains("@exclude https://*.youtube.com/embed/*"));
+
+        // THE PANE: the refused script must not read as merely "enabled".
+        let pane = facts["pane"].as_array().expect("pane rows");
+        let poisoned = pane
+            .iter()
+            .find(|row| row["stem"] == "poisoned")
+            .expect("the pane lists the refused script");
+        let refusal = poisoned["refusal"]
+            .as_str()
+            .expect("the pane must carry the refusal, or the user's only clue is stderr");
+        assert!(refusal.contains("@exclude https://*.youtube.com/embed/*"));
+        let clean_row = pane
+            .iter()
+            .find(|row| row["stem"] == "clean")
+            .expect("the pane lists the clean script");
+        assert!(
+            clean_row["refusal"].is_null(),
+            "a promotable script must carry no refusal"
         );
     }
 

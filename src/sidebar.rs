@@ -1373,10 +1373,10 @@ fn settings_schema_from(
     // Everything EXCEPT sponsorblock: one list-row each, with Enable/Disable and
     // a Delete (the "toggle + trash icon" the design calls for).
     widgets.push(json!({"kind": "section", "text": "Userscripts"}));
-    let managed: Vec<&(String, bool)> = state
+    let managed: Vec<&crate::webpolicy::UserscriptStatus> = state
         .userscripts
         .iter()
-        .filter(|(stem, _)| stem != crate::extensions::SPONSORBLOCK_STEM)
+        .filter(|script| script.stem != crate::extensions::SPONSORBLOCK_STEM)
         .collect();
     if managed.is_empty() {
         widgets.push(json!({
@@ -1386,8 +1386,12 @@ fn settings_schema_from(
                      ~/.yggterm/web-userscripts/ on the host ychrome runs on.",
         }));
     }
-    for (stem, enabled) in managed {
-        widgets.push(userscript_row(stem, *enabled));
+    for script in managed {
+        widgets.push(userscript_row(
+            &script.stem,
+            script.enabled,
+            script.refusal.as_deref(),
+        ));
     }
 
     // The catalog, filtered to what is not already installed. "Installed" is read
@@ -1397,7 +1401,7 @@ fn settings_schema_from(
     let installed: std::collections::HashSet<&str> = state
         .userscripts
         .iter()
-        .map(|(stem, _)| stem.as_str())
+        .map(|script| script.stem.as_str())
         .collect();
     let installable: Vec<&crate::extensions::Extension> = crate::extensions::catalog()
         .iter()
@@ -1471,32 +1475,50 @@ fn sponsorblock_widgets(state: &crate::webpolicy::PolicyState) -> Vec<Value> {
     let installed = state
         .userscripts
         .iter()
-        .find(|(stem, _)| stem == crate::extensions::SPONSORBLOCK_STEM);
-    let Some((stem, enabled)) = installed else {
+        .find(|script| script.stem == crate::extensions::SPONSORBLOCK_STEM);
+    let Some(script) = installed else {
         return Vec::new();
     };
-    vec![
+    let mut widgets = vec![
         json!({"kind": "section", "text": "SponsorBlock"}),
         json!({
             "kind": "toggle",
-            "id": format!("{USERSCRIPT_ACTION_PREFIX}{stem}"),
-            "action": format!("{USERSCRIPT_ACTION_PREFIX}{stem}"),
+            "id": format!("{USERSCRIPT_ACTION_PREFIX}{}", script.stem),
+            "action": format!("{USERSCRIPT_ACTION_PREFIX}{}", script.stem),
             "label": "Skip YouTube sponsor segments",
-            "value": enabled,
+            // The toggle stays honest to the FILENAME (that is what it flips);
+            // a gate refusal — impossible for the bundled header, but a user
+            // can edit the file — is surfaced right under it.
+            "value": script.enabled,
         }),
-    ]
+    ];
+    if let Some(refusal) = &script.refusal {
+        widgets.push(json!({ "kind": "label", "muted": true, "text": refusal }));
+    }
+    widgets
 }
 
 /// One managed userscript as a list-row: its on/off state in the subtitle, an
 /// Enable/Disable action, and a Delete. Keyed by stem so Dioxus never patches one
 /// script's row into another's (identity, not index — the pane's hard-won rule).
-fn userscript_row(stem: &str, enabled: bool) -> Value {
+///
+/// A gate-refused script is on disk and enabled BY FILENAME, but injected
+/// nowhere — its subtitle carries the refusal (naming each offending line
+/// verbatim) instead of the lie "Enabled". The actions stay: refusal is a
+/// verdict on the header, not a lock-out, and Disable/Delete are exactly what
+/// a user may want to do with a script that runs nowhere.
+fn userscript_row(stem: &str, enabled: bool, refusal: Option<&str>) -> Value {
     let toggle_label = if enabled { "Disable" } else { "Enable" };
+    let subtitle = match refusal {
+        Some(refusal) => refusal.to_string(),
+        None if enabled => "Enabled".to_string(),
+        None => "Disabled".to_string(),
+    };
     json!({
         "kind": "list-row",
         "id": format!("script-{stem}"),
         "title": stem,
-        "subtitle": if enabled { "Enabled" } else { "Disabled" },
+        "subtitle": subtitle,
         "actions": [
             {
                 "action": format!("{USERSCRIPT_ACTION_PREFIX}{stem}"),
@@ -1921,7 +1943,11 @@ mod tests {
             adblock_profile_disabled: false,
             userscripts: userscripts
                 .iter()
-                .map(|(stem, on)| (stem.to_string(), *on))
+                .map(|(stem, on)| crate::webpolicy::UserscriptStatus {
+                    stem: stem.to_string(),
+                    enabled: *on,
+                    refusal: None,
+                })
                 .collect(),
         }
     }
@@ -2136,6 +2162,44 @@ mod tests {
             !widgets.iter().any(|w| w["id"] == "script-sponsorblock"),
             "sponsorblock leaked into the generic userscripts list"
         );
+    }
+
+    // A script the promotion gate refuses is on disk and "enabled" by
+    // filename, but injected NOWHERE. The pane must say that — a user who
+    // never reads the daemon's stderr must still learn why their script does
+    // nothing, and which header lines to fix.
+    #[test]
+    fn a_refused_script_is_not_presented_as_enabled() {
+        let mut state = policy_state(true, &[("broken", true)]);
+        state.userscripts[0].refusal =
+            Some("Refused — not injected: @exclude https://*.youtube.com/embed/*".to_string());
+        let schema = settings_schema_from("work", &PageContext::default(), &no_zoom(), &state);
+        let widgets = schema["widgets"].as_array().expect("widgets");
+        let row = widgets
+            .iter()
+            .find(|w| w["id"] == "script-broken")
+            .expect("broken row");
+        let subtitle = row["subtitle"].as_str().expect("subtitle");
+        assert_ne!(
+            subtitle, "Enabled",
+            "a refused script was presented as running"
+        );
+        assert!(
+            subtitle.contains("Refused"),
+            "the refusal state is invisible in the pane: {subtitle}"
+        );
+        assert!(
+            subtitle.contains("@exclude https://*.youtube.com/embed/*"),
+            "the refusal must name the offending line verbatim: {subtitle}"
+        );
+        // The row keeps its controls: refusal is a verdict, not a lock-out.
+        let actions: Vec<&str> = row["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["action"].as_str().unwrap())
+            .collect();
+        assert_eq!(actions, ["userscript:broken", "userscript-delete:broken"]);
     }
 
     // The catalog shows only what is NOT installed, judged against the SAME state
