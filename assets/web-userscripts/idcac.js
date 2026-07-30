@@ -1,3 +1,9 @@
+// ==UserScript==
+// @name        I still don't care about cookies
+// @world       isolated
+// @all-frames
+// @run-at      document-start
+// ==/UserScript==
 // I still don't care about cookies — ychrome's userscript substitute.
 //
 // WebKitGTK cannot run the real extension (no .crx), and the real extension's

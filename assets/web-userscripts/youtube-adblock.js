@@ -1,3 +1,10 @@
+// ==UserScript==
+// @name        YouTube Ad Defense
+// @match       https://*.youtube.com/*
+// @match       https://youtube.com/*
+// @world       main
+// @run-at      document-start
+// ==/UserScript==
 // ychrome bundled userscript: YouTube ad defense.
 //
 // YouTube's ads are FIRST-PARTY — they arrive on the same origin, in the same
