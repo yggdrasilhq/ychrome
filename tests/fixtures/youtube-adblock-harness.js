@@ -82,11 +82,47 @@ sandbox.location = {
     pathname: '/watch',
     href: `https://${hostname}/watch?v=dQw4w9WgXcQ`,
 };
+// A player the script can actually BIND to, so layer 2 (the DOM belt) is driven
+// rather than grepped: a source needle cannot tell a working `defuse()` from one
+// whose first statement is `return;`. Only what the script touches — the
+// `ad-showing` class, a <video> with a duration, and the skip button — each
+// reporting whether it was used.
+function makePlayer(options) {
+    const opts = options || {};
+    const video = {
+        duration: opts.duration === undefined ? 30 : opts.duration,
+        currentTime: 0,
+        playbackRate: 1,
+    };
+    const button = opts.skipButton
+        ? { offsetHeight: 20, offsetParent: {}, clicks: 0, click() { this.clicks += 1; } }
+        : null;
+    const classes = new Set(['html5-video-player']);
+    if (opts.adShowing) classes.add('ad-showing');
+    return {
+        isConnected: true,
+        video,
+        button,
+        classList: {
+            contains: (name) => classes.has(name),
+            add: (name) => classes.add(name),
+            remove: (name) => classes.delete(name),
+        },
+        querySelector(selector) {
+            if (selector === 'video') return video;
+            if (button && selector === opts.skipButton) return button;
+            return null;
+        },
+    };
+}
+let currentPlayer = null;
+const observers = [];
 sandbox.document = {
     readyState: 'complete',
     documentElement: {},
     addEventListener() {},
-    querySelector() {
+    querySelector(selector) {
+        if (selector === '.html5-video-player') return currentPlayer;
         return null;
     },
     querySelectorAll() {
@@ -95,9 +131,13 @@ sandbox.document = {
 };
 const domListeners = [];
 sandbox.addEventListener = (name, fn) => domListeners.push([name, fn]);
-sandbox.MutationObserver = function MutationObserver() {
-    this.observe = () => {};
-    this.disconnect = () => {};
+sandbox.MutationObserver = function MutationObserver(callback) {
+    this.callback = callback;
+    this.observe = () => observers.push(this);
+    this.disconnect = () => {
+        const at = observers.indexOf(this);
+        if (at >= 0) observers.splice(at, 1);
+    };
 };
 // No timers: the script must not be able to keep this process alive.
 sandbox.setInterval = () => 0;
@@ -216,6 +256,41 @@ async function main() {
     // 4. The inline `var ytInitialPlayerResponse = {...}` a cold load ships.
     sandbox.ytInitialPlayerResponse = playerResponseFixture();
     assertPruned('ytInitialPlayerResponse', sandbox.ytInitialPlayerResponse);
+
+    // 5. LAYER 2 — the DOM belt, DRIVEN. `dispatchNavigate` fires the same
+    // `yt-navigate-finish` the script binds to, which is how a real SPA
+    // transition reaches `ensureBound` → `onAdState` → `defuse`.
+    const dispatchNavigate = () => {
+        domListeners
+            .filter(([name]) => name === 'yt-navigate-finish')
+            .forEach(([, fn]) => fn({ type: 'yt-navigate-finish' }));
+    };
+
+    // (a) A skippable ad: the button the DOM offers must be clicked and counted.
+    currentPlayer = makePlayer({ adShowing: true, skipButton: '.ytp-ad-skip-button' });
+    dispatchNavigate();
+    check('layer 2 clicks the skip button an ad offers', currentPlayer.button.clicks >= 1);
+    check('…and counts the skip', sandbox.__yga_state.skipped >= 1);
+
+    // (b) UNSKIPPABLE: no button, so the ad must be run out — rate first, then
+    // the seek (some builds refuse the seek; the rate still runs it out).
+    currentPlayer = makePlayer({ adShowing: true, duration: 42 });
+    dispatchNavigate();
+    check('layer 2 forces the rate on an unskippable ad', currentPlayer.video.playbackRate > 1);
+    check('…and seeks it to the end', currentPlayer.video.currentTime === 42);
+    check('…and counts the fast-forward', sandbox.__yga_state.forwarded >= 1);
+
+    // (c) The rate must be HANDED BACK when the ad ends: the same <video> plays
+    // the feature, so a stuck 16× is a bug the user feels immediately.
+    currentPlayer.classList.remove('ad-showing');
+    observers.forEach((observer) => observer.callback([], observer));
+    check('the content video gets its normal rate back', currentPlayer.video.playbackRate === 1);
+
+    // (d) The negative that matters: with no ad on screen, nothing is touched.
+    currentPlayer = makePlayer({ adShowing: false, skipButton: '.ytp-ad-skip-button' });
+    dispatchNavigate();
+    check('with no ad up, layer 2 clicks nothing', currentPlayer.button.clicks === 0);
+    check('…and leaves the rate alone', currentPlayer.video.playbackRate === 1);
 
     console.log(`ALL OK (${checks.length} checks, host=${hostname})`);
 }
