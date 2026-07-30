@@ -602,7 +602,12 @@ fn handle_control_conn(daemon: &Daemon, entry: &SessionEntry, stream: TcpStream)
         // The liveness half of a ping is open (an older GUI must keep its rail
         // and its ad blocking across a mixed-version deploy); the QUEUE half is
         // not. See `ping_reply`.
-        let gui = request.control_token.as_deref() == Some(entry.control.control_token.as_str());
+        //
+        // Asked through the ONE owner of "is this the GUI" rather than compared
+        // here: a second copy of a secret comparison is a second thing to get
+        // wrong, and only the copy inside `ControlState` is what the gate tests
+        // exercise.
+        let gui = entry.control.gui_authorized(&request);
         let reply = daemon.ping_reply(entry, session_param.as_deref(), ack.as_deref(), gui);
         sidebar::respond_json(stream, 200, &reply, &request.path);
         return;
@@ -1548,11 +1553,20 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("\n}\n").next())
             .expect("handle_control_conn body present");
+        // Rewritten 2026-07-30: this needle used to anchor the token comparison
+        // SPELLED OUT here, which locked in a second copy of the gate's own
+        // authorization rule — the comparison existed in `ControlState` too, and
+        // only that one was under test. The contract is that the queue half is
+        // decided by the ONE owner, so that is what is anchored.
         assert!(
-            body.contains(
-                "request.control_token.as_deref() == Some(entry.control.control_token.as_str())"
-            ),
-            "the ping's queue half must be decided by the token the caller presented"
+            body.contains("let gui = entry.control.gui_authorized(&request);"),
+            "the ping's queue half must ask `ControlState::gui_authorized` — a \
+             comparison rewritten inline here is a second encoding of the gate's \
+             rule that no gate test would cover"
+        );
+        assert!(
+            !body.contains("== Some(entry.control.control_token.as_str())"),
+            "the token comparison is back inline in the connection handler"
         );
         assert!(
             body.contains("sidebar::respond_preflight(stream, &request.path)"),

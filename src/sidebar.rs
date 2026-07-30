@@ -24,9 +24,11 @@
 //! `~/.yggterm/web-adblock` + `web-userscripts` — which over ssh is the REMOTE
 //! host, not the GUI's. See [`crate::webpolicy`].
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -223,9 +225,11 @@ impl ControlState {
         }
     }
 
-    /// Does this request carry the GUI's control token? One owner for the
-    /// question every [`RouteAccess::GuiOnly`] route asks.
-    fn gui_authorized(&self, req: &ParsedRequest) -> bool {
+    /// Does this request carry the GUI's control token? THE ONE OWNER of that
+    /// question — the gate below and the daemon's `/ping` drain both ask it here
+    /// rather than re-comparing the field, because two comparisons of one secret
+    /// are two places to get it wrong and only one of them would be under test.
+    pub(crate) fn gui_authorized(&self, req: &ParsedRequest) -> bool {
         req.control_token.as_deref() == Some(self.control_token.as_str())
     }
 }
@@ -277,6 +281,30 @@ pub(crate) fn route_access(path: &str) -> RouteAccess {
     }
 }
 
+/// Must this request prove it is the GUI? [`route_access`] answers for the PATH;
+/// this adds the METHOD, and the difference is load-bearing.
+///
+/// [`RouteAccess::Open`]'s entire justification is that the three paths are
+/// **reads** — a policy body, a zoom map, liveness stamps. The classification is
+/// path-keyed (a preflight must classify identically), so on its own it says
+/// nothing about `POST /zoom`. Today no such arm exists in [`dispatch`] and the
+/// method falls through to a 404, which is why this was never a live hole; but
+/// the enum's promise — *"a route added later is gated unless it says
+/// otherwise"* — covered only a new PATH, and the day someone adds
+/// `("POST", "/zoom")` to persist a zoom level it would be page-callable with no
+/// gate and no failing test. A non-GET on an open path is not the thing that was
+/// opened, so it is gated like anything else.
+fn requires_gui_token(method: &str, path: &str) -> bool {
+    match route_access(path) {
+        RouteAccess::Open => method != "GET",
+        RouteAccess::GuiOnly => true,
+        // Both authenticate themselves: the signer's bearer token on the page
+        // routes, the per-ceremony `request_id` on grant/deny. `/fido2` is
+        // deliberately untouched by this gate.
+        RouteAccess::PageSigner | RouteAccess::Ceremony => false,
+    }
+}
+
 /// A refused request, as a value: what to journal and what to answer. Pure, so
 /// the audit line can be asserted without a filesystem.
 pub(crate) struct Refusal {
@@ -317,6 +345,111 @@ pub(crate) fn gui_only_refusal(method: &str, path: &str, presented: Option<&str>
             "route": path,
         }),
     }
+}
+
+/// How long one distinct refusal stays coalesced.
+const REFUSAL_COALESCE_WINDOW: Duration = Duration::from_secs(60);
+
+/// How many distinct refusals the ledger tracks before it folds the rest
+/// together. The KEY contains the attacker-chosen path, so an unbounded ledger
+/// is both a memory leak and a way to get one journal line per made-up path —
+/// i.e. the flood back again, wearing a different hat.
+const REFUSAL_LEDGER_MAX: usize = 64;
+
+/// One run of identical refusals: when it started, and how many have been
+/// swallowed since the last line was written.
+#[derive(Debug)]
+pub(crate) struct RefusalRun {
+    first_at: Instant,
+    suppressed: u64,
+}
+
+/// Should this refusal be WRITTEN, and if so how many repeats did it stand in
+/// for? `None` means it was counted and not written.
+///
+/// **Why refusals are rationed at all.** A refusal is page-driven: a page in an
+/// ychrome surface can loop `fetch('yggterm-appctl://x/action', {method:'POST'})`
+/// forever, and one appended line per attempt is an unbounded write to
+/// `journal.jsonl` in the user's home — a disk-fill the audit trail hands the
+/// attacker, and a way to drown the very sighting the trail exists to keep. The
+/// `command_drain_refused` line next door already reasons this way ("say it once
+/// per withheld batch, not once per 4s heartbeat"); this is the same rule for the
+/// path an attacker actually controls.
+///
+/// **What is never rationed:** the FIRST of any distinct refusal is always
+/// written, immediately. Coalescing may cost us the repetition count's precision;
+/// it may never cost us the sighting.
+pub(crate) fn note_refusal(
+    ledger: &mut HashMap<String, RefusalRun>,
+    key: &str,
+    now: Instant,
+    window: Duration,
+) -> Option<u64> {
+    // Which run does this refusal count under? Resolved BEFORE touching the
+    // ledger: a new key on a full ledger is folded into the overflow run, so a
+    // caller varying the path cannot mint a fresh unrationed slot per request.
+    //
+    // Resolved here rather than by recursing into the overflow key, which is how
+    // this was first written and is an infinite recursion rather than a bound —
+    // the recursive call finds the ledger just as full and the overflow key just
+    // as absent. Its own lock caught it as a stack overflow (2026-07-30).
+    let key = if ledger.contains_key(key) || ledger.len() < REFUSAL_LEDGER_MAX {
+        key
+    } else {
+        OVERFLOW_REFUSAL_KEY
+    };
+    if let Some(run) = ledger.get_mut(key) {
+        if now.duration_since(run.first_at) < window {
+            run.suppressed += 1;
+            return None;
+        }
+        // The window closed: write one line that accounts for everything the
+        // window swallowed, and start a fresh run.
+        let suppressed = run.suppressed;
+        run.first_at = now;
+        run.suppressed = 0;
+        return Some(suppressed);
+    }
+    // The overflow run is admitted even though it takes the map one past the cap:
+    // a bound that cannot record the fact that it was hit is not a bound.
+    ledger.insert(
+        key.to_string(),
+        RefusalRun {
+            first_at: now,
+            suppressed: 0,
+        },
+    );
+    Some(0)
+}
+
+/// The key every refusal past [`REFUSAL_LEDGER_MAX`] is counted under.
+pub(crate) const OVERFLOW_REFUSAL_KEY: &str = "<ledger overflow: many distinct routes refused>";
+
+fn refusal_ledger() -> &'static Mutex<HashMap<String, RefusalRun>> {
+    static LEDGER: OnceLock<Mutex<HashMap<String, RefusalRun>>> = OnceLock::new();
+    LEDGER.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Write a refusal to the audit journal, rationed by [`note_refusal`]. The
+/// suppressed count rides the line that does get written, so a flood is visible
+/// as a number rather than as a million lines.
+pub(crate) fn journal_refusal(refusal: &Refusal) {
+    let key = format!(
+        "{}|{}|{}",
+        refusal.data["method"], refusal.data["path"], refusal.data["token_presented"]
+    );
+    let mut ledger = refusal_ledger().lock().unwrap();
+    let Some(suppressed) = note_refusal(&mut ledger, &key, Instant::now(), REFUSAL_COALESCE_WINDOW)
+    else {
+        return;
+    };
+    drop(ledger);
+    let mut data = refusal.data.clone();
+    if suppressed > 0 {
+        data["suppressed_repeats"] = json!(suppressed);
+        data["suppressed_window_secs"] = json!(REFUSAL_COALESCE_WINDOW.as_secs());
+    }
+    crate::daemon::journal(refusal.event, data);
 }
 
 /// A control-endpoint HTTP request, parsed off the wire (request line, headers,
@@ -490,9 +623,9 @@ pub(crate) fn dispatch(state: &ControlState, req: &ParsedRequest) -> (u16, Value
     // credential into the page and rewrite the profile's content policy, and the
     // control port is page-reachable through yggterm's `yggterm-appctl://`
     // bridge. Before 2026-07-27 `POST /action` had no gate at all.
-    if route_access(&req.path) == RouteAccess::GuiOnly && !state.gui_authorized(req) {
+    if requires_gui_token(&req.method, &req.path) && !state.gui_authorized(req) {
         let refusal = gui_only_refusal(&req.method, &req.path, req.control_token.as_deref());
-        crate::daemon::journal(refusal.event, refusal.data);
+        journal_refusal(&refusal);
         return (403, refusal.body);
     }
     let query = req.query.as_str();
@@ -661,7 +794,9 @@ pub(crate) fn respond_preflight(mut stream: TcpStream, path: &str) {
     if access != RouteAccess::PageSigner {
         if access == RouteAccess::GuiOnly {
             let refusal = gui_only_refusal("OPTIONS", path, None);
-            crate::daemon::journal(refusal.event, refusal.data);
+            // Rationed like every other refusal: a preflight is as cheap for a
+            // page to loop as the real request is.
+            journal_refusal(&refusal);
             write_json(stream, 403, &refusal.body, "");
             return;
         }
@@ -2919,6 +3054,172 @@ mod tests {
         );
     }
 
+    /// A refusal is page-driven, so the audit line it writes is page-driven too.
+    /// Unrationed, a page looping `POST /action` appends to `journal.jsonl`
+    /// forever: a disk-fill in the user's home, and a way to drown the sighting
+    /// the journal exists to preserve.
+    ///
+    /// The contract: the FIRST of any distinct refusal is written immediately
+    /// (coalescing may never cost us the sighting), repeats inside the window are
+    /// counted instead of written, and the count rides the next line that IS
+    /// written so a flood reads as a number.
+    #[test]
+    fn a_flood_of_refusals_is_counted_rather_than_written_but_the_first_is_never_lost() {
+        let mut ledger = HashMap::new();
+        let t0 = Instant::now();
+        let window = Duration::from_secs(60);
+
+        assert_eq!(
+            note_refusal(&mut ledger, "POST|/action|false", t0, window),
+            Some(0),
+            "the first sighting of a refusal must ALWAYS be written, at once"
+        );
+        for i in 1..500 {
+            assert_eq!(
+                note_refusal(
+                    &mut ledger,
+                    "POST|/action|false",
+                    t0 + Duration::from_millis(i),
+                    window
+                ),
+                None,
+                "a repeat inside the window must be counted, not written"
+            );
+        }
+        assert_eq!(
+            note_refusal(
+                &mut ledger,
+                "POST|/action|false",
+                t0 + Duration::from_secs(61),
+                window
+            ),
+            Some(499),
+            "the line that reopens the window must account for everything the \
+             window swallowed"
+        );
+        assert_eq!(
+            note_refusal(
+                &mut ledger,
+                "POST|/action|false",
+                t0 + Duration::from_secs(62),
+                window
+            ),
+            None,
+            "and the new window coalesces again from there"
+        );
+
+        // A DIFFERENT refusal is a different sighting and is written at once —
+        // rationing is per-refusal, not a global throttle that a first attack
+        // could hide a second one behind.
+        assert_eq!(
+            note_refusal(&mut ledger, "GET|/pane/vault|false", t0, window),
+            Some(0)
+        );
+    }
+
+    /// The ledger's key carries the attacker-chosen path, so the ledger itself
+    /// must be bounded — otherwise varying the path mints a fresh unrationed slot
+    /// per request and the flood is back, as both unbounded memory and one
+    /// written line per made-up route.
+    #[test]
+    fn varying_the_path_cannot_mint_unlimited_unrationed_journal_slots() {
+        let mut ledger = HashMap::new();
+        let t0 = Instant::now();
+        let window = Duration::from_secs(60);
+
+        for i in 0..REFUSAL_LEDGER_MAX {
+            assert_eq!(
+                note_refusal(&mut ledger, &format!("POST|/made-up-{i}|false"), t0, window),
+                Some(0),
+                "a genuinely distinct route is a distinct sighting while there is room"
+            );
+        }
+        assert_eq!(ledger.len(), REFUSAL_LEDGER_MAX);
+
+        // Past capacity the overflow run absorbs everything: ONE new key, one
+        // written line, and then counting.
+        assert_eq!(
+            note_refusal(&mut ledger, "POST|/made-up-overflow-1|false", t0, window),
+            Some(0),
+            "the overflow run announces itself once"
+        );
+        for i in 2..1000 {
+            assert_eq!(
+                note_refusal(
+                    &mut ledger,
+                    &format!("POST|/made-up-overflow-{i}|false"),
+                    t0,
+                    window
+                ),
+                None,
+                "every further made-up route is counted under the overflow run"
+            );
+        }
+        assert_eq!(
+            ledger.len(),
+            REFUSAL_LEDGER_MAX + 1,
+            "the ledger must not grow past its cap plus the single overflow run — \
+             it is fed by an attacker-chosen string"
+        );
+        assert!(
+            ledger.contains_key(OVERFLOW_REFUSAL_KEY),
+            "the overflow must be accounted under a named key, so the journal says \
+             'many distinct routes refused' rather than going quiet"
+        );
+    }
+
+    /// The open list opens a READ, not a path. `/policy` and `/zoom` are Open
+    /// because a GET of them is a read with no secret in it — so a POST to the
+    /// same path is gated, and stays gated the day someone adds a
+    /// `("POST", "/zoom")` arm to persist a zoom level.
+    ///
+    /// This is the other axis of the fail-closed promise. `route_access` is
+    /// path-keyed (a preflight has to classify identically), so before this lock
+    /// the enum's guarantee covered a new PATH only, and a new METHOD on an
+    /// already-open path would have been page-callable with every test green.
+    #[test]
+    fn a_write_to_an_open_path_is_gated_even_though_the_path_is_open() {
+        let state = control_state();
+        for path in ["/policy", "/zoom", "/ping"] {
+            assert_eq!(
+                route_access(path),
+                RouteAccess::Open,
+                "{path} is still an open path — this lock is about the METHOD"
+            );
+            assert!(
+                !requires_gui_token("GET", path),
+                "the GET these paths exist for must stay open: {path}"
+            );
+            for method in ["POST", "PUT", "DELETE", "PATCH"] {
+                assert!(
+                    requires_gui_token(method, path),
+                    "{method} {path} is a write on an open path and must need the \
+                     GUI's token"
+                );
+                assert_eq!(
+                    dispatch(&state, &page_request(method, path, json!({}))).0,
+                    403,
+                    "{method} {path} must be refused for an untokened caller, not \
+                     fall through to a 404 that a new dispatch arm would turn into \
+                     a page-callable mutation"
+                );
+            }
+        }
+
+        // The GUI itself is never blocked by this: it presents the token.
+        assert_eq!(
+            dispatch(&state, &gui_request(&state, "POST", "/zoom", json!({}))).0,
+            404,
+            "a tokened write reaches the dispatch table (404 = no such arm today), \
+             so the gate is refusing the CALLER, not the method"
+        );
+
+        // And /fido2 keeps authenticating itself — the method axis must not drag
+        // the signer's POST routes into the control gate.
+        assert!(!requires_gui_token("POST", "/fido2/get"));
+        assert!(!requires_gui_token("POST", "/fido2/grant"));
+    }
+
     /// A refused request must leave an honest line, and that line must not leak
     /// the credential it is protecting.
     #[test]
@@ -2954,8 +3255,28 @@ mod tests {
             .and_then(|rest| rest.split("let query = req.query.as_str();").next())
             .expect("the gate sits at the top of dispatch");
         assert!(
-            gate.contains("crate::daemon::journal(refusal.event, refusal.data)"),
-            "a refused control request must be journalled, not silently dropped"
+            gate.contains("journal_refusal(&refusal)"),
+            "a refused control request must be journalled, not silently dropped — \
+             and through `journal_refusal`, which rations a page-driven flood \
+             rather than appending a line per attempt"
+        );
+        assert!(
+            !gate.contains("crate::daemon::journal("),
+            "the gate writes straight to the journal again, bypassing the \
+             rationing: a page looping this route can fill the disk"
+        );
+        // ANCHOR: and the gate must ask the METHOD-aware predicate. Asking
+        // `route_access` alone here is the hole `requires_gui_token` exists to
+        // close, and it would leave every other lock in this file green.
+        assert!(
+            gate.contains("requires_gui_token(&req.method, &req.path)"),
+            "the gate must classify on method AND path — a write to an open path \
+             is not the read that path was opened for"
+        );
+        assert!(
+            !gate.contains("route_access(&req.path) == RouteAccess::GuiOnly"),
+            "the gate is back to a path-only classification, so a `POST /zoom` arm \
+             added later would be page-callable"
         );
     }
 
