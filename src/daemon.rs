@@ -323,6 +323,11 @@ impl Daemon {
                 return Ok(json!({
                     "ok": true,
                     "control_url": entry.control_url,
+                    // Same token for the life of the session entry: the client
+                    // re-declares it on every ~4s heartbeat, and a token that
+                    // rotated would leave the GUI holding a stale one between
+                    // the rotation and the next declare.
+                    "control_token": entry.control.control_token,
                     "env_id": env_id,
                     "version": VERSION,
                 }));
@@ -362,11 +367,13 @@ impl Daemon {
             .lock()
             .unwrap()
             .insert(env_id.to_string(), Arc::clone(&entry));
+        let control_token = entry.control.control_token.clone();
         self.spawn_session_accept_loop(Arc::clone(&entry), listener);
         journal("register", json!({ "env_id": env_id, "profile": profile, "pid": pid, "port": port }));
         Ok(json!({
             "ok": true,
             "control_url": control_url,
+            "control_token": control_token,
             "env_id": env_id,
             "version": VERSION,
         }))
@@ -477,7 +484,22 @@ impl Daemon {
     /// Build a `/ping` reply for a session: the liveness stamps a declare would
     /// carry (so a policy/zoom edit made while running still propagates) plus the
     /// command envelope. Also records the routing-capability marker.
-    fn ping_reply(&self, entry: &SessionEntry, session_param: Option<&str>, ack: Option<&str>) -> Value {
+    ///
+    /// `gui` is whether the caller presented this session's control token. The
+    /// STAMPS are open — they are not secrets, and gating them would strand an
+    /// older GUI's rail (and its surfaces' ad blocking) on a mixed-version
+    /// deploy. The COMMAND QUEUE is not: draining is a mutation, and a page
+    /// reaching `/ping?ack=` through the appctl bridge could swallow the routed
+    /// `open_tab` the GUI was supposed to receive. An untokened ping therefore
+    /// gets stamps only — no drain, no ack, no expiry sweep — and the withheld
+    /// batch is journalled so a too-old GUI is diagnosable rather than silent.
+    fn ping_reply(
+        &self,
+        entry: &SessionEntry,
+        session_param: Option<&str>,
+        ack: Option<&str>,
+        gui: bool,
+    ) -> Value {
         let profile = {
             let mut meta = entry.meta.lock().unwrap();
             if session_param.is_some() {
@@ -485,19 +507,36 @@ impl Daemon {
             }
             meta.profile.clone()
         };
-        let mut queue = entry.queue.lock().unwrap();
-        if let Some(batch) = ack {
-            queue.ack(batch);
-        }
-        for dropped in queue.expire() {
-            journal("command_expired", json!({ "env_id": entry.env_id, "command_id": dropped }));
-        }
         let mut reply = json!({
             "app_name": "Ychrome",
             "policy_version": crate::webpolicy::policy_version(&profile),
             "zoom_version": crate::webzoom::zoom_version(),
             "daemon_stale": self.is_stale(),
         });
+        let mut queue = entry.queue.lock().unwrap();
+        if !gui {
+            // Say it once per withheld batch, not once per 4s heartbeat: an
+            // empty queue means nobody lost anything, and a caller that cannot
+            // prove it is the GUI is only interesting when it would have taken
+            // something.
+            if !queue.pending.is_empty() {
+                journal(
+                    "command_drain_refused",
+                    json!({
+                        "env_id": entry.env_id,
+                        "pending": queue.pending.len(),
+                        "reason": "the /ping caller presented no valid X-Ychrome-Control token",
+                    }),
+                );
+            }
+            return reply;
+        }
+        if let Some(batch) = ack {
+            queue.ack(batch);
+        }
+        for dropped in queue.expire() {
+            journal("command_expired", json!({ "env_id": entry.env_id, "command_id": dropped }));
+        }
         if let Some(commands) = queue.drain_batch(&entry.env_id) {
             reply["commands"] = commands;
         }
@@ -554,18 +593,27 @@ fn handle_control_conn(daemon: &Daemon, entry: &SessionEntry, stream: TcpStream)
         return;
     };
     if request.method == "OPTIONS" {
-        sidebar::respond_preflight(stream);
+        sidebar::respond_preflight(stream, &request.path);
         return;
     }
     if request.method == "GET" && request.path == "/ping" {
         let session_param = sidebar::query_value(&request.query, "session");
         let ack = sidebar::query_value(&request.query, "ack");
-        let reply = daemon.ping_reply(entry, session_param.as_deref(), ack.as_deref());
-        sidebar::respond_json(stream, 200, &reply);
+        // The liveness half of a ping is open (an older GUI must keep its rail
+        // and its ad blocking across a mixed-version deploy); the QUEUE half is
+        // not. See `ping_reply`.
+        //
+        // Asked through the ONE owner of "is this the GUI" rather than compared
+        // here: a second copy of a secret comparison is a second thing to get
+        // wrong, and only the copy inside `ControlState` is what the gate tests
+        // exercise.
+        let gui = entry.control.gui_authorized(&request);
+        let reply = daemon.ping_reply(entry, session_param.as_deref(), ack.as_deref(), gui);
+        sidebar::respond_json(stream, 200, &reply, &request.path);
         return;
     }
     let (status, body) = sidebar::dispatch(&entry.control, &request);
-    sidebar::respond_json(stream, status, &body);
+    sidebar::respond_json(stream, status, &body, &request.path);
 }
 
 // ---------------------------------------------------------------------------
@@ -673,8 +721,9 @@ fn handle_unix_conn(daemon: &Arc<Daemon>, stream: UnixStream) -> bool {
 }
 
 /// Append one audit line. Best-effort — the daemon must not die over a journal
-/// write. Every routed open, delivery, drop and reap lands here (§9).
-fn journal(event: &str, data: Value) {
+/// write. Every routed open, delivery, drop and reap lands here (§9) — and every
+/// REFUSED control request, which is why `sidebar` reaches for it too.
+pub(crate) fn journal(event: &str, data: Value) {
     let Ok(path) = journal_path() else { return };
     let line = json!({ "ts_ms": now_millis(), "event": event, "data": data });
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
@@ -1076,26 +1125,50 @@ fn register_reply(env_id: &str, profile: &str) -> Result<Value> {
     Ok(reply)
 }
 
-/// The control url out of a register reply.
-fn control_url_of(reply: &Value) -> Result<String> {
-    reply
+/// What a client needs to DECLARE its control endpoint: where it is, and the
+/// token the GUI must present on the endpoint's GUI-only routes.
+///
+/// The two travel together because they are one fact — "this session's control
+/// endpoint" — and splitting them is how a declare ends up carrying a url the
+/// GUI cannot actually drive. Equality is on both fields: a respawned daemon
+/// hands back a new port AND a new token, and either moving means re-declare.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ControlEndpoint {
+    pub url: String,
+    pub token: String,
+}
+
+/// The control endpoint out of a register reply. A reply with no `control_token`
+/// is an OLDER daemon (pre-gate); it answers with an empty token, which the gate
+/// treats as "no token" — the declare then carries an empty string and the GUI's
+/// GUI-only calls are refused rather than silently trusted.
+fn control_endpoint_of(reply: &Value) -> Result<ControlEndpoint> {
+    let url = reply
         .get("control_url")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .context("daemon register reply had no control_url")
+        .context("daemon register reply had no control_url")?;
+    let token = reply
+        .get("control_token")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Ok(ControlEndpoint { url, token })
 }
 
-/// Register (or heartbeat) a session with the daemon; returns its control url.
-pub fn register(env_id: &str, profile: &str) -> Result<String> {
-    control_url_of(&register_reply(env_id, profile)?)
+/// Register (or heartbeat) a session with the daemon; returns its control
+/// endpoint.
+pub fn register(env_id: &str, profile: &str) -> Result<ControlEndpoint> {
+    control_endpoint_of(&register_reply(env_id, profile)?)
 }
 
 /// Heartbeat is a re-register — the same idempotent op keeps the entry alive.
 /// Supervising: if the daemon has died, respawn it and re-register (the registry
-/// is soft state, rebuilt from exactly this). Returns the current control url,
-/// which may CHANGE across a respawn (a fresh listener, a new port) — the caller
-/// re-declares when it moves. `None` only if the daemon cannot be brought up.
-pub fn register_supervised(env_id: &str, profile: &str) -> Option<String> {
+/// is soft state, rebuilt from exactly this). Returns the current control
+/// endpoint, which may CHANGE across a respawn (a fresh listener, a new port,
+/// a new token) — the caller re-declares when it moves. `None` only if the
+/// daemon cannot be brought up.
+pub fn register_supervised(env_id: &str, profile: &str) -> Option<ControlEndpoint> {
     if let Ok(reply) = register_reply(env_id, profile) {
         // A heartbeat is the FIRST thing that notices a deploy that landed while
         // this browser was open, and for a user who will never type `ychrome
@@ -1108,7 +1181,7 @@ pub fn register_supervised(env_id: &str, profile: &str) -> Option<String> {
         {
             let _ = ensure();
         }
-        return control_url_of(&reply).ok();
+        return control_endpoint_of(&reply).ok();
     }
     let _ = ensure();
     register(env_id, profile).ok()
@@ -1338,5 +1411,170 @@ mod tests {
         let gone = PathBuf::from("/tmp/ych-exe-nonexistent (deleted)");
         assert_eq!(spawnable_exe(gone.clone()), gone);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // THE CONTROL-TOKEN GATE, daemon half: the ping's two halves.
+    // -----------------------------------------------------------------------
+
+    /// `/ping` is Open because an older GUI must keep its rail and its
+    /// surfaces' ad blocking across a mixed-version deploy — but the command
+    /// QUEUE is a mutation, and the control port is page-reachable through
+    /// yggterm's appctl bridge. An untokened caller therefore gets the stamps
+    /// and nothing else: no drain, so a page cannot swallow the routed
+    /// `open_tab` the GUI was supposed to receive.
+    #[test]
+    fn an_untokened_ping_gets_liveness_but_never_the_command_queue() {
+        let daemon = Daemon::new();
+        attach(&daemon, "env-a", Instant::now());
+        let entry = Arc::clone(daemon.sessions.lock().unwrap().get("env-a").unwrap());
+        entry
+            .queue
+            .lock()
+            .unwrap()
+            .enqueue("env-a", 1, "open_tab", json!({ "url": "https://x" }));
+
+        let refused = daemon.ping_reply(&entry, Some("env-a"), None, false);
+        assert_eq!(refused["app_name"], "Ychrome", "liveness must still answer");
+        assert!(
+            !refused.get("daemon_stale").is_none(),
+            "the stamps an older GUI needs must survive: {refused:?}"
+        );
+        assert!(
+            refused.get("commands").is_none(),
+            "an untokened ping must not drain the queue: {refused:?}"
+        );
+        assert_eq!(
+            entry.queue.lock().unwrap().pending.len(),
+            1,
+            "and the command must still be there for the real GUI"
+        );
+
+        let delivered = daemon.ping_reply(&entry, Some("env-a"), None, true);
+        let commands = delivered
+            .get("commands")
+            .expect("the GUI's tokened ping still drains its queue");
+        assert_eq!(commands["entries"][0]["kind"], "open_tab");
+    }
+
+    /// An untokened ping must not be able to ACK either — retiring a batch it
+    /// never received is how a page would make the GUI lose a command silently.
+    #[test]
+    fn an_untokened_ping_cannot_ack_a_batch_away() {
+        let daemon = Daemon::new();
+        attach(&daemon, "env-a", Instant::now());
+        let entry = Arc::clone(daemon.sessions.lock().unwrap().get("env-a").unwrap());
+        entry
+            .queue
+            .lock()
+            .unwrap()
+            .enqueue("env-a", 1, "toast", json!({ "title": "a" }));
+        let batch = daemon.ping_reply(&entry, Some("env-a"), None, true)["commands"]["batch_id"]
+            .as_str()
+            .expect("a drained batch is labelled")
+            .to_string();
+
+        daemon.ping_reply(&entry, Some("env-a"), Some(&batch), false);
+        assert_eq!(
+            entry.queue.lock().unwrap().pending.len(),
+            1,
+            "an untokened ack must retire nothing"
+        );
+        daemon.ping_reply(&entry, Some("env-a"), Some(&batch), true);
+        assert!(
+            entry.queue.lock().unwrap().pending.is_empty(),
+            "the GUI's own ack still retires the batch it confirmed"
+        );
+    }
+
+    /// The client learns its token from the register reply and puts it in the
+    /// declare. An OLDER daemon answers without one — that is an empty token,
+    /// which the gate reads as "no token" and refuses, rather than a `None` a
+    /// caller might paper over.
+    #[test]
+    fn the_register_reply_carries_the_control_token_and_an_old_daemons_absence_is_empty() {
+        let fresh = json!({
+            "ok": true,
+            "control_url": "http://127.0.0.1:41234",
+            "control_token": "tok-abc",
+        });
+        assert_eq!(
+            control_endpoint_of(&fresh).unwrap(),
+            ControlEndpoint {
+                url: "http://127.0.0.1:41234".to_string(),
+                token: "tok-abc".to_string(),
+            }
+        );
+
+        let pre_gate = json!({ "ok": true, "control_url": "http://127.0.0.1:41234" });
+        assert_eq!(control_endpoint_of(&pre_gate).unwrap().token, "");
+        assert!(control_endpoint_of(&json!({ "ok": true })).is_err());
+
+        // A moved port OR a moved token is a moved endpoint: the client
+        // re-declares on either, so the GUI can never hold half of a stale pair.
+        assert_ne!(
+            control_endpoint_of(&fresh).unwrap(),
+            control_endpoint_of(&json!({
+                "ok": true,
+                "control_url": "http://127.0.0.1:41234",
+                "control_token": "tok-xyz",
+            }))
+            .unwrap()
+        );
+
+        // ANCHOR: both arms of `register` — the heartbeat and the fresh bind —
+        // must answer with the token, or a re-registering client would declare
+        // an endpoint it cannot drive.
+        let source = include_str!("daemon.rs");
+        let body = source
+            .split("fn register(self: &Arc<Self>, env_id: &str, profile: &str, pid: i32)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn deregister").next())
+            .expect("register body present");
+        assert_eq!(
+            body.matches("\"control_token\":").count(),
+            2,
+            "both the heartbeat reply and the fresh-session reply must carry the token"
+        );
+    }
+
+    /// A gate is only worth something if the LIVE connection is wired to it, and
+    /// three of those wires are one-liners in `handle_control_conn` that no
+    /// in-process test can see from the outside: the caller's token must reach
+    /// the ping's queue half, and the request's PATH must reach both responders
+    /// (they choose the CORS headers, and the preflight decides which route may
+    /// be asked about cross-origin at all). Anchored, because a refactor that
+    /// dropped any one of them would leave every other lock in this file green.
+    #[test]
+    fn the_gate_is_wired_into_the_live_control_connection() {
+        let source = include_str!("daemon.rs");
+        let body = source
+            .split("fn handle_control_conn(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("handle_control_conn body present");
+        // Rewritten 2026-07-30: this needle used to anchor the token comparison
+        // SPELLED OUT here, which locked in a second copy of the gate's own
+        // authorization rule — the comparison existed in `ControlState` too, and
+        // only that one was under test. The contract is that the queue half is
+        // decided by the ONE owner, so that is what is anchored.
+        assert!(
+            body.contains("let gui = entry.control.gui_authorized(&request);"),
+            "the ping's queue half must ask `ControlState::gui_authorized` — a \
+             comparison rewritten inline here is a second encoding of the gate's \
+             rule that no gate test would cover"
+        );
+        assert!(
+            !body.contains("== Some(entry.control.control_token.as_str())"),
+            "the token comparison is back inline in the connection handler"
+        );
+        assert!(
+            body.contains("sidebar::respond_preflight(stream, &request.path)"),
+            "a preflight must be answered for the route it is asking about"
+        );
+        assert!(
+            body.contains("sidebar::respond_json(stream, status, &body, &request.path)"),
+            "a response's CORS headers must be chosen by the route that produced it"
+        );
     }
 }
