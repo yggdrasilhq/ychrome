@@ -125,11 +125,24 @@ ychrome [--profile P] [--here] <url>
 - **Route on profile match** (settled): a live registered session with the
   REQUESTED profile (the default profile when no flag) exists on this host
   → POST /route on the daemon socket → enqueue `open_tab {session, url,
-  raise:true}` → print "opened in <session>" → exit 0.
-- **No match → anchor here**, exactly today's behavior (thin client in a
-  yggterm terminal, standalone window outside one).
-- `--here` forces anchoring even when a match exists (the "I want a second
-  surface in THIS terminal" case).
+  raise:true}` → print "opened <url> as a new tab in the running
+  [<profile>] session" → exit 0. `open_tab` is the GUI verb that MINTS a
+  new tab; routing never navigates an existing one, and the message says
+  which of the two happened (the second-invocation hijack, pending-bugs
+  "AGENT CO-BROWSE" A4, is dead by contract and locked by test).
+- **No match → anchor here, LOUDLY**: today's fallback (thin client in a
+  yggterm terminal, standalone window outside one), but every unrouted
+  shape — no match, a pre-routing GUI, an unreachable daemon — names the
+  act on stderr before anchoring. Never silent.
+- **Never onto an occupied stream**: before anchoring, the CLI asks the
+  registry whether ANOTHER live client already anchors THIS terminal's
+  stream (`daemon::live_anchor`: another pid's row, heartbeat within the
+  expiry window). If so it REFUSES with a named error and a nonzero exit —
+  the GUI keys web surfaces by PTY stream, so a second anchor on one
+  stream would retarget the live surface's page, not open beside it.
+- `--here` forces anchoring even when a match exists ELSEWHERE (the "I
+  want a second surface in THIS terminal" case). It carries the same
+  occupied-stream refusal: one stream holds one surface.
 - **Deterministic pick** when several sessions share the profile: most
   recently registered wins; `--session <env_id>` disambiguates explicitly;
   the choice is journaled.
@@ -139,8 +152,8 @@ ychrome [--profile P] [--here] <url>
 - **Honesty under version skew**: the daemon marks a GUI as
   routing-capable when it has seen a `?session=` ping recently. If none,
   /route refuses and the CLI warns and anchors instead of printing a
-  success it cannot deliver. (One GUI exists; deploying it first makes
-  this transient.)
+  success it cannot deliver (subject to the occupied-stream refusal
+  above). (One GUI exists; deploying it first makes this transient.)
 - **The fleet router is ssh** (settled non-feature): `ssh dev ychrome
   <url>` routes on dev with dev's identity and egress. Documented recipe,
   zero code.
