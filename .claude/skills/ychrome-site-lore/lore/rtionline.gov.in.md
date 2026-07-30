@@ -731,3 +731,36 @@ is live.
 7. **Ignore whatever the portal page says.** Confirm from the debit SMS and the
    registration e-mail. Reconcile debits against registration numbers before
    declaring the session done.
+
+## t4-t7-filed-handset-identity-and-card-limit-traps · WORKS
+task: 
+model: claude-fable-5
+date: 2026-07-27
+tags: 
+
+Fifth run (2026-07-27 evening). **T4-T7 all filed: RBIND/R/E/26/NNNNN,
+UGCOM/R/E/26/NNNNN, DARPG/R/E/26/NNNNN, NITDP/R/E/26/NNNNN. Four debits, four
+registration numbers, reconciled.** Recipe held end to end. New traps:
+
+1. **HANDSET IDENTITY: a canary that ANSWERS is not a canary on the RIGHT STORE.**
+   The Pixel 7a (tailnet "lynx") receives IDFC debit-card/savings families and
+   passes every liveness canary, but has NO RTISMS, NO EJGRTI, NO WOW-card-NNNN
+   traffic ever. The true handset is the Pixel 8 (SIM NNNNNNNNNN).
+   Discriminator: the round-3 debit SMSes (26-07 21:43:32/22:05:16/22:13:49)
+   exist only on the true phone. Tailnet-dead != sshd-dead: it answered on the
+   home LAN (192.168.N.NNN:8022, and link-local via a the GUI host ProxyJump) all along.
+2. **Card-limit exhaustion mode:** 3DS OTP arrives, ACS accepts, THEN SBIePay says
+   FAILURE; the tell is the bank SMS "exceeds your available limit". Zero debit.
+3. **After a failed gateway txn, payment.php -> confirmpayment.php auto-verify ->
+   /forbidden.php kills the session.** No re-payment path; re-file fresh.
+4. **IDFC netbanking merchant OTP did not deliver** (2 dispatches incl. Resend,
+   0 arrivals in 4 min) while card-3DS/portal OTPs hit the same phone in ~60 s.
+   Login worked first try via fill-vault. Netbanking: login-provable,
+   OTP-unreliable; the card stays the rail.
+5. **Portal-OTP e-mail throttles late in a run** (6th dispatch in 30 min never
+   e-mailed; SMS copy still delivered over cellular during a wifi Doze gap).
+6. **A session held ~29 min at the OTP gate answers Forbidden** — the "well past
+   20 minutes" claim has a ceiling. Restart is cheap; the portal re-sends the
+   SAME unconsumed OTP code to the new session.
+7. Surface note: the payment surface died once ("web surface not live");
+   `web ensure` rebuilt it (generation bump), cookies re-imported, run continued.
