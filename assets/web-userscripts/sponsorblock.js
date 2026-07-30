@@ -1,8 +1,20 @@
+// ==UserScript==
+// @name        SponsorBlock
+// @match       https://*.youtube.com/*
+// @match       https://youtube.com/*
+// @world       isolated
+// @run-at      document-start
+// ==/UserScript==
 // yggterm bundled userscript: SponsorBlock substitute for ychrome surfaces.
 // Auto-skips sponsor segments on YouTube using the community SponsorBlock API
 // (https://sponsor.ajay.app). Injected at document-start into the top frame;
 // deploy to ~/.yggterm/web-userscripts/ (shared across profiles) or a
 // per-profile userscripts/ dir. Disable = rename away from .js.
+//
+// @match keeps it off every non-YouTube tab — the engine does that matching, so
+// this script costs nothing anywhere else. It still self-checks the hostname
+// below: a copy of this file deployed by hand to a GUI too old to understand
+// @match would otherwise run everywhere.
 (function () {
     'use strict';
     if (window.__ysb_loaded) return;

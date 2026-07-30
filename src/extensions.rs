@@ -379,4 +379,51 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // What the SHIPPED bodies declare, read back through the parser that will
+    // read them on a user's disk. These bodies are `include_str!`d, so this is a
+    // lock on the asset files themselves: edit a header wrongly and the build
+    // that embeds it fails here.
+    #[test]
+    fn the_bundled_scripts_declare_the_placement_they_need() {
+        use crate::userscript::{ScriptWorld, parse};
+
+        // SponsorBlock is a YouTube script: it must be scoped, or every tab in
+        // the browser pays for it. Isolated is enough — it talks to the DOM and
+        // the network, never to a page global.
+        let sponsorblock = parse(find(SPONSORBLOCK_STEM).expect("sponsorblock").body);
+        assert!(
+            sponsorblock
+                .matches
+                .iter()
+                .any(|pattern| pattern.contains("youtube.com")),
+            "sponsorblock must be @match-scoped to YouTube, got {:?}",
+            sponsorblock.matches
+        );
+        assert_eq!(sponsorblock.world, ScriptWorld::Isolated);
+
+        // The selection unblocker is deliberately global and deliberately
+        // frame-crossing: the text you cannot select is usually in an iframe.
+        let unblock = parse(find("unblock-select").expect("unblock-select").body);
+        assert!(
+            unblock.matches.is_empty(),
+            "unblock-select applies everywhere by design"
+        );
+        assert!(unblock.all_frames, "the blocked text is usually in a frame");
+        assert_eq!(unblock.world, ScriptWorld::Isolated);
+    }
+
+    // Every bundled body must carry a metadata block at all. A catalog entry
+    // added without one silently inherits "every URL, isolated world", which for
+    // a site-specific script is a per-tab cost on every page the user opens.
+    #[test]
+    fn every_bundled_script_carries_a_metadata_block() {
+        for ext in catalog() {
+            assert!(
+                ext.body.contains("==UserScript=="),
+                "{} ships with no metadata block",
+                ext.stem
+            );
+        }
+    }
 }
