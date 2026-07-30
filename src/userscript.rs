@@ -1,5 +1,5 @@
-//! The SCRIPTLET PLANE: a userscript is a body plus the four facts that decide
-//! where it runs.
+//! The SCRIPTLET PLANE: a userscript is a body plus the placement facts that
+//! decide where it runs.
 //!
 //! Before this module every userscript ran on every page, in the page's own
 //! JavaScript world, in the top frame only. That is three wrong defaults in a
@@ -23,7 +23,7 @@
 //! re-derives them, and a script with no header block gets the documented
 //! defaults, so every `.js` already on a user's disk keeps working.
 //!
-//! ## The four facts
+//! ## The placement facts
 //!
 //! - **`@match`** — WebKit match patterns, passed through VERBATIM. WebKit's
 //!   `WebKitUserScript` takes an allow-list of patterns and does the matching
@@ -39,6 +39,16 @@
 //!   script on fewer pages than it declares, the same silent-wrong class as
 //!   feeding the glob to WebKit verbatim (where it matches NOTHING and the
 //!   script quietly never runs).
+//! - **`@exclude-match`** — `@match`'s dialect, SUBTRACTED. The same
+//!   `WebKitUserScript` takes a BLOCK-list beside its allow-list, and these
+//!   patterns go there verbatim: a page matching any of them never gets the
+//!   script, whatever the allow-list says.
+//! - **`@exclude`** — `@include`'s glob dialect, subtracted. Each glob goes
+//!   through the same [`translate_include`] proof and lands on the block-list;
+//!   one untranslatable `@exclude` refuses the WHOLE script's promotion, the
+//!   same all-or-nothing as `@include`. Silently ignoring an exclusion is
+//!   forbidden outright — it runs the script on pages its author explicitly
+//!   ruled out.
 //! - **`@world`** — `isolated` (the DEFAULT) or `main`. An isolated script gets
 //!   its own JavaScript world: same DOM, private globals. A script that must
 //!   patch something the PAGE will call — `window.fetch`,
@@ -77,11 +87,14 @@ impl ScriptWorld {
 /// The only `@run-at` any surface honours today.
 pub const RUN_AT_DOCUMENT_START: &str = "document-start";
 
-/// One `@include` whose glob could not be PROVEN equivalent to a WebKit match
-/// pattern: the glob verbatim (the refusal must name it), and why.
+/// One `@include` or `@exclude` whose glob could not be PROVEN equivalent to a
+/// WebKit match pattern: which directive carried it, the glob verbatim (the
+/// refusal must name the line as the author wrote it), and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UntranslatableInclude {
-    /// The `@include` value exactly as the author wrote it.
+    /// `"@include"` or `"@exclude"`, exactly as it reads in the header.
+    pub directive: &'static str,
+    /// The glob value exactly as the author wrote it.
     pub glob: String,
     /// Which equivalence rule it failed, in the author's terms.
     pub why: &'static str,
@@ -97,6 +110,11 @@ pub struct Userscript {
     /// WebKit match patterns from `@match`/`@include`, in declaration order.
     /// EMPTY = every URL.
     pub matches: Vec<String>,
+    /// WebKit match patterns from `@exclude-match`/`@exclude`, in declaration
+    /// order: the engine's BLOCK-list. A page matching any of these never gets
+    /// the script, whatever [`Userscript::matches`] says. EMPTY = exclude
+    /// nothing.
+    pub exclude_matches: Vec<String>,
     /// `@all-frames`: inject into sub-frames as well as the top frame.
     pub all_frames: bool,
     /// `@world`.
@@ -110,7 +128,8 @@ pub struct Userscript {
     /// injection, the declaration is already on the wire and no script has to be
     /// re-authored.
     pub run_at: String,
-    /// Every `@include` whose glob failed [`translate_include`], verbatim.
+    /// Every `@include`/`@exclude` whose glob failed [`translate_include`],
+    /// verbatim.
     ///
     /// NON-EMPTY = this script REFUSES promotion, whole. The one gate that
     /// enforces it is `webpolicy::promote_or_refuse` — nothing else decides —
@@ -127,6 +146,7 @@ impl Userscript {
         Self {
             body: body.into(),
             matches: Vec::new(),
+            exclude_matches: Vec::new(),
             all_frames: false,
             world: ScriptWorld::Isolated,
             run_at: RUN_AT_DOCUMENT_START.to_string(),
@@ -155,6 +175,7 @@ impl Userscript {
         serde_json::json!({
             "body": self.body,
             "matches": self.matches,
+            "exclude_matches": self.exclude_matches,
             "all_frames": self.all_frames,
             "world": self.world.as_str(),
             "run_at": self.run_at,
@@ -202,14 +223,17 @@ fn flag_value(value: &str) -> bool {
 /// a typo'd header is still a userscript, and refusing to run it would be a
 /// worse answer than running it with the safe defaults.
 ///
-/// The ONE deliberate exception is `@include`. A glob that cannot be proven
-/// equivalent to a WebKit match pattern is recorded in
+/// The deliberate exceptions are `@include` and `@exclude`. A glob that cannot
+/// be proven equivalent to a WebKit match pattern is recorded in
 /// [`Userscript::untranslatable_includes`], and any entry there refuses the
 /// whole script's promotion (all-or-nothing, enforced at
 /// `webpolicy::promote_or_refuse`). "Safe default" has no meaning for a bad
 /// `@include`: every URL is wider than declared, the translatable subset is
 /// narrower than declared, and verbatim is a pattern that matches nothing —
-/// all three run the script somewhere other than where its author said.
+/// all three run the script somewhere other than where its author said. A bad
+/// `@exclude` is worse still: dropping it runs the script on the very pages
+/// its author ruled out, which is the loudest possible way to disobey a
+/// declaration silently.
 pub fn parse(body: &str) -> Userscript {
     let mut script = Userscript::new(body);
     let mut lines = body.lines();
@@ -237,6 +261,22 @@ pub fn parse(body: &str) -> Userscript {
             "@include" if !value.is_empty() => match translate_include(value) {
                 Ok(pattern) => script.matches.push(pattern),
                 Err(why) => script.untranslatable_includes.push(UntranslatableInclude {
+                    directive: "@include",
+                    glob: value.to_string(),
+                    why,
+                }),
+            },
+            // @exclude-match is @match's dialect, subtracted: verbatim onto the
+            // engine's block-list.
+            "@exclude-match" if !value.is_empty() => script.exclude_matches.push(value.to_string()),
+            // @exclude is @include's glob dialect, subtracted: the same
+            // translate-or-refuse, landing on the block-list. Swallowing one
+            // (the pre-fix `_ => {}` arm) ran the script on pages its author
+            // explicitly ruled out.
+            "@exclude" if !value.is_empty() => match translate_include(value) {
+                Ok(pattern) => script.exclude_matches.push(pattern),
+                Err(why) => script.untranslatable_includes.push(UntranslatableInclude {
+                    directive: "@exclude",
                     glob: value.to_string(),
                     why,
                 }),
@@ -321,6 +361,14 @@ pub fn parse(body: &str) -> Userscript {
 /// this would empty the translatable subset; accepting it is documented here
 /// instead. Globs that PIN a port (`:` in the host) are still refused, since
 /// the pattern could not honour the pin.
+///
+/// Read from the BLOCK-list side (`@exclude`), the same port-blindness flips
+/// direction: a translated exclusion also excludes the explicit-port variants
+/// of its host+path, so the script may additionally SKIP a port variant its
+/// glob never ruled out — but it can never RUN on a page the author excluded.
+/// More exclusion is the conservative error for an exclusion, exactly as more
+/// inclusion is the accepted one for an `@include`; both err toward the
+/// pattern dialect's port-blindness and neither can betray a declared page.
 ///
 /// # Refused outright, by dialect
 ///
@@ -422,26 +470,40 @@ pub fn translate_include(glob: &str) -> Result<String, &'static str> {
 }
 
 /// The loud half of the all-or-nothing rule: what the refusal of one script's
-/// promotion says, naming EACH untranslatable `@include` verbatim with the
-/// rule it failed. Built here, beside the translator whose refusals it
-/// reports; printed by `webpolicy::promote_or_refuse`, the one gate.
+/// promotion says, naming EACH untranslatable `@include`/`@exclude` line
+/// verbatim with the rule it failed. Built here, beside the translator whose
+/// refusals it reports; printed by `webpolicy::promote_or_refuse`, the one
+/// gate.
 pub fn refusal_report(source: &str, refused: &[UntranslatableInclude]) -> String {
     use std::fmt::Write as _;
     let mut report = format!(
-        "ychrome: REFUSING userscript {source}: its @include lines cannot be proven \
-         equivalent to WebKit match patterns\n"
+        "ychrome: REFUSING userscript {source}: its @include/@exclude lines cannot be \
+         proven equivalent to WebKit match patterns\n"
     );
     for include in refused {
-        let _ = writeln!(report, "ychrome:   @include {}", include.glob);
+        let _ = writeln!(report, "ychrome:   {} {}", include.directive, include.glob);
         let _ = writeln!(report, "ychrome:     — {}", include.why);
     }
     let _ = writeln!(
         report,
         "ychrome:   the script was NOT injected anywhere: promoting only its translatable \
-         part would run it on fewer pages than it declares. Rewrite each line above as a \
-         @match pattern."
+         part would run it on pages other than the ones its author declared. Rewrite each \
+         line above as a @match / @exclude-match pattern."
     );
     report
+}
+
+/// The pane's one-line version of [`refusal_report`]: the same facts, sized
+/// for a row subtitle. Names each refused directive and glob verbatim — the
+/// settings pane must never present a refused script as running, and must say
+/// which lines to fix, or the user's only clue is a daemon's stderr they will
+/// never read.
+pub fn refusal_summary(refused: &[UntranslatableInclude]) -> String {
+    let lines: Vec<String> = refused
+        .iter()
+        .map(|include| format!("{} {}", include.directive, include.glob))
+        .collect();
+    format!("Refused — not injected: {}", lines.join(", "))
 }
 
 #[cfg(test)]
@@ -453,6 +515,8 @@ mod tests {
 // @name        Demo
 // @match       https://*.youtube.com/*
 // @include     https://m.youtube.com/*
+// @exclude-match https://*.youtube.com/embed/*
+// @exclude     https://m.youtube.com/embed*
 // @world       main
 // @all-frames
 // @run-at      document-start
@@ -470,6 +534,14 @@ mod tests {
                 "https://m.youtube.com/*".to_string()
             ]
         );
+        assert_eq!(
+            script.exclude_matches,
+            vec![
+                "https://*.youtube.com/embed/*".to_string(),
+                "https://m.youtube.com/embed*".to_string()
+            ],
+            "@exclude-match travels verbatim and a translatable @exclude joins it"
+        );
         assert_eq!(script.world, ScriptWorld::Main);
         assert!(script.all_frames);
         assert_eq!(script.run_at, RUN_AT_DOCUMENT_START);
@@ -485,6 +557,10 @@ mod tests {
     fn a_body_with_no_header_block_gets_the_documented_defaults() {
         let script = parse("console.log('hi');\n");
         assert!(script.matches.is_empty(), "no @match must mean every URL");
+        assert!(
+            script.exclude_matches.is_empty(),
+            "no @exclude must mean exclude nothing"
+        );
         assert_eq!(script.world, ScriptWorld::Isolated);
         assert!(!script.all_frames);
         assert_eq!(script.run_at, RUN_AT_DOCUMENT_START);
@@ -509,6 +585,11 @@ mod tests {
         // A valueless @match contributes nothing rather than an empty pattern,
         // which WebKit would reject for the whole script.
         assert!(parse("// ==UserScript==\n// @match\n").matches.is_empty());
+        // Valueless exclusions name no page: nothing to honour, nothing to
+        // refuse over.
+        let valueless = parse("// ==UserScript==\n// @exclude-match\n// @exclude\n");
+        assert!(valueless.exclude_matches.is_empty());
+        assert!(valueless.untranslatable_includes.is_empty());
         // Keys we do not implement are ignored, not fatal.
         let unknown = parse("// ==UserScript==\n// @grant none\n// @match https://a/*\n");
         assert_eq!(unknown.matches, vec!["https://a/*".to_string()]);
@@ -622,10 +703,71 @@ mod tests {
         }
     }
 
-    // ALL-OR-NOTHING, the parse half: one bad @include poisons the whole
-    // script even when good @match and @include lines sit beside it, and
-    // EVERY bad one is recorded verbatim — the refusal must name them all,
-    // not stop at the first.
+    // THE SILENTLY-IGNORED-EXCLUSION CLASS, locked with the review's exact
+    // script: `@match https://*.youtube.com/*` + `@exclude
+    // https://*.youtube.com/embed/*` used to promote cleanly and inject into
+    // the very embeds its author excluded. A wildcard-host @exclude glob is
+    // untranslatable, so the WHOLE script must refuse — and the two honourable
+    // spellings of the same exclusion must land on the block-list, never the
+    // allow-list, never the refusal list.
+    #[test]
+    fn an_exclusion_is_never_silently_ignored() {
+        let script = parse(
+            "// ==UserScript==\n\
+             // @match https://*.youtube.com/*\n\
+             // @exclude https://*.youtube.com/embed/*\n\
+             // ==/UserScript==\n\
+             x();\n",
+        );
+        assert_eq!(
+            script
+                .untranslatable_includes
+                .iter()
+                .map(|include| (include.directive, include.glob.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("@exclude", "https://*.youtube.com/embed/*")],
+            "an untranslatable @exclude must poison the script's promotion, not vanish"
+        );
+
+        // The match-pattern spelling of the same exclusion needs no proof:
+        // verbatim onto the engine's block-list.
+        let native = parse(
+            "// ==UserScript==\n\
+             // @match https://*.youtube.com/*\n\
+             // @exclude-match https://*.youtube.com/embed/*\n\
+             // ==/UserScript==\n\
+             x();\n",
+        );
+        assert!(native.untranslatable_includes.is_empty());
+        assert_eq!(
+            native.exclude_matches,
+            vec!["https://*.youtube.com/embed/*".to_string()]
+        );
+
+        // A TRANSLATABLE @exclude glob lands on the block-list translated.
+        let translated = parse(
+            "// ==UserScript==\n\
+             // @match https://*.youtube.com/*\n\
+             // @exclude https://m.youtube.com/embed*\n\
+             // ==/UserScript==\n\
+             x();\n",
+        );
+        assert!(translated.untranslatable_includes.is_empty());
+        assert_eq!(
+            translated.exclude_matches,
+            vec!["https://m.youtube.com/embed*".to_string()]
+        );
+        assert_eq!(
+            translated.matches,
+            vec!["https://*.youtube.com/*".to_string()],
+            "an @exclude leaked onto the ALLOW-list, widening where the script runs"
+        );
+    }
+
+    // ALL-OR-NOTHING, the parse half: one bad @include OR @exclude poisons the
+    // whole script even when good @match and @include lines sit beside it, and
+    // EVERY bad one is recorded verbatim with its directive — the refusal must
+    // name them all, not stop at the first.
     #[test]
     fn one_untranslatable_include_marks_the_whole_script_and_all_are_named() {
         let script = parse(
@@ -634,18 +776,24 @@ mod tests {
              // @include https://m.example.test/*\n\
              // @include /^https?://.*music.*/\n\
              // @include https://*.example.test/*\n\
+             // @exclude https://*.example.test/embed/*\n\
              // ==/UserScript==\n\
              x();\n",
         );
-        let globs: Vec<&str> = script
+        let lines: Vec<(&str, &str)> = script
             .untranslatable_includes
             .iter()
-            .map(|include| include.glob.as_str())
+            .map(|include| (include.directive, include.glob.as_str()))
             .collect();
         assert_eq!(
-            globs,
-            vec!["/^https?://.*music.*/", "https://*.example.test/*"],
-            "every untranslatable @include must be recorded verbatim, in order"
+            lines,
+            vec![
+                ("@include", "/^https?://.*music.*/"),
+                ("@include", "https://*.example.test/*"),
+                ("@exclude", "https://*.example.test/embed/*"),
+            ],
+            "every untranslatable line must be recorded verbatim, in order, \
+             with the directive that carried it"
         );
         // The translatable lines still parsed — the REFUSAL is the gate's job,
         // and the parse stays a faithful record of what the author wrote.
@@ -659,15 +807,18 @@ mod tests {
     }
 
     // The refusal report is the loud half of the contract: it must name the
-    // SOURCE and each untranslatable @include VERBATIM, with its rule.
+    // SOURCE and each untranslatable line VERBATIM — directive and glob — with
+    // its rule. The pane's one-line summary carries the same names.
     #[test]
     fn the_refusal_report_names_the_source_and_every_glob_verbatim() {
         let refused = vec![
             UntranslatableInclude {
+                directive: "@include",
                 glob: "/^https?://.*music.*/".to_string(),
                 why: "a /regex/ @include has no equivalent",
             },
             UntranslatableInclude {
+                directive: "@exclude",
                 glob: "https://*.example.test/*".to_string(),
                 why: "wildcard host",
             },
@@ -676,8 +827,9 @@ mod tests {
         assert!(report.contains("REFUSING userscript music-cleaner.js"));
         for include in &refused {
             assert!(
-                report.contains(&format!("@include {}", include.glob)),
-                "the report must name {} verbatim",
+                report.contains(&format!("{} {}", include.directive, include.glob)),
+                "the report must name `{} {}` verbatim",
+                include.directive,
                 include.glob
             );
             assert!(report.contains(include.why));
@@ -686,6 +838,17 @@ mod tests {
             report.contains("NOT injected"),
             "the report must say the whole script was withheld"
         );
+
+        let summary = refusal_summary(&refused);
+        assert!(summary.contains("Refused"));
+        for include in &refused {
+            assert!(
+                summary.contains(&format!("{} {}", include.directive, include.glob)),
+                "the pane summary must name `{} {}` verbatim",
+                include.directive,
+                include.glob
+            );
+        }
     }
 
     // The wire spelling is what yggterm matches on; a rename here silently
@@ -698,6 +861,11 @@ mod tests {
         assert_eq!(value["world"], "main");
         assert_eq!(value["all_frames"], true);
         assert_eq!(value["matches"][0], "https://*.youtube.com/*");
+        assert_eq!(
+            value["exclude_matches"][0], "https://*.youtube.com/embed/*",
+            "the block-list must travel on the wire, or the GUI injects into \
+             pages the author excluded"
+        );
         assert_eq!(value["run_at"], RUN_AT_DOCUMENT_START);
         assert!(value["body"].as_str().is_some_and(|b| b.contains("@match")));
     }
