@@ -298,21 +298,23 @@ fn drive_surface(
     // document-start. Open first and the GUI's first apply pass sees a surface
     // with no contribution and builds it unblocked — no userscripts, no adblock,
     // silently, for the life of that webview.
-    let mut control_url: Option<String> = match daemon::register_supervised(session, profile) {
-        Some(url) => {
-            sidebar::emit_declare(
-                session,
-                &url,
-                &webpolicy::policy_version(profile),
-                &webzoom::zoom_version(),
-            );
-            Some(url)
-        }
-        None => {
-            eprintln!("ychrome: sidebar unavailable (daemon did not come up)");
-            None
-        }
-    };
+    let mut control: Option<daemon::ControlEndpoint> =
+        match daemon::register_supervised(session, profile) {
+            Some(endpoint) => {
+                sidebar::emit_declare(
+                    session,
+                    &endpoint.url,
+                    &endpoint.token,
+                    &webpolicy::policy_version(profile),
+                    &webzoom::zoom_version(),
+                );
+                Some(endpoint)
+            }
+            None => {
+                eprintln!("ychrome: sidebar unavailable (daemon did not come up)");
+                None
+            }
+        };
     emit_web_surface_osc("open", session, url, title, profile, start_page);
     eprintln!(
         "ychrome: web surface open — {url} [{profile}]  (Ctrl+C to close, Ctrl+Z / yggterm Zzz to suspend)"
@@ -324,11 +326,15 @@ fn drive_surface(
     // onto a fresh listener. The declare IS the contribution's liveness signal,
     // and it must precede an "open" so a recreated surface never loads before its
     // policy (userscripts inject at document-start).
-    let redeclare = |control_url: &Option<String>| {
-        if let Some(url) = control_url {
+    // The declare carries the control TOKEN as well as the url — the GUI cannot
+    // drive a pane without it (see `sidebar::ControlState::control_token`), so a
+    // moved endpoint means both halves are re-declared together or neither is.
+    let redeclare = |control: &Option<daemon::ControlEndpoint>| {
+        if let Some(endpoint) = control {
             sidebar::emit_declare(
                 session,
-                url,
+                &endpoint.url,
+                &endpoint.token,
                 &webpolicy::policy_version(profile),
                 &webzoom::zoom_version(),
             );
@@ -343,8 +349,8 @@ fn drive_surface(
         // deliberately cannot re-CREATE a surface, and an "open" with an
         // unchanged URL is liveness-idempotent GUI-side.
         if last_tick.elapsed() > Duration::from_secs(3) {
-            control_url = daemon::register_supervised(session, profile).or(control_url);
-            redeclare(&control_url);
+            control = daemon::register_supervised(session, profile).or(control);
+            redeclare(&control);
             emit_web_surface_osc("open", session, url, title, profile, start_page);
         }
         last_tick = std::time::Instant::now();
@@ -358,10 +364,10 @@ fn drive_surface(
             // after a daemon respawn. A moved control url means a new listener —
             // re-declare so the GUI follows it.
             let refreshed = daemon::register_supervised(session, profile);
-            if refreshed.is_some() && refreshed != control_url {
-                control_url = refreshed;
+            if refreshed.is_some() && refreshed != control {
+                control = refreshed;
             }
-            redeclare(&control_url);
+            redeclare(&control);
         }
     }
     sidebar::emit_close(session);
