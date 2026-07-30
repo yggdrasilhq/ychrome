@@ -191,11 +191,15 @@ pub fn policy(profile: &str) -> Policy {
     // Each body carries its own placement in a metadata block; see
     // `crate::userscript`. Parsed HERE, once, on the host that owns the files —
     // the GUI never re-derives a `@match` and so can never disagree about one.
+    // Every script then passes the promotion gate: an untranslatable @include
+    // refuses the whole script, loudly, instead of shipping it half-scoped.
     let userscripts = userscript_dirs(profile)
         .iter()
         .flat_map(|dir| enabled_scripts(dir))
-        .filter_map(|path| std::fs::read_to_string(path).ok())
-        .map(|body| crate::userscript::parse(&body))
+        .filter_map(|path| {
+            let body = std::fs::read_to_string(&path).ok()?;
+            promote_or_refuse(&path.display().to_string(), crate::userscript::parse(&body))
+        })
         .collect();
 
     Policy {
@@ -203,6 +207,30 @@ pub fn policy(profile: &str) -> Policy {
         userscripts,
         user_agent: crate::useragent::effective(),
     }
+}
+
+/// The per-script ALL-OR-NOTHING promotion gate (integrator-settled): a script
+/// whose every `@include` translated promotes whole; a script with ANY
+/// untranslatable `@include` is refused whole, loudly, naming each offending
+/// glob verbatim on stderr. Promoting the translatable subset is forbidden —
+/// the script would run on fewer pages than it declares, the same
+/// silent-wrong class as feeding a glob to WebKit verbatim.
+///
+/// Refused means refused from BOTH wire shapes. The legacy array would run
+/// the raw body on every page in the page's world, which is even further from
+/// what the script declared than the half-scoped version.
+fn promote_or_refuse(
+    source: &str,
+    script: crate::userscript::Userscript,
+) -> Option<crate::userscript::Userscript> {
+    if script.untranslatable_includes.is_empty() {
+        return Some(script);
+    }
+    eprint!(
+        "{}",
+        crate::userscript::refusal_report(source, &script.untranslatable_includes)
+    );
+    None
 }
 
 /// An opaque stamp over everything `policy()` would read: which files exist,
@@ -549,6 +577,71 @@ mod tests {
         assert_eq!(rich[0]["matches"][0], "https://*.youtube.com/*");
         assert_eq!(rich[0]["all_frames"], false);
         assert_eq!(rich[0]["body"], value["userscripts"][0]);
+    }
+
+    // ALL-OR-NOTHING, the gate half: a script with any untranslatable
+    // @include must not promote — not into the rich array, not into the
+    // legacy one — while a clean script passes through untouched.
+    #[test]
+    fn the_promotion_gate_refuses_a_script_with_any_untranslatable_include() {
+        let poisoned = crate::userscript::parse(
+            "// ==UserScript==\n\
+             // @match https://*.youtube.com/*\n\
+             // @include /^https?://.*music.*/\n\
+             // ==/UserScript==\n\
+             x();\n",
+        );
+        assert!(
+            promote_or_refuse("poisoned.js", poisoned).is_none(),
+            "one untranslatable @include must refuse the WHOLE script"
+        );
+
+        let clean = crate::userscript::parse(
+            "// ==UserScript==\n\
+             // @include https://m.example.test/*\n\
+             // ==/UserScript==\n\
+             x();\n",
+        );
+        let promoted = promote_or_refuse("clean.js", clean).expect("a clean script promotes");
+        assert_eq!(
+            promoted.matches,
+            vec!["https://m.example.test/*".to_string()]
+        );
+    }
+
+    // Source-anchored on the ONE disk→Policy pipeline: every script read off
+    // the filesystem must pass through `promote_or_refuse` before it can
+    // reach either wire shape. Without this anchor, a refactor could collect
+    // `parse` results directly and a refused script would ship half-scoped —
+    // exactly the class the gate exists to stop. Bounded to the body of
+    // `policy()` so this test module's own mention of the gate cannot
+    // satisfy it.
+    #[test]
+    fn the_policy_loader_routes_every_script_through_the_promotion_gate() {
+        let source = include_str!("webpolicy.rs");
+        let suffix = source
+            .split("pub fn policy(")
+            .nth(1)
+            .expect("policy() is present");
+        // Bound at the next TOP-LEVEL fn of either visibility. The gate
+        // itself is a private `fn` right after policy(); a bound that only
+        // knew `pub fn` would sweep the gate's own definition into the slice
+        // and find its name there even after the call site is gone — which is
+        // exactly the could-only-pass shape this lock exists to avoid.
+        let end = [suffix.find("\nfn "), suffix.find("\npub fn ")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(suffix.len());
+        let body = &suffix[..end];
+        assert!(
+            body.contains("promote_or_refuse("),
+            "policy() no longer routes scripts through the promotion gate"
+        );
+        assert!(
+            !body.contains(".map(|body| crate::userscript::parse"),
+            "policy() collects raw parse results, bypassing the promotion gate"
+        );
     }
 
     // The passkey shim patches `navigator.credentials` for the PAGE to call, so
