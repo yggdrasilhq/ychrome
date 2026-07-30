@@ -114,3 +114,72 @@ Aadhaar" → consent + `Generate Aadhaar OTP` → six `#otp_<i>_<nonce>` boxes �
    for real page buttons — it is only the modals that demand native clicks).
 8. Steps are slow: allow 10-20s after each navigation, and the two validation
    passes can take ~20s each.
+
+## file-itr1-end-to-end · WORKS
+task: 
+model: claude-opus-5
+date: 2026-07-27
+tags: 
+
+Filed an ITR-1 end to end — prepared, submitted and e-verified — on a `--keep`
+session from `data-fabric/scripts/itr-portal.sh`. Reads were already proven; this
+is the write path working. Credentials come from the vault entry keyed by this
+domain; never inline them.
+
+FLOW: login -> #/dashboard/fileIncomeTaxReturn -> pick AY + Online -> Resume or
+Start New -> the five-section summary (P Info / GTI / Tot Deduct / TP / Tax Liab,
+each must show "Modify if required" before Proceed) -> Proceed To Verification ->
+Preview And Submit -> declaration -> Proceed To Validation -> Preview ->
+Proceed To Validation (again, upload-level) -> Proceed To Verification -> pick
+E-Verify Now -> Aadhaar OTP -> Validate -> "Confirm Submission of Return" modal ->
+Submit. The ack number is at e-File > Income Tax Returns > View Filed Returns.
+
+TRAPS, in the order they bite:
+
+1. NOT EVERY ACCOUNT HAS A LOGIN OTP. Where e-Filing Vault higher security is off,
+   the password alone lands on the dashboard. The OTP-request JS still "succeeds"
+   (it returns its label whether or not a button was found), so a watcher blocks
+   its full timeout and the run reports "no OTP arrived" — indistinguishable from a
+   dead phone. Check location.hash for /dashboard right after the password step.
+   Aadhaar OTP for E-VERIFICATION is a separate flow and does still fire.
+
+2. A SAVED DRAFT CAN BE STALE AND WRONG. A month-old draft carried an interest
+   figure that predated the SFT filings; filing it would have understated income by
+   ~4.1L against the department's own AIS. "Resume Filing" preserves the rest, so
+   resume — but diff every figure against a fresh AIS/TIS pull first. "Start New
+   Filing" deletes the draft.
+
+3. ANGULAR MATERIAL: JS .click() beats coordinates for expansion panels, mat-options
+   in a CDK overlay, and row checkboxes. But real input (web do click) WAS required
+   for the TIS<->AIS label-styled tab and the AY mat-select. Keep both, expect to
+   switch. And scrollIntoView() in the measuring eval + click in a LATER call = the
+   layout shifts between them and the click silently lands on nothing. Measure and
+   click in one eval, or use JS click.
+
+4. NUMBER INPUTS need the native-setter injection (getOwnPropertyDescriptor on
+   HTMLInputElement.prototype "value" .set, then dispatch input/change/blur). Plain
+   el.value= leaves the Angular model stale and the running total never moves.
+
+5. EDITABLE ROW TABLES (Income from Other Sources): tick the row checkbox -> _edit ->
+   fields become inputs -> _save -> _add_another. The nature-of-income _select writes
+   a hidden code (SAV = savings, IFD = interest from deposit).
+
+6. MANDATORY FIELDS FAIL LATE AND POINT AT THE WRONG PAGE. "Is the secondary address
+   same as primary address?" unanswered, and a secondary mobile holding the literal
+   "00" ("cannot begin with '0'"), both blocked Confirm on Personal Information — but
+   both are only editable inside the Contact sub-editor.
+
+7. PREFILLED "Nature of Employment" can be stale from a previous employer. Check it
+   against the salary actually being declared.
+
+8. SESSION IS 15 MIN IDLE, and time spent on the Compliance Portal (AIS) does NOT
+   count as activity here — expect to re-login after an AIS walk. Setting
+   location.href triggers a logout confirm dialog; answer No and use in-app nav.
+
+9. The dashboard's "Recent Filed Returns" accordion did not expand; go through the
+   e-File menu instead.
+
+VERIFICATION: "E-Verify Now" -> "OTP on mobile number registered with Aadhaar" ->
+tick consent -> Generate Aadhaar OTP -> six separate #otp_<i>_<suffix> boxes, which
+need real input (web do type) one digit at a time; eval cannot drive them. Stamp the
+since-timestamp BEFORE clicking Generate so a stale code cannot win.
