@@ -25,11 +25,20 @@
 //!
 //! ## The four facts
 //!
-//! - **`@match` / `@include`** — WebKit match patterns, passed through
-//!   VERBATIM. WebKit's `WebKitUserScript` takes an allow-list of patterns and
-//!   does the matching itself in the engine, so ychrome never interprets a
-//!   pattern and cannot disagree with the engine about what one means. No
-//!   pattern at all = every URL, which is what a header-less script already got.
+//! - **`@match`** — WebKit match patterns, passed through VERBATIM. WebKit's
+//!   `WebKitUserScript` takes an allow-list of patterns and does the matching
+//!   itself in the engine, so ychrome never interprets a `@match` and cannot
+//!   disagree with the engine about what one means. No pattern at all = every
+//!   URL, which is what a header-less script already got.
+//! - **`@include`** — a DIFFERENT dialect: Greasemonkey globs (`*` matches
+//!   anything, `/…/` is a regex), matched against the whole URL, not WebKit
+//!   match patterns. Each glob goes through [`translate_include`], which
+//!   accepts only the subset provably equivalent to a match pattern. One
+//!   untranslatable `@include` refuses the WHOLE script's promotion —
+//!   all-or-nothing, because promoting the translatable part would run the
+//!   script on fewer pages than it declares, the same silent-wrong class as
+//!   feeding the glob to WebKit verbatim (where it matches NOTHING and the
+//!   script quietly never runs).
 //! - **`@world`** — `isolated` (the DEFAULT) or `main`. An isolated script gets
 //!   its own JavaScript world: same DOM, private globals. A script that must
 //!   patch something the PAGE will call — `window.fetch`,
@@ -68,6 +77,16 @@ impl ScriptWorld {
 /// The only `@run-at` any surface honours today.
 pub const RUN_AT_DOCUMENT_START: &str = "document-start";
 
+/// One `@include` whose glob could not be PROVEN equivalent to a WebKit match
+/// pattern: the glob verbatim (the refusal must name it), and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UntranslatableInclude {
+    /// The `@include` value exactly as the author wrote it.
+    pub glob: String,
+    /// Which equivalence rule it failed, in the author's terms.
+    pub why: &'static str,
+}
+
 /// One userscript, with every placement decision already made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Userscript {
@@ -91,6 +110,13 @@ pub struct Userscript {
     /// injection, the declaration is already on the wire and no script has to be
     /// re-authored.
     pub run_at: String,
+    /// Every `@include` whose glob failed [`translate_include`], verbatim.
+    ///
+    /// NON-EMPTY = this script REFUSES promotion, whole. The one gate that
+    /// enforces it is `webpolicy::promote_or_refuse` — nothing else decides —
+    /// and a script that never came from `parse` (the passkey shim) is
+    /// promotable by construction because this list is empty.
+    pub untranslatable_includes: Vec<UntranslatableInclude>,
 }
 
 impl Userscript {
@@ -104,6 +130,7 @@ impl Userscript {
             all_frames: false,
             world: ScriptWorld::Isolated,
             run_at: RUN_AT_DOCUMENT_START.to_string(),
+            untranslatable_includes: Vec::new(),
         }
     }
 
@@ -115,6 +142,16 @@ impl Userscript {
     }
 
     pub fn to_json(&self) -> serde_json::Value {
+        // The wire never carries a refused script: the promotion gate
+        // (`webpolicy::promote_or_refuse`) drops it whole before any Policy
+        // holds it. This assert is that invariant, spelled where a bypass
+        // would first do damage — a refused script serialized here would ship
+        // with only its translatable patterns, running on fewer pages than it
+        // declares.
+        debug_assert!(
+            self.untranslatable_includes.is_empty(),
+            "a script with untranslatable @include lines reached the wire"
+        );
         serde_json::json!({
             "body": self.body,
             "matches": self.matches,
@@ -161,9 +198,18 @@ fn flag_value(value: &str) -> bool {
 /// than silently widening the script to every page.
 ///
 /// Every unrecognised key, malformed value, or absent block leaves the
-/// corresponding default from [`Userscript::new`] in place. There is no error
-/// path: a userscript with a typo'd header is still a userscript, and refusing
-/// to run it would be a worse answer than running it with the safe defaults.
+/// corresponding default from [`Userscript::new`] in place: a userscript with
+/// a typo'd header is still a userscript, and refusing to run it would be a
+/// worse answer than running it with the safe defaults.
+///
+/// The ONE deliberate exception is `@include`. A glob that cannot be proven
+/// equivalent to a WebKit match pattern is recorded in
+/// [`Userscript::untranslatable_includes`], and any entry there refuses the
+/// whole script's promotion (all-or-nothing, enforced at
+/// `webpolicy::promote_or_refuse`). "Safe default" has no meaning for a bad
+/// `@include`: every URL is wider than declared, the translatable subset is
+/// narrower than declared, and verbatim is a pattern that matches nothing —
+/// all three run the script somewhere other than where its author said.
 pub fn parse(body: &str) -> Userscript {
     let mut script = Userscript::new(body);
     let mut lines = body.lines();
@@ -183,7 +229,18 @@ pub fn parse(body: &str) -> Userscript {
         };
         match key {
             HEADER_CLOSE => break,
-            "@match" | "@include" if !value.is_empty() => script.matches.push(value.to_string()),
+            // @match IS WebKit's dialect: verbatim, the engine interprets it.
+            "@match" if !value.is_empty() => script.matches.push(value.to_string()),
+            // @include is Greasemonkey's dialect. Translate or refuse — never
+            // hand a glob to WebKit as if it were a match pattern, which is a
+            // script that quietly runs nowhere.
+            "@include" if !value.is_empty() => match translate_include(value) {
+                Ok(pattern) => script.matches.push(pattern),
+                Err(why) => script.untranslatable_includes.push(UntranslatableInclude {
+                    glob: value.to_string(),
+                    why,
+                }),
+            },
             "@all-frames" => script.all_frames = flag_value(value),
             "@world" => {
                 script.world = match value.trim().to_ascii_lowercase().as_str() {
@@ -201,6 +258,190 @@ pub fn parse(body: &str) -> Userscript {
         }
     }
     script
+}
+
+/// Translate one Greasemonkey `@include` glob into a WebKit match pattern, or
+/// refuse with the rule it failed.
+///
+/// # The two languages
+///
+/// A Greasemonkey `@include` is an ANCHORED GLOB over the page's whole
+/// normalized URL string (`location.href`): `*` matches any run of characters
+/// INCLUDING `/`, `?` and `#`, and a value spelled `/…/` is a regular
+/// expression instead. A WebKit match pattern
+/// (`WebCore::UserContentURLPattern`, the thing `webkit_user_script_new`'s
+/// allow-list holds) is `scheme://host/path` where the scheme is literal (or
+/// `*` = http|https), the host is literal (or `*`, or a leading `*.` which
+/// ALSO matches the bare host), and the path is an anchored glob tested
+/// against the URL's PATH ALONE — the query string, fragment, port and
+/// userinfo are invisible to it.
+///
+/// # The equivalence rules (why the accepted subset is exact)
+///
+/// A glob is accepted only when it has the shape
+/// `http(s)://<literal-host>/<literal>*` — literal lowercase scheme, literal
+/// host with a terminating `/`, and a path whose only wildcard is one `*` at
+/// the very end. On that shape the two languages read the SAME string the
+/// same way, so the translation is the identity spelling; what the function
+/// adds is the PROOF, argued fact by fact against a normalized href:
+///
+/// - **Scheme**: normalized hrefs spell the scheme lowercase; a literal
+///   `http`/`https` compares equal on both sides. Any `*` touching the scheme
+///   is refused: a glob `*` is not stopped by `://`, so `http*://a/` also
+///   matches an `://a/` buried in some other URL's query.
+/// - **Host**: in a normalized href the authority is everything between
+///   `scheme://` and the first `/`. The accepted host is literal, lowercase,
+///   and contains none of `* : @ ? #`, and the glob requires a `/` right
+///   after it — so the glob fires exactly when the authority IS that host,
+///   which is exactly the pattern's host test. Every wildcard host is
+///   refused, because the two languages genuinely disagree in BOTH
+///   directions: glob `https://*.a.example/*` also matches
+///   `https://evil.example/x.a.example/` (its `*` crosses into the path),
+///   while pattern `*.a.example` also matches the bare `a.example` (subdomain
+///   syntax includes the apex), so neither is a subset of the other.
+/// - **Path**: the glob tests `path + query + fragment`; the pattern tests
+///   the path alone. With `/<literal>*` — no `?`/`#`/`*` inside the literal —
+///   the glob matches iff the remainder STARTS WITH the literal, and because
+///   the literal contains no `?`/`#` the match can never extend past the end
+///   of the path; the pattern's trailing-`*` prefix test accepts exactly the
+///   same paths, with query and fragment free on both sides. A path with no
+///   trailing `*` is refused (the glob additionally demands NO query string,
+///   which a pattern cannot express), and a `*` anywhere else is refused (it
+///   can swallow the `?` and match pages whose path does not).
+///
+/// # The one asymmetry, named
+///
+/// A match pattern never sees the port or userinfo, so
+/// `https://a.example/*` as a pattern also fires on
+/// `https://a.example:8443/…` where the glob would not. Hrefs spell no
+/// default port (normalization strips `:443`/`:80`), so the divergence exists
+/// only for explicitly non-default-port URLs — and it is WIDER, never
+/// narrower: the script can gain a same-host, same-path port variant, but can
+/// never lose a page its glob declared. Refusing every host-bearing glob over
+/// this would empty the translatable subset; accepting it is documented here
+/// instead. Globs that PIN a port (`:` in the host) are still refused, since
+/// the pattern could not honour the pin.
+///
+/// # Refused outright, by dialect
+///
+/// `/regex/` forms (a different language), the Greasemonkey `.tld` magic
+/// suffix (dialect-specific rewriting), non-http(s) schemes (patterns and
+/// globs disagree about `file:`'s shape), and uppercase scheme/host (a
+/// normalized href never matches it case-sensitively, and whether a manager
+/// matches globs case-insensitively varies — unprovable either way).
+pub fn translate_include(glob: &str) -> Result<String, &'static str> {
+    if glob.len() >= 2 && glob.starts_with('/') && glob.ends_with('/') {
+        return Err(
+            "a /regex/ @include is a regular expression, a different language \
+                    with no match-pattern equivalent",
+        );
+    }
+    let (scheme, rest) = if let Some(rest) = glob.strip_prefix("http://") {
+        ("http", rest)
+    } else if let Some(rest) = glob.strip_prefix("https://") {
+        ("https", rest)
+    } else {
+        return Err(
+            "the scheme must be a literal lowercase `http://` or `https://`: a glob \
+                    `*` is not stopped by `://`, so a wildcard scheme can swallow into the \
+                    host and path",
+        );
+    };
+    let Some((host, path_tail)) = rest.split_once('/') else {
+        return Err(
+            "the host must end at a literal `/`: without one the glob's last host \
+                    character runs straight into the path",
+        );
+    };
+    if host.is_empty() {
+        return Err(
+            "an empty host matches no URL at all; refusing beats installing a \
+                    script that silently never runs",
+        );
+    }
+    if host.contains('*') {
+        return Err(
+            "a glob `*` in the host also matches `/`, so it can reach into the \
+                    path (`https://*.a.example/` fires on a `.a.example/` buried in \
+                    another site's path), while a pattern's `*.host` also matches the \
+                    bare host — the two languages disagree in both directions",
+        );
+    }
+    if host.contains(':') {
+        return Err(
+            "an explicit port: a match pattern never sees the port, so it cannot \
+                    honour the pin",
+        );
+    }
+    if host.contains('@') {
+        return Err("userinfo in the authority: a match pattern never sees it");
+    }
+    if host.contains('?') || host.contains('#') {
+        return Err(
+            "`?` or `#` before the first `/`: the glob is matching the query \
+                    string or fragment, which a match pattern cannot see",
+        );
+    }
+    if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err(
+            "uppercase in the host: a normalized URL's host is lowercase, so the \
+                    glob's meaning depends on the manager's case rules — not provable",
+        );
+    }
+    if host.ends_with(".tld") {
+        return Err(
+            "the Greasemonkey `.tld` magic suffix is dialect-specific rewriting \
+                    with no match-pattern equivalent",
+        );
+    }
+    let path = format!("/{path_tail}");
+    match path.find('*') {
+        None => {
+            return Err(
+                "no trailing `*`: the glob also demands that no query string or \
+                        fragment follow, which a match pattern cannot express",
+            );
+        }
+        Some(position) if position + 1 != path.len() => {
+            return Err(
+                "a `*` before the end of the path can swallow the `?` that starts \
+                        the query string, matching pages whose path does not match the \
+                        pattern",
+            );
+        }
+        Some(_) => {}
+    }
+    let literal = &path[..path.len() - 1];
+    if literal.contains('?') || literal.contains('#') {
+        return Err(
+            "`?` or `#` in the path: the glob is constraining the query string or \
+                    fragment, which a match pattern cannot see",
+        );
+    }
+    Ok(format!("{scheme}://{host}{path}"))
+}
+
+/// The loud half of the all-or-nothing rule: what the refusal of one script's
+/// promotion says, naming EACH untranslatable `@include` verbatim with the
+/// rule it failed. Built here, beside the translator whose refusals it
+/// reports; printed by `webpolicy::promote_or_refuse`, the one gate.
+pub fn refusal_report(source: &str, refused: &[UntranslatableInclude]) -> String {
+    use std::fmt::Write as _;
+    let mut report = format!(
+        "ychrome: REFUSING userscript {source}: its @include lines cannot be proven \
+         equivalent to WebKit match patterns\n"
+    );
+    for include in refused {
+        let _ = writeln!(report, "ychrome:   @include {}", include.glob);
+        let _ = writeln!(report, "ychrome:     — {}", include.why);
+    }
+    let _ = writeln!(
+        report,
+        "ychrome:   the script was NOT injected anywhere: promoting only its translatable \
+         part would run it on fewer pages than it declares. Rewrite each line above as a \
+         @match pattern."
+    );
+    report
 }
 
 #[cfg(test)]
@@ -273,18 +514,35 @@ mod tests {
         assert_eq!(unknown.matches, vec!["https://a/*".to_string()]);
     }
 
-    // A block that forgets its closing line must still yield the @match the
-    // author wrote. Dropping it would silently widen a YouTube script to every
-    // page on the internet — the opposite of a safe default.
+    // A block that forgets its closing line must do BOTH halves: still yield
+    // the @match the author wrote (dropping it would silently widen a YouTube
+    // script to every page), and STOP at the first line of code rather than
+    // merely skip past it. The discriminator for the second half is the pair
+    // of declaration-shaped comment lines AFTER the code: a parser that ends
+    // the block there never sees them, while one that keeps scanning
+    // (`continue` where the `break` belongs) reads them as declarations —
+    // handing the script the page's world and a second match pattern. The
+    // code line's own '@world main' string literal is NOT the discriminator:
+    // a non-comment line is skipped by both behaviours.
     #[test]
     fn an_unclosed_block_still_honours_what_it_declared_and_stops_at_the_code() {
         let script = parse(
-            "// ==UserScript==\n// @match https://*.youtube.com/*\n(function () { var at = '@world main'; })();\n",
+            "// ==UserScript==\n\
+             // @match https://*.youtube.com/*\n\
+             (function () { var at = '@world main'; })();\n\
+             // @world main\n\
+             // @match https://*.example.test/*\n",
         );
-        assert_eq!(script.matches, vec!["https://*.youtube.com/*".to_string()]);
-        // The line of CODE mentioning `@world main` is past the end of the
-        // block and must not have been read as a declaration.
-        assert_eq!(script.world, ScriptWorld::Isolated);
+        assert_eq!(
+            script.matches,
+            vec!["https://*.youtube.com/*".to_string()],
+            "a comment past the first line of code was read as an @match declaration"
+        );
+        assert_eq!(
+            script.world,
+            ScriptWorld::Isolated,
+            "a comment past the first line of code was read as an @world declaration"
+        );
     }
 
     // Bare `@all-frames` is the idiom; the flag parser must not need a value.
@@ -294,6 +552,140 @@ mod tests {
         assert!(flag_value("true"));
         assert!(!flag_value("false"));
         assert!(!flag_value("nonsense"));
+    }
+
+    // THE TRANSLATABLE DIRECTION. On the accepted subset the two languages
+    // coincide, so the output is the identity spelling — but each row here is
+    // a SHAPE the equivalence proof in `translate_include`'s doc covers, at
+    // its boundary: bare host with `/*`, subpath prefix, literal path with a
+    // trailing star, a one-letter host, dots and dashes in host and path.
+    #[test]
+    fn the_provably_equivalent_globs_translate_to_their_own_spelling() {
+        for glob in [
+            "https://m.example.test/*",
+            "http://m.example.test/*",
+            "https://a/*",
+            "https://m.example.test/watch*",
+            "https://m.example.test/a/b-c.d/e*",
+        ] {
+            assert_eq!(
+                translate_include(glob).as_deref(),
+                Ok(glob),
+                "{glob} is inside the provable subset and must translate to itself"
+            );
+        }
+    }
+
+    // THE REFUSED DIRECTION, each rule at its boundary. Every row is a glob
+    // whose Greasemonkey meaning provably differs from the same spelling read
+    // as a match pattern (or has no pattern spelling at all) — the doc on
+    // `translate_include` derives each divergence. A translator that started
+    // accepting any of these would ship scripts that run on the wrong pages.
+    #[test]
+    fn the_unprovable_globs_are_refused_with_the_rule_they_failed() {
+        for (glob, why_mentions) in [
+            // Greasemonkey's other language entirely.
+            ("/^https?://.*/", "regular expression"),
+            // Wildcard or non-http(s) schemes: `*` swallows past `://`.
+            ("*://m.example.test/*", "scheme"),
+            ("http*://m.example.test/*", "scheme"),
+            ("ftp://m.example.test/*", "scheme"),
+            ("HTTPS://m.example.test/*", "scheme"),
+            // The host never ends, or does not exist.
+            ("https://m.example.test*", "literal `/`"),
+            ("https://", "literal `/`"),
+            ("https:///*", "empty host"),
+            // Wildcard hosts: divergent in BOTH directions (glob `*` crosses
+            // into the path; pattern `*.host` includes the bare host).
+            ("https://*.example.test/*", "both directions"),
+            ("https://*/*", "both directions"),
+            // Authority facts a match pattern cannot see.
+            ("https://m.example.test:8443/*", "port"),
+            ("https://user@m.example.test/*", "userinfo"),
+            ("https://m.example.test?x=1/*", "query"),
+            // Case rules differ between managers; hrefs are lowercase.
+            ("https://M.example.test/*", "uppercase"),
+            // Dialect magic.
+            ("https://example.tld/*", ".tld"),
+            // Path shapes whose glob meaning constrains the query string.
+            ("https://m.example.test/watch", "trailing"),
+            ("https://m.example.test/a*b", "swallow"),
+            ("https://m.example.test/a*b*", "swallow"),
+            ("https://m.example.test/watch?v=*", "query"),
+        ] {
+            let refusal = translate_include(glob);
+            let why = refusal.expect_err(&format!("{glob} must be refused, not translated"));
+            assert!(
+                why.contains(why_mentions),
+                "{glob} was refused for the wrong rule: {why}"
+            );
+        }
+    }
+
+    // ALL-OR-NOTHING, the parse half: one bad @include poisons the whole
+    // script even when good @match and @include lines sit beside it, and
+    // EVERY bad one is recorded verbatim — the refusal must name them all,
+    // not stop at the first.
+    #[test]
+    fn one_untranslatable_include_marks_the_whole_script_and_all_are_named() {
+        let script = parse(
+            "// ==UserScript==\n\
+             // @match https://*.youtube.com/*\n\
+             // @include https://m.example.test/*\n\
+             // @include /^https?://.*music.*/\n\
+             // @include https://*.example.test/*\n\
+             // ==/UserScript==\n\
+             x();\n",
+        );
+        let globs: Vec<&str> = script
+            .untranslatable_includes
+            .iter()
+            .map(|include| include.glob.as_str())
+            .collect();
+        assert_eq!(
+            globs,
+            vec!["/^https?://.*music.*/", "https://*.example.test/*"],
+            "every untranslatable @include must be recorded verbatim, in order"
+        );
+        // The translatable lines still parsed — the REFUSAL is the gate's job,
+        // and the parse stays a faithful record of what the author wrote.
+        assert_eq!(
+            script.matches,
+            vec![
+                "https://*.youtube.com/*".to_string(),
+                "https://m.example.test/*".to_string()
+            ]
+        );
+    }
+
+    // The refusal report is the loud half of the contract: it must name the
+    // SOURCE and each untranslatable @include VERBATIM, with its rule.
+    #[test]
+    fn the_refusal_report_names_the_source_and_every_glob_verbatim() {
+        let refused = vec![
+            UntranslatableInclude {
+                glob: "/^https?://.*music.*/".to_string(),
+                why: "a /regex/ @include has no equivalent",
+            },
+            UntranslatableInclude {
+                glob: "https://*.example.test/*".to_string(),
+                why: "wildcard host",
+            },
+        ];
+        let report = refusal_report("music-cleaner.js", &refused);
+        assert!(report.contains("REFUSING userscript music-cleaner.js"));
+        for include in &refused {
+            assert!(
+                report.contains(&format!("@include {}", include.glob)),
+                "the report must name {} verbatim",
+                include.glob
+            );
+            assert!(report.contains(include.why));
+        }
+        assert!(
+            report.contains("NOT injected"),
+            "the report must say the whole script was withheld"
+        );
     }
 
     // The wire spelling is what yggterm matches on; a rename here silently
