@@ -260,25 +260,48 @@ mod tests {
             phrases.len() >= 10,
             "REJECT_TEXT did not parse: {phrases:?}"
         );
+        // A consent WORD anywhere disqualifies a phrase — unless the phrase also
+        // negates it. `starts_with` was not enough: "i accept" starts with "i",
+        // so prepending it to REJECT_TEXT left this lock green while the script
+        // would click the very button it exists to avoid (found by adversarial
+        // review). "continue without accepting" is the case the negation clause
+        // exists for: it carries "accepting" and is a REJECT phrase.
+        const NEGATIONS: [&str; 9] = [
+            "without", "non-", "only", "reject", "decline", "refuse", "deny", "no ", "never",
+        ];
         for phrase in &phrases {
+            let negated = NEGATIONS
+                .iter()
+                .any(|negation| phrase.contains(negation));
             for consent in [
                 "accept",
                 "agree",
-                "i agree",
                 "allow",
-                "ok",
-                "okay",
-                "got it",
-                "yes",
                 "consent",
                 "enable all",
                 "understood",
+                "got it",
+                "okay",
+                "yes",
             ] {
+                let carries = phrase
+                    .split(|ch: char| !ch.is_alphanumeric())
+                    .any(|word| word == consent)
+                    || phrase.contains(consent);
                 assert!(
-                    !phrase.starts_with(consent),
-                    "idcac would click a consent button: REJECT_TEXT has {phrase:?}"
+                    !(carries && !negated),
+                    "idcac would click a consent button: REJECT_TEXT has {phrase:?} \
+                     (consent word {consent:?}, and nothing in the phrase negates it)"
                 );
             }
+            // "ok" as its own WORD only — "reject cookies" contains the letters
+            // o-k, and a substring rule here would forbid the list's own spine.
+            assert!(
+                !phrase
+                    .split(|ch: char| !ch.is_alphanumeric())
+                    .any(|word| word == "ok"),
+                "idcac would click an OK button: REJECT_TEXT has {phrase:?}"
+            );
         }
         assert!(
             phrases.iter().any(|phrase| phrase == "reject all"),
