@@ -314,6 +314,28 @@ live pages; journal.
 *AC: a yggui-style script opens 10 pages, waits, screenshots all 10, clicks
 through one flow (e.g. DuckDuckGo search → result), all headless over ssh.*
 
+🟡 **STARTED 2026-07-31 — core API built, AC partly met.** `src/engine/api.rs`
+is the one router; `ychrome engine bench` drives it on real `/engine/*`
+requests from N threads, which is exactly what the socket handler does with one
+thread per connection, so what is proven live IS the shipping router and not a
+test-only path.
+
+Measured on dev: **10 pages opened concurrently in 1.3-2.2 s wall** (p50 within
+1 ms of the wall time, i.e. genuinely overlapped, not serialised), **10 listed
+live** via `/engine/pages`, **10 PNG readbacks** verified by magic bytes at
+~47 ms each. The click half of the AC is covered by Phase A's proof 5 rather
+than by a DuckDuckGo flow.
+
+What is **built but NOT live-proven**: the socket plumbing itself. The routes
+are wired into `handle_unix_conn` and unit-tested over a `UnixStream` pair, but
+they have not run against a deployed daemon — this branch does not deploy, and
+dev has live ychrome daemons serving real browsing.
+
+Still owed for Phase B: `/nav`, `/wait` (all four `until` forms), `/dom`, and
+the non-click `/input` event types (`move`/`type`/`key`/`scroll` — refused BY
+NAME today rather than silently dropped, so no script can believe an event
+fired that did not).
+
 **Phase C — identity parity.** Profiles/jars, SOCKS egress, adblock filters,
 userscripts, UA, zoom; vault /fill. The engine and the visible surface must be
 the SAME browser to a website.

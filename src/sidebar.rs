@@ -745,6 +745,21 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Answer with raw bytes and an explicit content type. `/engine/shot` returns
+/// `image/png` per docs/agent-engine.md §4: a screenshot is bytes the HTTP
+/// layer can carry natively, and base64 inside JSON would be a second encoding
+/// of it.
+pub(crate) fn respond_bytes(mut stream: impl Write, status: u16, content_type: &str, body: &[u8]) {
+    let head = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\n\
+         Content-Length: {len}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        len = body.len(),
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.flush();
+}
+
 pub(crate) fn respond_json(stream: impl Write, status: u16, body: &Value, path: &str) {
     write_json(stream, status, body, cors_headers(route_access(path)));
 }

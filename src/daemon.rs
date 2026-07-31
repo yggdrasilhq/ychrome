@@ -620,11 +620,75 @@ fn handle_control_conn(daemon: &Daemon, entry: &SessionEntry, stream: TcpStream)
 // Unix-socket API (local CLI, routing, status, supervision)
 // ---------------------------------------------------------------------------
 
+/// Which protocol a unix-socket connection is speaking.
+///
+/// This socket has carried newline-delimited JSON ops since it existed; the
+/// agent engine adds HTTP/1.1 at `/engine/*` (docs/agent-engine.md §3
+/// amendment). They are told apart by the FIRST BYTE, which is unambiguous and
+/// needs no negotiation: a JSON op is always an object and starts with `{`,
+/// while an HTTP request line always starts with a method token. No op name
+/// can ever collide with a path, and no version handshake is needed for an
+/// older client to keep working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SocketProtocol {
+    LegacyJsonOp,
+    Http,
+    Empty,
+}
+
+pub(crate) fn socket_protocol(first_byte: Option<u8>) -> SocketProtocol {
+    match first_byte {
+        None => SocketProtocol::Empty,
+        Some(b'{') => SocketProtocol::LegacyJsonOp,
+        Some(_) => SocketProtocol::Http,
+    }
+}
+
+/// Serve one `/engine/*` HTTP request off the daemon socket.
+fn serve_engine_http(mut reader: BufReader<UnixStream>, stream: UnixStream) {
+    let Some(request) = sidebar::read_request(&mut reader) else {
+        return;
+    };
+    if !crate::engine::api::owns(&request.path) {
+        // Named, not silently dropped: the only HTTP this socket serves is the
+        // engine's, and a client aiming at anything else should be told.
+        let body = json!({
+            "ok": false,
+            "error": format!("no HTTP route {} on the daemon socket (engine routes are /engine/*)", request.path),
+        });
+        sidebar::respond_json(stream, 404, &body, &request.path);
+        return;
+    }
+    match crate::engine::api::dispatch(&request) {
+        crate::engine::api::Reply::Json(status, body) => {
+            sidebar::respond_json(stream, status, &body, &request.path)
+        }
+        crate::engine::api::Reply::Png(png) => {
+            sidebar::respond_bytes(stream, 200, "image/png", &png)
+        }
+    }
+}
+
 fn handle_unix_conn(daemon: &Arc<Daemon>, stream: UnixStream) -> bool {
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(clone) => clone,
         Err(_) => return false,
     });
+    match socket_protocol(reader.fill_buf().ok().and_then(<[u8]>::first).copied()) {
+        SocketProtocol::Empty => return false,
+        SocketProtocol::Http => {
+            // ON ITS OWN THREAD, unlike the legacy ops below. Those are handled
+            // inline because they are genuinely non-blocking and because `stop`
+            // has to return `should_exit` from here. An engine verb is the
+            // opposite: `/engine/goto` waits up to 45s for a load, and serving
+            // it inline would wedge this socket for every browser heartbeat and
+            // every `route` queued behind it. The engine must never be able to
+            // stall the surfaces.
+            std::thread::spawn(move || serve_engine_http(reader, stream));
+            return false;
+        }
+        SocketProtocol::LegacyJsonOp => {}
+    }
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
         return false;
@@ -1687,6 +1751,56 @@ mod tests {
         assert!(
             body.contains("sidebar::respond_json(stream, status, &body, &request.path)"),
             "a response's CORS headers must be chosen by the route that produced it"
+        );
+    }
+
+    // The daemon socket now carries two protocols. Getting the discrimination
+    // wrong in either direction is severe: a legacy op read as HTTP would
+    // silently stop answering the browser, and an HTTP call read as an op
+    // would parse as `{}` and be dispatched as the empty verb.
+    #[test]
+    fn the_socket_tells_its_two_protocols_apart_by_the_first_byte() {
+        assert_eq!(socket_protocol(Some(b'{')), SocketProtocol::LegacyJsonOp);
+        for method in ["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"] {
+            assert_eq!(
+                socket_protocol(method.bytes().next()),
+                SocketProtocol::Http,
+                "{method} must read as HTTP"
+            );
+        }
+        assert_eq!(socket_protocol(None), SocketProtocol::Empty);
+    }
+
+    // End to end over a real UnixStream: an HTTP request that is NOT an engine
+    // route is refused by name, and — the load-bearing half — it is refused
+    // WITHOUT starting the engine. A daemon nobody has asked to browse must
+    // never pay for GTK, a display and a WebKit process just because something
+    // spoke HTTP at it.
+    #[test]
+    fn a_non_engine_http_path_is_refused_without_starting_the_engine() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        {
+            let mut client = &client;
+            client
+                .write_all(b"GET /pane/vault HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            client.flush().unwrap();
+        }
+        let reader = BufReader::new(server.try_clone().unwrap());
+        serve_engine_http(reader, server);
+
+        let mut raw = String::new();
+        BufReader::new(&client).read_to_string(&mut raw).unwrap();
+        assert!(raw.starts_with("HTTP/1.1 404"), "got {raw:?}");
+        assert!(raw.contains("/engine/*"), "the refusal must name the routes it does serve: {raw:?}");
+        // No Xvfb, no engine thread: `owns` is consulted before `dispatch`.
+        assert!(
+            !std::path::Path::new("/tmp/.X11-unix/X90").exists()
+                || std::env::var("DISPLAY").unwrap_or_default() != ":90",
+            "the refusal path must not have started an engine display"
         );
     }
 }

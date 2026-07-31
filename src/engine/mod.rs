@@ -16,6 +16,7 @@
 //!   `shot`/`click_trusted`).
 //! - `gate` — Phase A's five proofs, committed and re-runnable.
 
+pub mod api;
 pub mod gate;
 pub mod host;
 pub mod substrate;
@@ -117,7 +118,40 @@ pub fn run_verb(sub: Option<&str>, as_json: bool) -> Result<()> {
             }
             Ok(())
         }
-        Some(other) => bail!("unknown engine verb {other:?} (known: probe, gate)"),
-        None => bail!("usage: ychrome engine <probe|gate> [--json]"),
+        Some("bench") => {
+            let pages = std::env::args()
+                .nth(3)
+                .and_then(|arg| arg.parse::<usize>().ok())
+                .unwrap_or(10);
+            let report = api::bench(pages)?;
+            if as_json {
+                println!("{report}");
+            } else {
+                println!(
+                    "engine bench: {}/{} pages opened, {} listed live, {} shots",
+                    report["opened"],
+                    report["requested_pages"],
+                    report["listed_live"],
+                    report["shots"],
+                );
+                println!(
+                    "  open wall {}ms (p50 {}ms, p95 {}ms) | shot mean {}ms | smallest PNG {}B",
+                    report["open_wall_ms"],
+                    report["open_p50_ms"],
+                    report["open_p95_ms"],
+                    report["shot_mean_ms"],
+                    report["png_bytes_min"],
+                );
+                for failure in report["failures"].as_array().into_iter().flatten() {
+                    println!("  FAILURE: {failure}");
+                }
+            }
+            if report["ok"].as_bool() != Some(true) {
+                bail!("engine bench FAILED");
+            }
+            Ok(())
+        }
+        Some(other) => bail!("unknown engine verb {other:?} (known: probe, gate, bench)"),
+        None => bail!("usage: ychrome engine <probe|gate|bench> [--json]"),
     }
 }
