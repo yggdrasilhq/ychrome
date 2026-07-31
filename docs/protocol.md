@@ -143,6 +143,61 @@ and its ping stops draining commands — visible in the journal, not silent. A n
 GUI + an old ychrome is unaffected: the header is ignored by a server with no
 gate. ychrome and yggterm deploy as a fleet, so the matched pair is the norm.
 
+### The third mixed case: a new daemon and an OLD CLIENT — MEASURED LIVE 2026-07-31
+
+The two cases above are about the GUI. The one that actually bit is about the
+**client**, and it is worse because nothing about it looks broken:
+
+> The vault and settings panes render one line — `control endpoint returned
+> 403` — while ad blocking and SponsorBlock keep working perfectly.
+
+A `ychrome` CLI built before 2026-07-28 emits a declare with **no
+`control_token` field at all**. It still re-declares the moved control url on
+every heartbeat (that has been true since 2026-07-18), so `/policy`, `/zoom` and
+`/ping` follow a handed-over daemon and the content plane is healthy — while
+every GUI-only route is refused **for the life of that process**. Restarting the
+daemon does not help. Restarting the GUI does not help. Only cycling that CLI
+does, because the CLI is the token's only courier.
+
+Three things close it:
+
+1. **The client asserts its own capability.** `register` carries
+   `declares_control_token: true`; a binary older than the field cannot send it,
+   which is exactly what makes the absence trustworthy. The daemon records it per
+   session (re-asserted on every ~4s heartbeat, so it always describes the client
+   attached *now*) and reports it as `control_token_declared` in `status`.
+2. **The refusal names the cause and the remedy.** A GUI-only 403 now carries a
+   machine-readable `cause` — `client_predates_control_token`, `token_mismatch`
+   or `token_absent` — and prose that says which one it is and what ends it. The
+   client pid rides the JOURNAL line only: the 403 body is page-reachable, so it
+   carries no host facts.
+3. **`ychrome status` marks the sessions**, so the condition is findable without
+   provoking a 403:
+
+   ```
+   [NO PANES] 1 session(s) run a ychrome CLI that predates the control-token gate…
+   [NO PANES] ad blocking and userscripts are unaffected. A daemon restart does
+              NOT fix this — press Ctrl+C in each session's terminal and run
+              ychrome again.
+   ```
+
+   Explicitly `false`, never merely absent: a daemon too old to report the field
+   has no gate either, so its panes work and a warning would be a false alarm.
+
+**And the client cannot declare a stale endpoint at all.** `declare_current` is
+the one function that emits a declare, it registers first, and it takes no
+endpoint argument — so there is no variable a caller could hand it. The previous
+shape kept the last-known endpoint in a local and re-declared it whenever the
+re-register failed, which is precisely what happens DURING a handover: it
+published a url+token pair belonging to a daemon that had already exited, and if
+the successor re-bound the same port the GUI held a live url with a dead token.
+A missed declare costs one ~4s tick against the GUI's 15s expiry; a wrong one
+costs the rail.
+
+⚠ **Deploy rule, unchanged and now enforced by a visible marker:** hand over the
+daemon and cycle the clients together. `ychrome status` tells you which clients
+still owe a restart.
+
 ### `app_name`
 
 The display name yggterm shows on the main zoom control ("Ychrome Global Zoom").
