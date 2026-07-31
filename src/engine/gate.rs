@@ -266,7 +266,14 @@ pub fn run() -> Result<Value> {
         && synthetic_seen == vec![json!(false)]
         && after_trusted["guard"] == json!("mutated-by-trusted-input")
         && trusted_seen == vec![json!(false), json!(true)]
-        && dispatched == 2;
+        // Three, not two. A click is a pointer ARRIVING and then pressing:
+        // motion, press, release. This read `== 2` while `click_trusted` sent
+        // only the button pair, and Phase B's `/input` corrected that — without
+        // the motion, WebKit's last-known pointer position is stale, so
+        // `:hover` never applies and a hover-opened menu is not open when the
+        // press lands. The count is asserted exactly, rather than loosened to
+        // `>= 2`, so that losing the motion again shows up here.
+        && dispatched == 3;
     record(
         &mut proofs,
         Proof {
