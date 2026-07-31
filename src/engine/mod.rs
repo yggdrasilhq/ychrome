@@ -17,6 +17,7 @@
 //! - `gate` — Phase A's five proofs, committed and re-runnable.
 
 pub mod api;
+pub mod ctl;
 pub mod flow;
 pub mod gate;
 pub mod host;
@@ -53,6 +54,22 @@ fn exit_now(code: i32) -> ! {
     // SAFETY: `_exit` is always available and, by construction, this is the
     // last thing this process does.
     unsafe { libc::_exit(code) }
+}
+
+/// End the process the engine's way, reporting an error first.
+///
+/// Every entry point that may have started an engine goes through this, because
+/// `_exit` is the only safe way out once WebKit has been initialised (see
+/// [`exit_now`]) and because the registry's engine must be torn down first.
+pub fn exit_with(outcome: Result<()>) -> ! {
+    api::shutdown();
+    match outcome {
+        Ok(()) => exit_now(0),
+        Err(error) => {
+            eprintln!("ychrome: {error:#}");
+            exit_now(1)
+        }
+    }
 }
 
 /// `engine` verbs, with the engine-owned exit above. `main` calls this;

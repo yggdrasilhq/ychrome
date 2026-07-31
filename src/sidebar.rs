@@ -745,6 +745,19 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Open a streaming NDJSON response: headers now, body written by the caller.
+///
+/// No `Content-Length`, because the whole point is that the length is not known
+/// when the first line goes out — `Connection: close` is what ends it. This is
+/// what `/engine/batch` needs so a 300-page crawl reports each page as it
+/// finishes instead of after the last one.
+pub(crate) fn respond_ndjson_head(stream: &mut impl Write) {
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\
+                Cache-Control: no-store\r\nConnection: close\r\n\r\n";
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.flush();
+}
+
 /// Answer with raw bytes and an explicit content type. `/engine/shot` returns
 /// `image/png` per docs/agent-engine.md §4: a screenshot is bytes the HTTP
 /// layer can carry natively, and base64 inside JSON would be a second encoding
