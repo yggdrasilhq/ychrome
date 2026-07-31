@@ -39,17 +39,31 @@ shape is **per-origin installation**: build the shim's `Userscript::matches`
 from the set of rpIds the vault actually holds passkeys for, so a page for a
 site you have no passkey for sees a pristine `navigator`.
 
-That needs a vault op this client does not have — `passkeys <item>` resolves one
-item and there is no way to enumerate rpIds. The work is:
+### IMPLEMENTED 2026-08-01, NOT YET PROVEN ON A REAL PAGE
 
-1. add a `passkey-hosts` op to `ychrome-vault`'s agent (metadata only: rpIds, no
-   credential ids, no keys);
-2. call it from `sidebar.rs` through `ychrome-vault-proto` (already linked, no
-   subprocess) and set `matches` to `*://*.<rpId>/*` per host;
-3. a LOCKED vault answers nothing, and installing no shim is then CORRECT rather
-   than a regression — a ceremony needs an unlocked agent anyway;
-4. ⚠ do not put the rpId probe on the `policy_version` path: that stamp is
-   recomputed on the ~4 s heartbeat and must not grow a socket round trip.
+All four steps are done and unit-locked: the `passkey-hosts` agent op (metadata
+only — rpIds, no credential ids, no keys), the `sidebar.rs` call through
+`ychrome-vault-proto`, no-shim-on-a-locked-vault, and the probe kept off the
+`policy_version` heartbeat. Match patterns are `*://<rp>/*` PLUS `*://*.<rp>/*`,
+because WebKit's `*://*.example.com/*` does not admit the bare host while
+WebAuthn scopes a credential to the rpId and its subdomains. The user-presence
+invariant is untouched and locked: scoping decides only WHERE
+`navigator.credentials` is patched.
+
+**What is NOT yet demonstrated, and why this entry stays open:**
+
+1. **No end-to-end proof on a real page.** Nobody has loaded a site the vault
+   holds a passkey for and confirmed the shim is present, then loaded one it
+   does not and confirmed `navigator.credentials` is pristine. That is the
+   observation that would actually close this.
+2. **The running vault agent predates the op**, so on dev today the browser
+   installs the shim NOWHERE. Verified live: the agent answers `unknown op
+   "passkey-hosts"`. The code says so loudly on stderr, once, rather than
+   letting it look like the healthy case — but until the agent is handed over
+   (`ychrome-vault handover`) passkeys are off.
+3. ⚠ **DEPLOY ORDERING IS PART OF THIS FIX.** The vault agent must be handed
+   over before, or with, the browser. Shipping the browser alone turns passkey
+   logins off everywhere.
 
 ---
 
