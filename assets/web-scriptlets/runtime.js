@@ -1,12 +1,18 @@
 // ychrome scriptlet runtime — the library behind `##+js(...)`.
 //
 // ⚠ WRITTEN FROM THE DOCUMENTED BEHAVIOUR OF THE FILTER SYNTAX, NOT FROM
-// ANOTHER BLOCKER'S SOURCE. uBlock Origin is GPLv3 and this project ships
-// Apache; a filter *name* and what it observably does are not copyrightable,
-// an implementation is. Every function below was written against the argument
-// grammar the filter lists use. If a future change needs a behaviour that
-// cannot be reproduced without reading someone's implementation, STOP and ask
-// rather than copying.
+// ANOTHER BLOCKER'S SOURCE. Every function below was written against the
+// argument grammar the filter lists use.
+//
+// The original reason was licence incompatibility -- uBO is GPLv3 and this
+// project shipped Apache. That reason is GONE: the browser is now
+// GPL-3.0-or-later. The rule survives anyway, for two that outlive it.
+// Provenance here stays clean and auditable whatever licence the repo wears;
+// and `crates/ychrome-vault*` next door are Apache-2.0, where GPL code must
+// never land, so a habit of transcribing is a hazard one directory away.
+//
+// Adopting uBO code here is now LAWFUL. If you do, ATTRIBUTE it and mark it,
+// in the file and in THIRD-PARTY-NOTICES.md -- do not fold it in silently.
 //
 // The contract: this file is a FUNCTION EXPRESSION. `abp::generate_scriptlet_script`
 // splices it into a generated userscript next to its payload and calls it.
