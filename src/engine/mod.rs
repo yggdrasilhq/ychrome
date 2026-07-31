@@ -20,7 +20,9 @@ pub mod api;
 pub mod flow;
 pub mod gate;
 pub mod host;
+pub mod identity;
 pub mod js;
+pub mod parity;
 pub mod pool;
 pub mod substrate;
 
@@ -152,6 +154,30 @@ pub fn run_verb(sub: Option<&str>, as_json: bool) -> Result<()> {
             }
             Ok(())
         }
+        Some("parity") => {
+            let report = parity::run()?;
+            if as_json {
+                println!("{report}");
+            } else {
+                println!("phase-c identity parity");
+                for check in report["checks"].as_array().into_iter().flatten() {
+                    println!(
+                        "  {} {}",
+                        if check["pass"].as_bool() == Some(true) {
+                            "PASS"
+                        } else {
+                            "FAIL"
+                        },
+                        check["check"].as_str().unwrap_or(""),
+                    );
+                }
+                println!("  sponsorblock: {}", report["sponsorblock"]);
+            }
+            if report["pass"].as_bool() != Some(true) {
+                bail!("phase-c identity parity FAILED");
+            }
+            Ok(())
+        }
         Some("govern") => {
             let pages = std::env::args()
                 .nth(3)
@@ -216,8 +242,8 @@ pub fn run_verb(sub: Option<&str>, as_json: bool) -> Result<()> {
             Ok(())
         }
         Some(other) => {
-            bail!("unknown engine verb {other:?} (known: probe, gate, flow, bench, govern)")
+            bail!("unknown engine verb {other:?} (known: probe, gate, flow, bench, govern, parity)")
         }
-        None => bail!("usage: ychrome engine <probe|gate|flow|bench|govern> [--json]"),
+        None => bail!("usage: ychrome engine <probe|gate|flow|bench|govern|parity> [--json]"),
     }
 }

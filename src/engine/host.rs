@@ -36,7 +36,7 @@ use glib::translate::{ToGlibPtr, ToGlibPtrMut};
 use gtk::prelude::*;
 use javascriptcore::ValueExt;
 use serde_json::Value;
-use webkit2gtk::{LoadEvent, SnapshotOptions, SnapshotRegion, WebView, WebViewExt};
+use webkit2gtk::{LoadEvent, SettingsExt, SnapshotOptions, SnapshotRegion, WebView, WebViewExt};
 
 use super::substrate::{self, HeadlessDisplay, Probe, Substrate};
 
@@ -44,6 +44,7 @@ use super::substrate::{self, HeadlessDisplay, Probe, Substrate};
 struct Page {
     window: gtk::Window,
     view: WebView,
+    profile: String,
 }
 
 thread_local! {
@@ -97,6 +98,7 @@ fn with_page<T>(id: &str, responder: Responder<T>, f: impl FnOnce(&Page, Respond
         pages.borrow().get(id).map(|page| Page {
             window: page.window.clone(),
             view: page.view.clone(),
+            profile: page.profile.clone(),
         })
     });
     match view {
@@ -233,23 +235,109 @@ impl Engine {
     /// view that is realised and visible, and a snapshot of an unpainted view
     /// is the blank-canvas lie this engine exists to end. "Headless" here means
     /// the DISPLAY has no screen anyone can see, not that the view is unmapped.
-    pub fn open(&self, id: &str, width: i32, height: i32) -> Result<()> {
+    pub fn open(&self, id: &str, width: i32, height: i32, profile: &str) -> Result<()> {
         let id = id.to_string();
-        on_engine(Duration::from_secs(20), move |responder| {
+        let profile = profile.to_string();
+        on_engine(Duration::from_secs(240), move |responder| {
             let exists = PAGES.with(|pages| pages.borrow().contains_key(&id));
             if exists {
                 responder.fail(format!("page {id:?} is already open"));
                 return;
             }
+            // The profile's identity — jar, adblock filter, userscripts, UA —
+            // from its owners, built once per profile and reused. This is what
+            // makes the engine and the visible surface the SAME browser.
+            let identity = match super::identity::for_profile(&profile) {
+                Ok(identity) => identity,
+                Err(error) => return responder.fail(error.to_string()),
+            };
             let window = gtk::Window::new(gtk::WindowType::Toplevel);
             window.set_default_size(width, height);
-            let view = WebView::new();
+            let view = WebView::builder()
+                .web_context(&identity.context)
+                .user_content_manager(&identity.content)
+                .build();
+            if let Some(agent) = &identity.user_agent {
+                let settings: webkit2gtk::Settings =
+                    WebViewExt::settings(&view).unwrap_or_default();
+                settings.set_user_agent(Some(agent.as_str()));
+                WebViewExt::set_settings(&view, &settings);
+            }
             window.add(&view);
             window.show_all();
             PAGES.with(|pages| {
-                pages.borrow_mut().insert(id, Page { window, view });
+                pages.borrow_mut().insert(
+                    id,
+                    Page {
+                        window,
+                        view,
+                        profile,
+                    },
+                );
             });
             responder.ok(())
+        })
+    }
+
+    /// Apply the per-site zoom this host has recorded for a URL's host.
+    ///
+    /// Per SITE, so it belongs to navigation rather than to page creation:
+    /// `webzoom` is the owner and the engine only asks it. A host with no
+    /// recorded zoom gets 1.0 rather than whatever the previous page used.
+    pub fn apply_zoom(&self, id: &str, url: &str) -> Result<f64> {
+        let host = url::Url::parse(url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_string));
+        let sites = crate::webzoom::sites();
+        let percent = host
+            .as_deref()
+            .and_then(|host| crate::webzoom::zoom_for_host(&sites, host))
+            .unwrap_or(100.0);
+        let level = percent / 100.0;
+        let id = id.to_string();
+        on_engine(Duration::from_secs(10), move |responder| {
+            with_page(&id, responder, move |page, responder| {
+                page.view.set_zoom_level(level);
+                responder.ok(level)
+            })
+        })
+    }
+
+    /// Point a profile's network at a SOCKS endpoint (or back to direct).
+    pub fn set_egress(&self, profile: &str, socks: Option<String>) -> Result<()> {
+        let profile = profile.to_string();
+        on_engine(
+            Duration::from_secs(240),
+            move |responder| match super::identity::for_profile(&profile) {
+                Ok(identity) => {
+                    super::identity::set_egress(&identity, socks.as_deref());
+                    responder.ok(())
+                }
+                Err(error) => responder.fail(error.to_string()),
+            },
+        )
+    }
+
+    /// What identity a profile actually resolved to — the jar, the UA, how many
+    /// userscripts attached, and whether the content filter loaded or compiled.
+    pub fn identity(&self, profile: &str) -> Result<Value> {
+        let profile = profile.to_string();
+        on_engine(
+            Duration::from_secs(240),
+            move |responder| match super::identity::for_profile(&profile) {
+                Ok(identity) => responder.ok(identity.applied),
+                Err(error) => responder.fail(error.to_string()),
+            },
+        )
+    }
+
+    /// Which profile a page was opened on.
+    pub fn page_profile(&self, id: &str) -> Result<String> {
+        let id = id.to_string();
+        on_engine(Duration::from_secs(10), move |responder| {
+            with_page(&id, responder, move |page, responder| {
+                responder.ok(page.profile.clone())
+            })
         })
     }
 
@@ -444,7 +532,25 @@ impl Engine {
             // loading through it.
             self.settle(INPUT_SETTLE)?;
         }
+        // Drain whatever the last event left pending, then give the web process
+        // one more slice to apply it, so a read issued straight after this call
+        // sees the effect rather than racing it.
+        self.drain()?;
+        self.settle(INPUT_FLUSH)?;
         Ok(dispatched)
+    }
+
+    /// Run the engine loop until it has nothing pending.
+    fn drain(&self) -> Result<()> {
+        on_engine(Duration::from_secs(20), move |responder| {
+            let context = glib::MainContext::default();
+            let mut spins = 0;
+            while context.pending() && spins < 10_000 {
+                context.iteration(false);
+                spins += 1;
+            }
+            responder.ok(())
+        })
     }
 
     /// One input event, one job on the engine thread.
@@ -537,6 +643,22 @@ impl Engine {
 /// How long the engine loop is given to deliver one input event to the web
 /// process before the next is dispatched. See [`Engine::input`].
 const INPUT_SETTLE: Duration = Duration::from_millis(12);
+
+/// An extra barrier after the LAST event of a batch.
+///
+/// ⚠ **This is a heuristic, and the race it mitigates is real.** WebKitGTK
+/// queues key events in the UI process and only sends the next one after the
+/// previous is acknowledged, while `evaluate_javascript` is sent immediately —
+/// so a read issued right after a `type` can overtake the final keystroke and
+/// observe the field one character short. Measured before this barrier existed:
+/// `"ada lovelace"` came back as `"ada lovelac"` on roughly two runs in three.
+///
+/// There is no public API for "the key queue has drained", so this spins the
+/// loop until it has nothing pending and then waits once more. It has held over
+/// repeated runs, but a caller that must be certain should `/engine/wait` on the
+/// state it expects rather than trusting this alone — which is what `wait`
+/// exists for.
+const INPUT_FLUSH: Duration = Duration::from_millis(60);
 
 /// What `/engine/nav` can do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
