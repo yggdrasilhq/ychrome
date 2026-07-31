@@ -35,7 +35,7 @@ use gdk::prelude::*;
 use glib::translate::{ToGlibPtr, ToGlibPtrMut};
 use gtk::prelude::*;
 use javascriptcore::ValueExt;
-use serde_json::Value;
+use serde_json::{Value, json};
 use webkit2gtk::{LoadEvent, SettingsExt, SnapshotOptions, SnapshotRegion, WebView, WebViewExt};
 
 use super::substrate::{self, HeadlessDisplay, Probe, Substrate};
@@ -299,6 +299,62 @@ impl Engine {
             with_page(&id, responder, move |page, responder| {
                 page.view.set_zoom_level(level);
                 responder.ok(level)
+            })
+        })
+    }
+
+    /// Apply the browser identity this host has recorded for a URL's host.
+    ///
+    /// Per SITE, like [`Engine::apply_zoom`], and for the same reason: the
+    /// override belongs to the site, not to the page object. Unlike zoom it must
+    /// run BEFORE the navigation — the UA is a request header, so applying it
+    /// afterwards would identify the browser correctly only from the SECOND load
+    /// onwards, which is the load a bot check has already scored.
+    ///
+    /// A host with no override falls back to the profile's identity, and with no
+    /// global preset either that is `None` — WebKitGTK's own UA, which is the
+    /// coherent one. Setting `None` explicitly matters: without it a page would
+    /// keep whatever the previous navigation set, so one visit to an
+    /// override-marked site would leak that identity onto every site after it.
+    pub fn apply_identity(&self, id: &str, url: &str) -> Result<Option<String>> {
+        let host = url::Url::parse(url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_string));
+        let agent = match host.as_deref() {
+            Some(host) => crate::useragent::effective_for_host(host),
+            None => crate::useragent::effective(),
+        };
+        let id = id.to_string();
+        let applied = agent.clone();
+        on_engine(Duration::from_secs(10), move |responder| {
+            let agent = applied.clone();
+            with_page(&id, responder, move |page, responder| {
+                let settings: webkit2gtk::Settings =
+                    WebViewExt::settings(&page.view).unwrap_or_default();
+                settings.set_user_agent(agent.as_deref());
+                WebViewExt::set_settings(&page.view, &settings);
+                responder.ok(agent)
+            })
+        })
+    }
+
+    /// Journal what the MAIN FRAME's last load actually returned: the committed
+    /// url, the HTTP status, and the Cloudflare headers that name a bot check.
+    ///
+    /// ⭐ This exists because a challenge loop, a blocked asset and a jar that
+    /// does not persist all LOOK IDENTICAL from outside — the page comes back,
+    /// it is not what you asked for, and nothing anywhere says why. `cf-mitigated`
+    /// is the header Cloudflare sets when it served a challenge instead of the
+    /// origin's response, so a run of loads carrying it IS the loop, stated.
+    ///
+    /// Best-effort by construction: `main_resource` is `None` before the first
+    /// commit and a data: URL has no response. A missing field is reported
+    /// absent, never guessed.
+    pub fn trace_main_frame(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        on_engine(Duration::from_secs(10), move |responder| {
+            with_page(&id, responder, move |page, responder| {
+                responder.ok(main_frame_trace(&page.view))
             })
         })
     }
@@ -725,6 +781,50 @@ impl Drop for Engine {
         }
         drop(self.display.take());
     }
+}
+
+/// The headers worth naming in a load trace. Deliberately a SHORT list of
+/// non-secret response headers: `cf-mitigated` says a bot check answered instead
+/// of the origin, `cf-ray` is the id Cloudflare's own support asks for, `server`
+/// says who answered at all, and `content-type` separates "a challenge page" from
+/// "the JSON your app expected". No `set-cookie`, ever — a clearance cookie is a
+/// credential and a journal is not the place for one.
+const TRACED_HEADERS: [&str; 4] = ["cf-mitigated", "cf-ray", "server", "content-type"];
+
+/// Read the main frame's last response. See [`Engine::trace_main_frame`].
+fn main_frame_trace(view: &WebView) -> Value {
+    use webkit2gtk::{URIResponseExt, WebResourceExt};
+
+    let uri = view.uri().map(|uri| uri.to_string());
+    let Some(response) = view
+        .main_resource()
+        .and_then(|resource| resource.response())
+    else {
+        // Honest absence. Before the first commit there IS no response, and a
+        // zero status would read as a measurement.
+        return json!({ "url": uri, "response": Value::Null });
+    };
+    let status = response.status_code();
+    let mut headers = serde_json::Map::new();
+    if let Some(raw) = response.http_headers() {
+        for name in TRACED_HEADERS {
+            if let Some(value) = raw.one(name) {
+                headers.insert(name.to_string(), json!(value.to_string()));
+            }
+        }
+    }
+    json!({
+        "url": uri,
+        "response": {
+            "status": status,
+            "headers": headers,
+            // The named verdict, so a caller does not have to know Cloudflare's
+            // header vocabulary to see the loop. `cf-mitigated: challenge` is
+            // set on exactly the responses where a bot check replaced the page.
+            "bot_check": headers.get("cf-mitigated").is_some()
+                || matches!(status, 403 | 503) && headers.get("cf-ray").is_some(),
+        },
+    })
 }
 
 /// Arm a one-shot wait for the next load to settle, resolving to the committed
