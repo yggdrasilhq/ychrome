@@ -1038,11 +1038,46 @@ fn opened_as_tab_line(url: &str, profile: &str, session: &str) -> String {
     format!("ychrome: opened {url} as a new tab in the running [{profile}] session ({session})")
 }
 
+/// Every verb `main` dispatches off argv before clap. **This is the one list**
+/// — the dispatch arms below read as string literals for clarity, and
+/// `every_dispatched_subcommand_is_reserved` locks them to this array, so a new
+/// verb cannot be added without appearing here.
+///
+/// Reserving a name is what lets an unknown-but-subcommand-shaped token fail
+/// loudly instead of being browsed to. See the guard at the end of `main`.
+const RESERVED_SUBCOMMANDS: &[&str] = &[
+    "status",
+    "daemon",
+    "provision",
+    "adblock",
+    "ctl",
+    "engine",
+];
+
+/// Whether `token` is subcommand-shaped rather than URL-shaped: a single bare
+/// label with no scheme, no dot, no port and no path.
+///
+/// `localhost` is the one bare label that IS reachable, so it is allowed
+/// through; every other bare word would become `https://<word>`, which cannot
+/// resolve. Deterministic by construction — no guessing, no distance metric,
+/// no network lookup.
+fn looks_like_a_bare_subcommand(token: &str) -> bool {
+    if token.is_empty() || token == "localhost" || token == "about:blank" {
+        return false;
+    }
+    !token.contains("://")
+        && !token.contains('.')
+        && !token.contains(':')
+        && !token.contains('/')
+        && !token.contains('?')
+}
+
 fn main() -> Result<()> {
-    // Three internal/agent entry points, dispatched off argv before clap so the
+    // Internal/agent entry points, dispatched off argv before clap so the
     // open-a-url arg shape stays exactly as it was. `--daemon` is the host
     // daemon itself (spawned detached by the view client); `status` is the
     // host-side truth for agents; `daemon <verb>` supervises the running one.
+    // Every name here must also appear in RESERVED_SUBCOMMANDS — locked.
     let raw: Vec<String> = std::env::args().collect();
     if raw.get(1).map(String::as_str) == Some("--daemon") {
         // ⛔ THE DAEMON MUST RECONCILE TOO, and this call is why. The reconcile
@@ -1092,6 +1127,40 @@ fn main() -> Result<()> {
     if raw.get(1).map(String::as_str) == Some("engine") {
         let as_json = raw.iter().any(|arg| arg == "--json");
         engine::run_verb_and_exit(raw.get(2).map(String::as_str), as_json);
+    }
+
+    // ⛔ A SUBCOMMAND-SHAPED TOKEN MUST NEVER FALL THROUGH INTO THE URL.
+    //
+    // `Args` takes a positional `[URL]`, so before this guard ANY bare word in
+    // argv[1] was accepted as a URL — including one that is obviously a verb.
+    // `ychrome ctl --help` printed the plain usage and **exited 0** on a binary
+    // that had never heard of `ctl`, and bare `ychrome ctl` did not fail at all:
+    // it tried to browse to `https://ctl` and HUNG.
+    //
+    // That is not cosmetic. `cmd sub --help; echo $?` is how everyone probes
+    // whether a build has a feature, and it answered YES on a build without it
+    // — which produced a false fleet-wide deploy report on 2026-07-31.
+    //
+    // Reserving the known verbs is necessary but NOT sufficient, and it is
+    // worth being clear why: an old binary cannot know the name of a verb added
+    // after it was built, so a reserved list can never fix the cross-version
+    // case that caused the bad report. What fixes it permanently is refusing a
+    // token that CANNOT be a URL. A single bare label has no scheme, no dot, no
+    // port and no path; `https://ctl` can never resolve, while `localhost` can,
+    // so that one name is allowed through. Anything else bare is ambiguous, and
+    // the honest answer to an ambiguous argument is a question, not a hang.
+    if let Some(first) = raw.get(1).map(String::as_str)
+        && !first.starts_with('-')
+        && looks_like_a_bare_subcommand(first)
+    {
+        bail!(
+            "ychrome: {first:?} is not a known subcommand of this build (ychrome {}), \
+             and it cannot be a URL — a bare word has no scheme, dot or port.\n\
+             \x20 known subcommands: {}\n\
+             \x20 if you meant a host, give it a scheme: ychrome http://{first}",
+            env!("CARGO_PKG_VERSION"),
+            RESERVED_SUBCOMMANDS.join(", "),
+        );
     }
 
     let args = Args::parse();
@@ -1380,6 +1449,67 @@ mod second_invocation_tests {
                 }
                 other => panic!("a free stream anchors here, got {other:?} for {reply:?}"),
             }
+        }
+    }
+
+    /// Every verb `main` actually dispatches must be in `RESERVED_SUBCOMMANDS`.
+    /// Without this, adding a verb and forgetting to reserve it silently
+    /// restores the swallow-as-URL bug for that one name.
+    #[test]
+    fn every_dispatched_subcommand_is_reserved() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main() -> Result<()> {")
+            .nth(1)
+            .expect("main body present")
+            .split("let args = Args::parse();")
+            .next()
+            .expect("the pre-clap dispatch region");
+        let mut dispatched: Vec<String> = Vec::new();
+        for piece in body.split("raw.get(1).map(String::as_str) == Some(\"").skip(1) {
+            let name = piece.split('"').next().expect("verb literal closes");
+            dispatched.push(name.to_string());
+        }
+        assert!(
+            !dispatched.is_empty(),
+            "the dispatch region must contain verbs — did the shape change?"
+        );
+        for verb in &dispatched {
+            if verb.starts_with("--") {
+                continue; // `--daemon` is a flag, not a browsable token
+            }
+            assert!(
+                RESERVED_SUBCOMMANDS.contains(&verb.as_str()),
+                "{verb:?} is dispatched but NOT reserved — a token that means a \
+                 verb here would be browsed to as https://{verb} on any build \
+                 that does not dispatch it"
+            );
+        }
+    }
+
+    /// The guard's shape rule, stated as cases rather than prose.
+    #[test]
+    fn a_bare_label_is_a_subcommand_and_anything_url_shaped_is_not() {
+        for verb in ["ctl", "engine", "clt", "stauts", "someverb"] {
+            assert!(
+                looks_like_a_bare_subcommand(verb),
+                "{verb:?} is a bare label and can never resolve as https://{verb}"
+            );
+        }
+        for url in [
+            "example.com",
+            "http://example.com",
+            "https://example.com/x?y",
+            "localhost",
+            "localhost:3000",
+            "about:blank",
+            "198.51.100.1",
+            "oi.gour.top/c/abc",
+        ] {
+            assert!(
+                !looks_like_a_bare_subcommand(url),
+                "{url:?} is URL-shaped and must reach the browser untouched"
+            );
         }
     }
 
