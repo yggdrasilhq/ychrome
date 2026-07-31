@@ -203,8 +203,19 @@ mod tests {
         require(ext, "new MutationObserver(");
         require(ext, ".ytp-skip-ad-button");
         require(ext, ".ytp-ad-skip-button");
-        require(ext, "video.playbackRate = 16");
         require(ext, "video.currentTime = video.duration");
+        // The belt must SAY it fired. An ad on screen means the network prune
+        // missed, and a silent fallback turns that into a mystery — which is
+        // exactly how "I still see youtube ads, sped up to 2x" reached the
+        // user instead of "the blocker needs attention".
+        require(ext, "function warnLayerOneMissed");
+        require(ext, "console.warn(");
+        assert!(
+            !running_body(ext).contains("playbackRate ="),
+            "the forced playbackRate is back. WebKit clamps it to about 2x, so it never \
+             skipped an ad — it made the user watch every one of them at double speed while \
+             hiding that layer 1 was dead."
+        );
         // SPA navigation: without this the hooks bind once and never rebind.
         require(ext, "'yt-navigate-finish'");
     }
