@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        SponsorBlock
-// @version     1.0.0
+// @version     1.1.0
 // @match       https://*.youtube.com/*
 // @match       https://youtube.com/*
 // @world       isolated
@@ -8,7 +8,18 @@
 // ==/UserScript==
 // yggterm bundled userscript: SponsorBlock substitute for ychrome surfaces.
 // Auto-skips sponsor segments on YouTube using the community SponsorBlock API
-// (https://sponsor.ajay.app). Injected at document-start into the top frame;
+// (https://sponsor.ajay.app).
+//
+// PRIVACY: it asks by HASH PREFIX, never by video id. The real extension does
+// this and it is the reason it can be trusted; asking `/api/skipSegments?
+// videoID=<id>` tells sponsor.ajay.app exactly what you are watching, every
+// time. Instead the first 4 hex characters of SHA-256(videoID) go up,
+// sponsor.ajay.app answers with every video sharing that prefix (77 rows for a
+// sample prefix, measured), and the match happens here. There is deliberately
+// NO fallback to the by-id endpoint: a privacy property that silently
+// degrades is not a privacy property.
+//
+// Injected at document-start into the top frame;
 // deploy to ~/.yggterm/web-userscripts/ (shared across profiles) or a
 // per-profile userscripts/ dir. Disable = rename away from .js.
 //
@@ -22,9 +33,15 @@
     if (!/(^|\.)youtube\.com$/.test(location.hostname)) return;
     window.__ysb_loaded = true;
 
-    var API = 'https://sponsor.ajay.app/api/skipSegments';
+    // The PREFIX endpoint. `/api/skipSegments/<sha256-prefix>` returns every
+    // video whose id hashes to that prefix, so the id itself never leaves.
+    var API = 'https://sponsor.ajay.app/api/skipSegments/';
     var CATEGORIES = ['sponsor', 'selfpromo', 'interaction'];
-    var state = { videoId: null, segments: [], skipped: 0 };
+    // How much of the hash to send. 4 is what the real extension uses: enough
+    // to keep the answer small, short enough that the answer names thousands of
+    // videos and identifies none.
+    var HASH_PREFIX_LENGTH = 4;
+    var state = { videoId: null, segments: [], skipped: 0, lookups: 0 };
     window.__ysb_state = state;
 
     function currentVideoId() {
@@ -38,20 +55,62 @@
         return null;
     }
 
+    function hashPrefix(videoId) {
+        // No crypto.subtle means no hash, and NO REQUEST. Falling back to the
+        // by-id endpoint would trade the user's privacy for a feature without
+        // telling them, which is not a trade this script gets to make.
+        if (!window.crypto || !window.crypto.subtle || !window.TextEncoder) {
+            return Promise.reject(new Error('no crypto.subtle: refusing to ask by video id'));
+        }
+        return window.crypto.subtle
+            .digest('SHA-256', new TextEncoder().encode(videoId))
+            .then(function (buffer) {
+                var bytes = new Uint8Array(buffer);
+                var hex = '';
+                for (var i = 0; i < bytes.length && hex.length < HASH_PREFIX_LENGTH; i++) {
+                    hex += (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
+                }
+                return hex.slice(0, HASH_PREFIX_LENGTH);
+            });
+    }
+
     function fetchSegments(videoId) {
-        var url = API + '?videoID=' + encodeURIComponent(videoId) +
-            '&categories=' + encodeURIComponent(JSON.stringify(CATEGORIES));
-        fetch(url).then(function (resp) {
-            if (resp.status === 404) return [];
-            if (!resp.ok) throw new Error('sponsorblock http ' + resp.status);
-            return resp.json();
+        hashPrefix(videoId).then(function (prefix) {
+            state.lookups += 1;
+            var url = API + prefix +
+                '?categories=' + encodeURIComponent(JSON.stringify(CATEGORIES));
+            return fetch(url).then(function (resp) {
+                if (resp.status === 404) return [];
+                if (!resp.ok) throw new Error('sponsorblock http ' + resp.status);
+                return resp.json();
+            });
         }).then(function (rows) {
             if (state.videoId !== videoId) return;
-            state.segments = (rows || []).map(function (row) {
-                return { start: row.segment[0], end: row.segment[1], category: row.category };
-            }).sort(function (a, b) { return a.start - b.start; });
+            // The prefix answer covers thousands of videos; ours is one of
+            // them, and the match is made HERE, in the browser.
+            var mine = (rows || []).filter(function (row) { return row.videoID === videoId; });
+            var segments = [];
+            mine.forEach(function (row) {
+                (row.segments || []).forEach(function (seg) {
+                    // `actionType` matters: only `skip` means "seek past this".
+                    // A `mute` segment should be muted, not skipped, and a
+                    // `full` one labels the whole video — treating either as a
+                    // skip would jump the user out of content they wanted.
+                    if (seg.actionType && seg.actionType !== 'skip') return;
+                    // A segment the community voted down is one the community
+                    // says is wrong. -1 is the real extension's threshold.
+                    if (typeof seg.votes === 'number' && seg.votes < -1) return;
+                    segments.push({
+                        start: seg.segment[0],
+                        end: seg.segment[1],
+                        category: seg.category,
+                    });
+                });
+            });
+            state.segments = segments.sort(function (a, b) { return a.start - b.start; });
         }).catch(function () {
-            // Network/API failure: leave segments empty; never break playback.
+            // Network/API failure, or no crypto.subtle: leave segments empty
+            // and never break playback.
         });
     }
 
