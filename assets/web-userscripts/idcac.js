@@ -1,5 +1,6 @@
 // ==UserScript==
 // @name        I still don't care about cookies
+// @version     1.0.0
 // @world       isolated
 // @all-frames
 // @run-at      document-start
