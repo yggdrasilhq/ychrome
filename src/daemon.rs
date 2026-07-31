@@ -666,6 +666,11 @@ fn serve_engine_http(mut reader: BufReader<UnixStream>, stream: UnixStream) {
         crate::engine::api::Reply::Png(png) => {
             sidebar::respond_bytes(stream, 200, "image/png", &png)
         }
+        crate::engine::api::Reply::Ndjson(write_body) => {
+            let mut stream = stream;
+            sidebar::respond_ndjson_head(&mut stream);
+            write_body(&mut stream);
+        }
     }
 }
 

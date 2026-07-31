@@ -37,9 +37,17 @@ const POLL_MS: u64 = 100;
 /// with its own content type, as §4 specifies — a base64 blob inside JSON
 /// would have been a second encoding of an image the HTTP layer can carry
 /// natively.
+/// Writes an NDJSON stream, one JSON object per line, flushing as it goes.
+pub type NdjsonBody = Box<dyn FnOnce(&mut dyn std::io::Write) + Send>;
+
 pub enum Reply {
     Json(u16, Value),
     Png(Vec<u8>),
+    /// A streaming NDJSON body. The closure writes one JSON object per line as
+    /// each result lands, so a caller sees page 1 while page 300 is still
+    /// loading. §4 specifies this for `/engine/batch`; Phase D shipped a JSON
+    /// array as an honest placeholder and this closes it.
+    Ndjson(NdjsonBody),
 }
 
 impl Reply {
@@ -124,7 +132,7 @@ pub fn dispatch(request: &ParsedRequest) -> Reply {
     let reply = route(&verb, request);
     let (status, error) = match &reply {
         Reply::Json(status, body) => (*status, body.get("error").and_then(Value::as_str)),
-        Reply::Png(_) => (200, None),
+        Reply::Png(_) | Reply::Ndjson(_) => (200, None),
     };
     crate::daemon::journal(
         "engine.verb",
@@ -440,10 +448,36 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
 const DRIVES_A_PAGE: [&str; 7] = ["goto", "nav", "eval", "shot", "dom", "input", "wait"];
 
 /// A reply's status and body, for callers that only need the pair.
-fn json_status(reply: Reply) -> (u16, Value) {
+///
+/// An NDJSON stream is drained into memory HERE and only here — an in-process
+/// caller (the bench, the parity run) still exercises the real streaming code
+/// path and then reads the lines it produced, rather than the router growing a
+/// second non-streaming batch for tests to call.
+pub fn json_status(reply: Reply) -> (u16, Value) {
     match reply {
         Reply::Json(status, body) => (status, body),
         Reply::Png(png) => (200, json!({ "png_bytes": png.len() })),
+        Reply::Ndjson(write_body) => {
+            let mut buffer = Vec::new();
+            write_body(&mut buffer);
+            let lines: Vec<Value> = String::from_utf8_lossy(&buffer)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            let summary = lines
+                .iter()
+                .rev()
+                .find(|line| line["summary"] == json!(true))
+                .cloned()
+                .unwrap_or_else(|| json!({ "summary": false }));
+            let mut body = summary;
+            if let Some(map) = body.as_object_mut() {
+                map.insert("ok".into(), json!(true));
+                map.insert("lines".into(), json!(lines.len()));
+            }
+            (200, body)
+        }
     }
 }
 
@@ -492,74 +526,77 @@ fn batch(request: &ParsedRequest) -> Reply {
         .as_u64()
         .unwrap_or(8)
         .clamp(1, 64) as usize;
-    let started = Instant::now();
-    crate::daemon::journal(
-        "engine.batch.start",
-        json!({ "count": entries.len(), "concurrency": concurrency }),
-    );
 
-    let mut results = Vec::new();
-    let mut opened = 0;
-    let mut refused = 0;
-    // Chunked rather than one thread per entry: `concurrency` is a promise
-    // about how much is in flight, and 300 threads would break it.
-    for chunk in entries.chunks(concurrency) {
-        let mut handles = Vec::new();
-        for entry in chunk {
-            let entry = entry.clone();
-            handles.push(std::thread::spawn(move || {
-                let mut body = json!({ "page_id": new_page_id() });
-                if let Some(map) = body.as_object_mut() {
-                    for (key, value) in entry.as_object().into_iter().flatten() {
-                        map.insert(key.clone(), value.clone());
+    Reply::Ndjson(Box::new(move |out: &mut dyn std::io::Write| {
+        let started = Instant::now();
+        crate::daemon::journal(
+            "engine.batch.start",
+            json!({ "count": entries.len(), "concurrency": concurrency }),
+        );
+        let mut line = |value: Value| {
+            // Flush per line: a stream a reader cannot see until the end is a
+            // JSON array with extra steps.
+            let _ = writeln!(out, "{value}");
+            let _ = out.flush();
+        };
+
+        let mut opened = 0;
+        let mut refused = 0;
+        // Chunked rather than one thread per entry: `concurrency` is a promise
+        // about how much is in flight, and 300 threads would break it.
+        for chunk in entries.chunks(concurrency) {
+            let mut handles = Vec::new();
+            for entry in chunk {
+                let entry = entry.clone();
+                handles.push(std::thread::spawn(move || {
+                    let mut body = json!({ "page_id": new_page_id() });
+                    if let Some(map) = body.as_object_mut() {
+                        for (key, value) in entry.as_object().into_iter().flatten() {
+                            map.insert(key.clone(), value.clone());
+                        }
                     }
-                }
-                let reply = dispatch(&request_with("open", body));
-                match reply {
-                    Reply::Json(status, body) => (status, body),
-                    Reply::Png(_) => (500, json!({ "error": "open returned a PNG" })),
-                }
-            }));
-        }
-        for handle in handles {
-            match handle.join() {
-                Ok((200, body)) => {
-                    opened += 1;
-                    results.push(body);
-                }
-                Ok((status, body)) => {
-                    refused += 1;
-                    results.push(json!({ "status": status, "error": body["error"] }));
-                }
-                Err(_) => {
-                    refused += 1;
-                    results.push(json!({ "status": 500, "error": "batch worker panicked" }));
+                    match dispatch(&request_with("open", body)) {
+                        Reply::Json(status, body) => (status, body),
+                        _ => (500, json!({ "error": "open did not answer with JSON" })),
+                    }
+                }));
+            }
+            for handle in handles {
+                match handle.join() {
+                    Ok((200, body)) => {
+                        opened += 1;
+                        line(body);
+                    }
+                    Ok((status, body)) => {
+                        refused += 1;
+                        line(json!({ "ok": false, "status": status, "error": body["error"] }));
+                    }
+                    Err(_) => {
+                        refused += 1;
+                        line(
+                            json!({ "ok": false, "status": 500, "error": "batch worker panicked" }),
+                        );
+                    }
                 }
             }
         }
-    }
 
-    let (live, parked, total) = pool().counts();
-    let report = json!({
-        "ok": true,
-        "requested": entries.len(),
-        "opened": opened,
-        "refused": refused,
-        "live": live,
-        "parked": parked,
-        "logical_pages": total,
-        "elapsed_ms": started.elapsed().as_millis(),
-        "pages": results,
-    });
-    crate::daemon::journal(
-        "engine.batch.result",
-        json!({
-            "requested": entries.len(), "opened": opened, "refused": refused,
-            "live": live, "parked": parked, "logical_pages": total,
+        let (live, parked, total) = pool().counts();
+        let summary = json!({
+            "summary": true,
+            "requested": entries.len(),
+            "opened": opened,
+            "refused": refused,
+            "live": live,
+            "parked": parked,
+            "logical_pages": total,
             "elapsed_ms": started.elapsed().as_millis(),
-        }),
-    );
-    Reply::Json(200, report)
+        });
+        crate::daemon::journal("engine.batch.result", summary.clone());
+        // The LAST line is the summary, marked, so a reader knows the stream
+        // ended on purpose rather than on a dropped connection.
+        line(summary);
+    }))
 }
 
 /// `/engine/wait` — the primitive that makes scripts honest (§4).
@@ -864,11 +901,10 @@ pub fn govern(pages: usize) -> Result<Value> {
         .enumerate()
         .map(|(index, url)| json!({ "url": url, "tags": [format!("batch-{}", index % 3)] }))
         .collect();
-    let (status, batch) =
-        match dispatch(&request("batch", json!({ "open": open, "concurrency": 8 }))) {
-            Reply::Json(status, body) => (status, body),
-            Reply::Png(_) => (500, json!({})),
-        };
+    let (status, batch) = json_status(dispatch(&request(
+        "batch",
+        json!({ "open": open, "concurrency": 8 }),
+    )));
 
     watching.store(false, std::sync::atomic::Ordering::Relaxed);
     let _ = watcher.join();
@@ -900,15 +936,13 @@ pub fn govern(pages: usize) -> Result<Value> {
             ));
             let park = json_status(dispatch(&request("park", json!({ "page_id": id }))));
             let resume = json_status(dispatch(&request("resume", json!({ "page_id": id }))));
-            let after = match dispatch(&request(
+            let after = json_status(dispatch(&request(
                 "eval",
                 json!({ "page_id": id, "js":
                     "[document.getElementById('f').value, Math.round(window.scrollY)]" }),
-            )) {
-                Reply::Json(200, body) => body["value"].clone(),
-                Reply::Json(_, body) => body,
-                Reply::Png(_) => Value::Null,
-            };
+            )))
+            .1["value"]
+                .clone();
             let value_back = after[0] == json!(marker);
             let scroll_back = (after[1].as_f64().unwrap_or(0.0) - 1234.0).abs() <= 2.0;
             json!({
@@ -991,14 +1025,12 @@ pub fn bench(pages: usize) -> Result<Value> {
         handles.push(std::thread::spawn(move || {
             let began = Instant::now();
             let url = format!("https://example.com/?bench={index}");
-            let reply = dispatch(&request("open", json!({ "url": url })));
-            match reply {
-                Reply::Json(200, body) => Ok((
+            match json_status(dispatch(&request("open", json!({ "url": url })))) {
+                (200, body) => Ok((
                     body["page_id"].as_str().unwrap_or_default().to_string(),
                     began.elapsed().as_millis() as u64,
                 )),
-                Reply::Json(status, body) => Err(format!("open {index} -> {status} {body}")),
-                Reply::Png(_) => Err(format!("open {index} returned a PNG")),
+                (status, body) => Err(format!("open {index} -> {status} {body}")),
             }
         }));
     }
@@ -1028,7 +1060,10 @@ pub fn bench(pages: usize) -> Result<Value> {
         match dispatch(&request("shot", json!({ "page_id": id }))) {
             Reply::Png(png) if png.starts_with(b"\x89PNG\r\n\x1a\n") => shot_bytes.push(png.len()),
             Reply::Png(_) => failures.push(format!("{id}: readback was not a PNG")),
-            Reply::Json(status, body) => failures.push(format!("{id}: shot -> {status} {body}")),
+            other => {
+                let (status, body) = json_status(other);
+                failures.push(format!("{id}: shot -> {status} {body}"));
+            }
         }
     }
     let shot_ms = shot_started.elapsed().as_millis();

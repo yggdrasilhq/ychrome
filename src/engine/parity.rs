@@ -15,7 +15,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use super::api::{Reply, dispatch, request};
+use super::api::{dispatch, request};
 
 /// A generic cosmetic selector from the SHIPPED ruleset.
 ///
@@ -58,10 +58,7 @@ impl Check {
 }
 
 fn call(verb: &str, body: Value) -> (u16, Value) {
-    match dispatch(&request(verb, body)) {
-        Reply::Json(status, body) => (status, body),
-        Reply::Png(png) => (200, json!({ "png_bytes": png.len() })),
-    }
+    super::api::json_status(dispatch(&request(verb, body)))
 }
 
 fn read(page: &str, js: &str) -> Value {

@@ -1070,6 +1070,13 @@ fn main() -> Result<()> {
     // The agent engine (docs/agent-engine.md). Headless by construction: it
     // never opens a window on the invoking terminal's display and never emits
     // OSC 7717, so it is a peer of the surface path rather than a mode of it.
+    // `ychrome ctl <verb>` — the engine's thin client (docs/agent-engine.md §3).
+    // Dispatched here for the same reason as `engine`: argv-prefix, before
+    // clap, so the browser's url arg shape is untouched.
+    if raw.get(1).map(String::as_str) == Some("ctl") {
+        let outcome = engine::ctl::run(&raw[2..]);
+        engine::exit_with(outcome);
+    }
     if raw.get(1).map(String::as_str) == Some("engine") {
         let as_json = raw.iter().any(|arg| arg == "--json");
         engine::run_verb_and_exit(raw.get(2).map(String::as_str), as_json);
