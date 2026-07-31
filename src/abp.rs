@@ -108,9 +108,11 @@ pub enum DropReason {
     RequestRewrite,
     /// `$csp=`, `$permissions=`: inject a response header. No action for it.
     HeaderInjection,
-    /// `##+js(...)`: uBO scriptlet injection. Needs a library of surrogate
-    /// implementations and a JS injection plane keyed per domain. Out of scope
-    /// here, and named so the size of the gap is visible.
+    /// `##+js(...)` naming a scriptlet the runtime does not implement, or one
+    /// with no domain scope. The scriptlet PLANE exists now
+    /// (`generate_scriptlet_script`); this counts what it still cannot run, so
+    /// the size of the remaining gap stays visible instead of shrinking to
+    /// "we support scriptlets".
     Scriptlet,
     /// `#$#` / `#%#` / `#$?#`: CSS injection and snippet filters. `css-display-none`
     /// can only hide; it cannot set an arbitrary property.
@@ -190,7 +192,8 @@ impl DropReason {
             }
             DropReason::HeaderInjection => "there is no action that injects a response header",
             DropReason::Scriptlet => {
-                "uBO scriptlet injection needs a surrogate library and per-domain JS injection"
+                "no implementation for this scriptlet in the runtime library, or the filter \
+                 named no domain to scope it to"
             }
             DropReason::StyleOrSnippet => {
                 "css-display-none can only hide an element; it cannot set an arbitrary property"
@@ -253,6 +256,10 @@ pub struct Report {
     /// Procedural cosmetic filters routed to the generated userscript rather
     /// than dropped.
     pub cosmetic_procedural_rules: usize,
+    /// `##+js(...)` filters routed to the generated scriptlet userscript.
+    pub scriptlet_rules: usize,
+    /// `#@#+js(...)` exceptions honoured by removing a scriptlet from a domain.
+    pub scriptlet_unhide_applied: usize,
     /// Rules emitted, total.
     pub emitted: usize,
     /// Identical rules collapsed. Overlapping lists produce a lot of these.
@@ -316,6 +323,8 @@ impl Report {
             "cosmetic_domain_rules": self.cosmetic_domain_rules,
             "cosmetic_unhide_applied": self.cosmetic_unhide_applied,
             "cosmetic_procedural_rules": self.cosmetic_procedural_rules,
+            "scriptlet_rules": self.scriptlet_rules,
+            "scriptlet_unhide_applied": self.scriptlet_unhide_applied,
             "dropped_total": self.dropped_total(),
             "dropped": dropped,
         })
@@ -440,6 +449,9 @@ pub struct Conversion {
     /// Procedural cosmetic rules WebKit cannot express, keyed by domain, ready
     /// for [`generate_cosmetic_script`]. Deterministic order.
     pub procedural: BTreeMap<String, BTreeSet<ProceduralRule>>,
+    /// `##+js(...)` scriptlet invocations the runtime implements, keyed by
+    /// domain, ready for [`generate_scriptlet_script`]. Deterministic order.
+    pub scriptlets: BTreeMap<String, BTreeSet<ScriptletRule>>,
     pub report: Report,
 }
 
@@ -463,6 +475,238 @@ pub enum ProceduralRule {
     /// (`body.didomi-popup-open:style(overflow: auto !important;)` alone rides
     /// on 205 domains).
     Style { prefix: String, decls: String },
+}
+
+// ---------------------------------------------------------------------------
+// Scriptlets (`##+js(...)`)
+// ---------------------------------------------------------------------------
+
+/// One scriptlet invocation from a filter: the CANONICAL name and its
+/// arguments, already alias-resolved.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ScriptletRule {
+    pub name: &'static str,
+    pub args: Vec<String>,
+}
+
+/// The scriptlet library: one canonical name, every alias the lists spell it
+/// with, and the measured number of filters it unlocks.
+///
+/// ⚠ **This table and `assets/web-scriptlets/runtime.js` are ONE contract.**
+/// A canonical name here with no implementation there would route filters into
+/// a runtime that silently ignores them, which is the exact silent-degradation
+/// shape this converter exists to end.
+/// `extensions.rs::the_scriptlet_table_and_the_runtime_are_one_contract` fails
+/// if either side moves.
+///
+/// ⚠ **The implementations are OURS, written from the documented behaviour of
+/// the filter syntax.** uBlock Origin is GPLv3 and this project ships Apache.
+/// A scriptlet's NAME, its argument grammar and what it observably does are not
+/// copyrightable; an implementation is. Nothing here was transcribed.
+///
+/// `filters` is what the 2026-07-31 snapshot of the nine shipped lists actually
+/// uses, counted rather than guessed — it is why the order is what it is.
+pub struct Scriptlet {
+    pub canonical: &'static str,
+    pub aliases: &'static [&'static str],
+    /// Filters in the shipped corpus, measured 2026-07-31.
+    pub filters: usize,
+}
+
+/// Ordered by measured coverage, highest first, so the reason each one is here
+/// is legible. `scriptlet_coverage_is_ordered_by_what_it_unlocks` keeps it that
+/// way.
+pub static SCRIPTLETS: &[Scriptlet] = &[
+    Scriptlet {
+        canonical: "set-cookie",
+        aliases: &["trusted-set-cookie", "set-cookie.js"],
+        filters: 1070,
+    },
+    Scriptlet {
+        canonical: "abort-on-property-read",
+        aliases: &["aopr", "abort-on-property-read.js"],
+        filters: 637,
+    },
+    Scriptlet {
+        canonical: "abort-current-script",
+        aliases: &[
+            "acs",
+            "abort-current-inline-script",
+            "acis",
+            "abort-current-script.js",
+            "abort-current-inline-script.js",
+        ],
+        filters: 363,
+    },
+    Scriptlet {
+        canonical: "set-constant",
+        aliases: &["set", "set-constant.js"],
+        filters: 345,
+    },
+    Scriptlet {
+        canonical: "set-local-storage-item",
+        aliases: &["trusted-set-local-storage-item"],
+        filters: 237,
+    },
+    Scriptlet {
+        canonical: "no-setTimeout-if",
+        aliases: &["nostif", "prevent-setTimeout", "setTimeout-defuser"],
+        filters: 211,
+    },
+    Scriptlet {
+        canonical: "addEventListener-defuser",
+        aliases: &[
+            "aeld",
+            "prevent-addEventListener",
+            "addEventListener-defuser.js",
+        ],
+        filters: 205,
+    },
+    Scriptlet {
+        canonical: "abort-on-property-write",
+        aliases: &["aopw", "abort-on-property-write.js"],
+        filters: 183,
+    },
+    Scriptlet {
+        canonical: "no-window-open-if",
+        aliases: &["nowoif", "prevent-window-open", "window.open-defuser"],
+        filters: 183,
+    },
+    Scriptlet {
+        canonical: "remove-cookie",
+        aliases: &["cookie-remover", "cookie-remover.js"],
+        filters: 67,
+    },
+    Scriptlet {
+        canonical: "href-sanitizer",
+        aliases: &[],
+        filters: 62,
+    },
+    Scriptlet {
+        canonical: "adjust-setInterval",
+        aliases: &["nano-sib", "nano-setInterval-booster"],
+        filters: 51,
+    },
+    Scriptlet {
+        canonical: "remove-node-text",
+        aliases: &["rmnt", "remove-node-text.js"],
+        filters: 49,
+    },
+    Scriptlet {
+        canonical: "nowebrtc",
+        aliases: &["nowebrtc.js"],
+        filters: 47,
+    },
+    Scriptlet {
+        canonical: "no-xhr-if",
+        aliases: &["prevent-xhr"],
+        filters: 46,
+    },
+    Scriptlet {
+        canonical: "no-fetch-if",
+        aliases: &["prevent-fetch"],
+        filters: 40,
+    },
+    Scriptlet {
+        canonical: "adjust-setTimeout",
+        aliases: &["nano-stb", "nano-setTimeout-booster"],
+        filters: 32,
+    },
+    Scriptlet {
+        canonical: "remove-attr",
+        aliases: &["ra", "remove-attr.js"],
+        filters: 31,
+    },
+    Scriptlet {
+        canonical: "noeval-if",
+        aliases: &["noeval", "noeval.js", "silent-noeval", "prevent-eval-if"],
+        filters: 30,
+    },
+    Scriptlet {
+        canonical: "no-setInterval-if",
+        aliases: &["nosiif", "prevent-setInterval", "setInterval-defuser"],
+        filters: 28,
+    },
+    Scriptlet {
+        canonical: "json-prune",
+        aliases: &["json-prune.js"],
+        filters: 27,
+    },
+    Scriptlet {
+        canonical: "set-session-storage-item",
+        aliases: &["trusted-set-session-storage-item"],
+        filters: 9,
+    },
+    Scriptlet {
+        canonical: "remove-class",
+        aliases: &["rc"],
+        filters: 1,
+    },
+];
+
+/// Canonical name for a spelling the lists use, or `None` when the runtime has
+/// no implementation.
+pub fn canonical_scriptlet(name: &str) -> Option<&'static str> {
+    let name = name.trim();
+    SCRIPTLETS
+        .iter()
+        .find(|entry| entry.canonical == name || entry.aliases.contains(&name))
+        .map(|entry| entry.canonical)
+}
+
+/// Split `+js(name, a, b)`'s inside into its comma-separated arguments,
+/// honouring `\,` as a literal comma. uBO's grammar is positional and
+/// unquoted; a value that needs a comma escapes it, and that is the only
+/// escape there is.
+fn split_scriptlet_args(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut chars = body.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if chars.peek() == Some(&',') => {
+                chars.next();
+                current.push(',');
+            }
+            ',' => {
+                out.push(current.trim().to_string());
+                current = String::new();
+            }
+            _ => current.push(ch),
+        }
+    }
+    out.push(current.trim().to_string());
+    out
+}
+
+/// Parse a cosmetic body of the form `+js(name, args...)`.
+///
+/// Returns `None` for anything that is not a scriptlet invocation, and for a
+/// scriptlet whose name the runtime does not implement — the caller counts that
+/// as a drop rather than shipping a rule nothing will run.
+pub fn parse_scriptlet(body: &str) -> Option<ScriptletRule> {
+    let inner = body.strip_prefix("+js(")?.strip_suffix(')')?;
+    let mut args = split_scriptlet_args(inner);
+    if args.is_empty() || args[0].is_empty() {
+        return None;
+    }
+    let raw = args.remove(0);
+    let name = canonical_scriptlet(raw.trim_matches(|c| c == '\'' || c == '"'))?;
+    // Trailing empty positional arguments carry no meaning and would otherwise
+    // make two spellings of the same filter into two different rules.
+    while args.last().is_some_and(String::is_empty) {
+        args.pop();
+    }
+    Some(ScriptletRule {
+        name,
+        args: args
+            .into_iter()
+            .map(|arg| {
+                arg.trim_matches(|c| c == '\'' || c == '"')
+                    .replace("\\'", "'")
+            })
+            .collect(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,6 +1310,42 @@ pub fn convert(sources: &[Source<'_>]) -> Conversion {
     // Procedural rules go to the userscript plane, keyed by bare domain (the
     // generated script matches a host to its rules itself).
     let mut procedural: BTreeMap<String, BTreeSet<ProceduralRule>> = BTreeMap::new();
+    // Scriptlets take the same plane, the same key, and the same rule: a
+    // filter with no domain is refused rather than run on every page.
+    let mut scriptlets: BTreeMap<String, BTreeSet<ScriptletRule>> = BTreeMap::new();
+    let mut scriptlet_unhide: Vec<(String, ScriptletRule)> = Vec::new();
+    let mut take_scriptlet = |domains: &str, body: &str, report: &mut Report, line: &str| {
+        // A scriptlet with no domain scope would patch page globals on EVERY
+        // site in the browser. Nothing in the shipped corpus is written that
+        // way, and one that is gets counted rather than paid for everywhere.
+        if domains.is_empty() {
+            report.drop(DropReason::Scriptlet, line);
+            return;
+        }
+        let Some(rule) = parse_scriptlet(body) else {
+            report.drop(DropReason::Scriptlet, line);
+            return;
+        };
+        let mut landed = false;
+        for entry in domains.split(',').map(str::trim) {
+            if entry.is_empty() || entry.starts_with('~') {
+                continue;
+            }
+            let Some(host) = translate_domain(entry) else {
+                continue;
+            };
+            scriptlets
+                .entry(host.trim_start_matches('*').to_string())
+                .or_default()
+                .insert(rule.clone());
+            landed = true;
+        }
+        if landed {
+            report.scriptlet_rules += 1;
+        } else {
+            report.drop(DropReason::Scriptlet, line);
+        }
+    };
     let mut take_procedural = |domains: &str, body: &str, report: &mut Report, line: &str| {
         // A procedural rule with no domain would run its text scan on every
         // page in the browser. Every one in the shipped corpus is scoped; an
@@ -1125,6 +1405,27 @@ pub fn convert(sources: &[Source<'_>]) -> Conversion {
                         report.drop(DropReason::StyleOrSnippet, line);
                     }
                     "#?#" => take_procedural(domains, body, &mut report, line),
+                    "#@#" | "#@?#" if body.starts_with("+js(") => {
+                        // A scriptlet exception. Recorded and applied after
+                        // every scriptlet is known, because a `#@#+js` may
+                        // precede the `##+js` it cancels.
+                        if let Some(rule) = parse_scriptlet(body) {
+                            for entry in domains.split(',').map(str::trim) {
+                                if entry.is_empty() {
+                                    continue;
+                                }
+                                if let Some(host) = translate_domain(entry.trim_start_matches('~'))
+                                {
+                                    scriptlet_unhide.push((
+                                        host.trim_start_matches('*').to_string(),
+                                        rule.clone(),
+                                    ));
+                                }
+                            }
+                        } else {
+                            report.drop(DropReason::Scriptlet, line);
+                        }
+                    }
                     "#@#" | "#@?#" => {
                         // Record the unhide; it is applied after every hide is
                         // known, because a `#@#` may precede its `##`.
@@ -1147,7 +1448,9 @@ pub fn convert(sources: &[Source<'_>]) -> Conversion {
                             }
                         }
                     }
-                    "##" if body.starts_with("+js(") => report.drop(DropReason::Scriptlet, line),
+                    "##" if body.starts_with("+js(") => {
+                        take_scriptlet(domains, body, &mut report, line)
+                    }
                     "##" if body.starts_with('^') => report.drop(DropReason::HtmlFiltering, line),
                     "##" => {
                         if PROCEDURAL_MARKERS.iter().any(|m| body.contains(m)) {
@@ -1320,9 +1623,22 @@ pub fn convert(sources: &[Source<'_>]) -> Conversion {
         rules.truncate(WEBKIT_RULE_CEILING);
     }
     report.emitted = rules.len();
+    // `#@#+js(...)`: honoured last, because an exception may be written above
+    // the filter it cancels. Dropping the whole domain would be wrong — the
+    // exception names ONE scriptlet.
+    for (host, rule) in scriptlet_unhide {
+        if let Some(rules) = scriptlets.get_mut(&host)
+            && rules.remove(&rule)
+        {
+            report.scriptlet_unhide_applied += 1;
+            report.scriptlet_rules = report.scriptlet_rules.saturating_sub(1);
+        }
+    }
+    scriptlets.retain(|_, rules| !rules.is_empty());
     Conversion {
         rules,
         procedural,
+        scriptlets,
         report,
     }
 }
@@ -1330,6 +1646,115 @@ pub fn convert(sources: &[Source<'_>]) -> Conversion {
 /// The stem the generated cosmetic userscript is installed under, in the
 /// catalog and on disk. Named once, here, beside the generator.
 pub const COSMETIC_SCRIPT_STEM: &str = "cosmetic-filters";
+
+/// The stem the generated scriptlet userscript is installed under.
+pub const SCRIPTLET_SCRIPT_STEM: &str = "scriptlets";
+
+/// The runtime library, embedded. It is a FUNCTION EXPRESSION so the node
+/// harness can drive the real thing rather than a copy of it; see the header of
+/// `assets/web-scriptlets/runtime.js`.
+pub const SCRIPTLET_RUNTIME: &str = include_str!("../assets/web-scriptlets/runtime.js");
+
+/// The markers the generated body wraps the runtime in, so the harness can cut
+/// the real implementation out of the SHIPPED artefact and drive it with its
+/// own rules. Testing a copy of the runtime would prove nothing about the file
+/// the catalog serves.
+pub const RUNTIME_BEGIN: &str = "ychrome-scriptlet-runtime:begin";
+pub const RUNTIME_END: &str = "ychrome-scriptlet-runtime:end";
+
+/// Render the scriptlet rules as a userscript body.
+///
+/// **The plane is reused, not reinvented.** Per-domain JS injection was named
+/// as the blocker on `##+js(...)` for a whole release, and it is a matching
+/// problem this repo already solved: `@match` lines scope the script to exactly
+/// the domains that have rules, WebKit does the matching in the engine, and on
+/// every other page the script does not exist. `cosmetic-filters.js` holds the
+/// same contract.
+///
+/// **The world is MAIN, and that is not a detail.** A scriptlet's whole job is
+/// to edit page globals — `window.open`, `JSON.parse`, a property the page's
+/// own script reads. In an isolated world every one of those edits is invisible
+/// to the page, and the script would run, report success, and change nothing.
+/// That exact mistake cost this project a release with `youtube-adblock`
+/// (docs/adblock.md §6), and a scriptlet plane is strictly more exposed to it.
+///
+/// Deterministic by construction: `BTreeMap` of `BTreeSet`, serialized as JSON.
+pub fn generate_scriptlet_script(
+    scriptlets: &BTreeMap<String, BTreeSet<ScriptletRule>>,
+    version: &str,
+) -> String {
+    // THE RULES ARE INTERNED. One filter names dozens of domains — a single
+    // `set-cookie` line rides on 2,191 of them — so a domain-keyed table of
+    // whole invocations repeats the same row thousands of times. Measured on
+    // the 2026-07-31 corpus: 8,736 instances over 2,428 DISTINCT rules, and
+    // spelling each one out cost 845 KB of the generated file. `TABLE` holds
+    // each rule once; `RULES` maps a domain to indices into it.
+    //
+    // Deterministic: the table is built by walking a `BTreeMap` of `BTreeSet`s,
+    // so a rule's index is a pure function of the corpus.
+    let mut table: Vec<Value> = Vec::new();
+    let mut index_of: BTreeMap<&ScriptletRule, usize> = BTreeMap::new();
+    let mut payload: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (domain, rules) in scriptlets {
+        let mut indices = Vec::with_capacity(rules.len());
+        for rule in rules {
+            let next = index_of.len();
+            let at = *index_of.entry(rule).or_insert_with(|| {
+                let mut row = vec![Value::from(rule.name)];
+                row.extend(rule.args.iter().map(|arg| Value::from(arg.as_str())));
+                table.push(Value::Array(row));
+                next
+            });
+            indices.push(at);
+        }
+        payload.insert(domain.as_str(), indices);
+    }
+    let table = serde_json::to_string(&table).unwrap_or_else(|_| "[]".to_string());
+    let matches: String = scriptlets
+        .keys()
+        .map(|domain| format!("// @match       *://*.{domain}/*\n"))
+        .collect();
+    let rule_count: usize = scriptlets.values().map(BTreeSet::len).sum();
+    let domain_count = scriptlets.len();
+    let payload = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+    let runtime = SCRIPTLET_RUNTIME;
+    let begin = RUNTIME_BEGIN;
+    let end = RUNTIME_END;
+
+    format!(
+        "// ==UserScript==\n\
+         // @name        ychrome scriptlets (GENERATED)\n\
+         // @version     {version}\n\
+         {matches}\
+         // @world       main\n\
+         // @run-at      document-start\n\
+         // ==/UserScript==\n\
+         // GENERATED by `ychrome adblock update` from the upstream filter lists.\n\
+         // DO NOT EDIT: regenerate it. {rule_count} scriptlet invocations over\n\
+         // {domain_count} domains.\n\
+         //\n\
+         // `##+js(name, args...)` asks the blocker to run a named piece of\n\
+         // JavaScript on a page. A declarative content blocker cannot: it decides\n\
+         // yes or no about a request and never runs anything. So the filters become\n\
+         // DATA — a domain-keyed table of invocations — and the library below runs\n\
+         // them. A new site costs a line in an upstream list; only a new PRIMITIVE\n\
+         // costs code.\n\
+         //\n\
+         // @world main is load-bearing: these edit the page's own globals, and in\n\
+         // an isolated world every edit would be invisible to the page while the\n\
+         // script reported success.\n\
+         (function () {{\n\
+         \x20   'use strict';\n\
+         \x20   if (window.__yggScriptlets) return;\n\
+         \x20   var TABLE = {table};\n\
+         \x20   var RULES = {payload};\n\
+         \x20   /* {begin} */\n\
+         \x20   var run = {runtime};\n\
+         \x20   /* {end} */\n\
+         \x20   run(RULES, TABLE, window);\n\
+         }})();\n"
+    )
+}
 
 /// Render the procedural rules as a userscript body.
 ///
@@ -1791,12 +2216,15 @@ mod tests {
         let conversion = convert_one(
             "a.test##div:upward(2)\n\
              a.test#?#div:xpath(//div)\n\
-             a.test##+js(set-constant, x, true)\n\
+             a.test##+js(trusted-click-element, .accept)\n\
              a.test#$#body { display: block; }\n\
              a.test##^script:has-text(ads)\n",
         );
         let dropped = &conversion.report.dropped;
         assert_eq!(dropped.get("procedural-selector"), Some(&2));
+        // A scriptlet the runtime does not implement is still COUNTED. The
+        // plane existing is not the same as the plane covering everything, and
+        // collapsing the two would hide the remaining gap.
         assert_eq!(dropped.get("scriptlet"), Some(&1));
         assert_eq!(dropped.get("style-or-snippet"), Some(&1));
         assert_eq!(dropped.get("html-filtering"), Some(&1));
@@ -1804,9 +2232,136 @@ mod tests {
         // And each one keeps a verbatim sample, so the report names what it
         // refused rather than only counting it.
         assert!(
-            conversion.report.samples["scriptlet"][0].contains("+js(set-constant"),
+            conversion.report.samples["scriptlet"][0].contains("+js(trusted-click-element"),
             "a drop must name the filter verbatim"
         );
+    }
+
+    // THE SCRIPTLET PLANE. `##+js(...)` was counted as impossible for a whole
+    // release ("needs a surrogate library and per-domain JS injection"); the
+    // per-domain injection was the userscript plane all along, and the library
+    // is `assets/web-scriptlets/runtime.js`.
+    #[test]
+    fn implemented_scriptlets_route_to_the_userscript_plane() {
+        let conversion = convert_one(
+            "a.test,b.test##+js(set-constant, adsEnabled, false)\n\
+             a.test##+js(aopr, blockAdBlock)\n\
+             a.test##+js(no-such-scriptlet-exists, x)\n\
+             ##+js(set-constant, everywhere, true)\n",
+        );
+        assert_eq!(conversion.report.scriptlet_rules, 2);
+        // Aliases resolve to ONE canonical name, so `aopr` and
+        // `abort-on-property-read` can never become two rules for one filter.
+        let a = &conversion.scriptlets["a.test"];
+        assert!(a.contains(&ScriptletRule {
+            name: "set-constant",
+            args: vec!["adsEnabled".into(), "false".into()],
+        }));
+        assert!(a.contains(&ScriptletRule {
+            name: "abort-on-property-read",
+            args: vec!["blockAdBlock".into()],
+        }));
+        assert_eq!(conversion.scriptlets["b.test"].len(), 1);
+        // An unimplemented name and an UNSCOPED filter are both refused. The
+        // second matters most: a scriptlet with no domain would patch page
+        // globals on every site in the browser.
+        assert_eq!(conversion.report.dropped.get("scriptlet"), Some(&2));
+    }
+
+    // `#@#+js(...)` disables ONE scriptlet on a domain, not the domain. It is
+    // applied after the whole corpus is read, because an exception is regularly
+    // written above the filter it cancels.
+    #[test]
+    fn a_scriptlet_exception_removes_exactly_one_rule() {
+        let conversion = convert_one(
+            "a.test#@#+js(set-constant, adsEnabled, false)\n\
+             a.test,b.test##+js(set-constant, adsEnabled, false)\n\
+             a.test##+js(aopr, blockAdBlock)\n",
+        );
+        assert_eq!(conversion.report.scriptlet_unhide_applied, 1);
+        let a = &conversion.scriptlets["a.test"];
+        assert_eq!(a.len(), 1, "only the excepted rule is gone");
+        assert_eq!(a.iter().next().unwrap().name, "abort-on-property-read");
+        assert_eq!(
+            conversion.scriptlets["b.test"].len(),
+            1,
+            "the exception names one domain and must not reach another"
+        );
+    }
+
+    // The generated body is the artefact the catalog ships, so its SHAPE is a
+    // contract: main world, one @match per domain, the runtime between its
+    // markers, and rules interned rather than repeated.
+    #[test]
+    fn the_generated_scriptlet_body_is_scoped_interned_and_main_world() {
+        let conversion = convert_one(
+            "a.test,b.test##+js(set-constant, adsEnabled, false)\n\
+             b.test##+js(aopr, blockAdBlock)\n",
+        );
+        let body = generate_scriptlet_script(&conversion.scriptlets, "1.0.0");
+        assert!(body.contains("// @world       main"));
+        assert!(body.contains("// @match       *://*.a.test/*"));
+        assert!(body.contains("// @match       *://*.b.test/*"));
+        assert!(body.contains(RUNTIME_BEGIN) && body.contains(RUNTIME_END));
+        // Interning: the shared rule appears ONCE in the table even though two
+        // domains use it. Spelling it out per domain cost 845 KB on the real
+        // corpus (8,736 instances over 2,428 distinct rules).
+        assert_eq!(
+            body.matches("[\"set-constant\",\"adsEnabled\",\"false\"]")
+                .count(),
+            1,
+            "a rule shared by two domains must be stored once and referenced twice"
+        );
+        // Deterministic: same corpus, same bytes.
+        assert_eq!(
+            body,
+            generate_scriptlet_script(&conversion.scriptlets, "1.0.0")
+        );
+    }
+
+    // The order of `SCRIPTLETS` is a CLAIM — "highest coverage first" is why
+    // this list is the length it is and why `trusted-click-element` is missing
+    // from it. A claim a reader cannot check is decoration.
+    #[test]
+    fn scriptlet_coverage_is_ordered_by_what_it_unlocks() {
+        let mut previous = usize::MAX;
+        for entry in SCRIPTLETS {
+            assert!(
+                entry.filters <= previous,
+                "{:?} ({} filters) is listed after something smaller — the table claims to be \
+                 ordered by measured coverage",
+                entry.canonical,
+                entry.filters
+            );
+            previous = entry.filters;
+        }
+        // 3,954 of the corpus's 5,057 `##+js(...)` filters, measured 2026-07-31.
+        // A change that moves this number should move docs/adblock.md §5 with it.
+        let total: usize = SCRIPTLETS.iter().map(|entry| entry.filters).sum();
+        assert_eq!(total, 3954);
+    }
+
+    // The argument grammar, which is positional and has exactly one escape.
+    #[test]
+    fn scriptlet_arguments_parse_the_way_the_lists_write_them() {
+        let rule = parse_scriptlet("+js(set-constant, a.b.c, noopFunc)").expect("parses");
+        assert_eq!(rule.name, "set-constant");
+        assert_eq!(rule.args, vec!["a.b.c", "noopFunc"]);
+        // `\,` is a literal comma — the only escape the syntax has, and the
+        // reason a regex argument can contain one at all.
+        let rule = parse_scriptlet("+js(nostif, /ad\\,break/, 1000)").expect("parses");
+        assert_eq!(rule.name, "no-setTimeout-if");
+        assert_eq!(rule.args, vec!["/ad,break/", "1000"]);
+        // Trailing empty positionals carry no meaning; keeping them would make
+        // two spellings of one filter into two rules.
+        assert_eq!(
+            parse_scriptlet("+js(aopr, x, , )").expect("parses").args,
+            vec!["x"]
+        );
+        // An unimplemented name is refused HERE, so the caller counts it rather
+        // than shipping a rule nothing will run.
+        assert!(parse_scriptlet("+js(trusted-click-element, .ok)").is_none());
+        assert!(parse_scriptlet("##.not-a-scriptlet").is_none());
     }
 
     // THE OTHER HALF OF COSMETIC FILTERING. `:has-text()` and `:style()` are
