@@ -41,13 +41,20 @@ pub fn find(stem: &str) -> Option<&'static Extension> {
     CATALOG.iter().find(|ext| ext.stem == stem)
 }
 
-static CATALOG: [Extension; 5] = [
+static CATALOG: [Extension; 6] = [
     Extension {
         stem: crate::abp::COSMETIC_SCRIPT_STEM,
         name: "Cosmetic filters",
         description: "Hide the ad shapes WebKit's content blocker cannot express \
                       (:has-text, :style) — generated from the upstream filter lists.",
         body: include_str!("../assets/web-userscripts/cosmetic-filters.js"),
+    },
+    Extension {
+        stem: crate::abp::SCRIPTLET_SCRIPT_STEM,
+        name: "Scriptlets",
+        description: "Run the per-site fixes the filter lists ask for with `##+js(...)` — \
+                      a declarative blocker can only allow or deny, never run anything.",
+        body: include_str!("../assets/web-userscripts/scriptlets.js"),
     },
     Extension {
         stem: SPONSORBLOCK_STEM,
@@ -146,6 +153,10 @@ mod tests {
     fn every_catalog_body_is_the_script_it_claims_to_be() {
         let fingerprints = [
             (crate::abp::COSMETIC_SCRIPT_STEM, "window.__yggCosmetic"),
+            (
+                crate::abp::SCRIPTLET_SCRIPT_STEM,
+                "W.__yggScriptlets = state;",
+            ),
             (SPONSORBLOCK_STEM, "sponsor.ajay.app"),
             ("youtube-adblock", "'/youtubei/v1/player'"),
             ("idcac", "window.__yggIdcac"),
@@ -207,6 +218,31 @@ mod tests {
         require(ext, "xhrProto.open = function");
         require(ext, "xhrProto.send = function");
 
+        // THE TWO PARSE FUNNELS, and they are not optional. Measured on one
+        // cold watch-page load in the ychrome engine on 2026-07-31: the fetch
+        // hook saw ONE `/youtubei/v1/player` call and it was not the video's
+        // player response, while `JSON.parse` was handed the real one 30 times
+        // and `Response.prototype.json` twice more — every copy still carrying
+        // all four ad fields. With only the network hooks, `getPlayerResponse()`
+        // on the SECOND video of a session still answered
+        // `["playerAds","adPlacements","adBreakHeartbeatParams"]`. That is the
+        // whole of "the script runs and the user still sees ads".
+        require(ext, "JSON.parse = function");
+        require(ext, "responseProto.json = function");
+        // …and the trap that makes the two layers cancel out. `pruneText` has
+        // to parse with the parser it captured BEFORE hooking: with the hooked
+        // one, the parse hook cleans the object first, `pruneAds` then finds
+        // nothing to remove, and the fetch hook hands back the ORIGINAL TEXT to
+        // any caller reading the body as text.
+        require(ext, "var nativeParse = JSON.parse;");
+        require(ext, "data = nativeParse(text);");
+        assert!(
+            !running_body(ext).contains("data = JSON.parse(text)"),
+            "pruneText is parsing with the HOOKED JSON.parse. The parse hook will clean the \
+             object first, the rewrite will decide nothing was removed, and the body will go \
+             back to the page unedited — two working layers cancelling out, silently."
+        );
+
         // The DOM belt for the day the response shape shifts.
         require(ext, "new MutationObserver(");
         require(ext, ".ytp-skip-ad-button");
@@ -250,6 +286,18 @@ mod tests {
                     "Object.defineProperty(window, 'ytInitialPlayerResponse'"
                 ),
             "the inline-response hook is installed before the youtube.com guard"
+        );
+        // The parse hooks are the WIDEST thing this script installs. `fetch` and
+        // XHR are per-request; `JSON.parse` runs thousands of times on every
+        // page in the browser. Installed above the guard, this blocker becomes a
+        // tax on the whole web instead of a fix for one site.
+        assert!(
+            guard < code_index(ext, "JSON.parse = function"),
+            "the JSON.parse hook is installed before the youtube.com guard"
+        );
+        assert!(
+            guard < code_index(ext, "responseProto.json = function"),
+            "the Response.prototype.json hook is installed before the youtube.com guard"
         );
     }
 
@@ -323,9 +371,7 @@ mod tests {
             "not ", "never",
         ];
         for phrase in &phrases {
-            let negated = NEGATIONS
-                .iter()
-                .any(|negation| phrase.contains(negation));
+            let negated = NEGATIONS.iter().any(|negation| phrase.contains(negation));
             // English, plus the consent verbs of every language REJECT_TEXT
             // now speaks. A list that says no in six languages and only
             // recognises yes in one is a lock with a hole in it: "alle
@@ -573,6 +619,134 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // THE ANTI-DRIFT LOCK, and the most important test in this file.
+    //
+    // `abp::SCRIPTLETS` decides which `##+js(...)` filters get ROUTED into the
+    // generated script; `assets/web-scriptlets/runtime.js` decides which ones
+    // that script can RUN. A canonical name in the table with no implementation
+    // in the runtime routes filters into a runtime that ignores them — the
+    // ruleset would report thousands of scriptlets "supported" and the user
+    // would see the ads anyway. That is exactly the silent-degradation shape
+    // this converter was built to end, so it is a test, not a comment.
+    #[test]
+    fn the_scriptlet_table_and_the_runtime_are_one_contract() {
+        let runtime = crate::abp::SCRIPTLET_RUNTIME;
+        for entry in crate::abp::SCRIPTLETS {
+            assert!(
+                runtime.contains(&format!("'{}': function", entry.canonical)),
+                "abp::SCRIPTLETS routes {:?} but runtime.js has no implementation for it — \
+                 every filter naming it would be counted as supported and then ignored",
+                entry.canonical
+            );
+        }
+        // …and the other direction: an implementation nothing routes to is dead
+        // weight in a body injected on 5,000 domains.
+        let mut implemented: Vec<&str> = Vec::new();
+        for line in runtime.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix('\'')
+                && let Some((name, tail)) = rest.split_once('\'')
+                && tail.starts_with(": function")
+            {
+                implemented.push(name);
+            }
+        }
+        for name in &implemented {
+            assert!(
+                crate::abp::SCRIPTLETS
+                    .iter()
+                    .any(|entry| entry.canonical == *name),
+                "runtime.js implements {name:?} but abp::SCRIPTLETS never routes a filter to it"
+            );
+        }
+        assert_eq!(
+            implemented.len(),
+            crate::abp::SCRIPTLETS.len(),
+            "the table and the runtime disagree on how many scriptlets exist"
+        );
+        // Aliases must be unambiguous: two entries claiming one spelling would
+        // make the winner depend on table order.
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for entry in crate::abp::SCRIPTLETS {
+            assert!(
+                seen.insert(entry.canonical),
+                "duplicate {:?}",
+                entry.canonical
+            );
+            for alias in entry.aliases {
+                assert!(
+                    seen.insert(alias),
+                    "{alias:?} is claimed by more than one scriptlet"
+                );
+            }
+        }
+    }
+
+    // The GENERATED scriptlet script, DRIVEN. Source needles prove a name is
+    // mentioned; only running it proves `window.open` is actually refused and
+    // that a page with no rules pays nothing.
+    #[test]
+    fn the_generated_scriptlet_script_actually_runs_its_scriptlets() {
+        let ext = find(crate::abp::SCRIPTLET_SCRIPT_STEM).expect("scriptlets in catalog");
+        let node_ok = std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !node_ok {
+            assert!(
+                std::env::var_os("YCHROME_ALLOW_NO_NODE").is_some(),
+                "node is needed to run the scriptlet behaviour lock; install it, or set \
+                 YCHROME_ALLOW_NO_NODE=1 to knowingly ship without this proof"
+            );
+            return;
+        }
+        let dir = scratch_dir("scriptlets");
+        let script = dir.join("scriptlets.js");
+        std::fs::write(&script, ext.body).expect("write the script under test");
+        let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/scriptlets-harness.js");
+        // The probe host drives one synthetic rule per implemented scriptlet;
+        // the second is the performance contract, on a host with no rules.
+        for host in ["ychrome-probe.test", "not-in-the-list.example"] {
+            let out = std::process::Command::new("node")
+                .arg(&harness)
+                .arg(&script)
+                .arg(host)
+                .output()
+                .expect("run the node harness");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success() && stdout.contains("ALL OK"),
+                "scriptlets harness failed on {host}:\n{stdout}\n{stderr}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The world is the whole ballgame for this one. A scriptlet edits the
+    // PAGE's globals; in an isolated world every edit is invisible to the page
+    // and the script reports success while changing nothing. That is not
+    // hypothetical here — it is exactly how `youtube-adblock` shipped broken
+    // (docs/adblock.md §6), and a scriptlet plane is strictly more exposed.
+    #[test]
+    fn the_scriptlet_script_runs_in_the_main_world() {
+        let ext = find(crate::abp::SCRIPTLET_SCRIPT_STEM).expect("scriptlets in catalog");
+        let parsed = crate::userscript::parse(ext.body);
+        assert_eq!(
+            parsed.world,
+            crate::userscript::ScriptWorld::Main,
+            "the scriptlet script must run in the MAIN world; an isolated one cannot touch \
+             a single page global it exists to edit"
+        );
+        assert!(
+            !parsed.matches.is_empty(),
+            "the scriptlet script must be @match-scoped to the domains that have rules — \
+             unscoped, it patches page globals on every site in the browser"
+        );
     }
 
     // What the SHIPPED bodies declare, read back through the parser that will
