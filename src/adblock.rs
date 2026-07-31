@@ -270,9 +270,16 @@ fn fetch(url: &str) -> Result<String> {
 }
 
 /// Build the sidecar for a conversion.
+/// The version this run stamps on both artefacts. One string, one owner: the
+/// ruleset's sidecar and the generated userscript's `@version` must agree, or
+/// the reconciler would heal one and leave the other.
+fn ruleset_version() -> String {
+    format!("{RULESET_FORMAT_VERSION}.{}", today_stamp())
+}
+
 fn meta_for(conversion: &Conversion, sources: &[(String, usize)]) -> Value {
     json!({
-        "ruleset_version": format!("{RULESET_FORMAT_VERSION}.{}", today_stamp()),
+        "ruleset_version": ruleset_version(),
         "generator": "ychrome abp converter",
         "webkit_rule_ceiling": crate::abp::WEBKIT_RULE_CEILING,
         "sources": sources
@@ -310,6 +317,14 @@ fn build_into(dir: &Path, loaded: Vec<(String, String)>) -> Result<Conversion> {
         &rules,
         &serde_json::to_string(&meta_for(&conversion, &counted))?,
     )?;
+    // The cosmetic userscript is the SAME conversion's other half, so it is
+    // written by the same call. Two owners of "what the filter lists say" is
+    // exactly the divergence this repo forbids.
+    std::fs::write(
+        dir.join(format!("{}.js", crate::abp::COSMETIC_SCRIPT_STEM)),
+        crate::abp::generate_cosmetic_script(&conversion.procedural, &ruleset_version()),
+    )
+    .with_context(|| format!("writing {}.js", crate::abp::COSMETIC_SCRIPT_STEM))?;
     Ok(conversion)
 }
 
