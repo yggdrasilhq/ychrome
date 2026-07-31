@@ -111,11 +111,17 @@ half-delivered: **headless means off-screen, not off-host.** `Xvfb :90` and ever
 WebKitWebProcess run on **the GUI host — the operator's machine** — so the CPU, RAM and
 thermal cost are still his; only the pixels are hidden.
 
-`dev` and `oc` still have the OLD binary (`ychrome ctl pool --json` →
-`unexpected argument 'pool'`), so there is nowhere else to run it. dev is a
-container on mains power and is the documented preference for anything that
-renders (`data-fabric`: *"Prefer dev over the GUI host… the GUI host is the laptop the user is
-working on"*).
+**HALF-CLOSED 2026-07-31 (oc).** `fleet-binary-sync` pulled the engine binary to
+**oc**, where `ychrome ctl pool --json` now answers for real and the whole IBKR
+login flow was driven off the operator's laptop. **`dev` is still uncovered, and
+worse than before: `ychrome` is `command not found` there** — not an old binary,
+no binary. dev is a container on mains power and is the documented preference for
+anything that renders (`data-fabric`: *"Prefer dev over the GUI host… the GUI host is the laptop
+the user is working on"*), so it is the one host that most needs it.
+
+⚠ **oc can run the engine but CANNOT mint a TOTP** — see the clock-skew entry
+below. Any flow that needs a second factor has to source the code from the GUI host even
+when the browsing itself happens on oc.
 
 **This is a bug, not a deployment chore**, because the feature's stated benefit
 does not exist until it lands: an engine that can only run on the operator's
@@ -127,6 +133,48 @@ agent browsing.
 **Wants:** ychrome deployed fleet-wide (it "deploys as a fleet" per standing
 practice), and the engine verified reachable from dev/oc, so `ctl` runs where
 nobody is sitting.
+
+## ★★★ the hypervisor host's CLOCK IS 72 s SLOW, SO `ychrome-vault totp` CANNOT WORK ON dev OR oc
+
+**Measured 2026-07-31 on oc.** Three independent servers agree, and so does the
+host's own chrony:
+
+```
+google.com  skew=72s   cloudflare.com  skew=72s   interactivebrokers.co.in  skew=73s
+chronyc tracking → System time : 71.908782959 seconds slow of NTP time
+timedatectl      → System clock synchronized: no   (NTP service: active)
+```
+
+Epoch compared across the fleet: **the GUI host `…997` (correct); dev `…925`; oc `…925`.**
+dev and oc are LXCs on **the hypervisor host** and share its `CLOCK_REALTIME`, so this is one
+clock, wrong, serving two of the three hosts. the GUI host is a separate machine and is
+fine.
+
+**Why it is a ychrome bug and not just infra trivia:** a TOTP window is 30 s, so
+72 s is **2.4 windows stale** and servers accept at most ±1. `ychrome-vault totp`
+on dev/oc therefore emits a code that is *always* wrong, while looking perfectly
+well-formed — six digits, stable within its window, no error. It is a
+lie-of-success in the same family as the click-into-the-void: the instrument
+reports a confident answer that cannot be right. **Waiting does not help** — the
+skew is constant, so the host can never drift into the correct window.
+
+⚠ **The trap that cost this session two live-brokerage 2FA attempts:** chrony
+reports `Last offset : -0.000112349 seconds` and `RMS offset : 0.0003 s` — it
+believes it is tracking *perfectly* while system time is 72 s out. Reading
+`chronyc tracking`'s offset lines alone tells you the clock is healthy. **Only
+the `System time :` line, or a comparison against a real server's `Date` header,
+shows the truth.**
+
+**Also at risk:** `fleet-memory-sync.sh` is newest-**mtime**-wins with no
+`--delete`. With a 72 s offset between the GUI host and the hypervisor host, two edits to the same
+memory inside a 72 s window resolve by the wrong winner — a file genuinely newer
+on the GUI host can lose to a stale the hypervisor host copy.
+
+**Wants:** the hypervisor host's clock stepped and kept in sync (oc *does* hold `cap_sys_time`
+and sudo, but the clock is the shared host's — stepping it from inside a
+container hits the hypervisor host and dev's running agents, so it is the operator's call);
+and `ychrome-vault totp` should **refuse, not guess**, when the host clock is
+further than one window from a trusted reference.
 
 ## ★★ THE `dream-control-surfaces` ITEMS ARE BUGS, NOT ASPIRATIONS
 
