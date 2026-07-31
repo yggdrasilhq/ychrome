@@ -101,6 +101,30 @@ fn exe_stamp() -> String {
     format!("{}@{mtime}", path.display())
 }
 
+/// When THIS daemon started, so a refusal can name which generation refused.
+static STARTED_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Which daemon answered — `pid 923108, up 42s`.
+///
+/// A page belongs to the daemon generation that opened it, so "no page" is
+/// ambiguous on its own between *you never opened it*, *it was closed*, and
+/// *you opened it on a daemon that is no longer the one answering you*. The
+/// third used to be common enough to break every `assets/engine-recipes/`
+/// script, which is a sequence of `ctl` calls against one `page_id`, and it was
+/// invisible: the agent had no way to tell that two calls hit two daemons. The
+/// singleton makes it rare; naming the generation makes it diagnosable when it
+/// happens anyway.
+pub fn generation_label() -> String {
+    let pid = std::process::id();
+    match STARTED_AT_MS.load(Ordering::SeqCst) {
+        0 => format!("pid {pid}"),
+        started => {
+            let up = now_millis().saturating_sub(u128::from(started)) / 1000;
+            format!("pid {pid}, up {up}s")
+        }
+    }
+}
+
 fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -853,6 +877,11 @@ fn handle_unix_conn(daemon: &Arc<Daemon>, stream: UnixStream) -> bool {
         if let Ok(sock) = sock_path() {
             let _ = std::fs::remove_file(&sock);
         }
+        // …and hand on the singleton in the same breath, for the same reason:
+        // the successor must be able to START while this process is still
+        // shutting its engine down. Freeing the path but keeping the lock would
+        // make every handover wait out a full engine teardown.
+        DaemonLock::release();
         journal(
             "retire",
             json!({ "pid": std::process::id(), "op": op, "stale": daemon.is_stale() }),
@@ -930,10 +959,29 @@ struct DaemonLock {
     _file: std::fs::File,
 }
 
+/// The lock this process holds while it is THE serving daemon.
+///
+/// ⛔ IT MEANS "I AM SERVING", NOT "MY PROCESS EXISTS", and the difference is a
+/// measured regression. A retiring daemon unlinks its socket BEFORE answering
+/// (see `handle_unix_conn`) precisely so its successor can bind and start
+/// serving while this one is still winding its engine down — that overlap is
+/// the design. Holding the lock until process exit removed it: every handover
+/// then had to wait for a full engine shutdown, which made
+/// `tests/daemon_staleness.rs` flaky and roughly doubled its runtime.
+/// `release()` is called at the same instant the socket is unlinked.
+static SINGLETON: Mutex<Option<DaemonLock>> = Mutex::new(None);
+
 impl DaemonLock {
     /// `Ok(None)` when another daemon provably holds it and we must step aside.
     fn acquire() -> Result<Option<DaemonLock>> {
         Self::acquire_at(&daemon_dir()?.join("daemon.lock"))
+    }
+
+    /// Hand the singleton to whoever comes next. Idempotent.
+    fn release() {
+        if let Ok(mut held) = SINGLETON.lock() {
+            held.take();
+        }
     }
 
     /// The path is a parameter ONLY so the lock's exclusion can be proven on a
@@ -970,11 +1018,16 @@ impl DaemonLock {
 pub fn run() -> Result<()> {
     // Decided before anything is bound, spawned, or started, so a losing daemon
     // costs nothing and — the load-bearing half — touches nothing.
-    let Some(_singleton) = DaemonLock::acquire()? else {
+    let Some(singleton) = DaemonLock::acquire()? else {
         // The kernel says another daemon is alive. That is the fact the 2 s ping
         // could not establish. Step aside WITHOUT unlinking its socket.
         return Ok(());
     };
+    // Parked where the retire path can hand it on the moment we stop serving,
+    // rather than at process exit. See `SINGLETON`.
+    if let Ok(mut held) = SINGLETON.lock() {
+        *held = Some(singleton);
+    }
 
     // Safe HERE and only here: holding the singleton, before anything of ours is
     // running, an orphaned engine display can only be a dead daemon's. See
@@ -1014,6 +1067,7 @@ pub fn run() -> Result<()> {
     std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
         .context("locking down daemon.sock")?;
 
+    STARTED_AT_MS.store(now_millis() as u64, Ordering::SeqCst);
     let daemon = Arc::new(Daemon::new());
     write_daemon_json(&daemon)?;
     journal("daemon_start", json!({ "version": VERSION, "pid": std::process::id() }));
@@ -2077,6 +2131,35 @@ mod tests {
             !source.contains(&banned_fn),
             "the ping-based liveness predicate must stay deleted: a second \
              answer to 'is a daemon alive?' is how the first one got trusted"
+        );
+    }
+
+    // ⛔ THE SINGLETON IS RELEASED WHERE THE SOCKET IS, NOT AT PROCESS EXIT.
+    // A retiring daemon frees the path before answering so its successor can
+    // start serving while it winds its engine down. Holding the lock past that
+    // point removed the overlap: measured, it made tests/daemon_staleness.rs
+    // flaky and roughly doubled its runtime (~12s green -> ~18-21s intermittent).
+    #[test]
+    fn retiring_hands_on_the_singleton_in_the_same_breath_as_the_socket() {
+        let source = include_str!("daemon.rs");
+        let body = source
+            .split("fn handle_unix_conn(daemon: &Arc<Daemon>, stream: UnixStream) -> bool {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n}").next())
+            .expect("handle_unix_conn body present");
+        let unlink_at = body
+            .find("remove_file(&sock)")
+            .expect("the retire path unlinks the socket");
+        let release_at = body
+            .find("DaemonLock::release()")
+            .expect(
+                "the retire path must release the singleton too — freeing the \
+                 socket while keeping the lock makes every handover wait out a \
+                 full engine teardown",
+            );
+        assert!(
+            release_at > unlink_at,
+            "release belongs with the unlink, on the retire path"
         );
     }
 
