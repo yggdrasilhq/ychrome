@@ -235,6 +235,46 @@ Wire shape from the app's side:
   routing). Heartbeat/ping logic never synthesizes one; a ping only ever
   refreshes.
 
+## ⭐ OWED: the detached shape (user-settled 2026-07-31, NOT BUILT)
+
+Today this protocol has exactly two shapes, and the one an agent actually wants
+is neither of them:
+
+| shape | how it is chosen | who sees it |
+|---|---|---|
+| standalone window | `YGGTERM_SESSION_ID` absent | the human, in an OS window |
+| takes the session viewport | `YGGTERM_SESSION_ID` present ⇒ `open` | the human, in **their** yggterm |
+
+**The missing third shape is the one that should be the DEFAULT for an agent:** a
+canonical surface that is alive and driveable and that **nobody is looking at**,
+which a human can be shown on request and taken off again without stopping it.
+
+The user's words: *"The shadow sessions of agents need not connect to yggterm
+client GUI. This is already true for yRDP but I want it to be true for all
+libyggterm apps in general including ychrome… for many work it simply pollutes my
+Live sessions. Sometimes I do need to co-browse. For that attach is necessary."*
+
+Why it is not a small change here: **the surface is CREATED by `open`, and `open`
+is also what reveals it.** There is no action in this protocol that means "exist
+but stay out of the viewport", so the detached shape needs a protocol addition on
+the yggterm side, not a flag on ychrome:
+
+- a create-without-reveal action (the daemon can already hold soft-stashed and
+  never-revealed surfaces — see yggterm `docs/web-surfaces.md`, "Which verbs need
+  a MAPPED surface": everything eval-backed already works on one),
+- `attach` / `detach` as explicit, idempotent, additive actions,
+- and the state announced in machine-readable output at creation, so an agent
+  never has to infer whether it just took the user's screen.
+
+**Invariants the addition must hold** (from
+`yggterm/docs/agent-surface-attachment.md`, which is the normative version):
+`detach` never stops anything · `attach` adds a viewer rather than handing over ·
+neither is ever implicit · and if a viewer is ever allowed to RESIZE the surface
+rather than scale it, that re-pin must carry a **geometry epoch** so coordinates
+learned before it are refused rather than silently misapplied. yRDP has that
+mechanism working today (`yrdp repin` / `screenshot`'s `epoch` / `state`'s
+`geometry_stale`) and is the reference implementation.
+
 ## Open questions (for the next libyggterm apps)
 
 1. Per-surface SOCKS egress (full network-identity borrowing) and verifying
