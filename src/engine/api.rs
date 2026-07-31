@@ -13,10 +13,11 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
-use super::host::Engine;
+use super::host::{Engine, InputEvent, NavAction};
+use super::js;
 use crate::sidebar::ParsedRequest;
 
 /// Default page viewport. The spec's `page` shape carries a per-page viewport;
@@ -26,6 +27,10 @@ const DEFAULT_H: i32 = 900;
 
 /// How long a navigation may take before `/engine/goto` gives up.
 const GOTO_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// `/engine/wait`'s default budget, and its poll cadence (§4).
+const WAIT_TIMEOUT_MS: u64 = 15_000;
+const POLL_MS: u64 = 100;
 
 /// What a route hands back. Most replies are JSON; `/engine/shot` is PNG bytes
 /// with its own content type, as §4 specifies — a base64 blob inside JSON
@@ -212,31 +217,82 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
             let Some(id) = page_id else {
                 return Reply::bad(400, "input needs a page_id");
             };
-            let events = request.body["events"]
+            let raw = request.body["events"]
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            let mut dispatched = 0;
-            for event in &events {
-                let kind = event["type"].as_str().unwrap_or("");
-                // v1 carries the verb Phase A proved. `move`, `type`, `key` and
-                // `scroll` are the same GdkEvent shape and land next; refusing
-                // by name beats silently dropping an event a script thinks fired.
-                if kind != "click" {
-                    return Reply::bad(
-                        400,
-                        format!("input event type {kind:?} is not implemented yet (v1: click)"),
-                    );
-                }
-                let (Some(x), Some(y)) = (event["x"].as_f64(), event["y"].as_f64()) else {
-                    return Reply::bad(400, "a click event needs x and y");
-                };
-                match engine.click_trusted(&id, x, y) {
-                    Ok(count) => dispatched += count,
+            // Parse the WHOLE batch before dispatching any of it. A batch that
+            // failed halfway would leave the page in a state no caller asked
+            // for and none can name.
+            let mut events = Vec::with_capacity(raw.len());
+            for event in &raw {
+                match parse_input(&engine, &id, event) {
+                    Ok(parsed) => events.push(parsed),
                     Err(error) => return Reply::bad(400, error.to_string()),
                 }
             }
-            Reply::Json(200, json!({ "ok": true, "dispatched": dispatched }))
+            match engine.input(&id, events) {
+                Ok(dispatched) => Reply::Json(200, json!({ "ok": true, "dispatched": dispatched })),
+                Err(error) => Reply::bad(400, error.to_string()),
+            }
+        }
+        "nav" => {
+            let (Some(id), Some(action)) = (
+                page_id,
+                request
+                    .body
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .and_then(NavAction::parse),
+            ) else {
+                return Reply::bad(
+                    400,
+                    "nav needs a page_id and action: back|forward|reload|stop",
+                );
+            };
+            match engine.nav(&id, action, GOTO_TIMEOUT) {
+                Ok(_) => Reply::Json(200, page_status(&engine, &id)),
+                Err(error) => Reply::bad(502, error.to_string()),
+            }
+        }
+        "wait" => {
+            let Some(id) = page_id else {
+                return Reply::bad(400, "wait needs a page_id");
+            };
+            let timeout = Duration::from_millis(
+                request.body["timeout_ms"]
+                    .as_u64()
+                    .unwrap_or(WAIT_TIMEOUT_MS),
+            );
+            match wait(&engine, &id, &request.body["until"], timeout) {
+                Ok(outcome) => Reply::Json(200, outcome),
+                Err(error) => Reply::bad(400, error.to_string()),
+            }
+        }
+        "dom" => {
+            let Some(id) = page_id else {
+                return Reply::bad(400, "dom needs a page_id");
+            };
+            let mode = request
+                .body
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("snapshot");
+            let js = match mode {
+                "html" => "document.documentElement.outerHTML",
+                "text" => "document.body ? document.body.innerText : ''",
+                "snapshot" => js::DOM_SNAPSHOT,
+                other => {
+                    return Reply::bad(
+                        400,
+                        format!("unknown dom mode {other:?} (html|text|snapshot)"),
+                    );
+                }
+            };
+            match engine.eval(&id, js) {
+                Ok(value) => Reply::Json(200, json!({ "ok": true, "mode": mode, "dom": value })),
+                Err(error) => Reply::bad(400, error.to_string()),
+            }
         }
         "" | "status" => Reply::Json(
             200,
@@ -249,6 +305,199 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
         ),
         other => Reply::bad(404, format!("unknown engine verb {other:?}")),
     }
+}
+
+/// `/engine/wait` — the primitive that makes scripts honest (§4).
+///
+/// Four `until` forms. Everything except `load: finished` polls at 100 ms,
+/// which is the cadence the spec names; `finished` hangs off WebKit's own
+/// load signal instead, because a poll can miss a load that starts and ends
+/// between two samples.
+///
+/// A timeout is NOT an error. It answers `{met: false, reason}` with the
+/// elapsed time, because "I waited and it did not happen" is a fact a script
+/// needs to branch on, not an exception to swallow.
+fn wait(engine: &Engine, id: &str, until: &Value, timeout: Duration) -> Result<Value> {
+    let started = Instant::now();
+    let met = |elapsed: Duration, extra: Value| {
+        let mut body = json!({ "ok": true, "met": true, "elapsed_ms": elapsed.as_millis() });
+        if let (Some(map), Some(more)) = (body.as_object_mut(), extra.as_object()) {
+            for (key, value) in more {
+                map.insert(key.clone(), value.clone());
+            }
+        }
+        body
+    };
+    let unmet = |reason: &str, elapsed: Duration| json!({ "ok": true, "met": false, "reason": reason, "elapsed_ms": elapsed.as_millis() });
+
+    // `load: finished` — the signal, not a poll.
+    if until.get("load").and_then(Value::as_str) == Some("finished") {
+        return match engine.wait_load(id, timeout) {
+            Ok(url) => Ok(met(started.elapsed(), json!({ "url": url }))),
+            Err(_) => Ok(unmet(
+                "load did not finish within the timeout",
+                started.elapsed(),
+            )),
+        };
+    }
+
+    // Everything else is a truthy poll; only the expression differs.
+    let (expression, reason): (String, &str) = if until.get("load").and_then(Value::as_str)
+        == Some("committed")
+    {
+        // "Committed" to a script means the document exists and is being
+        // built — exactly what leaving readyState 'loading' marks.
+        (
+            "document.readyState !== 'loading'".to_string(),
+            "load was never committed",
+        )
+    } else if let Some(idle_ms) = until.get("idle_ms").and_then(Value::as_u64) {
+        (
+            format!("({}).idle_ms >= {idle_ms}", js::IDLE_PROBE),
+            "the page never went idle",
+        )
+    } else if let Some(selector) = until.get("selector").and_then(Value::as_str) {
+        let state = until
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("attached");
+        let quoted = serde_json::to_string(selector)?;
+        match state {
+            "attached" => (
+                format!("document.querySelector({quoted}) !== null"),
+                "the selector never attached",
+            ),
+            "visible" => (
+                format!(
+                    "(() => {{ const e = document.querySelector({quoted}); if (!e) return false; \
+                     const s = getComputedStyle(e); const r = e.getBoundingClientRect(); \
+                     return s.display !== 'none' && s.visibility !== 'hidden' \
+                     && r.width > 0 && r.height > 0; }})()"
+                ),
+                "the selector never became visible",
+            ),
+            other => bail!("unknown selector state {other:?} (attached|visible)"),
+        }
+    } else if let Some(js) = until.get("js").and_then(Value::as_str) {
+        (format!("!!({js})"), "the expression never became truthy")
+    } else {
+        bail!("wait needs an `until`: {{load}}, {{idle_ms}}, {{selector,state}} or {{js}}");
+    };
+
+    loop {
+        // An eval error (a page mid-navigation tears its context down) is a
+        // "not yet", not a failure — the next poll asks again.
+        if let Ok(value) = engine.eval(id, &expression)
+            && value == json!(true)
+        {
+            return Ok(met(started.elapsed(), json!({})));
+        }
+        if started.elapsed() >= timeout {
+            return Ok(unmet(reason, started.elapsed()));
+        }
+        std::thread::sleep(Duration::from_millis(POLL_MS));
+    }
+}
+
+/// Parse one `/engine/input` event.
+///
+/// Selector-addressed clicks are sugar (§4): the engine resolves the selector's
+/// centre in the page, scrolls it into view, and dispatches REAL coordinates.
+/// One resolver, shared by `/input` and `/dom`, so a selector means the same
+/// thing to both.
+fn parse_input(engine: &Engine, id: &str, event: &Value) -> Result<InputEvent> {
+    let kind = event["type"].as_str().unwrap_or("");
+    let point = |event: &Value| -> Result<(f64, f64)> {
+        match (event["x"].as_f64(), event["y"].as_f64()) {
+            (Some(x), Some(y)) => Ok((x, y)),
+            _ => bail!("a {kind} event needs x and y (or, for a click, a selector)"),
+        }
+    };
+    match kind {
+        "click" => {
+            let (x, y) = match event["selector"].as_str() {
+                Some(selector) => resolve_selector(engine, id, selector)?,
+                None => point(event)?,
+            };
+            let button = match event["button"].as_str().unwrap_or("left") {
+                "left" => 1,
+                "middle" => 2,
+                "right" => 3,
+                other => bail!("unknown mouse button {other:?} (left|middle|right)"),
+            };
+            let count = event["count"].as_u64().unwrap_or(1).clamp(1, 3) as u32;
+            Ok(InputEvent::Click {
+                x,
+                y,
+                button,
+                count,
+            })
+        }
+        "move" => {
+            let (x, y) = point(event)?;
+            Ok(InputEvent::Move { x, y })
+        }
+        "scroll" => {
+            let x = event["x"].as_f64().unwrap_or(0.0);
+            let y = event["y"].as_f64().unwrap_or(0.0);
+            Ok(InputEvent::Scroll {
+                x,
+                y,
+                dx: event["dx"].as_f64().unwrap_or(0.0),
+                dy: event["dy"].as_f64().unwrap_or(0.0),
+            })
+        }
+        "type" => match event["text"].as_str() {
+            Some(text) => Ok(InputEvent::Text {
+                text: text.to_string(),
+            }),
+            None => bail!("a type event needs text"),
+        },
+        "key" => {
+            let Some(name) = event["key"].as_str() else {
+                bail!("a key event needs a key name, e.g. \"Enter\"");
+            };
+            let mods: Vec<String> = event["mods"]
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(InputEvent::Key {
+                keyval: super::host::keyval_from_name(name)?,
+                mods: super::host::modifier_mask(&mods)?,
+            })
+        }
+        other => bail!("unknown input event type {other:?} (click|move|scroll|type|key)"),
+    }
+}
+
+/// Scroll a selector into view and return the viewport centre of its rect.
+fn resolve_selector(engine: &Engine, id: &str, selector: &str) -> Result<(f64, f64)> {
+    let quoted = serde_json::to_string(selector)?;
+    let value = engine.eval(
+        id,
+        &format!(
+            "(() => {{ const e = document.querySelector({quoted}); if (!e) return null; \
+             e.scrollIntoView({{block:'center', inline:'center', behavior:'instant'}}); \
+             const r = e.getBoundingClientRect(); \
+             return {{ x: r.x + r.width / 2, y: r.y + r.height / 2, \
+                       w: r.width, h: r.height }}; }})()"
+        ),
+    )?;
+    if value.is_null() {
+        bail!("selector {selector:?} matched nothing on this page");
+    }
+    let (Some(x), Some(y)) = (value["x"].as_f64(), value["y"].as_f64()) else {
+        bail!("selector {selector:?} resolved to no rect");
+    };
+    if value["w"].as_f64().unwrap_or(0.0) <= 0.0 || value["h"].as_f64().unwrap_or(0.0) <= 0.0 {
+        bail!("selector {selector:?} has zero area — it cannot be clicked");
+    }
+    Ok((x, y))
 }
 
 /// The one `page` status shape (§4), built in one place so no route grows its
@@ -264,6 +513,7 @@ fn page_status(engine: &Engine, id: &str) -> Value {
         "url": url,
         "title": title,
         "state": "live",
+        "loading": engine.is_loading(id).unwrap_or(false),
     })
 }
 

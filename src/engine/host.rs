@@ -404,6 +404,126 @@ impl Engine {
         })
     }
 
+    /// Dispatch a batch of REAL input events.
+    ///
+    /// Every variant below goes in as a `GdkEvent` through `gtk_main_do_event`,
+    /// exactly like [`click_trusted`](Self::click_trusted). None of them is a
+    /// `dispatchEvent`: an engine that reached for synthetic DOM events for the
+    /// "easy" verbs would reintroduce, one verb at a time, precisely the
+    /// instrument-lying that gate proof 5 exists to close. `isTrusted` is true
+    /// for all of them, hover really hovers, and a key press produces text.
+    pub fn input(&self, id: &str, events: Vec<InputEvent>) -> Result<u32> {
+        // Text becomes individual key events HERE, so every event below is one
+        // job, and the engine loop gets to spin between them.
+        let mut expanded = Vec::new();
+        for event in events {
+            match event {
+                InputEvent::Text { text } => {
+                    for ch in text.chars() {
+                        // SAFETY: a pure value conversion in gdk, no pointers
+                        // and no display involved.
+                        let keyval = unsafe { gdk::ffi::gdk_unicode_to_keyval(ch as u32) };
+                        expanded.push(InputEvent::Key { keyval, mods: 0 });
+                    }
+                }
+                other => expanded.push(other),
+            }
+        }
+
+        let mut dispatched = 0;
+        for event in expanded {
+            dispatched += self.input_one(id, event)?;
+            // The engine loop MUST run between events.
+            //
+            // WebKitGTK hands a key event to the web process and waits to hear
+            // whether the page consumed it before it will take the next one.
+            // Dispatching a whole batch inside one job never lets that reply
+            // arrive, so the queue collapses: measured, typing "ada lovelace"
+            // dispatched all 24 events and landed exactly ONE character. This
+            // is a settle, not a sleep on the engine thread — other pages keep
+            // loading through it.
+            self.settle(INPUT_SETTLE)?;
+        }
+        Ok(dispatched)
+    }
+
+    /// One input event, one job on the engine thread.
+    fn input_one(&self, id: &str, event: InputEvent) -> Result<u32> {
+        let id = id.to_string();
+        on_engine(Duration::from_secs(20), move |responder| {
+            with_page(&id, responder, move |page, responder| match dispatch_input(
+                &page.view, &event,
+            ) {
+                Ok(count) => responder.ok(count),
+                Err(error) => responder.fail(error.to_string()),
+            })
+        })
+    }
+
+    /// History and reload (`/engine/nav`). `Stop` returns at once; the others
+    /// wait for the load they start, so a caller that gets a reply has a page
+    /// that has actually settled.
+    pub fn nav(&self, id: &str, action: NavAction, timeout: Duration) -> Result<String> {
+        let id = id.to_string();
+        on_engine(timeout, move |responder| {
+            with_page(&id, responder, move |page, responder| {
+                let view = &page.view;
+                match action {
+                    NavAction::Back if !view.can_go_back() => {
+                        responder.fail("cannot go back: no earlier entry in this page's history")
+                    }
+                    NavAction::Forward if !view.can_go_forward() => {
+                        responder.fail("cannot go forward: no later entry in this page's history")
+                    }
+                    NavAction::Stop => {
+                        view.stop_loading();
+                        responder.ok(view.uri().map(|uri| uri.to_string()).unwrap_or_default())
+                    }
+                    NavAction::Back => {
+                        arm_load_wait(view, responder);
+                        view.go_back();
+                    }
+                    NavAction::Forward => {
+                        arm_load_wait(view, responder);
+                        view.go_forward();
+                    }
+                    NavAction::Reload => {
+                        arm_load_wait(view, responder);
+                        view.reload();
+                    }
+                }
+            })
+        })
+    }
+
+    /// Is WebKit still loading this page? The signal behind `/engine/wait`'s
+    /// `load` form, read as a property so a poll can ask cheaply.
+    pub fn is_loading(&self, id: &str) -> Result<bool> {
+        let id = id.to_string();
+        on_engine(Duration::from_secs(10), move |responder| {
+            with_page(&id, responder, move |page, responder| {
+                responder.ok(page.view.is_loading())
+            })
+        })
+    }
+
+    /// Wait for the CURRENT navigation to finish, without starting one.
+    pub fn wait_load(&self, id: &str, timeout: Duration) -> Result<String> {
+        let id = id.to_string();
+        on_engine(timeout, move |responder| {
+            with_page(&id, responder, move |page, responder| {
+                if !page.view.is_loading() {
+                    return responder.ok(page
+                        .view
+                        .uri()
+                        .map(|uri| uri.to_string())
+                        .unwrap_or_default());
+                }
+                arm_load_wait(&page.view, responder);
+            })
+        })
+    }
+
     /// Let the engine thread run for a while without blocking a verb on it —
     /// used after input, so the page's handlers and any resulting layout land
     /// before the next read.
@@ -412,6 +532,60 @@ impl Engine {
             glib::timeout_add_once(duration, move || responder.ok(()));
         })
     }
+}
+
+/// How long the engine loop is given to deliver one input event to the web
+/// process before the next is dispatched. See [`Engine::input`].
+const INPUT_SETTLE: Duration = Duration::from_millis(12);
+
+/// What `/engine/nav` can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavAction {
+    Back,
+    Forward,
+    Reload,
+    Stop,
+}
+
+impl NavAction {
+    pub fn parse(name: &str) -> Option<NavAction> {
+        match name {
+            "back" => Some(NavAction::Back),
+            "forward" => Some(NavAction::Forward),
+            "reload" => Some(NavAction::Reload),
+            "stop" => Some(NavAction::Stop),
+            _ => None,
+        }
+    }
+}
+
+/// One input event, already validated. `/engine/input`'s JSON is parsed into
+/// these in `api`, so this layer never sees a half-checked event.
+#[derive(Debug, Clone)]
+pub enum InputEvent {
+    Click {
+        x: f64,
+        y: f64,
+        button: u32,
+        count: u32,
+    },
+    Move {
+        x: f64,
+        y: f64,
+    },
+    Scroll {
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+    },
+    Key {
+        keyval: u32,
+        mods: u32,
+    },
+    Text {
+        text: String,
+    },
 }
 
 impl Drop for Engine {
@@ -505,49 +679,282 @@ fn disconnect_all(view: &WebView, handlers: &Rc<RefCell<Vec<glib::SignalHandlerI
     }
 }
 
-/// Build and deliver a press/release pair as seat input. Returns how many
-/// events were dispatched.
-fn dispatch_click(view: &WebView, x: f64, y: f64) -> Result<u32> {
+/// Everything an event needs to look like it came from the seat.
+struct Seat {
+    window: gdk::Window,
+    pointer: gdk::Device,
+    keyboard: Option<gdk::Device>,
+    keymap: gdk::Keymap,
+    time: u32,
+}
+
+/// A strictly increasing event timestamp.
+///
+/// `g_get_monotonic_time() / 1000` gave a whole batch of events the SAME
+/// timestamp, because they are built well inside one millisecond. That was my
+/// first hypothesis for the one-character typing bug and it was WRONG — fixing
+/// it changed nothing, and the real cause was the main loop (see
+/// [`Engine::input`]). It is kept anyway because duplicate timestamps are
+/// independently wrong: multi-click detection is defined in terms of the gap
+/// between press times, so `count: 2` needs two distinct ones. The clock starts
+/// at the real monotonic time and then only moves forward.
+fn next_event_time() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CLOCK: AtomicU32 = AtomicU32::new(0);
+    let now = (unsafe { glib::ffi::g_get_monotonic_time() } / 1000) as u32;
+    // Two steps per call: every event kind here spends at most two ticks
+    // (press then release) before the next `seat()`.
+    CLOCK
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            Some(if now > last.saturating_add(2) {
+                now
+            } else {
+                last.saturating_add(2)
+            })
+        })
+        .unwrap_or(now)
+}
+
+fn seat(view: &WebView) -> Result<Seat> {
     let window = view
         .window()
         .context("the view has no GdkWindow yet — it was never realised")?;
-    let pointer = gdk::Display::default()
-        .and_then(|display| display.default_seat())
-        .and_then(|seat| seat.pointer())
+    let display = gdk::Display::default().context("no gdk display")?;
+    let gdk_seat = display.default_seat().context("no default seat")?;
+    let pointer = gdk_seat
+        .pointer()
         .context("no pointer device on the engine's display")?;
+    Ok(Seat {
+        window,
+        pointer,
+        keyboard: gdk_seat.keyboard(),
+        keymap: gdk::Keymap::for_display(&display).context("no keymap for the engine's display")?,
+        time: next_event_time(),
+    })
+}
 
-    let base_time = unsafe { glib::ffi::g_get_monotonic_time() / 1000 } as u32;
+/// Dispatch one input event as real seat input.
+fn dispatch_input(view: &WebView, event: &InputEvent) -> Result<u32> {
+    match event {
+        InputEvent::Click {
+            x,
+            y,
+            button,
+            count,
+        } => {
+            // A click begins with the pointer ARRIVING. Without the motion,
+            // WebKit's last-known pointer position is stale, so `:hover` never
+            // applies and a menu that opens on hover is never open by the time
+            // the press lands. This is the difference between "the click was
+            // delivered" and "the click did what a user's click does".
+            let mut dispatched = dispatch_motion(view, *x, *y)?;
+            for _ in 0..(*count).max(1) {
+                dispatched += dispatch_button(view, *x, *y, *button)?;
+            }
+            Ok(dispatched)
+        }
+        InputEvent::Move { x, y } => dispatch_motion(view, *x, *y),
+        InputEvent::Scroll { x, y, dx, dy } => dispatch_scroll(view, *x, *y, *dx, *dy),
+        InputEvent::Key { keyval, mods } => dispatch_key(view, *keyval, *mods),
+        InputEvent::Text { text } => {
+            let mut dispatched = 0;
+            for ch in text.chars() {
+                // SAFETY: a pure value conversion in gdk, no pointers involved.
+                let keyval = unsafe { gdk::ffi::gdk_unicode_to_keyval(ch as u32) };
+                dispatched += dispatch_key(view, keyval, 0)?;
+            }
+            Ok(dispatched)
+        }
+    }
+}
+
+/// Fill the fields every GdkEvent shares. Returns the raw pointer for the
+/// caller to finish filling as its own union member.
+///
+/// # Safety
+/// `event` must have been created by `gdk_event_new` with a type whose union
+/// member starts with these fields — which is every event type here.
+unsafe fn fill_common(event: &mut gdk::Event, seat: &Seat) -> *mut gdk::ffi::GdkEvent {
+    let ptr: *mut gdk::ffi::GdkEvent = event.to_glib_none_mut().0;
+    let any = ptr as *mut gdk::ffi::GdkEventAny;
+    unsafe {
+        (*any).window = seat.window.to_glib_full();
+        // `send_event: 0` says "this came from the server". WebKit does not
+        // read it, but a GTK widget in the chain might, and an event that
+        // claims to be synthetic invites exactly the special-casing this
+        // engine exists to avoid.
+        (*any).send_event = 0;
+    }
+    ptr
+}
+
+fn dispatch_motion(view: &WebView, x: f64, y: f64) -> Result<u32> {
+    let seat = seat(view)?;
+    let mut event = gdk::Event::new(gdk::EventType::MotionNotify);
+    // SAFETY: freshly created MotionNotify event; the motion union member is
+    // the live one, and every pointer we store is either owned (`to_glib_full`)
+    // or null.
+    unsafe {
+        let raw = fill_common(&mut event, &seat) as *mut gdk::ffi::GdkEventMotion;
+        (*raw).time = seat.time;
+        (*raw).x = x;
+        (*raw).y = y;
+        (*raw).axes = std::ptr::null_mut();
+        (*raw).state = 0;
+        (*raw).is_hint = 0;
+        (*raw).x_root = x;
+        (*raw).y_root = y;
+    }
+    event.set_device(Some(&seat.pointer));
+    gtk::main_do_event(&mut event);
+    Ok(1)
+}
+
+fn dispatch_scroll(view: &WebView, x: f64, y: f64, dx: f64, dy: f64) -> Result<u32> {
+    let seat = seat(view)?;
+    let mut event = gdk::Event::new(gdk::EventType::Scroll);
+    // SAFETY: freshly created Scroll event; the scroll union member is live.
+    unsafe {
+        let raw = fill_common(&mut event, &seat) as *mut gdk::ffi::GdkEventScroll;
+        (*raw).time = seat.time;
+        (*raw).x = x;
+        (*raw).y = y;
+        (*raw).state = 0;
+        // Smooth scrolling, which is what a modern seat sends and what lets a
+        // page read fractional deltas instead of quantised clicks.
+        (*raw).direction = gdk::ffi::GDK_SCROLL_SMOOTH;
+        (*raw).x_root = x;
+        (*raw).y_root = y;
+        (*raw).delta_x = dx;
+        (*raw).delta_y = dy;
+        (*raw).is_stop = 0;
+    }
+    event.set_device(Some(&seat.pointer));
+    gtk::main_do_event(&mut event);
+    Ok(1)
+}
+
+/// A key press/release pair.
+///
+/// `hardware_keycode` is looked up in the real keymap rather than left zero:
+/// WebKit derives the DOM `code` and much of its text input from it, and a
+/// zero keycode is how "the key arrived but nothing was typed" happens.
+fn dispatch_key(view: &WebView, keyval: u32, mods: u32) -> Result<u32> {
+    let seat = seat(view)?;
+    let entry = seat.keymap.entries_for_keyval(keyval).into_iter().next();
+    let (keycode, group) = entry
+        .map(|key| (key.keycode() as u16, key.group() as u8))
+        .unwrap_or((0, 0));
+    if keycode == 0 {
+        bail!(
+            "no key on this keymap produces keyval {keyval} \
+             (0x{keyval:04x}) — the engine will not pretend it typed it"
+        );
+    }
+
+    let mut dispatched = 0;
+    for (step, kind) in [gdk::EventType::KeyPress, gdk::EventType::KeyRelease]
+        .into_iter()
+        .enumerate()
+    {
+        let mut event = gdk::Event::new(kind);
+        // SAFETY: freshly created key event; the key union member is live and
+        // `string` is left null (it is deprecated; WebKit reads keyval).
+        unsafe {
+            let raw = fill_common(&mut event, &seat) as *mut gdk::ffi::GdkEventKey;
+            (*raw).time = seat.time + step as u32;
+            (*raw).state = mods;
+            (*raw).keyval = keyval;
+            (*raw).length = 0;
+            (*raw).string = std::ptr::null_mut();
+            (*raw).hardware_keycode = keycode;
+            (*raw).group = group;
+            (*raw).is_modifier = 0;
+        }
+        if let Some(keyboard) = &seat.keyboard {
+            event.set_device(Some(keyboard));
+        }
+        gtk::main_do_event(&mut event);
+        dispatched += 1;
+    }
+    Ok(dispatched)
+}
+
+/// Modifier names to GDK's mask bits. One owner, so `/engine/input` and any
+/// future keyboard caller cannot disagree about what "ctrl" means.
+pub fn modifier_mask(names: &[String]) -> Result<u32> {
+    let mut mask = 0;
+    for name in names {
+        mask |= match name.to_ascii_lowercase().as_str() {
+            "shift" => gdk::ModifierType::SHIFT_MASK.bits(),
+            "ctrl" | "control" => gdk::ModifierType::CONTROL_MASK.bits(),
+            "alt" => gdk::ModifierType::MOD1_MASK.bits(),
+            "meta" | "super" | "cmd" => gdk::ModifierType::SUPER_MASK.bits(),
+            other => bail!("unknown modifier {other:?} (known: shift, ctrl, alt, meta)"),
+        };
+    }
+    Ok(mask)
+}
+
+/// A key NAME (`Enter`, `Tab`, `a`, `F5`) to its GDK keyval.
+pub fn keyval_from_name(name: &str) -> Result<u32> {
+    let c_name = std::ffi::CString::new(name).context("key name has an interior NUL")?;
+    // SAFETY: `gdk_keyval_from_name` takes a NUL-terminated string and returns
+    // a plain value; `c_name` outlives the call.
+    let keyval = unsafe { gdk::ffi::gdk_keyval_from_name(c_name.as_ptr()) };
+    if keyval == gdk::ffi::GDK_KEY_VoidSymbol as u32 || keyval == 0 {
+        bail!("unknown key name {name:?}");
+    }
+    Ok(keyval)
+}
+
+/// Build and deliver a press/release pair as seat input. Returns how many
+/// events were dispatched.
+///
+/// `gdk_event_new` returns a zeroed GdkEvent whose union is already tagged with
+/// the type, so filling the matching member is the documented way to build one.
+/// gdk-rs 0.18 exposes getters for `GdkEventButton` but no setters, and the
+/// adblock FFI in the surface path is the same precedent. `to_glib_full` hands
+/// the event an owned reference on the window, which `gdk_event_free` releases.
+fn dispatch_button(view: &WebView, x: f64, y: f64, button: u32) -> Result<u32> {
+    let seat = seat(view)?;
     let mut dispatched = 0;
     for (step, kind) in [gdk::EventType::ButtonPress, gdk::EventType::ButtonRelease]
         .into_iter()
         .enumerate()
     {
         let mut event = gdk::Event::new(kind);
-        // SAFETY: `gdk_event_new` returns a zeroed GdkEvent whose union is
-        // already tagged with `kind`, so reading it as the matching member is
-        // the documented way to fill one in. gdk-rs 0.18 exposes getters for
-        // GdkEventButton but no setters, and the adblock FFI in the surface
-        // path is the same precedent. `to_glib_full` hands the event an owned
-        // reference on the window, which `gdk_event_free` releases.
+        // SAFETY: freshly created button event; the button union member is
+        // live and `axes` is left null.
         unsafe {
-            let event_ptr: *mut gdk::ffi::GdkEvent = event.to_glib_none_mut().0;
-            let raw = event_ptr as *mut gdk::ffi::GdkEventButton;
-            (*raw).window = window.to_glib_full();
-            (*raw).send_event = 0;
-            (*raw).time = base_time + step as u32;
+            let raw = fill_common(&mut event, &seat) as *mut gdk::ffi::GdkEventButton;
+            (*raw).time = seat.time + step as u32;
             (*raw).x = x;
             (*raw).y = y;
             (*raw).axes = std::ptr::null_mut();
             (*raw).state = 0;
-            (*raw).button = 1;
+            (*raw).button = button;
             (*raw).x_root = x;
             (*raw).y_root = y;
         }
-        event.set_device(Some(&pointer));
+        event.set_device(Some(&seat.pointer));
         gtk::main_do_event(&mut event);
         dispatched += 1;
     }
     Ok(dispatched)
+}
+
+/// The Phase A gate's click, now one case of [`dispatch_input`].
+fn dispatch_click(view: &WebView, x: f64, y: f64) -> Result<u32> {
+    dispatch_input(
+        view,
+        &InputEvent::Click {
+            x,
+            y,
+            button: 1,
+            count: 1,
+        },
+    )
 }
 
 #[cfg(test)]

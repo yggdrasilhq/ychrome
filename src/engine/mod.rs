@@ -17,8 +17,10 @@
 //! - `gate` — Phase A's five proofs, committed and re-runnable.
 
 pub mod api;
+pub mod flow;
 pub mod gate;
 pub mod host;
+pub mod js;
 pub mod substrate;
 
 use std::io::Write;
@@ -122,6 +124,33 @@ pub fn run_verb(sub: Option<&str>, as_json: bool) -> Result<()> {
             }
             Ok(())
         }
+        Some("flow") => {
+            let report = flow::run()?;
+            if as_json {
+                println!("{report}");
+            } else {
+                println!(
+                    "phase-b verb flow ({} steps)",
+                    report["steps"].as_array().map(Vec::len).unwrap_or(0)
+                );
+                for step in report["steps"].as_array().into_iter().flatten() {
+                    println!(
+                        "  {} {:<28} {}",
+                        if step["pass"].as_bool() == Some(true) {
+                            "PASS"
+                        } else {
+                            "FAIL"
+                        },
+                        step["verb"].as_str().unwrap_or(""),
+                        step["step"].as_str().unwrap_or(""),
+                    );
+                }
+            }
+            if report["pass"].as_bool() != Some(true) {
+                bail!("phase-b verb flow FAILED — see the journal and the report above");
+            }
+            Ok(())
+        }
         Some("bench") => {
             let pages = std::env::args()
                 .nth(3)
@@ -155,7 +184,7 @@ pub fn run_verb(sub: Option<&str>, as_json: bool) -> Result<()> {
             }
             Ok(())
         }
-        Some(other) => bail!("unknown engine verb {other:?} (known: probe, gate, bench)"),
-        None => bail!("usage: ychrome engine <probe|gate|bench> [--json]"),
+        Some(other) => bail!("unknown engine verb {other:?} (known: probe, gate, flow, bench)"),
+        None => bail!("usage: ychrome engine <probe|gate|flow|bench> [--json]"),
     }
 }
