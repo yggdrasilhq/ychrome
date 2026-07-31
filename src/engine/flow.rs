@@ -194,12 +194,29 @@ pub fn run() -> Result<Value> {
         "input",
         json!({ "page_id": page, "events": [{ "type": "type", "text": "ada lovelace" }] }),
     )));
+    // WAIT for the text rather than reading straight after the batch. Not a
+    // weakened assertion — it still demands the exact string — but an honest
+    // one: WebKitGTK queues key events in the UI process and only sends the
+    // next after the previous is acked, so a read issued immediately can
+    // overtake the final keystroke and see "ada lovelac". `/engine/wait` is
+    // precisely the primitive for "do not believe the page until it says so",
+    // and a proof that races is a proof that will lie one run in six.
+    let (_, settled) = json_reply(dispatch(&request(
+        "wait",
+        json!({ "page_id": page,
+                "until": { "js": "document.getElementById('name').value === 'ada lovelace'" },
+                "timeout_ms": 4000 }),
+    )));
     let value = read(&page, "document.getElementById('name').value");
     record(Step {
         name: "trusted key events actually produce text",
         verb: "/engine/input type",
-        pass: status == 200 && value == json!("ada lovelace"),
-        detail: json!({ "dispatched": typed["dispatched"], "field_value": value }),
+        pass: status == 200 && value == json!("ada lovelace") && settled["met"] == json!(true),
+        detail: json!({
+            "dispatched": typed["dispatched"],
+            "field_value": value,
+            "wait_elapsed_ms": settled["elapsed_ms"],
+        }),
     });
 
     let (status, key) = json_reply(dispatch(&request(

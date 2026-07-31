@@ -71,6 +71,11 @@ pub struct LogicalPage {
     pub state: PageState,
     pub place: Place,
     pub viewport: (i32, i32),
+    /// The profile whose identity this page browses under. Carried on the
+    /// LOGICAL page so a resume rebuilds the view on the same jar, adblock
+    /// filter and userscripts it was parked from — a page that came back as a
+    /// different identity would be a silent logout.
+    pub profile: String,
     pub opened_at_ms: u128,
     pub last_used_ms: u128,
     /// Why this page is `Crashed`, when it is. Absent otherwise.
@@ -91,6 +96,7 @@ impl LogicalPage {
             "url": self.url,
             "tags": self.tags,
             "state": self.state.id(),
+            "profile": self.profile,
             "viewport": { "w": self.viewport.0, "h": self.viewport.1 },
             "scroll": { "x": self.place.scroll_x, "y": self.place.scroll_y },
             "opened_at_ms": self.opened_at_ms,
@@ -479,7 +485,7 @@ pub fn resume(engine: &Engine, id: &str) -> Result<LogicalPage> {
         .map_err(|_| anyhow::anyhow!("admission lock"))?;
     make_room_locked(engine, id)?;
 
-    if let Err(error) = engine.open(id, page.viewport.0, page.viewport.1) {
+    if let Err(error) = engine.open(id, page.viewport.0, page.viewport.1, &page.profile) {
         pool().mark_crashed(id, &error.to_string());
         return Err(error);
     }
@@ -594,6 +600,7 @@ pub fn open(
     engine: &Engine,
     id: &str,
     url: &str,
+    profile: &str,
     tags: Vec<String>,
     viewport: (i32, i32),
 ) -> Result<LogicalPage> {
@@ -610,13 +617,14 @@ pub fn open(
         state: PageState::Live,
         place: Place::default(),
         viewport,
+        profile: profile.to_string(),
         opened_at_ms: now,
         last_used_ms: now,
         error: None,
         // Admitted but not yet loaded: not evictable until the caller unpins.
         pinned: true,
     });
-    engine.open(id, viewport.0, viewport.1)?;
+    engine.open(id, viewport.0, viewport.1, profile)?;
     Ok(pool().get(id).expect("just inserted"))
 }
 
