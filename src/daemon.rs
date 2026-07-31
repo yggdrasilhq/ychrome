@@ -868,6 +868,11 @@ pub fn run() -> Result<()> {
     // The socket was already unlinked by the op that asked us to leave, before
     // it answered (see `handle_unix_conn`). Removing it here as well would let a
     // retiring daemon delete its SUCCESSOR's socket.
+    // A retiring daemon takes its engine with it. Same reason as the CLI's:
+    // the registry holds the engine in a static, and a static is never
+    // dropped, so the headless display would outlive the daemon that started
+    // it and burn its display number for the successor.
+    crate::engine::api::shutdown();
     journal("daemon_stop", json!({ "pid": std::process::id() }));
     Ok(())
 }

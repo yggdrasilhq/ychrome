@@ -53,7 +53,11 @@ fn exit_now(code: i32) -> ! {
 /// `engine` verbs, with the engine-owned exit above. `main` calls this;
 /// `run_verb` stays a normal `Result` so it is testable.
 pub fn run_verb_and_exit(sub: Option<&str>, as_json: bool) -> ! {
-    match run_verb(sub, as_json) {
+    let outcome = run_verb(sub, as_json);
+    // Before `_exit`, because `_exit` runs no destructors and the registry's
+    // engine lives in a static that Rust would never drop anyway.
+    api::shutdown();
+    match outcome {
         Ok(()) => exit_now(0),
         Err(error) => {
             eprintln!("ychrome: {error:#}");
