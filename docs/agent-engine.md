@@ -1,9 +1,48 @@
 # The YChrome Agent Engine — agent-first headless browsing at fleet scale
 
-Status: **SPEC — approved direction 2026-07-13** (discussion: yggterm session
-13b4cdb5). **Phase A is BUILT and PASSING** (`ychrome engine gate`, proven on
-dev 2026-07-31 — see §9.1); Phases B-E are not. Nothing else below is built
-except where marked "exists today".
+Status: **BUILT — phases A through E are all implemented and proven**
+(approved 2026-07-13, delivered 2026-07-31). Run the proofs yourself:
+`ychrome engine gate` (A, green on dev **and** the GUI host), `engine flow` (B),
+`engine parity` (C), `engine govern 300` (D), `assets/engine-recipes/run-all.sh`
+(E, green on dev/the GUI host/oc). **Phase F (promote-to-visible) remains a separate
+campaign and is untouched.** Read §10 HONEST GAPS before believing any claim
+this document makes about what is covered.
+
+## ⛔ 0. THE SUBSTRATE IS WEBKITGTK, AND THAT IS THE SETTLED ANSWER
+
+**This document is named for WPE, and WPE is not what it runs on.** Read this
+before §3 or you will chase an API that does not exist here.
+
+Debian's WPE WebKit 2.52.5 ships with **WPEPlatform compiled out** — an upstream
+build flag. Verified independently, twice: no `wpe-platform-1.0`/`-2.0`
+pkg-config, **zero** headers declaring `wpe_display_headless_new`, and **zero**
+`wpe_display_*` symbols exported by `libWPEWebKit-2.0.so.1`. The version number
+in §3 was doing all the persuading and none of the deciding. This is not a
+version to wait out; it is a packaging decision.
+
+**Owner's ruling, 2026-07-31: WebKitGTK stays.** The options were put and
+settled — *"as long as all agents are happy and yggterm is happy, webkitgtk
+stays."* So the engine runs **WebKitGTK behind an engine-owned Xvfb, kept behind
+a swappable substrate seam**, and it delivers the two properties §9's risk
+register feared the fallback would not: trusted input and faithful snapshots.
+
+**Do NOT re-litigate this by vendoring WebKit.** The blocking objection is not
+build cost (real: hours, ~20 GB) — it is that vendoring a browser engine makes
+us permanently responsible for shipping its CVE fixes, for a browser holding the
+user's real cookie jars, passwords and vault. Distro and Flatpak runtimes carry
+that maintenance for us.
+
+⚠ And be clear about what WPE would have bought: **not speed.** The measured
+~650 ms is WebKit's own WebProcess startup, identical in both ports. WPE buys
+no-X-server and somewhat lower memory — a modest prize.
+
+If dropping the Xvfb dependency ever becomes worth a spike, the cheap route is
+**libwpe + `libwpebackend-fdo`** (Debian packages both, and ships `cog`, a
+working WPE browser on that path); `webkit_web_view_backend_new` **is** exported
+by the installed library. That is the pre-WPEPlatform backend API, and it is a
+far smaller change than building WebKit. It is not scheduled.
+
+**Believe `ychrome engine probe`, never this document's prose.**
 
 ## 1. Vision
 
