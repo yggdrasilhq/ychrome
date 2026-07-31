@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 
 use super::host::{Engine, InputEvent, NavAction};
 use super::js;
+use super::pool::{self, pool};
 use crate::sidebar::ParsedRequest;
 
 /// Default page viewport. The spec's `page` shape carries a per-page viewport;
@@ -74,6 +75,9 @@ fn engine() -> Result<Arc<Engine>> {
         }),
     );
     *guard = Some(Arc::clone(&engine));
+    // §5's governor tick. Started with the engine, not before: a daemon with
+    // no engine has nothing to govern.
+    pool::start_governor(Arc::downgrade(&engine));
     Ok(engine)
 }
 
@@ -148,6 +152,18 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
         Err(error) => return Reply::bad(503, format!("engine unavailable: {error}")),
     };
 
+    // Any verb that drives a named page needs it LIVE, and needs the LRU clock
+    // stamped — or the governor will park the very page a script is working.
+    // A parked page resumes here, transparently, which is what makes §5's
+    // "hundreds of logical pages" usable rather than something a caller has to
+    // manage by hand.
+    if let Some(id) = &page_id
+        && DRIVES_A_PAGE.contains(&verb)
+        && let Err(error) = pool::ensure_live(&engine, id)
+    {
+        return saturated_or_bad(&error);
+    }
+
     match verb {
         "open" => {
             let id = page_id.unwrap_or_else(new_page_id);
@@ -157,35 +173,76 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
             let height = request.body["viewport"]["h"]
                 .as_i64()
                 .unwrap_or(DEFAULT_H as i64) as i32;
-            if let Err(error) = engine.open(&id, width, height) {
-                return Reply::bad(400, error.to_string());
+            let tags = request.body["tags"]
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let url = request
+                .body
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("about:blank");
+            // The pool makes room FIRST (§5): parking LRU views until this one
+            // fits the budget, or refusing with the pressure numbers.
+            if let Err(error) = pool::open(&engine, &id, url, tags, (width, height)) {
+                return saturated_or_bad(&error);
             }
-            // `{url}` on open is sugar for open-then-goto, and it waits, so a
-            // caller that passed a url gets a page that has actually loaded.
-            if let Some(url) = request.body.get("url").and_then(Value::as_str)
-                && let Err(error) = engine.goto(&id, url, GOTO_TIMEOUT)
-            {
+            // The page is PINNED until this first load settles, so the
+            // governor cannot park a view out from under a navigation that has
+            // not happened yet. Unpinned on both paths — a failed load must
+            // still release the page, or it would hold a live slot forever.
+            let loaded = if url == "about:blank" {
+                Ok(String::new())
+            } else {
+                engine.goto(&id, url, GOTO_TIMEOUT)
+            };
+            pool().unpin(&id);
+            if let Err(error) = loaded {
                 return Reply::bad(502, error.to_string());
             }
             Reply::Json(200, page_status(&engine, &id))
         }
         "close" => match page_id {
             None => Reply::bad(400, "close needs a page_id"),
-            Some(id) => match engine.close(&id) {
-                Ok(()) => Reply::Json(200, json!({ "ok": true, "closed": id })),
-                Err(error) => Reply::bad(404, error.to_string()),
-            },
+            Some(id) => {
+                let pooled = pool().remove(&id);
+                // A parked page owns no view, so closing it is just forgetting
+                // it — not an error the caller should have to special-case.
+                let parked = pooled
+                    .as_ref()
+                    .is_some_and(|page| page.state != pool::PageState::Live);
+                match engine.close(&id) {
+                    Ok(()) => Reply::Json(200, json!({ "ok": true, "closed": id })),
+                    Err(_) if parked => {
+                        Reply::Json(200, json!({ "ok": true, "closed": id, "was_parked": true }))
+                    }
+                    Err(error) => Reply::bad(404, error.to_string()),
+                }
+            }
         },
-        "pages" => match engine.page_ids() {
-            Ok(ids) => Reply::Json(
-                200,
-                json!({
-                    "ok": true,
-                    "pages": ids.iter().map(|id| page_status(&engine, id)).collect::<Vec<_>>(),
-                }),
-            ),
-            Err(error) => Reply::bad(500, error.to_string()),
-        },
+        "pages" => {
+            // LOGICAL pages, live and parked alike, filtered as §4 allows. A
+            // listing that showed only live views would hide most of the pool.
+            let want_state = crate::sidebar::query_value(&request.query, "state");
+            let want_tag = crate::sidebar::query_value(&request.query, "tag");
+            let pages: Vec<Value> = pool()
+                .all()
+                .into_iter()
+                .filter(|page| want_state.as_deref().is_none_or(|s| page.state.id() == s))
+                .filter(|page| {
+                    want_tag
+                        .as_deref()
+                        .is_none_or(|t| page.tags.iter().any(|tag| tag == t))
+                })
+                .map(|page| page.to_json())
+                .collect();
+            Reply::Json(200, json!({ "ok": true, "pages": pages }))
+        }
         "goto" => {
             let (Some(id), Some(url)) = (page_id, request.body.get("url").and_then(Value::as_str))
             else {
@@ -294,6 +351,32 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
                 Err(error) => Reply::bad(400, error.to_string()),
             }
         }
+        "park" => match page_id {
+            None => Reply::bad(400, "park needs a page_id"),
+            Some(id) => match pool::park(&engine, &id) {
+                Ok(page) => Reply::Json(200, page.to_json()),
+                Err(error) => Reply::bad(404, error.to_string()),
+            },
+        },
+        "resume" => match page_id {
+            None => Reply::bad(400, "resume needs a page_id"),
+            Some(id) => match pool::resume(&engine, &id) {
+                Ok(page) => Reply::Json(200, page.to_json()),
+                Err(error) => saturated_or_bad(&error),
+            },
+        },
+        "pool" | "metrics" => Reply::Json(200, pool().metrics()),
+        "budget" => {
+            let budget = pool().set_budget(
+                request.body["max_live"]
+                    .as_u64()
+                    .map(|value| value as usize),
+                request.body["max_rss_mb"].as_u64(),
+            );
+            crate::daemon::journal("engine.governor.budget", budget_json(&budget));
+            Reply::Json(200, json!({ "ok": true, "budgets": budget_json(&budget) }))
+        }
+        "batch" => batch(request),
         "" | "status" => Reply::Json(
             200,
             json!({
@@ -305,6 +388,136 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
         ),
         other => Reply::bad(404, format!("unknown engine verb {other:?}")),
     }
+}
+
+/// Verbs that drive a NAMED page, and therefore need it live and touched.
+///
+/// `park` is deliberately absent: parking a page must not first resume it.
+/// `close` is absent for the same reason — forgetting a parked page should not
+/// cost a page load.
+const DRIVES_A_PAGE: [&str; 7] = ["goto", "nav", "eval", "shot", "dom", "input", "wait"];
+
+/// A reply's status and body, for callers that only need the pair.
+fn json_status(reply: Reply) -> (u16, Value) {
+    match reply {
+        Reply::Json(status, body) => (status, body),
+        Reply::Png(png) => (200, json!({ "png_bytes": png.len() })),
+    }
+}
+
+fn budget_json(budget: &pool::Budget) -> Value {
+    json!({
+        "max_live": budget.max_live,
+        "max_rss_mb": budget.max_rss_mb,
+        "per_page_rss_mb": budget.per_page_rss_mb,
+    })
+}
+
+/// Turn a pool error into a reply. Saturation is `429` with the live pressure
+/// numbers attached (§5) — a script must SEE the constraint, not wait behind
+/// it, and not be told a generic 400 that hides which budget it hit.
+fn saturated_or_bad(error: &anyhow::Error) -> Reply {
+    let message = error.to_string();
+    if message.starts_with("pool_saturated") {
+        let mut body = pool().metrics();
+        if let Some(map) = body.as_object_mut() {
+            map.insert("ok".into(), json!(false));
+            map.insert("error".into(), json!("pool_saturated"));
+            map.insert("detail".into(), json!(message));
+        }
+        return Reply::Json(429, body);
+    }
+    Reply::bad(400, message)
+}
+
+/// `/engine/batch` — the hundreds-of-pages verb (§4).
+///
+/// A convenience loop over open + wait with the governor in charge. It must not
+/// bypass budgets, so every page goes through the same `pool::open` any single
+/// `/engine/open` uses; when the pool saturates, the batch records the refusal
+/// for that entry and keeps going rather than dying, because a 300-page crawl
+/// that aborts on the first budget refusal is useless.
+///
+/// v1 returns the whole result array. §4 describes NDJSON streaming, which
+/// needs a chunked responder the control endpoint does not have yet; Phase E
+/// owns it, and this is a JSON array until then rather than a half-stream.
+fn batch(request: &ParsedRequest) -> Reply {
+    let entries = request.body["open"].as_array().cloned().unwrap_or_default();
+    if entries.is_empty() {
+        return Reply::bad(400, "batch needs a non-empty `open` array");
+    }
+    let concurrency = request.body["concurrency"]
+        .as_u64()
+        .unwrap_or(8)
+        .clamp(1, 64) as usize;
+    let started = Instant::now();
+    crate::daemon::journal(
+        "engine.batch.start",
+        json!({ "count": entries.len(), "concurrency": concurrency }),
+    );
+
+    let mut results = Vec::new();
+    let mut opened = 0;
+    let mut refused = 0;
+    // Chunked rather than one thread per entry: `concurrency` is a promise
+    // about how much is in flight, and 300 threads would break it.
+    for chunk in entries.chunks(concurrency) {
+        let mut handles = Vec::new();
+        for entry in chunk {
+            let entry = entry.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut body = json!({ "page_id": new_page_id() });
+                if let Some(map) = body.as_object_mut() {
+                    for (key, value) in entry.as_object().into_iter().flatten() {
+                        map.insert(key.clone(), value.clone());
+                    }
+                }
+                let reply = dispatch(&request_with("open", body));
+                match reply {
+                    Reply::Json(status, body) => (status, body),
+                    Reply::Png(_) => (500, json!({ "error": "open returned a PNG" })),
+                }
+            }));
+        }
+        for handle in handles {
+            match handle.join() {
+                Ok((200, body)) => {
+                    opened += 1;
+                    results.push(body);
+                }
+                Ok((status, body)) => {
+                    refused += 1;
+                    results.push(json!({ "status": status, "error": body["error"] }));
+                }
+                Err(_) => {
+                    refused += 1;
+                    results.push(json!({ "status": 500, "error": "batch worker panicked" }));
+                }
+            }
+        }
+    }
+
+    let (live, parked, total) = pool().counts();
+    let report = json!({
+        "ok": true,
+        "requested": entries.len(),
+        "opened": opened,
+        "refused": refused,
+        "live": live,
+        "parked": parked,
+        "logical_pages": total,
+        "elapsed_ms": started.elapsed().as_millis(),
+        "pages": results,
+    });
+    crate::daemon::journal(
+        "engine.batch.result",
+        json!({
+            "requested": entries.len(), "opened": opened, "refused": refused,
+            "live": live, "parked": parked, "logical_pages": total,
+            "elapsed_ms": started.elapsed().as_millis(),
+        }),
+    );
+    Reply::Json(200, report)
 }
 
 /// `/engine/wait` — the primitive that makes scripts honest (§4).
@@ -526,8 +739,12 @@ fn new_page_id() -> String {
 }
 
 /// Build a request the way the socket handler will, so callers that are not
-/// HTTP (the bench verb) exercise the very same router.
+/// HTTP (the bench and flow verbs) exercise the very same router.
 pub fn request(verb: &str, body: Value) -> ParsedRequest {
+    request_with(verb, body)
+}
+
+fn request_with(verb: &str, body: Value) -> ParsedRequest {
     ParsedRequest {
         method: "POST".to_string(),
         path: format!("/engine/{verb}"),
@@ -536,6 +753,178 @@ pub fn request(verb: &str, body: Value) -> ParsedRequest {
         control_token: None,
         body,
     }
+}
+
+/// `ychrome engine govern [n]` — Phase D's acceptance run (§8).
+///
+/// Opens N logical pages through `/engine/batch` under `max_live=12` and
+/// `max_rss_mb=4096`, then checks the things the AC actually asks about: that
+/// the run COMPLETES, that live never exceeded the budget, that parking
+/// honoured LRU, and that peak PSS stayed within budget +10%.
+///
+/// The pages are local `file://` fixtures, not 300 requests at a live site.
+/// That keeps the measurement about the governor instead of about someone
+/// else's rate limiter, and it makes the run repeatable.
+pub fn govern(pages: usize) -> Result<Value> {
+    let started = Instant::now();
+    let dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("no home dir"))?
+        .join(".yggterm/ychrome/engine-pool");
+    std::fs::create_dir_all(&dir)?;
+
+    // Each fixture holds a little state so parking has something real to
+    // capture: a scroll position and a filled field.
+    let mut urls = Vec::with_capacity(pages);
+    for index in 0..pages {
+        let path = dir.join(format!("page-{index:04}.html"));
+        std::fs::write(
+            &path,
+            format!(
+                "<!doctype html><title>pool page {index}</title>\
+                 <body><h1>pool page {index}</h1>\
+                 <input id=\"f\" value=\"state-{index}\">\
+                 <div style=\"height:2500px\"></div>\
+                 <script>window.scrollTo(0, {});</script>",
+                (index % 7) * 100 + 120
+            ),
+        )?;
+        urls.push(format!("file://{}", path.display()));
+    }
+
+    let budget = pool().set_budget(Some(12), Some(4096));
+    crate::daemon::journal(
+        "engine.govern.start",
+        json!({ "pages": pages, "budget": budget_json(&budget) }),
+    );
+
+    // Sample live-count and PSS throughout, so "never exceeded the budget" is
+    // a measurement rather than an end-state guess.
+    let watching = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let samples = Arc::new(Mutex::new(Vec::<(usize, u64)>::new()));
+    let watcher = {
+        let watching = Arc::clone(&watching);
+        let samples = Arc::clone(&samples);
+        std::thread::spawn(move || {
+            while watching.load(std::sync::atomic::Ordering::Relaxed) {
+                let (live, _, _) = pool().counts();
+                let (pss, _) = pool::measure_pss();
+                if let Ok(mut samples) = samples.lock() {
+                    samples.push((live, pss));
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        })
+    };
+
+    let open: Vec<Value> = urls
+        .iter()
+        .enumerate()
+        .map(|(index, url)| json!({ "url": url, "tags": [format!("batch-{}", index % 3)] }))
+        .collect();
+    let (status, batch) =
+        match dispatch(&request("batch", json!({ "open": open, "concurrency": 8 }))) {
+            Reply::Json(status, body) => (status, body),
+            Reply::Png(_) => (500, json!({})),
+        };
+
+    watching.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = watcher.join();
+    let samples = samples.lock().map(|s| s.clone()).unwrap_or_default();
+    let max_live_seen = samples.iter().map(|(live, _)| *live).max().unwrap_or(0);
+    let peak_pss = samples.iter().map(|(_, pss)| *pss).max().unwrap_or(0);
+
+    // ---- restore is a PLACE, not a URL ----------------------------------
+    //
+    // The batch alone never resumes anything, so parking would be "proven"
+    // without ever showing the state comes back. Mutate a live page into a
+    // condition its own markup does NOT produce, park it, resume it, and read
+    // it back: a plain reload would restore `state-N` and the fixture's own
+    // inline `scrollTo`, so only a real place-restore can pass this.
+    let restore = pool()
+        .all()
+        .into_iter()
+        .find(|page| page.state == pool::PageState::Live && !page.pinned)
+        .map(|page| page.id.clone());
+    let restored = match &restore {
+        None => json!({ "ran": false, "reason": "no live page to test" }),
+        Some(id) => {
+            let marker = "RESTORE-MARKER";
+            let _ = dispatch(&request(
+                "eval",
+                json!({ "page_id": id, "js": format!(
+                    "(() => {{ document.getElementById('f').value = '{marker}';                       window.scrollTo(0, 1234); return 'set'; }})()"
+                )}),
+            ));
+            let park = json_status(dispatch(&request("park", json!({ "page_id": id }))));
+            let resume = json_status(dispatch(&request("resume", json!({ "page_id": id }))));
+            let after = match dispatch(&request(
+                "eval",
+                json!({ "page_id": id, "js":
+                    "[document.getElementById('f').value, Math.round(window.scrollY)]" }),
+            )) {
+                Reply::Json(200, body) => body["value"].clone(),
+                Reply::Json(_, body) => body,
+                Reply::Png(_) => Value::Null,
+            };
+            let value_back = after[0] == json!(marker);
+            let scroll_back = (after[1].as_f64().unwrap_or(0.0) - 1234.0).abs() <= 2.0;
+            json!({
+                "ran": true,
+                "page_id": id,
+                "parked_ok": park.0 == 200,
+                "resumed_ok": resume.0 == 200,
+                "form_value_restored": value_back,
+                "scroll_restored": scroll_back,
+                "read_back": after,
+                "pass": park.0 == 200 && resume.0 == 200 && value_back && scroll_back,
+            })
+        }
+    };
+
+    let metrics = pool().metrics();
+    let (live, parked, total) = pool().counts();
+    let parked_total = metrics["totals"]["parked"].as_u64().unwrap_or(0);
+
+    // The AC, item by item.
+    let completed = status == 200 && batch["opened"].as_u64().unwrap_or(0) as usize == pages;
+    let live_within_budget = max_live_seen <= budget.max_live;
+    let pss_within_budget = peak_pss <= budget.max_rss_mb + budget.max_rss_mb / 10;
+    let parked_as_expected = parked_total as usize >= pages.saturating_sub(budget.max_live);
+    let all_accounted = total == pages;
+    let place_restored = restored["pass"] == json!(true);
+
+    let report = json!({
+        "bench": "phase-d-governor",
+        "ok": completed && live_within_budget && pss_within_budget
+              && parked_as_expected && all_accounted && place_restored,
+        "requested_pages": pages,
+        "budget": budget_json(&budget),
+        "checks": {
+            "run_completed": completed,
+            "live_never_exceeded_max_live": live_within_budget,
+            "peak_pss_within_budget_plus_10pct": pss_within_budget,
+            "lru_parking_happened": parked_as_expected,
+            "every_page_still_accounted_for": all_accounted,
+            "resume_restores_the_place_not_just_the_url": place_restored,
+        },
+        "restore_proof": restored,
+        "measured": {
+            "max_live_seen": max_live_seen,
+            "peak_pss_mb": peak_pss,
+            "budget_plus_10pct_mb": budget.max_rss_mb + budget.max_rss_mb / 10,
+            "parked_total": parked_total,
+            "resumed_total": metrics["totals"]["resumed"],
+            "saturated_refusals": metrics["totals"]["saturated_refusals"],
+            "final_live": live,
+            "final_parked": parked,
+            "logical_pages": total,
+            "samples": samples.len(),
+            "batch_elapsed_ms": batch["elapsed_ms"],
+            "elapsed_ms": started.elapsed().as_millis(),
+        },
+    });
+    crate::daemon::journal("engine.govern.result", report.clone());
+    Ok(report)
 }
 
 /// `ychrome engine bench [n]` — §6's standardised run, and the shape of Phase

@@ -206,3 +206,63 @@ pub const IDLE_PROBE: &str = r#"(() => {
   return { idle_ms: s.inflight > 0 ? 0 : Math.round(performance.now() - s.last),
            inflight: s.inflight };
 })()"#;
+
+/// Capture the PLACE for `/engine/park` (§5).
+///
+/// Scroll offset plus best-effort form state, keyed by the same selector shape
+/// `DOM_SNAPSHOT` emits so the two agree about what names an element.
+///
+/// **Password and file inputs are never captured.** Parking is a memory
+/// optimisation; it must not become a way to spill a credential into a pool
+/// entry that outlives the view. A field we refuse to capture is simply not
+/// restored, which is the correct failure — the vault refills it.
+pub const CAPTURE_PLACE: &str = r#"(() => {
+  const form = {};
+  const nth = (el) => {
+    const p = el.parentNode;
+    if (!p || !p.children) return el.localName;
+    const kin = Array.prototype.filter.call(p.children, (c) => c.localName === el.localName);
+    return kin.length > 1
+      ? el.localName + ':nth-of-type(' + (kin.indexOf(el) + 1) + ')'
+      : el.localName;
+  };
+  const path = (el) => {
+    if (el.id) { try { if (document.querySelectorAll('#' + CSS.escape(el.id)).length === 1) return '#' + CSS.escape(el.id); } catch (e) {} }
+    const parts = []; let n = el;
+    while (n && n.nodeType === 1 && n !== document.documentElement) { parts.unshift(nth(n)); n = n.parentElement; }
+    return parts.join(' > ');
+  };
+  for (const el of document.querySelectorAll('input, textarea, select')) {
+    const t = (el.getAttribute('type') || '').toLowerCase();
+    if (t === 'password' || t === 'file') continue;
+    if (t === 'checkbox' || t === 'radio') { form[path(el)] = { checked: !!el.checked }; }
+    else if (typeof el.value === 'string' && el.value !== '') { form[path(el)] = { value: el.value }; }
+  }
+  return { url: location.href, scroll_x: window.scrollX, scroll_y: window.scrollY, form_state: form };
+})()"#;
+
+/// Restore a captured place after `/engine/resume` re-navigates.
+///
+/// Reports what it actually put back rather than claiming success: a page whose
+/// markup changed between park and resume may no longer have the fields, and
+/// §5's rule is "documented best-effort; never claim more than captured".
+pub const RESTORE_PLACE: &str = r#"(place) => {
+  let fields = 0, missing = 0;
+  const form = (place && place.form_state) || {};
+  for (const selector of Object.keys(form)) {
+    let el = null;
+    try { el = document.querySelector(selector); } catch (e) { el = null; }
+    if (!el) { missing++; continue; }
+    const saved = form[selector];
+    if ('checked' in saved) { el.checked = saved.checked; }
+    else { el.value = saved.value; }
+    // A restored value that fires no event is invisible to a framework that
+    // tracks its own state, so say it changed.
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    fields++;
+  }
+  window.scrollTo(place.scroll_x || 0, place.scroll_y || 0);
+  return { fields_restored: fields, fields_missing: missing,
+           scroll_y: Math.round(window.scrollY) };
+}"#;

@@ -21,6 +21,7 @@ pub mod flow;
 pub mod gate;
 pub mod host;
 pub mod js;
+pub mod pool;
 pub mod substrate;
 
 use std::io::Write;
@@ -151,6 +152,36 @@ pub fn run_verb(sub: Option<&str>, as_json: bool) -> Result<()> {
             }
             Ok(())
         }
+        Some("govern") => {
+            let pages = std::env::args()
+                .nth(3)
+                .and_then(|arg| arg.parse::<usize>().ok())
+                .unwrap_or(300);
+            let report = api::govern(pages)?;
+            if as_json {
+                println!("{report}");
+            } else {
+                println!(
+                    "phase-d governor: {} logical pages, budget {}",
+                    report["requested_pages"], report["budget"]
+                );
+                for (name, value) in report["checks"].as_object().into_iter().flatten() {
+                    println!(
+                        "  {} {name}",
+                        if value.as_bool() == Some(true) {
+                            "PASS"
+                        } else {
+                            "FAIL"
+                        }
+                    );
+                }
+                println!("  measured: {}", report["measured"]);
+            }
+            if report["ok"].as_bool() != Some(true) {
+                bail!("phase-d governor run FAILED");
+            }
+            Ok(())
+        }
         Some("bench") => {
             let pages = std::env::args()
                 .nth(3)
@@ -184,7 +215,9 @@ pub fn run_verb(sub: Option<&str>, as_json: bool) -> Result<()> {
             }
             Ok(())
         }
-        Some(other) => bail!("unknown engine verb {other:?} (known: probe, gate, flow, bench)"),
-        None => bail!("usage: ychrome engine <probe|gate|flow|bench> [--json]"),
+        Some(other) => {
+            bail!("unknown engine verb {other:?} (known: probe, gate, flow, bench, govern)")
+        }
+        None => bail!("usage: ychrome engine <probe|gate|flow|bench|govern> [--json]"),
     }
 }
