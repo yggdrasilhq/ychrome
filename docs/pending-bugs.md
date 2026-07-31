@@ -104,45 +104,6 @@ at a moment the user is not mid-task, because it reloads their page.
 
 ---
 
-## ★★★ `/input` DISPATCHES A SELECTOR CLICK TO A ZERO-SIZE ELEMENT AND REPORTS SUCCESS
-
-**Cost three wrong conclusions in one session, one of which blamed the operator's
-vault for a failure that never happened.**
-
-`document.querySelector` returns the FIRST match, and real pages carry hidden
-duplicates. IBKR's login page has six-plus `button[type=submit]`, five of them
-hidden at `0x0`, the live one third in document order:
-
-```
-[{txt:"Login", vis:false, wh:[0,0]},   ← querySelector returns THIS
- {txt:"Login", vis:false, wh:[0,0]},
- {txt:"Login", vis:true,  wh:[414,48]},  ← the real one
- {txt:"Authenticate", vis:false, wh:[0,0]}, …]
-```
-
-`ychrome ctl input page_id=… events='[{"type":"click","selector":"button[type=submit]"}]'`
-resolved that to a `0x0` rect, dispatched at **(0,0)**, and answered:
-
-    {"dispatched":3,"ok":true}
-
-Nothing was clicked. The page appeared to "reset", and I concluded a brokerage
-2FA had rejected a TOTP that had in fact never been submitted — then said so to
-the operator, about his vault.
-
-**The old surface plane already gets this right:** `web do` refuses with
-`"<selector> matched a zero-size element"`, alongside its siblings
-`detached_node` and `target_moved`. §4 of `agent-engine.md` says selector clicks
-are sugar that "resolves center, scrolls into view" — the resolver needs the same
-refusals the surface plane's has.
-
-**Fix:** refuse a `0x0` or offscreen target by default (`zero_size_element`),
-after attempting `scrollIntoView` and re-measuring. Consider preferring the first
-VISIBLE match over the first match, or requiring the caller to opt in to
-ambiguity. **`{"dispatched":n,"ok":true}` must never describe a click that hit
-nothing** — an engine that reports events dispatched into the void is the exact
-lie-of-success shape this codebase refuses everywhere else. Lock it with a
-fixture page carrying a hidden duplicate ahead of the real control.
-
 ## ★★ THE ENGINE ONLY EXISTS ON the GUI host, SO AGENT BROWSING STILL BURNS THE OPERATOR'S LAPTOP
 
 The engine's whole purpose is that agent browsing stops costing the human. It is
