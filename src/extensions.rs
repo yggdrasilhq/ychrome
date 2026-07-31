@@ -41,7 +41,14 @@ pub fn find(stem: &str) -> Option<&'static Extension> {
     CATALOG.iter().find(|ext| ext.stem == stem)
 }
 
-static CATALOG: [Extension; 4] = [
+static CATALOG: [Extension; 5] = [
+    Extension {
+        stem: crate::abp::COSMETIC_SCRIPT_STEM,
+        name: "Cosmetic filters",
+        description: "Hide the ad shapes WebKit's content blocker cannot express \
+                      (:has-text, :style) — generated from the upstream filter lists.",
+        body: include_str!("../assets/web-userscripts/cosmetic-filters.js"),
+    },
     Extension {
         stem: SPONSORBLOCK_STEM,
         name: "SponsorBlock",
@@ -138,6 +145,7 @@ mod tests {
     #[test]
     fn every_catalog_body_is_the_script_it_claims_to_be() {
         let fingerprints = [
+            (crate::abp::COSMETIC_SCRIPT_STEM, "window.__yggCosmetic"),
             (SPONSORBLOCK_STEM, "sponsor.ajay.app"),
             ("youtube-adblock", "'/youtubei/v1/player'"),
             ("idcac", "window.__yggIdcac"),
@@ -486,6 +494,82 @@ mod tests {
             assert!(
                 out.status.success() && stdout.contains("ALL OK"),
                 "youtube-adblock harness failed on {host}:\n{stdout}\n{stderr}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The GENERATED cosmetic script, DRIVEN. Source needles prove `:has-text`
+    // is mentioned; only running it proves the element gets hidden. Three
+    // hosts: one with a :has-text rule, one with a :style rule, and one that is
+    // not in the list at all — the last is the performance contract, because a
+    // text-scanning observer on every page in the browser is a different
+    // product than this one.
+    #[test]
+    fn the_generated_cosmetic_script_actually_hides_and_styles() {
+        let ext = find(crate::abp::COSMETIC_SCRIPT_STEM).expect("cosmetic-filters in catalog");
+        let node_ok = std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !node_ok {
+            assert!(
+                std::env::var_os("YCHROME_ALLOW_NO_NODE").is_some(),
+                "node is needed to run the cosmetic-filters behaviour lock; install it, or \
+                 set YCHROME_ALLOW_NO_NODE=1 to knowingly ship without this proof"
+            );
+            return;
+        }
+
+        // Pick the hosts out of the script's OWN payload, so the lock never
+        // encodes a domain that a regeneration might drop.
+        let payload = ext
+            .body
+            .split("var RULES = ")
+            .nth(1)
+            .and_then(|rest| rest.split(";\n").next())
+            .expect("the generated script carries a RULES payload");
+        let rules: serde_json::Value =
+            serde_json::from_str(payload).expect("the RULES payload is JSON");
+        let map = rules.as_object().expect("RULES is an object");
+        assert!(
+            map.len() > 100,
+            "the generated script covers only {} domains — a regeneration that produced \
+             almost nothing",
+            map.len()
+        );
+        let host_with = |kind: &str| -> String {
+            map.iter()
+                .find(|(_, list)| {
+                    list.as_array()
+                        .is_some_and(|rules| rules.iter().any(|rule| rule[0] == kind))
+                })
+                .map(|(domain, _)| domain.clone())
+                .unwrap_or_else(|| panic!("no domain carries a {kind:?} rule"))
+        };
+
+        let dir = scratch_dir("cosmetic-filters");
+        let script = dir.join("cosmetic-filters.js");
+        std::fs::write(&script, ext.body).expect("write the script under test");
+        let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cosmetic-filters-harness.js");
+        for host in [
+            host_with("t"),
+            host_with("s"),
+            "not-in-the-list.example".to_string(),
+        ] {
+            let out = std::process::Command::new("node")
+                .arg(&harness)
+                .arg(&script)
+                .arg(&host)
+                .output()
+                .expect("run the node harness");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success() && stdout.contains("ALL OK"),
+                "cosmetic-filters harness failed on {host}:\n{stdout}\n{stderr}"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
