@@ -250,6 +250,9 @@ pub struct Report {
     /// `#@#` exceptions that were honoured by removing a selector or adding an
     /// `unless-domain`.
     pub cosmetic_unhide_applied: usize,
+    /// Procedural cosmetic filters routed to the generated userscript rather
+    /// than dropped.
+    pub cosmetic_procedural_rules: usize,
     /// Rules emitted, total.
     pub emitted: usize,
     /// Identical rules collapsed. Overlapping lists produce a lot of these.
@@ -312,6 +315,7 @@ impl Report {
             "cosmetic_domain_selectors": self.cosmetic_domain_selectors,
             "cosmetic_domain_rules": self.cosmetic_domain_rules,
             "cosmetic_unhide_applied": self.cosmetic_unhide_applied,
+            "cosmetic_procedural_rules": self.cosmetic_procedural_rules,
             "dropped_total": self.dropped_total(),
             "dropped": dropped,
         })
@@ -429,10 +433,36 @@ pub struct Source<'a> {
     pub text: &'a str,
 }
 
-/// The output: the ruleset, and the account of how it was reached.
+/// The output: the ruleset, the generated cosmetic userscript, and the account
+/// of how both were reached.
 pub struct Conversion {
     pub rules: Vec<Value>,
+    /// Procedural cosmetic rules WebKit cannot express, keyed by domain, ready
+    /// for [`generate_cosmetic_script`]. Deterministic order.
+    pub procedural: BTreeMap<String, BTreeSet<ProceduralRule>>,
     pub report: Report,
+}
+
+/// One procedural cosmetic rule, in the only two forms this converter
+/// implements.
+///
+/// 646 procedural rules across the shipped corpus, all domain-scoped, over 804
+/// distinct domains. 422 of them are `:has-text()` and 159 are `:style()` —
+/// 90% between them. The remaining 65 (`:upward()`, `:xpath()`, `:remove()`,
+/// `:matches-css`, `:matches-attr()`, `:matches-path()`, `:others()`) are
+/// counted and dropped, because each needs its own semantics and the tail is
+/// not worth a second engine.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProceduralRule {
+    /// `<prefix>:has-text(TEXT)` — hide elements matching `prefix` whose text
+    /// contains `text`. uBO's own most common procedural form.
+    HasText { prefix: String, text: String },
+    /// `<prefix>:style(DECLS)` — apply `decls` to elements matching `prefix`.
+    /// `css-display-none` can only hide; this is how the consent lists give a
+    /// page its scrolling back
+    /// (`body.didomi-popup-open:style(overflow: auto !important;)` alone rides
+    /// on 205 domains).
+    Style { prefix: String, decls: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -592,9 +622,7 @@ fn matches_everything(url_filter: &str) -> bool {
     url_filter
         .chars()
         .zip(url_filter.chars().skip(1).chain(std::iter::once(' ')))
-        .all(|(ch, next)| {
-            matches!(ch, '^' | '$' | '*') || (ch == '.' && next == '*')
-        })
+        .all(|(ch, next)| matches!(ch, '^' | '$' | '*') || (ch == '.' && next == '*'))
 }
 
 // ---------------------------------------------------------------------------
@@ -866,6 +894,55 @@ const PROCEDURAL_MARKERS: [&str; 18] = [
     ":if(",
 ];
 
+/// Parse a procedural selector into the subset this converter implements, or
+/// `None` when it is one of the forms that stay dropped.
+///
+/// Deliberately strict about NESTING: `a:has(p:has-text(Sponsored))` puts the
+/// procedural part inside a `:has()`, and hiding `a:has(p)` instead would hide
+/// far more than the filter asked. Only a procedural pseudo-class in the LAST
+/// position, with a plain-CSS prefix, is accepted.
+pub fn parse_procedural(selector: &str) -> Option<ProceduralRule> {
+    for (marker, build) in [
+        (":has-text(", 0u8),
+        (":-abp-contains(", 0),
+        (":contains(", 0),
+        (":style(", 1),
+    ] {
+        let Some(at) = selector.rfind(marker) else {
+            continue;
+        };
+        if !selector.ends_with(')') {
+            continue;
+        }
+        let prefix = &selector[..at];
+        let arg = &selector[at + marker.len()..selector.len() - 1];
+        // The argument must be the LAST thing: a nested form leaves an
+        // unbalanced prefix or trailing content.
+        if arg.contains('(') || arg.contains(')') || arg.is_empty() {
+            continue;
+        }
+        if prefix.is_empty() || !selector_ok(prefix) {
+            continue;
+        }
+        // A /regex/ argument is uBO's other language; not implemented.
+        if build == 0 && arg.starts_with('/') && arg.ends_with('/') {
+            continue;
+        }
+        return Some(if build == 0 {
+            ProceduralRule::HasText {
+                prefix: prefix.to_string(),
+                text: arg.to_string(),
+            }
+        } else {
+            ProceduralRule::Style {
+                prefix: prefix.to_string(),
+                decls: arg.to_string(),
+            }
+        });
+    }
+    None
+}
+
 /// Whether a selector is one this converter is willing to hand WebKit.
 ///
 /// Conservative on purpose: WebKit drops an invalid selector without failing
@@ -986,6 +1063,43 @@ pub fn convert(sources: &[Source<'_>]) -> Conversion {
     let mut domain_hide: BTreeMap<DomainScope, BTreeSet<String>> = BTreeMap::new();
     let mut generic_unhide: BTreeSet<String> = BTreeSet::new();
     let mut domain_unhide: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // Procedural rules go to the userscript plane, keyed by bare domain (the
+    // generated script matches a host to its rules itself).
+    let mut procedural: BTreeMap<String, BTreeSet<ProceduralRule>> = BTreeMap::new();
+    let mut take_procedural = |domains: &str, body: &str, report: &mut Report, line: &str| {
+        // A procedural rule with no domain would run its text scan on every
+        // page in the browser. Every one in the shipped corpus is scoped; an
+        // unscoped one is refused rather than paid for everywhere.
+        if domains.is_empty() {
+            report.drop(DropReason::ProceduralSelector, line);
+            return;
+        }
+        let Some(rule) = parse_procedural(body) else {
+            report.drop(DropReason::ProceduralSelector, line);
+            return;
+        };
+        let mut landed = false;
+        for entry in domains.split(',').map(str::trim) {
+            if entry.is_empty() || entry.starts_with('~') {
+                continue;
+            }
+            // The generated script matches hosts itself, so it wants the bare
+            // domain, not WebKit's `*`-prefixed spelling.
+            let Some(host) = translate_domain(entry) else {
+                continue;
+            };
+            procedural
+                .entry(host.trim_start_matches('*').to_string())
+                .or_default()
+                .insert(rule.clone());
+            landed = true;
+        }
+        if landed {
+            report.cosmetic_procedural_rules += 1;
+        } else {
+            report.drop(DropReason::ProceduralSelector, line);
+        }
+    };
 
     for source in sources {
         for raw in source.text.lines() {
@@ -1010,7 +1124,7 @@ pub fn convert(sources: &[Source<'_>]) -> Conversion {
                     "#$#" | "#%#" | "#$?#" | "#@$#" | "#@$?#" => {
                         report.drop(DropReason::StyleOrSnippet, line);
                     }
-                    "#?#" => report.drop(DropReason::ProceduralSelector, line),
+                    "#?#" => take_procedural(domains, body, &mut report, line),
                     "#@#" | "#@?#" => {
                         // Record the unhide; it is applied after every hide is
                         // known, because a `#@#` may precede its `##`.
@@ -1037,7 +1151,7 @@ pub fn convert(sources: &[Source<'_>]) -> Conversion {
                     "##" if body.starts_with('^') => report.drop(DropReason::HtmlFiltering, line),
                     "##" => {
                         if PROCEDURAL_MARKERS.iter().any(|m| body.contains(m)) {
-                            report.drop(DropReason::ProceduralSelector, line);
+                            take_procedural(domains, body, &mut report, line);
                         } else if !selector_ok(body) {
                             report.drop(DropReason::UnprovableSelector, line);
                         } else if domains.is_empty() {
@@ -1206,7 +1320,165 @@ pub fn convert(sources: &[Source<'_>]) -> Conversion {
         rules.truncate(WEBKIT_RULE_CEILING);
     }
     report.emitted = rules.len();
-    Conversion { rules, report }
+    Conversion {
+        rules,
+        procedural,
+        report,
+    }
+}
+
+/// The stem the generated cosmetic userscript is installed under, in the
+/// catalog and on disk. Named once, here, beside the generator.
+pub const COSMETIC_SCRIPT_STEM: &str = "cosmetic-filters";
+
+/// Render the procedural rules as a userscript body.
+///
+/// This is the SECOND half of cosmetic filtering and it reuses the userscript
+/// plane rather than inventing an injection path: `@match` lines scope it to
+/// exactly the domains that have rules, so WebKit does the matching in the
+/// engine and the script costs literally nothing on every other page in the
+/// browser. That scoping is the whole reason a text-scanning MutationObserver
+/// is affordable at all.
+///
+/// Deterministic by construction: the rules arrive in a `BTreeMap` of
+/// `BTreeSet`s and the payload is serialized as JSON, so the same corpus always
+/// renders the same bytes.
+pub fn generate_cosmetic_script(
+    procedural: &BTreeMap<String, BTreeSet<ProceduralRule>>,
+    version: &str,
+) -> String {
+    // domain -> [["t"|"s", prefix, arg], ...]. A compact positional shape: the
+    // payload is the bulk of the file and a verbose one would triple it.
+    let payload: BTreeMap<&str, Vec<Value>> = procedural
+        .iter()
+        .map(|(domain, rules)| {
+            (
+                domain.as_str(),
+                rules
+                    .iter()
+                    .map(|rule| match rule {
+                        ProceduralRule::HasText { prefix, text } => json!(["t", prefix, text]),
+                        ProceduralRule::Style { prefix, decls } => json!(["s", prefix, decls]),
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    let matches: String = procedural
+        .keys()
+        .map(|domain| format!("// @match       *://*.{domain}/*\n"))
+        .collect();
+    let rule_count: usize = procedural.values().map(BTreeSet::len).sum();
+
+    format!(
+        "// ==UserScript==\n\
+         // @name        ychrome cosmetic filters (GENERATED)\n\
+         // @version     {version}\n\
+         {matches}\
+         // @world       isolated\n\
+         // @run-at      document-start\n\
+         // ==/UserScript==\n\
+         // GENERATED by `ychrome adblock update` from the upstream filter lists.\n\
+         // DO NOT EDIT: regenerate it. {rule_count} procedural cosmetic rules over\n\
+         // {domain_count} domains.\n\
+         //\n\
+         // These are the cosmetic filters WebKit's content blocker cannot express.\n\
+         // `css-display-none` takes a CSS selector and can only hide; `:has-text()`\n\
+         // is not CSS, and `:style()` sets a property rather than hiding. Measured:\n\
+         // WebKit drops such a rule SILENTLY, compile still succeeding, which is the\n\
+         // silent-degradation shape this whole lane exists to close.\n\
+         //\n\
+         // The @match list above is the performance story. WebKit matches in the\n\
+         // engine, so on any page not named there this script does not exist.\n\
+         (function () {{\n\
+         \x20   'use strict';\n\
+         \x20   if (window.__yggCosmetic) return;\n\
+         \x20   window.__yggCosmetic = true;\n\
+         \x20   var RULES = {payload};\n\
+         \x20   // Longest-suffix host match, the same rule webzoom uses: a rule for\n\
+         \x20   // `example.com` covers `www.example.com`, and a bare TLD never matches.\n\
+         \x20   var host = String(location.hostname || '').toLowerCase();\n\
+         \x20   var mine = [];\n\
+         \x20   for (var key in RULES) {{\n\
+         \x20       if (host === key || (host.length > key.length\n\
+         \x20           && host.slice(-(key.length + 1)) === '.' + key)) {{\n\
+         \x20           mine = mine.concat(RULES[key]);\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         \x20   if (!mine.length) return;\n\
+         \x20   var state = {{ hidden: 0, styled: 0, passes: 0 }};\n\
+         \x20   window.__yggCosmeticState = state;\n\
+         \x20\n\
+         \x20   function apply() {{\n\
+         \x20       state.passes += 1;\n\
+         \x20       for (var i = 0; i < mine.length; i++) {{\n\
+         \x20           var rule = mine[i];\n\
+         \x20           var nodes;\n\
+         \x20           try {{\n\
+         \x20               nodes = document.querySelectorAll(rule[1]);\n\
+         \x20           }} catch (e) {{ continue; }}\n\
+         \x20           for (var j = 0; j < nodes.length; j++) {{\n\
+         \x20               var el = nodes[j];\n\
+         \x20               if (rule[0] === 't') {{\n\
+         \x20                   // :has-text(): hide when the element's text carries it.\n\
+         \x20                   if (el.__yggHidden) continue;\n\
+         \x20                   var text = el.textContent || '';\n\
+         \x20                   if (text.toLowerCase().indexOf(rule[2].toLowerCase()) === -1) continue;\n\
+         \x20                   el.__yggHidden = true;\n\
+         \x20                   el.style.setProperty('display', 'none', 'important');\n\
+         \x20                   state.hidden += 1;\n\
+         \x20               }} else {{\n\
+         \x20                   // :style(): apply the declarations verbatim. This is how a\n\
+         \x20                   // consent banner's `overflow:hidden` scroll lock comes off.\n\
+         \x20                   if (el.__yggStyled === rule[2]) continue;\n\
+         \x20                   el.__yggStyled = rule[2];\n\
+         \x20                   var decls = rule[2].split(';');\n\
+         \x20                   for (var k = 0; k < decls.length; k++) {{\n\
+         \x20                       var at = decls[k].indexOf(':');\n\
+         \x20                       if (at === -1) continue;\n\
+         \x20                       var name = decls[k].slice(0, at).trim();\n\
+         \x20                       var value = decls[k].slice(at + 1).trim();\n\
+         \x20                       var important = '';\n\
+         \x20                       if (value.slice(-10).toLowerCase() === '!important') {{\n\
+         \x20                           value = value.slice(0, -10).trim();\n\
+         \x20                           important = 'important';\n\
+         \x20                       }}\n\
+         \x20                       if (name) el.style.setProperty(name, value, important);\n\
+         \x20                   }}\n\
+         \x20                   state.styled += 1;\n\
+         \x20               }}\n\
+         \x20           }}\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         \x20\n\
+         \x20   // Coalesced: a page that rewrites its DOM in a loop must not make this\n\
+         \x20   // run in that loop. One pass per animation frame at most.\n\
+         \x20   var queued = false;\n\
+         \x20   function schedule() {{\n\
+         \x20       if (queued) return;\n\
+         \x20       queued = true;\n\
+         \x20       var run = function () {{ queued = false; apply(); }};\n\
+         \x20       if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run);\n\
+         \x20       else setTimeout(run, 50);\n\
+         \x20   }}\n\
+         \x20\n\
+         \x20   function start() {{\n\
+         \x20       apply();\n\
+         \x20       new MutationObserver(schedule).observe(document.documentElement,\n\
+         \x20           {{ childList: true, subtree: true }});\n\
+         \x20   }}\n\
+         \x20   if (document.readyState === 'loading') {{\n\
+         \x20       document.addEventListener('DOMContentLoaded', start, {{ once: true }});\n\
+         \x20   }} else {{\n\
+         \x20       start();\n\
+         \x20   }}\n\
+         }})();\n",
+        version = version,
+        matches = matches,
+        payload = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()),
+        rule_count = rule_count,
+        domain_count = procedural.len(),
+    )
 }
 
 #[cfg(test)]
@@ -1517,8 +1789,8 @@ mod tests {
     #[test]
     fn procedural_and_scriptlet_filters_are_counted_never_silently_dropped() {
         let conversion = convert_one(
-            "a.test##div:has-text(Sponsored)\n\
-             a.test#?#div:-abp-contains(Ad)\n\
+            "a.test##div:upward(2)\n\
+             a.test#?#div:xpath(//div)\n\
              a.test##+js(set-constant, x, true)\n\
              a.test#$#body { display: block; }\n\
              a.test##^script:has-text(ads)\n",
@@ -1535,6 +1807,105 @@ mod tests {
             conversion.report.samples["scriptlet"][0].contains("+js(set-constant"),
             "a drop must name the filter verbatim"
         );
+    }
+
+    // THE OTHER HALF OF COSMETIC FILTERING. `:has-text()` and `:style()` are
+    // not CSS, so WebKit drops them SILENTLY (measured: the compile still
+    // succeeds). 90% of the corpus's procedural rules are these two, so they go
+    // to the userscript plane instead of the count column.
+    #[test]
+    fn the_two_procedural_forms_that_matter_route_to_the_userscript_plane() {
+        let conversion = convert_one(
+            "a.test,b.test##div.promo:has-text(Sponsored)\n\
+             a.test#?#body.locked:style(overflow: auto !important;)\n\
+             a.test##nav:-abp-contains(Advertisement)\n",
+        );
+        assert_eq!(conversion.report.cosmetic_procedural_rules, 3);
+        let a = conversion
+            .procedural
+            .get("a.test")
+            .expect("a.test has procedural rules");
+        assert!(a.contains(&ProceduralRule::HasText {
+            prefix: "div.promo".to_string(),
+            text: "Sponsored".to_string(),
+        }));
+        assert!(a.contains(&ProceduralRule::Style {
+            prefix: "body.locked".to_string(),
+            decls: "overflow: auto !important;".to_string(),
+        }));
+        assert!(
+            conversion.procedural.contains_key("b.test"),
+            "every domain a scoped rule names must get it"
+        );
+        // And none of it leaked into the content blocker, where WebKit would
+        // have discarded it without a word.
+        assert!(
+            !conversion
+                .rules
+                .iter()
+                .any(|rule| rule["action"]["selector"]
+                    .as_str()
+                    .is_some_and(|sel| sel.contains(":has-text"))),
+            "a procedural selector reached the content blocker"
+        );
+    }
+
+    // NESTING is where a naive splitter does damage: `a:has(p:has-text(X))`
+    // means "an <a> containing a <p> that says X", and treating the prefix
+    // `a:has(p` as the thing to hide would hide every such <a> on the page.
+    // Refusing is the only honest answer.
+    #[test]
+    fn a_nested_or_unimplemented_procedural_form_is_refused_not_guessed_at() {
+        assert!(parse_procedural("a[role=\"button\"]:has(p:has-text(Sponsored))").is_none());
+        assert!(
+            parse_procedural(":has-text(Sponsored)").is_none(),
+            "no prefix"
+        );
+        assert!(parse_procedural("div:has-text()").is_none(), "no argument");
+        assert!(
+            parse_procedural("div:has-text(/ad[0-9]+/)").is_none(),
+            "a /regex/ argument is uBO's other language"
+        );
+        assert!(parse_procedural("div:upward(2)").is_none());
+        assert!(parse_procedural("div:xpath(//x)").is_none());
+        // …and the ones that ARE implemented still parse.
+        assert!(parse_procedural("div.a:has-text(Ad)").is_some());
+        assert!(parse_procedural("body:style(overflow: auto)").is_some());
+    }
+
+    // The generated script is a build artefact this repo commits, so it must be
+    // byte-stable for a given corpus, and it must declare the placement that
+    // makes it affordable: @match-scoped to exactly the domains with rules, so
+    // WebKit skips it entirely everywhere else.
+    #[test]
+    fn the_generated_cosmetic_script_is_deterministic_and_scoped() {
+        let corpus =
+            "z.test##div:has-text(Z)\na.test##div:has-text(A)\na.test#?#p:style(color: red)\n";
+        let first = convert_one(corpus);
+        let second = convert_one(corpus);
+        let one = generate_cosmetic_script(&first.procedural, "1.20260731");
+        let two = generate_cosmetic_script(&second.procedural, "1.20260731");
+        assert_eq!(one, two, "the generated script must be byte-stable");
+
+        let parsed = crate::userscript::parse(&one);
+        assert_eq!(
+            parsed.version,
+            crate::userscript::ScriptVersion::parse("1.20260731"),
+            "the generated script must carry the version the reconciler compares"
+        );
+        assert_eq!(
+            parsed.matches,
+            vec!["*://*.a.test/*".to_string(), "*://*.z.test/*".to_string()],
+            "the @match list is what keeps this off every other page in the browser"
+        );
+        assert_eq!(parsed.world, crate::userscript::ScriptWorld::Isolated);
+        assert!(
+            parsed.untranslatable_includes.is_empty(),
+            "a generated script that the promotion gate refuses would ship nowhere"
+        );
+        // The payload really carries the rules, not an empty object.
+        assert!(one.contains("[\"t\",\"div\",\"A\"]"));
+        assert!(one.contains("[\"s\",\"p\",\"color: red\"]"));
     }
 
     // `#@#` is an un-hide. Honouring it matters: leaving the selector in place
