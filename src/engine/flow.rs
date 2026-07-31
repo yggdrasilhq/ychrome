@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use super::api::{Reply, dispatch, request};
+use super::api::{dispatch, request};
 
 /// The fixture. Every element it carries exists to make one verb falsifiable:
 ///
@@ -77,12 +77,11 @@ impl Step {
     }
 }
 
-fn json_reply(reply: Reply) -> (u16, Value) {
-    match reply {
-        Reply::Json(status, body) => (status, body),
-        Reply::Png(png) => (200, json!({ "png_bytes": png.len() })),
-    }
-}
+/// One owner of "reply -> (status, body)", shared with the parity run and the
+/// bench. A local copy here would have to learn every new `Reply` variant
+/// separately, and the NDJSON one proved that: three copies, three compile
+/// errors, and one of them could have been "silently drop the stream".
+use super::api::json_status as json_reply;
 
 /// Read one value out of the page through `/engine/eval`.
 fn read(page: &str, js: &str) -> Value {

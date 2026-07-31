@@ -451,6 +451,36 @@ recipes (crawl-and-extract, form-fill, watch-page-until), /dom snapshot
 extractor hardening, NDJSON streaming.
 *AC: the three recipe scripts run green on the GUI host/dev/oc; skill documented.*
 
+✅ **DONE 2026-07-31. All three recipes GREEN on dev, the GUI host AND oc.**
+`assets/engine-recipes/{crawl-and-extract,form-fill,watch-page-until}.sh` plus
+`run-all.sh`; the SKILL doc gained an agent-engine section.
+
+- **`/engine/batch` now streams NDJSON**, closing the Phase D placeholder: one
+  JSON object per page as it finishes, flushed per line, and a final
+  `"summary": true` line so a reader can tell a finished stream from a dropped
+  connection. `ychrome ctl batch` prints each line as it arrives.
+- **`ychrome ctl <verb> key=value …` exists.** Deliberately thin per §3: a value
+  that parses as JSON is JSON, anything else is a string, so a new engine verb
+  needs no CLI change and every verb stays curl-able.
+- **The daemon-socket transport is now live-proven**, which it was not through
+  Phases B-D: `ctl` drives `/engine/*` over the real `daemon.sock` on three
+  hosts. That gap is closed.
+
+**The recipes teach the wait rule, they do not merely mention it.** Each one
+waits for the state it expects after every input, and `form-fill.sh` carries the
+comment saying why. A recipe that races is worse than no recipe.
+
+### ⚠ SponsorBlock: the Phase C gap is NOT closed, and here is exactly where it stops
+
+Installed into an isolated `HOME` and driven at `https://www.youtube.com/`: the
+page really loaded (`location.host === "www.youtube.com"`) and
+`window.__ysb` was **`undefined`** after a 15 s wait. The script declares
+`@match https://*.youtube.com/*`, so the match is not the problem — its runtime
+state appears to be watch-page-only, and a watch page was not exercised. So:
+the userscript PLANE is proven (Phase C's probe script runs in its declared
+world on an engine page), and **SponsorBlock's own state remains unproven**.
+Do not read Phase C's green as covering it.
+
 **Phase F — promote-to-visible (SEPARATE CAMPAIGN, not overnight work).**
 Composite an engine view's texture into a yggterm session viewport; unify the
 input seat; retire the native-child overlay for surfaces. Requires DMABUF
