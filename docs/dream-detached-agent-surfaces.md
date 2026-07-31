@@ -88,28 +88,57 @@ to remove, reintroduced by building the feature wrong.
 
 ---
 
-## 4. ⚠ What is UNRESOLVED — and it is the load-bearing question
+## 4. ✅ SETTLED — injection DOES land on an unrevealed surface
 
-**Does an injected click actually reach the page on an unrevealed surface in the
-shipped build?**
+**Answered with a page-side readback on 2026-07-31, after two wrong answers.**
 
-- `web do click --selector …` returned **`accepted: true, is_trusted: true`**.
-- A **capture-phase** `click` listener on that exact element, and a `submit`
-  listener on its form, **both recorded nothing**. The page did not navigate.
-- `injection_map_plan` says it *should* deliver (`WakeAndRehide`).
-- pt14's standing lesson says the verb's own field proves nothing:
-  *"a verb reporting `accepted:true, is_trusted:true` is the injector's
-  ASSUMPTION, not an observation — always read back page-side EFFECT."*
+The control that settled it needed no credentials and no page of my own: any real
+site with a button. On the Binance login page, on a surface **never revealed**:
 
-**So the honest state is: unknown.** I asserted "it works" on the verb's
-self-report — the exact error pt14 warns about — and then found a page-side
-readback that contradicts it. Both of my instruments in this session were also
-unverified and one was demonstrably broken (a fetch/XHR tap that failed to record
-my own `fetch`, and which would never have seen a form POST anyway).
+```
+document.visibilityState : "hidden"
+button rect              : 343 x 48          ← real layout
+web do click             : accepted:true, is_trusted:true
+PAGE-SIDE READBACK       : hits:[{ trusted:true }]      ← a capture-phase
+                                                          listener FIRED
+```
 
-**Do not build on either of my conclusions. Settle it with the control below.**
+**That is the standard to hold anything to here:** the page's own listener, not
+the verb's success field. `injection_map_plan`'s `WakeAndRehide` path works in
+the shipped build.
 
----
+### How this question was got wrong twice — worth 60 seconds
+
+- *Claim A:* "detached can't take a trusted click; hidden ⇒ no layout ⇒ 0x0 rect
+  ⇒ **reveal it on the operator's screen**." Built from ONE
+  `"matched a zero-size element"` refusal, no counterfactual. The button measured
+  414x48. **A wrong plane-level diagnosis manufactures a reason to take the
+  human's screen** — which is what this whole feature exists to prevent.
+- *Claim B:* "proven — it works." The "proof" was `accepted:true,
+  is_trusted:true`, i.e. the verb's own field, which pt14 records as *"the
+  injector's ASSUMPTION, not an observation."* Right answer, worthless evidence.
+
+Three unverified instruments in one session: a fetch/XHR tap that never recorded
+my own `fetch` (and would never have seen a form POST anyway); a fill "verified"
+by `.value.length`, which is the accepted-is-not-committed shape I was
+documenting at the time; and the verb field above. **Verify the instrument before
+the hypothesis.**
+
+### ⚠ What is still open: does the click hit the INTENDED element?
+
+In the clean run only a **document-level** capture listener recorded the hit; a
+listener bound to the button itself did not fire in that same run. A follow-up
+probe meant to compare aim-point against the button's rect was malformed and its
+output is not trustworthy, so **I am not claiming a targeting bug — only that it
+is unverified.** If it is real, the likely family is pt14's cause 2 (widget-local
+coords versus an ancestor `event->window` under glass) or the
+`css_viewport_to_widget` zoom/scroll mapping.
+
+**The cheap decisive probe:** bind a capture listener that records
+`{clientX, clientY, target.tagName, target.id}`, stash the button's
+`getBoundingClientRect()` in the same script, click, and compare. Keep the two in
+ONE eval so a re-render cannot invalidate the id between them — that is what
+broke my attempt.
 
 ## 5. How to settle it (the experiment I could not finish)
 
@@ -161,5 +190,6 @@ into the site. Site lore: `.claude/skills/ychrome-site-lore/lore/interactivebrok
 | detached must be **host-hidden**, not hard-stashed | **hard constraint** — get this wrong and the feature is dead on arrival |
 | `app open --client <shadow>` not registering a surface | **sharp edge**, wants a real error |
 | no `web navigate` verb | **gap** — blocks building controls |
-| does injection land on an unrevealed surface | **UNKNOWN** — run §5 first |
+| does injection land on an unrevealed surface | ✅ **YES** — page-side listener fired, `isTrusted:true`, `visibilityState:"hidden"` |
+| does the click hit the INTENDED element | ⚠ **unverified** — see §4, one run saw only a document-level hit |
 | geometry epoch for adopt-mode resizes | **built in yRDP**, copy the shape (`yrdp repin` / `screenshot`'s `epoch` / `state`'s `geometry_stale`) |
