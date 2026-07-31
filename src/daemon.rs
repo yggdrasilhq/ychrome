@@ -976,6 +976,15 @@ pub fn run() -> Result<()> {
         return Ok(());
     };
 
+    // Safe HERE and only here: holding the singleton, before anything of ours is
+    // running, an orphaned engine display can only be a dead daemon's. See
+    // `reap_orphaned_displays` for why a live daemon's — including one under
+    // another HOME — can never be selected.
+    let reaped = crate::engine::substrate::reap_orphaned_displays();
+    if !reaped.is_empty() {
+        journal("engine.display.reaped", json!({ "displays": reaped }));
+    }
+
     let sock = sock_path()?;
     let listener = match UnixListener::bind(&sock) {
         Ok(listener) => listener,
@@ -987,6 +996,21 @@ pub fn run() -> Result<()> {
             UnixListener::bind(&sock).context("binding daemon.sock after reclaiming a stale one")?
         }
     };
+
+    // ⛔ WITHOUT THIS, EVERY NON-GRACEFUL EXIT LEAKS AN X SERVER. `run()` reaps
+    // the engine on its way out of the accept loop, but a `kill` never reaches
+    // that line — which is how 15 Xvfb came to be parented to init on dev.
+    // `ctrlc` runs this on its own thread rather than in signal context, so
+    // taking the engine's mutex and writing the journal here is sound.
+    if let Err(error) = ctrlc::set_handler(|| {
+        crate::engine::api::shutdown();
+        journal("daemon_stop", json!({ "pid": std::process::id(), "cause": "signal" }));
+        std::process::exit(0);
+    }) {
+        // Not fatal: a daemon that cannot install the handler still serves, it
+        // just leaks its display if it is signalled. Saying so beats pretending.
+        eprintln!("ychrome: could not install the daemon's signal handler ({error}); a signal will leak its X display");
+    }
     std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
         .context("locking down daemon.sock")?;
 
