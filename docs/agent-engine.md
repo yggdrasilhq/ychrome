@@ -1,7 +1,9 @@
 # The YChrome Agent Engine — agent-first headless browsing at fleet scale
 
 Status: **SPEC — approved direction 2026-07-13** (discussion: yggterm session
-13b4cdb5). Nothing below is built yet except where marked "exists today".
+13b4cdb5). **Phase A is BUILT and PASSING** (`ychrome engine gate`, proven on
+dev 2026-07-31 — see §9.1); Phases B-E are not. Nothing else below is built
+except where marked "exists today".
 
 ## 1. Vision
 
@@ -59,9 +61,12 @@ yggui script / agent
 ~/.yggterm/ychrome/daemon.sock        (unix socket, 0600 — the HOST DAEMON's
      │                                 socket; engine API mounts at /engine/*)
 ychrome daemon ─ engine subsystem     (one daemon per host per user)
-     │  WPEPlatform headless display  (libwpewebkit-2.0, WPEDisplayHeadless)
+     │  headless display             (substrate seam — §9.1. INTENDED:
+     │                                 WPEDisplayHeadless. ACTUAL today:
+     │                                 WebKitGTK on an engine-owned Xvfb,
+     │                                 because Debian's WPE has no WPEPlatform)
      ├── page pool ────────────────── logical pages (100s)
-     │     ├── live views (N≈12) ──── WPEWebView → WebKitWebProcess each
+     │     ├── live views (N≈12) ──── one web view → WebKitWebProcess each
      │     └── parked pages ───────── serialized state, no engine resources
      ├── governor ─────────────────── PSS/CPU probes, budgets, LRU park/kill
      └── journal ──────────────────── ~/.yggterm/ychrome/journal.jsonl (shared)
@@ -69,20 +74,30 @@ ychrome daemon ─ engine subsystem     (one daemon per host per user)
 
 - **Engine host process**: the engine subsystem of `ychrome daemon` —
   long-running, one per host per user, started lazily on the first
-  `/engine/*` call. It owns a WPEPlatform **headless
-  display** (`WPEDisplayHeadless`, available in wpewebkit-2.0 ≥ 2.44; Debian
-  ships 2.52.x) and any number of `WPEWebView`s on it. No GTK, no Wayland, no
-  X11, no window manager — runs identically over ssh, in cron, on oc.
+  `/engine/*` call. It owns a headless **display** and any number of web views
+  on it, through the substrate seam in `src/engine/substrate.rs`.
+
+  ⚠ **The intended substrate does not exist on our hosts.** This section used
+  to assert "WPEDisplayHeadless, available in wpewebkit-2.0 ≥ 2.44; Debian
+  ships 2.52.x". Debian's wpe-webkit-2.0 2.52.5 is built WITHOUT WPEPlatform:
+  no `wpe-platform-*.pc`, no header declaring `wpe_display_headless_new`, and
+  zero `wpe_display_*` symbols in `libWPEWebKit-2.0.so.1`. The version number
+  was never the deciding fact. §9's sanctioned fallback is what runs today —
+  WebKitGTK views on an engine-owned headless X display — behind the same
+  verbs. `ychrome engine probe` reports both substrates live, so the day a
+  WPEPlatform build lands, the swap is a change to `Engine::start` and nothing
+  above it. Full evidence and the reasoning: §9.1.
 - **Engine ≠ surface**: the engine never emits OSC 7717 and is not tied to a
   terminal session. It is a peer of the surface path, sharing the identity
   modules underneath.
 - **CLI**: `ychrome ctl <verb> [args] [--json]` — a thin HTTP client over the
   socket. Every verb is also directly curl-able (agents may skip the CLI).
-- **Rust bindings**: the gir-generated `wpe-webkit`/`wpe-platform` crates if
-  usable at our WebKit version; otherwise a small `engine-sys` bindgen shim
-  over `libwpewebkit-2.0` + `libwpe-1.0`. **Phase A settles this — see the
-  risk register.** The vendored-wry adblock FFI precedent (webkit2gtk::ffi in
-  `web_surface.rs`) shows the shim route is workable.
+- **Rust bindings**: **SETTLED in Phase A — the gir-generated crates, and no
+  shim.** Not the `wpe-webkit`/`wpe-platform` crates this line originally
+  guessed at (they bind an API this host does not have), but the
+  `webkit2gtk` / `gtk` / `gdk` / `glib` / `cairo-rs` / `javascriptcore-rs`
+  crates that `wry` already links, at the versions already in `Cargo.lock`.
+  Reasoning and the falsified alternatives: §9.1.
 
 ### 3.1 What exists today (reuse, do not rebuild)
 
@@ -99,10 +114,20 @@ ychrome daemon ─ engine subsystem     (one daemon per host per user)
 
 ## 4. Control API
 
-Transport: HTTP/1.1 over the unix socket. Every request carries
-`Authorization: Bearer <token>` (token minted at engine start into
-`~/.yggterm/web-engine/token`, 0600 — same trust shape as the vault bridge).
-All responses JSON. All verbs idempotent where meaningful.
+Transport: HTTP/1.1 over the ychrome daemon's unix socket
+`~/.yggterm/ychrome/daemon.sock`, with every route below mounted under
+`/engine/*` (so `/open` reads as `POST /engine/open`). All responses JSON. All
+verbs idempotent where meaningful.
+
+**There is no engine token, and there must not be one.** This section used to
+require `Authorization: Bearer <token>` minted into
+`~/.yggterm/web-engine/token`; the §3 AMENDMENT of 2026-07-18 settled with the
+owner that the engine has no socket, token or lifecycle of its own, and the
+amendment wins. It also agrees with AGENTS.md, which is explicit: "The agent's
+authority is the unix socket (dir `0700`, socket `0600`). Adding a token buys
+nothing against a same-uid attacker; do not add one." A token here would have
+been a second encoding of an authority the socket permissions already carry —
+exactly the divergence the single-source-of-truth rule forbids.
 
 ### Page lifecycle
 
@@ -230,7 +255,8 @@ hundred *live* engine views would be 10–30 GB. Nobody gets that. So:
 
 ## 6. Probes and profiling — designed in, not bolted on
 
-- **Journal**: `~/.yggterm/web-engine/journal.jsonl` — every verb with
+- **Journal**: `~/.yggterm/ychrome/journal.jsonl` — the DAEMON's journal, shared
+  per the §3 amendment, not a second file. Every verb with
   latency, every governor action (park/resume/kill with the numbers that
   triggered it), every page state transition, every input batch. Same
   event-trace discipline as yggterm; the telemetry campaign can mine it.
@@ -246,7 +272,8 @@ hundred *live* engine views would be 10–30 GB. Nobody gets that. So:
 
 ## 7. Security
 
-- Socket 0600 + bearer token: same-user-only, no network exposure ever.
+- Socket 0600, and nothing else: same-user-only, no network exposure ever. No
+  bearer token (see §4).
 - **Audit is the journal**: every action an agent takes through the engine is
   attributable and replayable in reading order. No silent driving.
 - **Per-profile agent policy**: `web-profiles/<p>/profile.json` gains
@@ -271,6 +298,15 @@ that an untrusted synthetic click provably does not (isTrusted differential).
 Settles the bindings question (gir crates vs bindgen shim).
 *AC: committed spike binary + journal lines proving all four, plus a written
 bindings decision in this doc's §9.*
+
+✅ **DONE 2026-07-31, all five proofs PASS** — `ychrome engine gate`
+(`src/engine/gate.rs`), re-runnable, journaling `engine.gate.proof` lines to
+the daemon journal and PNGs to `~/.yggterm/ychrome/engine-gate/`. Proven on
+**dev**, a headless LXC with no display server and no GPU, NOT on the GUI host as this
+line asks: headless is headless, and dev is the harsher host. **Re-run it on
+the GUI host to close the letter of the AC.** The gate ran on the FALLBACK substrate
+because the intended one is absent (§9.1); the numbers, the two bugs it
+surfaced, and the bindings decision are all in §9.1.
 
 **Phase B — engine daemon + core API.** `ychrome engine serve` + socket +
 token; verbs: open/close/pages/goto/nav/wait/shot/eval/input; 10 concurrent
@@ -306,20 +342,183 @@ momentum). Deliberately out of scope here; the engine's existence de-risks it.
 
 | Risk | Signal | Mitigation / fallback |
 |---|---|---|
-| Rust bindings for wpe-webkit-2.0 missing/stale | Phase A | bindgen shim over the C API (precedent: adblock FFI); worst case a tiny C helper lib |
-| WPEPlatform headless API gaps at 2.52 (input dispatch, snapshot) | Phase A | fallback substrate: webkit2gtk views inside a headless wayland compositor (`weston --backend=headless` or `cage`) — same control API, uglier host; keep API identical so the substrate can swap |
+| ~~Rust bindings for wpe-webkit-2.0 missing/stale~~ **RESOLVED, differently than expected** | Phase A | Moot: there is no WPEPlatform to bind. We use the gir crates wry already links. No shim, no C helper, no build.rs — §9.1 |
+| ~~WPEPlatform headless API gaps at 2.52~~ **FIRED — the whole API is absent, not just gaps** | Phase A | Fallback substrate taken. Xvfb, not `cage`/`weston`: same class of thing, already installed, and GTK3 is X11-native so it needs no new package — §9.1 |
 | Debian packages absent on a fleet host | `apt list` on dev/oc before Phase B | `sudo apt install libwpewebkit-2.0-1 libwpe-1.0-1` is a documented one-time prereq (oc precedent: libwebkit2gtk) |
 | GPU-less hosts (oc) render slowly | bench in Phase D | swrast is fine for agent work; record numbers, don't guess |
 | Form-state park/restore lossy | Phase D | documented best-effort; tags let scripts re-derive; never claim more than captured |
 | Shared jar: engine + visible surface open same profile concurrently | Phase C | WebKit handles multi-process jar access via the network process per session; verify with a live differential, journal a warning if two writers detected |
 | Anti-bot flags headless views | Phase C | we present the SAME UA/identity as the visible browser and real input events; do not add evasion beyond that — honesty rule |
 
+## 9.1 Decision: substrate and bindings (Phase A, settled 2026-07-31)
+
+Phase A's acceptance criterion asked for "a written bindings decision in this
+doc's §9". §9 is a risk-register table with no room for one, and its first row
+recorded only a fallback, so this section exists to hold the decision itself.
+Two questions were genuinely open. Both are now closed by measurement on dev.
+
+### The finding that reframed both questions
+
+**Debian's WPE WebKit carries no WPEPlatform.** `libwpewebkit-2.0-dev`
+2.52.5-1 and `libwpe-1.0-dev` 1.16.3-1+b1 were installed fresh for this work,
+and:
+
+| Check | Result |
+|---|---|
+| `pkg-config --modversion wpe-webkit-2.0` | `2.52.5` |
+| `pkg-config --modversion wpe-platform-1.0` / `-2.0` | **not found** (only `wpe-webkit-2.0`, `wpe-1.0`, `wpe-web-process-extension-2.0` exist) |
+| `grep -rl 'WPEDisplayHeadless\|wpe_display_headless' /usr/include/` | **no hits** |
+| `nm -D libWPEWebKit-2.0.so.1 \| grep -c wpe_display` | **0** |
+| any `libWPEPlatform*.so` | **absent** |
+| compile `wpe_display_headless_new()` against `wpe-webkit-2.0` | `error: unknown type name 'WPEDisplay'` |
+| the view constructor actually shipped | `webkit_web_view_new(WebKitWebViewBackend*)` — the pre-WPEPlatform libwpe API |
+| GIR/typelib for WPE (`/usr/share/gir-1.0`, `girepository-1.0`) | **none** |
+
+The version number in §3 was doing all the persuading and none of the
+deciding. WPEPlatform is an upstream build option; Debian's 2.52.5 is built
+without it. `ychrome engine probe` performs the first four of these checks at
+runtime so this stays a live fact rather than a dated paragraph.
+
+**Consequence for the substrate.** The shipped API needs a `libwpe` *backend
+implementation* to produce a `wpe_view_backend`, and Debian packages exactly
+one (`libwpebackend-fdo`, not installed here) which wants a Wayland display and
+EGL. There is no displayless path through the WPE packages on this host at all.
+So §9's fallback row fires: **WebKitGTK behind the same verbs.**
+
+**Chosen headless host: Xvfb, not `cage`/`weston --backend=headless`.** The
+risk row named the Wayland compositors. Xvfb is the same class of thing (a
+display server nobody can see), it was already installed, `webkit2gtk-4.1` is
+GTK3 and therefore X11-native so it needs no extra package, and the engine
+starts and kills its own instance so nothing leaks into the user's session.
+`cage`/`weston` remain available if a Wayland-only behaviour ever turns out to
+matter; the seam is what makes that a local change.
+
+### Decision 1 — substrate: WebKitGTK on an engine-owned headless display
+
+Selected by live probe, not configuration. `engine::substrate` is the single
+owner; `engine::host` speaks page verbs and never names a substrate. When a
+WPEPlatform build appears, `probe_wpe` starts returning available and the work
+is a new arm in `Engine::start`.
+
+**What this costs us, stated honestly**, because the fallback is not free:
+
+- a display-server process per engine host (~4 MB, one `Xvfb`), where
+  WPEPlatform would have needed none;
+- software rasterisation (`libEGL warning: DRI3 error` on every run) — fine
+  for agent work, and the numbers say so: full gate in **1.8-2.2 s**, snapshot
+  in **118 ms** at 1024x768;
+- a window that must be *mapped* for WebKit to paint. "Headless" here means the
+  display has no viewer, not that the view is unmapped. A snapshot of an
+  unmapped view is blank, which is precisely the instrument-lie this engine
+  exists to end.
+
+What it does **not** cost: trusted input works (proof 5), snapshots are
+faithful (proof 3), and both were the specific things §9 worried the fallback
+might not deliver.
+
+### Decision 2 — bindings: the gir-generated crates, no shim, no build.rs
+
+The open question was "gir crates vs a `bindgen` shim over the C API". The
+WPEPlatform finding collapses one side of it and the answer is neither of the
+two originally imagined:
+
+- **gir crates for WPE** — impossible AND pointless. There is no `.gir` file
+  installed to generate from, and the API they would bind does not exist here.
+- **a `bindgen` shim over `libwpewebkit-2.0`** — buildable, useless. It would
+  bind `webkit_web_view_new(WebKitWebViewBackend*)`, which cannot produce a
+  headless view without a libwpe backend nobody packages. The shim was the
+  fallback for *stale* bindings; the problem is a missing *engine feature*, and
+  no amount of binding work reaches it.
+- **the gir crates for the substrate we actually run** — `webkit2gtk 2.0.2`,
+  `gtk 0.18`, `gdk 0.18`, `glib 0.18`, `cairo-rs 0.18`, `javascriptcore-rs
+  1.1`. **Chosen.** They were already in `Cargo.lock` as `wry 0.55`'s
+  transitive dependencies, so the engine promoted them to direct dependencies
+  at the versions already resolved. Zero new crates were downloaded, zero
+  version churn, no `build.rs`, no `-sys` crate of our own, no bindgen.
+
+Feature deltas, the whole of them: `webkit2gtk/v2_40` (for
+`webkit_web_view_evaluate_javascript`; wry already enables `v2_38`, so this is
+one additive step on a shared dependency) and `cairo-rs/png`. Plus `libc`, for
+`_exit` alone — see below.
+
+**Raw FFI is still needed in exactly one place**, and it is worth naming so
+nobody re-litigates it: `gdk-rs` 0.18 exposes *getters* for `GdkEventButton`
+but no setters, so synthesising a pointer event fills
+`gdk::ffi::GdkEventButton` through a raw pointer (`engine::host::dispatch_click`).
+That is the same shape as the vendored-wry adblock FFI the original §3 cited as
+precedent — about fifteen lines, not a binding layer.
+
+### Decision 3 — the event loop
+
+The brief asked for this explicitly: WPE (and WebKitGTK) need a running
+`GMainContext` on their own thread, and the only loop in this repo today is
+`tao`'s, which is GTK-bound and owns the browser process's main thread.
+
+**They are not shared, and they never meet.** The engine lives in the
+**daemon** process, which has no `tao` loop and no windows. There it takes one
+dedicated thread that calls `gtk::init()` then `gtk::main()`, acquiring the
+global default `GMainContext`. Page objects live in a `thread_local` on that
+thread and are never sent anywhere. Callers on any other thread post a closure
+with `glib::idle_add_once` (which is thread-safe and targets exactly that
+context) and block on an `mpsc` reply.
+
+The closure receives a `Responder` it may fire immediately *or* move into
+WebKit's own callback and fire later. That is what turns a callback API into
+verbs a control-plane handler can call synchronously: `goto` returning means
+the load **finished**, not that a request was posted.
+
+One consequence to carry into Phase B: the browser process must never host the
+engine, because `gtk::init` and `tao` would fight over the same process-global
+context — and `DISPLAY` is process-global too, which the engine sets for its
+private display.
+
+### Two bugs Phase A surfaced, both found by measuring rather than reading
+
+1. **Exit 134 with every proof passing.** The gate printed five PASSes and
+   then `SIGABRT`. gdb put it at `exit -> __run_exit_handlers ->
+   g_object_unref -> WebKit -> abort` on the main thread: WebKit registers an
+   atexit handler that unrefs its process-global context, and that unref needs
+   a run loop which is gone once `main` has returned. The engine now ends its
+   own process (`engine::exit_now`, `_exit`) after flushing; every durable
+   artifact is a closed file well before that point. Left alone, a passing gate
+   and a crashing one would both have exited 134 — the exit code would have
+   been worthless as a signal.
+2. **A leaked display number per run.** `Child::kill` is `SIGKILL`, so `Xvfb`
+   never removed `/tmp/.X<n>-lock`, and `start` treats a surviving lock as
+   "taken". Seven runs, seven orphaned locks, the display climbing `:90` ->
+   `:96`. Now `SIGTERM` first with a 2 s grace, then unlink. Three consecutive
+   runs reuse `:91`.
+
+Neither was visible in code review. Both were visible the moment the thing ran.
+
+### The gate's own numbers (dev, 2026-07-31)
+
+| Proof | Evidence |
+|---|---|
+| 1. display + view | substrate `webkitgtk-headless`, display `:90`, 227 ms |
+| 2. example.com | committed `https://example.com/`, `readyState: complete`, 856 ms |
+| 3. PNG pixels | `<h1>` rect `(205,115) 614x33` read from the DOM; **1338** dark pixels inside it, **0** in a blank control region; 1024x768, 16968-byte PNG, 118 ms |
+| 4. eval | `document.title` -> `"Example Domain"` |
+| 5. isTrusted | synthetic `dispatchEvent`: guard `untouched`, seen `[false]`. Trusted `GdkEvent`: guard `mutated-by-trusted-input`, seen `[false, true]`. 2 events dispatched, 2 concurrent live pages |
+
+Proof 3 is a differential, not a file-size check: a blank canvas scores 0 ink
+in the heading rect, and a uniformly dark one scores ink in the control region.
+Proof 5 is a differential too — the fixture mutates its guarded state **only**
+when `event.isTrusted`, so a substrate with no trusted input fails it instead
+of quietly recording `false` twice. A unit test locks that property of the
+fixture.
+
+**Not yet proven on the GUI host.** The AC names the GUI host as the gate host. Headless is
+headless and dev is the harsher machine (no display server at all), but the
+letter of the AC wants `ychrome engine gate` re-run there.
+
+
 ## 10. Estimate
 
 Assuming one strong agent per overnight run, live verification between runs:
 
-- Phase A: **1 night** (this is the gate; if the fallback substrate is needed,
-  +1 night).
+- Phase A: ✅ **done** (the fallback substrate WAS needed and cost far less
+  than the +1 night budgeted, because the bindings came for free).
 - Phase B: **1 night** (mechanical once A settles bindings; the control-server
   pattern already exists in sidebar.rs).
 - Phase C: **1 night** (mostly extraction/reuse; the WPE settings/content
