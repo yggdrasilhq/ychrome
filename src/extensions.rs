@@ -321,11 +321,36 @@ mod tests {
         require(ext, "api/skipSegments/");
         require(ext, "HASH_PREFIX_LENGTH");
         // The match happens in the browser, over the prefix answer.
-        require(ext, "row.videoID === videoId");
-        // And the two filters that stop it skipping things the community did
-        // not mean: a non-`skip` actionType, and a downvoted segment.
-        require(ext, "seg.actionType !== 'skip'");
-        require(ext, "seg.votes < -1");
+        require(ext, "row.videoID !== videoId");
+        // And the filters that stop it skipping things the community did not
+        // mean. ⚠ These three locks were REWRITTEN for v2 rather than dropped:
+        // v1 refused every non-`skip` actionType outright, which is why a
+        // `mute` segment was silently discarded; v2 routes each action type to
+        // its own behaviour, so the property worth locking is that a `full`
+        // segment (which labels the WHOLE video) can never become a seek.
+        require(ext, "if (action === 'full') return 'label';");
+        require(ext, "seg.votes < MIN_VOTES");
+        require(ext, "var MIN_VOTES = -1;");
+    }
+
+    // v1 asked for three categories and took the API's default `actionTypes`,
+    // so eight categories and every mute/full/poi/chapter segment were
+    // invisible — measured against the live API, 48.7% of videos that HAVE
+    // community segments had nothing in those three, which is what "SponsorBlock
+    // does not work" looked like from the sofa. The query must name what it
+    // wants, both halves.
+    #[test]
+    fn sponsorblock_asks_for_more_than_the_api_default() {
+        let ext = find(SPONSORBLOCK_STEM).expect("sponsorblock in catalog");
+        require(ext, "'?categories='");
+        require(ext, "'&actionTypes='");
+        let body = running_body(ext);
+        for action in ["'skip'", "'mute'", "'full'", "'poi'", "'chapter'"] {
+            assert!(
+                body.contains(action),
+                "sponsorblock never asks for the {action} action type"
+            );
+        }
     }
 
     // The cookie script must never consent on the user's behalf. `REJECT_TEXT`
