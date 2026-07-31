@@ -51,3 +51,53 @@ human's screen.
 
 NOT ATTEMPTED: the paper-account password reset itself (Client Portal ->
 Settings -> Paper Trading Account). No credential was changed.
+
+## detached-surfaces-DO-take-trusted-clicks · WORKS
+task: retract the previous entry's plane-level diagnosis
+model: claude-opus-5
+date: 2026-07-31
+tags: 
+
+⛔ RETRACTS the mechanism in `login-blocked-on-a-hidden-surface` above. That
+entry's OBSERVATIONS were real; its EXPLANATION was invented from one data point
+and is false. Kept, not deleted — the wrong version is the intuitive one.
+
+IT CLAIMED: a never-revealed surface reports visibilityState "hidden", the SPA
+defers layout while hidden, so `do click` resolves a 0x0 rect and rung 2 is
+unusable while detached — therefore completing this login needs a reveal on the
+operator's viewport.
+
+MEASURED THE NEXT HOUR, same site, never-revealed surface:
+    visibilityState: "hidden"        <- still hidden, by design
+    .xyz-button-login rect: 414x48   <- laid out fine
+    web do click --selector ...   ->  accepted:true, is_trusted:true
+
+Both halves were wrong. A hidden page still lays out, and injected input still
+lands: the engine host WAKES a view it hid for the length of an injection burst
+and re-hides it after (WebSurfaceHost::engine_webview_for_injection).
+yggterm-shell/src/shell.rs:5430 says it outright —
+    "Visibility gates RENDERING, never the drive path."
+
+So "matched a zero-size element" is a PAGE-STATE answer (a modal over it, a
+spinner, a route mid-transition), not a statement about detached surfaces. Read
+it as "the page is not showing that right now", re-observe, and do NOT let it
+push you into revealing a surface on the human's screen.
+
+STILL TRUE from the earlier entry, and still useful:
+  - `web ensure --session` materialises an unregistered surface (reason "healed");
+    `app open --client <shadow>` does NOT, and its "session has no web surface"
+    reads like a dead surface when it is only an unregistered one.
+  - the form fill DOES commit via execCommand('insertText') after focus+selectAll,
+    and survives a click (u/p lengths intact afterwards).
+  - #toggle1/paperSwitch on the login page chooses LIVE vs PAPER; paper has its
+    own username+password.
+
+WHAT ACTUALLY BLOCKS THE LOGIN IS STILL UNKNOWN. Fields hold their values, the
+button is enabled and 414x48, the click is delivered trusted — and the page does
+not navigate. The page is neither Angular nor React (window.ng false, no
+[ng-version], no react root). A notice renders: "Uppercase characters in
+usernames are not supported. Those were automatically converted to lowercase."
+Next probe should watch the NETWORK, not the DOM: whether a POST leaves at all
+says immediately whether this is a client-side guard or a rejected credential.
+
+No credential was changed. The paper-account reset was never attempted.
