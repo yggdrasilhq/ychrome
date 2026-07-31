@@ -19,6 +19,15 @@ const source = fs.readFileSync(scriptPath, 'utf8');
 
 const PLAYER_URL = 'https://www.youtube.com/youtubei/v1/player?key=AIza&prettyPrint=false';
 const ASSET_URL = 'https://www.youtube.com/s/player/abc123/base.js';
+// A REAL response, captured from https://www.youtube.com/watch?v=dQw4w9WgXcQ on
+// 2026-07-31 and scrubbed of tokens and URLs (every leaf string over 60 chars,
+// plus visitorData / trackingParams / signatureCipher / cpn, became
+// "<scrubbed>"). The KEY STRUCTURE is untouched, which is the part the prune
+// walks. A synthetic fixture proves the walk works on a shape someone imagined;
+// this proves AD_FIELDS still names what YouTube is really sending.
+const REAL_PLAYER_URL = 'https://www.youtube.com/youtubei/v1/player?real=1';
+const realPlayerResponse = () => JSON.parse(fs.readFileSync(
+    require('path').join(__dirname, 'youtube-player-response-captured.json'), 'utf8'));
 
 // The shape this whole script exists to edit. Ad fields at the top level, one
 // nested a level down, and one buried deep — the walk must reach all three, and
@@ -63,10 +72,14 @@ const bodies = {
     // is valid on purpose: if the URL guard is fake, the prune bites here and
     // the body comes back rewritten, which the pass-through check catches.
     [ASSET_URL]: '{"adPlacements":[1],"adSlots":[2],"note":"not a player response"}',
+    [REAL_PLAYER_URL]: JSON.stringify(realPlayerResponse()),
 };
 
+const warnings = [];
 const sandbox = {
-    console,
+    console: Object.assign(Object.create(console), {
+        warn: (...args) => { warnings.push(args.join(' ')); },
+    }),
     Response,
     Set,
     Object,
@@ -257,6 +270,35 @@ async function main() {
     sandbox.ytInitialPlayerResponse = playerResponseFixture();
     assertPruned('ytInitialPlayerResponse', sandbox.ytInitialPlayerResponse);
 
+    // 4b. THE REAL RESPONSE. The synthetic fixture above is a shape somebody
+    // wrote down; this one is what YouTube actually served. If AD_FIELDS ever
+    // stops naming the live ad fields, this check fails and the synthetic one
+    // still passes — which is the whole reason it is here.
+    const realBefore = realPlayerResponse();
+    check(
+        'the captured response really does carry ad fields (or this proves nothing)',
+        realBefore.adPlacements !== undefined && realBefore.adBreakHeartbeatParams !== undefined,
+    );
+    const realResp = await sandbox.fetch(REAL_PLAYER_URL);
+    const real = JSON.parse(await realResp.text());
+    for (const field of AD_FIELDS) {
+        check(`real capture: ${field} is gone`, real[field] === undefined);
+    }
+    check(
+        'real capture: no ad field name survives anywhere in the body',
+        !AD_FIELDS.some((field) => JSON.stringify(real).indexOf(field) !== -1),
+    );
+    for (const kept of ['streamingData', 'videoDetails', 'playabilityStatus', 'captions',
+        'playerConfig', 'microformat', 'annotations', 'storyboards']) {
+        if (realBefore[kept] === undefined) continue;
+        check(`real capture: ${kept} survives`, real[kept] !== undefined);
+    }
+    check(
+        'real capture: the video itself is intact',
+        JSON.stringify(real.streamingData) === JSON.stringify(realBefore.streamingData)
+            && JSON.stringify(real.videoDetails) === JSON.stringify(realBefore.videoDetails),
+    );
+
     // 5. LAYER 2 — the DOM belt, DRIVEN. `dispatchNavigate` fires the same
     // `yt-navigate-finish` the script binds to, which is how a real SPA
     // transition reaches `ensureBound` → `onAdState` → `defuse`.
@@ -272,19 +314,29 @@ async function main() {
     check('layer 2 clicks the skip button an ad offers', currentPlayer.button.clicks >= 1);
     check('…and counts the skip', sandbox.__yga_state.skipped >= 1);
 
-    // (b) UNSKIPPABLE: no button, so the ad must be run out — rate first, then
-    // the seek (some builds refuse the seek; the rate still runs it out).
+    // (b) UNSKIPPABLE: no button, so the ad is SEEKED past — and the rate is
+    // never touched. A forced playbackRate is clamped by WebKit to about 2×,
+    // so it never skipped anything; it made the user watch every ad at double
+    // speed while disguising a dead layer 1. That is the bug that was reported.
     currentPlayer = makePlayer({ adShowing: true, duration: 42 });
     dispatchNavigate();
-    check('layer 2 forces the rate on an unskippable ad', currentPlayer.video.playbackRate > 1);
-    check('…and seeks it to the end', currentPlayer.video.currentTime === 42);
-    check('…and counts the fast-forward', sandbox.__yga_state.forwarded >= 1);
+    check('layer 2 seeks an unskippable ad to the end', currentPlayer.video.currentTime === 42);
+    check('…and counts it', sandbox.__yga_state.forwarded >= 1);
+    check(
+        '…and NEVER touches playbackRate',
+        currentPlayer.video.playbackRate === 1,
+        `playbackRate=${currentPlayer.video.playbackRate}`,
+    );
 
-    // (c) The rate must be HANDED BACK when the ad ends: the same <video> plays
-    // the feature, so a stuck 16× is a bug the user feels immediately.
-    currentPlayer.classList.remove('ad-showing');
-    observers.forEach((observer) => observer.callback([], observer));
-    check('the content video gets its normal rate back', currentPlayer.video.playbackRate === 1);
+    // (c) An ad on screen means layer 1 missed, and the belt must SAY so. A
+    // silent fallback is how "the blocker is broken in a weird way" reaches a
+    // user instead of "the blocker needs attention".
+    check('layer 2 warns that the network prune missed', warnings.length >= 1);
+    check(
+        '…and the warning names the world/AD_FIELDS check when nothing was pruned',
+        warnings.some((line) => line.indexOf('youtube-adblock') !== -1),
+        JSON.stringify(warnings),
+    );
 
     // (d) The negative that matters: with no ad on screen, nothing is touched.
     currentPlayer = makePlayer({ adShowing: false, skipButton: '.ytp-ad-skip-button' });

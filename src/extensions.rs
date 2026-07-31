@@ -41,7 +41,14 @@ pub fn find(stem: &str) -> Option<&'static Extension> {
     CATALOG.iter().find(|ext| ext.stem == stem)
 }
 
-static CATALOG: [Extension; 4] = [
+static CATALOG: [Extension; 5] = [
+    Extension {
+        stem: crate::abp::COSMETIC_SCRIPT_STEM,
+        name: "Cosmetic filters",
+        description: "Hide the ad shapes WebKit's content blocker cannot express \
+                      (:has-text, :style) — generated from the upstream filter lists.",
+        body: include_str!("../assets/web-userscripts/cosmetic-filters.js"),
+    },
     Extension {
         stem: SPONSORBLOCK_STEM,
         name: "SponsorBlock",
@@ -138,6 +145,7 @@ mod tests {
     #[test]
     fn every_catalog_body_is_the_script_it_claims_to_be() {
         let fingerprints = [
+            (crate::abp::COSMETIC_SCRIPT_STEM, "window.__yggCosmetic"),
             (SPONSORBLOCK_STEM, "sponsor.ajay.app"),
             ("youtube-adblock", "'/youtubei/v1/player'"),
             ("idcac", "window.__yggIdcac"),
@@ -203,8 +211,19 @@ mod tests {
         require(ext, "new MutationObserver(");
         require(ext, ".ytp-skip-ad-button");
         require(ext, ".ytp-ad-skip-button");
-        require(ext, "video.playbackRate = 16");
         require(ext, "video.currentTime = video.duration");
+        // The belt must SAY it fired. An ad on screen means the network prune
+        // missed, and a silent fallback turns that into a mystery — which is
+        // exactly how "I still see youtube ads, sped up to 2x" reached the
+        // user instead of "the blocker needs attention".
+        require(ext, "function warnLayerOneMissed");
+        require(ext, "console.warn(");
+        assert!(
+            !running_body(ext).contains("playbackRate ="),
+            "the forced playbackRate is back. WebKit clamps it to about 2x, so it never \
+             skipped an ad — it made the user watch every one of them at double speed while \
+             hiding that layer 1 was dead."
+        );
         // SPA navigation: without this the hooks bind once and never rebind.
         require(ext, "'yt-navigate-finish'");
     }
@@ -232,6 +251,33 @@ mod tests {
                 ),
             "the inline-response hook is installed before the youtube.com guard"
         );
+    }
+
+    // SponsorBlock's PRIVACY property, locked in the running body. Asking
+    // `/api/skipSegments?videoID=<id>` tells sponsor.ajay.app exactly what the
+    // user is watching, every single video. The hash-prefix endpoint tells it
+    // four hex characters, which name thousands of videos and identify none —
+    // and there must be no fallback to the by-id form, because a privacy
+    // property that silently degrades is not one.
+    #[test]
+    fn sponsorblock_never_asks_by_video_id() {
+        let ext = find(SPONSORBLOCK_STEM).expect("sponsorblock in catalog");
+        let body = running_body(ext);
+        assert!(
+            !body.contains("videoID="),
+            "sponsorblock builds a by-id query — that leaks the exact video to a third party \
+             on every watch"
+        );
+        require(ext, "crypto.subtle");
+        require(ext, "'SHA-256'");
+        require(ext, "api/skipSegments/");
+        require(ext, "HASH_PREFIX_LENGTH");
+        // The match happens in the browser, over the prefix answer.
+        require(ext, "row.videoID === videoId");
+        // And the two filters that stop it skipping things the community did
+        // not mean: a non-`skip` actionType, and a downvoted segment.
+        require(ext, "seg.actionType !== 'skip'");
+        require(ext, "seg.votes < -1");
     }
 
     // The cookie script must never consent on the user's behalf. `REJECT_TEXT`
@@ -266,13 +312,24 @@ mod tests {
         // would click the very button it exists to avoid (found by adversarial
         // review). "continue without accepting" is the case the negation clause
         // exists for: it carries "accepting" and is a REJECT phrase.
-        const NEGATIONS: [&str; 9] = [
-            "without", "non-", "only", "reject", "decline", "refuse", "deny", "no ", "never",
+        // "do not consent" and "do not sell my personal information" are
+        // REJECT phrases that carry a consent word; "not " is what makes them
+        // legible, exactly as "without" does for "continue without accepting".
+        // "sans" is French for "without" and carries the same weight in
+        // "continuer sans accepter"; a list that says no in six languages needs
+        // its negations in six languages too.
+        const NEGATIONS: [&str; 11] = [
+            "without", "sans ", "non-", "only", "reject", "decline", "refuse", "deny", "no ",
+            "not ", "never",
         ];
         for phrase in &phrases {
             let negated = NEGATIONS
                 .iter()
                 .any(|negation| phrase.contains(negation));
+            // English, plus the consent verbs of every language REJECT_TEXT
+            // now speaks. A list that says no in six languages and only
+            // recognises yes in one is a lock with a hole in it: "alle
+            // akzeptieren" is German for "accept all" and used to pass.
             for consent in [
                 "accept",
                 "agree",
@@ -283,11 +340,47 @@ mod tests {
                 "got it",
                 "okay",
                 "yes",
+                // German
+                "akzept",
+                "zustimm",
+                "einverstanden",
+                "erlauben",
+                // Spanish / Portuguese
+                "acept",
+                "aceit",
+                "permitir",
+                // Italian
+                "accett",
+                "accordo",
+                // Dutch
+                "akkoord",
+                "toestaan",
+                // Nordic
+                "godta",
+                "godkann",
+                "godkänn",
+                "tillad",
+                "tillat",
+                // Polish
+                "akcept",
+                "zgadzam",
             ] {
-                let carries = phrase
-                    .split(|ch: char| !ch.is_alphanumeric())
-                    .any(|word| word == consent)
-                    || phrase.contains(consent);
+                // A consent word counts when it stands as its own word, or
+                // when it BEGINS one — "acceptera alla" is Swedish for
+                // "accept all" and must be caught. It does not count when a
+                // letter runs into it from the left: "disagree" carries the
+                // letters of "agree" and means the opposite. This is a
+                // sharper rule than a bare substring, not a looser one; the
+                // adversarial case the comment above names ("i accept",
+                // which starts with "i") is still caught, because "accept"
+                // there begins a word.
+                let carries = phrase.match_indices(consent).any(|(at, _)| {
+                    at == 0
+                        || !phrase[..at]
+                            .chars()
+                            .next_back()
+                            .is_some_and(|ch| ch.is_alphanumeric())
+                });
                 assert!(
                     !(carries && !negated),
                     "idcac would click a consent button: REJECT_TEXT has {phrase:?} \
@@ -306,6 +399,32 @@ mod tests {
         assert!(
             phrases.iter().any(|phrase| phrase == "reject all"),
             "REJECT_TEXT lost 'reject all': {phrases:?}"
+        );
+        // The list's whole value is that it says no in more ways than the
+        // ruleset ever can, so it must stay broad and must stay multilingual.
+        assert!(
+            phrases.len() >= 45,
+            "REJECT_TEXT shrank to {} phrases — this list is the one job no \
+             content-blocker rule can do",
+            phrases.len()
+        );
+        for must in [
+            "decline all",
+            "alle ablehnen",
+            "tout refuser",
+            "rechazar todo",
+            "do not consent",
+        ] {
+            assert!(
+                phrases.iter().any(|phrase| phrase == must),
+                "REJECT_TEXT lost {must:?}"
+            );
+        }
+        // The precision rule above, pinned in both directions.
+        assert!(
+            phrases.iter().any(|phrase| phrase == "disagree"),
+            "'disagree' is a REJECT phrase; a substring rule that reads it as \
+             'agree' is the rule that is wrong"
         );
         // Hiding a banner without undoing its scroll lock leaves an unreadable
         // page — the third thing it does, and the easy one to drop.
@@ -375,6 +494,82 @@ mod tests {
             assert!(
                 out.status.success() && stdout.contains("ALL OK"),
                 "youtube-adblock harness failed on {host}:\n{stdout}\n{stderr}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The GENERATED cosmetic script, DRIVEN. Source needles prove `:has-text`
+    // is mentioned; only running it proves the element gets hidden. Three
+    // hosts: one with a :has-text rule, one with a :style rule, and one that is
+    // not in the list at all — the last is the performance contract, because a
+    // text-scanning observer on every page in the browser is a different
+    // product than this one.
+    #[test]
+    fn the_generated_cosmetic_script_actually_hides_and_styles() {
+        let ext = find(crate::abp::COSMETIC_SCRIPT_STEM).expect("cosmetic-filters in catalog");
+        let node_ok = std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !node_ok {
+            assert!(
+                std::env::var_os("YCHROME_ALLOW_NO_NODE").is_some(),
+                "node is needed to run the cosmetic-filters behaviour lock; install it, or \
+                 set YCHROME_ALLOW_NO_NODE=1 to knowingly ship without this proof"
+            );
+            return;
+        }
+
+        // Pick the hosts out of the script's OWN payload, so the lock never
+        // encodes a domain that a regeneration might drop.
+        let payload = ext
+            .body
+            .split("var RULES = ")
+            .nth(1)
+            .and_then(|rest| rest.split(";\n").next())
+            .expect("the generated script carries a RULES payload");
+        let rules: serde_json::Value =
+            serde_json::from_str(payload).expect("the RULES payload is JSON");
+        let map = rules.as_object().expect("RULES is an object");
+        assert!(
+            map.len() > 100,
+            "the generated script covers only {} domains — a regeneration that produced \
+             almost nothing",
+            map.len()
+        );
+        let host_with = |kind: &str| -> String {
+            map.iter()
+                .find(|(_, list)| {
+                    list.as_array()
+                        .is_some_and(|rules| rules.iter().any(|rule| rule[0] == kind))
+                })
+                .map(|(domain, _)| domain.clone())
+                .unwrap_or_else(|| panic!("no domain carries a {kind:?} rule"))
+        };
+
+        let dir = scratch_dir("cosmetic-filters");
+        let script = dir.join("cosmetic-filters.js");
+        std::fs::write(&script, ext.body).expect("write the script under test");
+        let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cosmetic-filters-harness.js");
+        for host in [
+            host_with("t"),
+            host_with("s"),
+            "not-in-the-list.example".to_string(),
+        ] {
+            let out = std::process::Command::new("node")
+                .arg(&harness)
+                .arg(&script)
+                .arg(&host)
+                .output()
+                .expect("run the node harness");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success() && stdout.contains("ALL OK"),
+                "cosmetic-filters harness failed on {host}:\n{stdout}\n{stderr}"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);

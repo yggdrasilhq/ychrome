@@ -25,6 +25,10 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 dirs = "5"
+# Pure-Rust (miniz_oxide) inflate for the bundled adblock ruleset, which is
+# 19 MB of JSON and 1.9 MB gzipped. No C toolchain, no TLS, nothing that
+# weighs on the browser build the way the vault crate's deps would.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 serde_json = "1"
 # The vault agent's client transport — crypto-free, so the browser stays lean.
 # The sidebar's vault pane and the passkey signer speak the agent socket through
