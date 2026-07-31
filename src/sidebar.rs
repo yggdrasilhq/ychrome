@@ -312,36 +312,116 @@ pub(crate) struct Refusal {
     pub(crate) body: Value,
 }
 
+/// Can the client that registered this session deliver the GUI's token at all?
+///
+/// The token has exactly one courier: the `sidebar ; declare` OSC the session's
+/// own `ychrome` CLI writes to its PTY. A CLI built before the gate existed
+/// (2026-07-28) emits a declare with no `control_token` field, so the GUI holds
+/// nothing to present and **every GUI-only route 403s for the life of that
+/// process** — while `/policy`, `/zoom` and `/ping` keep answering, so ad
+/// blocking and userscripts look perfectly healthy. Neither a daemon handover
+/// nor a GUI restart changes it; only cycling that CLI does.
+///
+/// This is not inferred. The client ASSERTS it in the same `register` round trip
+/// that mints the token (`declares_control_token`), which is the only place the
+/// fact can be known first-hand: an old binary cannot claim a capability whose
+/// name it has never heard, and nothing else has to guess its vintage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenCourier {
+    /// The registered client declares the token. A refusal here is about THIS
+    /// request (a page, or a GUI holding an older generation's token), not about
+    /// the session being permanently undrivable.
+    Live,
+    /// The registered client never claimed the capability. Carries its pid for
+    /// the JOURNAL only — see [`gui_only_refusal`] on why the body stays
+    /// pid-free.
+    Absent { client_pid: i32 },
+    /// **Deliberately not consulted.** A CORS preflight is a PAGE asking whether
+    /// it may drive a GUI-only route cross-origin, and the answer is no whatever
+    /// the session's client vintage is. Telling that page which vintage runs on
+    /// the host would be a fact about the machine handed to the exact caller
+    /// this gate exists to refuse, so the preflight asks a different question and
+    /// gets a page-facing answer.
+    NotAsked,
+}
+
 /// The refusal for a GUI-only route reached without the control token. Names
-/// the route and the reason.
+/// the route, the reason, and — this is the part that took a live incident to
+/// learn — **what the reader can do about it**.
 ///
 /// `presented` is what the caller sent, and only its PRESENCE is recorded — a
 /// refusal is exactly the moment an attacker's guess would be written down, and
 /// an audit line that echoes the credential it is protecting (into a file that
 /// outlives the request, and that a support paste would carry) is worse than no
 /// audit line at all.
-pub(crate) fn gui_only_refusal(method: &str, path: &str, presented: Option<&str>) -> Refusal {
-    let reason = if presented.is_some() {
-        "the X-Ychrome-Control token did not match this session"
-    } else {
-        "no X-Ychrome-Control token was presented"
+///
+/// The BODY is page-reachable (that is the whole reason this gate exists), so it
+/// carries prose and no host facts; the client pid rides the journal line, which
+/// a page cannot read.
+pub(crate) fn gui_only_refusal(
+    method: &str,
+    path: &str,
+    presented: Option<&str>,
+    courier: TokenCourier,
+) -> Refusal {
+    // Three distinct failures wore one message until 2026-07-31, and the one
+    // that actually happens — a pre-gate CLI that can never deliver the token —
+    // was the one the message did not describe. The user saw "control endpoint
+    // returned 403" and had nothing to act on.
+    let (reason, remedy) = match (courier, presented.is_some()) {
+        (TokenCourier::Absent { .. }, _) => (
+            "the ychrome CLI serving this session predates the control-token gate, so it \
+             declares no token and this route can never answer",
+            "restarting the daemon does not fix it and neither does restarting the GUI: \
+             press Ctrl+C in that session's terminal and run ychrome again. \
+             `ychrome status` marks every session in this state.",
+        ),
+        (TokenCourier::Live, true) => (
+            "the X-Ychrome-Control token did not match this session",
+            "the caller is holding a token from an earlier daemon generation; the session's \
+             CLI re-declares the current one on its next heartbeat (~4s). If it persists, \
+             that CLI is no longer registering, so restart it.",
+        ),
+        (TokenCourier::Live | TokenCourier::NotAsked, false) => (
+            "no X-Ychrome-Control token was presented",
+            "this endpoint is reachable from a page through the yggterm-appctl bridge, so \
+             mutating routes require the control token ychrome declares to the GUI over \
+             OSC 7717. A page cannot hold it, and a pre-gate GUI does not send it.",
+        ),
+        (TokenCourier::NotAsked, true) => (
+            "the X-Ychrome-Control token did not match this session",
+            "this endpoint is reachable from a page through the yggterm-appctl bridge, so \
+             mutating routes require the control token ychrome declares to the GUI over \
+             OSC 7717.",
+        ),
     };
+    let mut data = json!({
+        "method": method,
+        "path": path,
+        "reason": reason,
+        "token_presented": presented.is_some(),
+        "token_courier": match courier {
+            TokenCourier::Live => "live",
+            TokenCourier::Absent { .. } => "absent",
+            TokenCourier::NotAsked => "not_asked",
+        },
+    });
+    if let TokenCourier::Absent { client_pid } = courier {
+        data["client_pid"] = json!(client_pid);
+    }
     Refusal {
         event: "control_refused",
-        data: json!({
-            "method": method,
-            "path": path,
-            "reason": reason,
-            "token_presented": presented.is_some(),
-        }),
+        data,
         body: json!({
-            "error": format!(
-                "forbidden: {path} is GUI-only and {reason}. This endpoint is \
-                 reachable from a page through the yggterm-appctl bridge, so \
-                 mutating routes require the control token ychrome declares to \
-                 the GUI over OSC 7717."
-            ),
+            "error": format!("forbidden: {path} is GUI-only and {reason}. {remedy}"),
             "route": path,
+            // A machine-readable handle on WHICH of the three it was, so the GUI
+            // (or an agent) can act without parsing prose.
+            "cause": match courier {
+                TokenCourier::Absent { .. } => "client_predates_control_token",
+                _ if presented.is_some() => "token_mismatch",
+                _ => "token_absent",
+            },
         }),
     }
 }
@@ -631,14 +711,27 @@ fn emit_osc(action: &str, payload: &str) {
 /// former needs no state, the latter reads the session's command queue, which
 /// lives on the daemon, not here. Everything else (panes, policy, zoom,
 /// appearance, actions, the WebAuthn signer) is the app's, and answers here.
-pub(crate) fn dispatch(state: &ControlState, req: &ParsedRequest) -> (u16, Value) {
+///
+/// `courier` is the session's registration fact, not this request's: it is what
+/// turns a bare 403 into a refusal that names the cause and the remedy. See
+/// [`TokenCourier`].
+pub(crate) fn dispatch(
+    state: &ControlState,
+    req: &ParsedRequest,
+    courier: TokenCourier,
+) -> (u16, Value) {
     // THE GATE. Nothing below this line may run for a GUI-only route reached
     // without the GUI's token — the next arms unlock the vault, fill a
     // credential into the page and rewrite the profile's content policy, and the
     // control port is page-reachable through yggterm's `yggterm-appctl://`
     // bridge. Before 2026-07-27 `POST /action` had no gate at all.
     if requires_gui_token(&req.method, &req.path) && !state.gui_authorized(req) {
-        let refusal = gui_only_refusal(&req.method, &req.path, req.control_token.as_deref());
+        let refusal = gui_only_refusal(
+            &req.method,
+            &req.path,
+            req.control_token.as_deref(),
+            courier,
+        );
         journal_refusal(&refusal);
         return (403, refusal.body);
     }
@@ -839,7 +932,9 @@ pub(crate) fn respond_preflight(mut stream: impl Write, path: &str) {
     let access = route_access(path);
     if access != RouteAccess::PageSigner {
         if access == RouteAccess::GuiOnly {
-            let refusal = gui_only_refusal("OPTIONS", path, None);
+            // `NotAsked`: a preflight is a page-origin question, so the answer
+            // must not describe the host's own client. See [`TokenCourier`].
+            let refusal = gui_only_refusal("OPTIONS", path, None, TokenCourier::NotAsked);
             // Rationed like every other refusal: a preflight is as cheap for a
             // page to loop as the real request is.
             journal_refusal(&refusal);
@@ -3329,6 +3424,14 @@ mod tests {
         ControlState::new("default", "sess-1", 41234)
     }
 
+    /// Every gate lock below is about the REQUEST — which credential it carried
+    /// and which route it aimed at — so they all drive a session whose client
+    /// does declare the token. The courier's own arms are locked separately in
+    /// `a_refusal_names_which_of_the_three_failures_it_is`.
+    fn dispatch_live(state: &ControlState, req: &ParsedRequest) -> (u16, Value) {
+        dispatch(state, req, TokenCourier::Live)
+    }
+
     /// A request as a page would make it: whatever the page can set, and
     /// nothing it cannot. The fido2 token is deliberately fillable — every page
     /// in the profile holds it, baked into the shim userscript — which is
@@ -3354,7 +3457,7 @@ mod tests {
     #[test]
     fn an_untokened_action_post_is_refused_and_the_refusal_names_the_route() {
         let state = control_state();
-        let (status, body) = dispatch(
+        let (status, body) = dispatch_live(
             &state,
             &page_request(
                 "POST",
@@ -3393,7 +3496,7 @@ mod tests {
                 json!({"pane": SETTINGS_PANE, "action": "x"}),
             )
         };
-        let (status, body) = dispatch(&state, &stolen);
+        let (status, body) = dispatch_live(&state, &stolen);
         assert_eq!(
             status, 403,
             "the shim's token must not gate /action: {body:?}"
@@ -3413,7 +3516,7 @@ mod tests {
     #[test]
     fn the_guis_tokened_action_reaches_the_real_dispatch() {
         let state = control_state();
-        let (status, body) = dispatch(
+        let (status, body) = dispatch_live(
             &state,
             &gui_request(
                 &state,
@@ -3435,9 +3538,10 @@ mod tests {
     #[test]
     fn the_pane_schema_is_gui_only_but_still_answers_the_gui() {
         let state = control_state();
-        let (status, _) = dispatch(&state, &page_request("GET", "/pane/settings", Value::Null));
+        let (status, _) =
+            dispatch_live(&state, &page_request("GET", "/pane/settings", Value::Null));
         assert_eq!(status, 403, "an untokened pane fetch must be refused");
-        let (status, body) = dispatch(
+        let (status, body) = dispatch_live(
             &state,
             &gui_request(&state, "GET", "/pane/settings", Value::Null),
         );
@@ -3456,7 +3560,7 @@ mod tests {
     fn policy_and_zoom_reads_stay_open_to_an_untokened_caller() {
         let state = control_state();
         for path in ["/policy", "/zoom"] {
-            let (status, body) = dispatch(&state, &page_request("GET", path, Value::Null));
+            let (status, body) = dispatch_live(&state, &page_request("GET", path, Value::Null));
             assert_eq!(status, 200, "{path} must stay open, got {status} {body:?}");
         }
         assert_eq!(route_access("/policy"), RouteAccess::Open);
@@ -3470,7 +3574,7 @@ mod tests {
     #[test]
     fn the_gate_leaves_fido2_alone() {
         let state = control_state();
-        let unauthorized = dispatch(
+        let unauthorized = dispatch_live(
             &state,
             &page_request("POST", "/fido2/get", json!({"rpId": "example.com"})),
         );
@@ -3483,7 +3587,7 @@ mod tests {
             fido2_token: Some(state.signer.token.clone()),
             ..page_request("POST", "/fido2/get", Value::Null)
         };
-        let (status, _) = dispatch(&state, &shimmed);
+        let (status, _) = dispatch_live(&state, &shimmed);
         assert_eq!(
             status, 400,
             "a signer-tokened page route must reach the signer (400 = its own bad-request), \
@@ -3491,7 +3595,7 @@ mod tests {
         );
         let grant = page_request("POST", "/fido2/deny", json!({"request_id": "nope"}));
         assert_ne!(
-            dispatch(&state, &grant).0,
+            dispatch_live(&state, &grant).0,
             403,
             "grant/deny authenticate on the request_id and must not need the control token"
         );
@@ -3512,7 +3616,7 @@ mod tests {
         assert_eq!(route_access("/pane/vault"), RouteAccess::GuiOnly);
         let state = control_state();
         assert_eq!(
-            dispatch(
+            dispatch_live(
                 &state,
                 &page_request("POST", "/some-route-added-later", json!({}))
             )
@@ -3665,7 +3769,7 @@ mod tests {
                      GUI's token"
                 );
                 assert_eq!(
-                    dispatch(&state, &page_request(method, path, json!({}))).0,
+                    dispatch_live(&state, &page_request(method, path, json!({}))).0,
                     403,
                     "{method} {path} must be refused for an untokened caller, not \
                      fall through to a 404 that a new dispatch arm would turn into \
@@ -3676,7 +3780,7 @@ mod tests {
 
         // The GUI itself is never blocked by this: it presents the token.
         assert_eq!(
-            dispatch(&state, &gui_request(&state, "POST", "/zoom", json!({}))).0,
+            dispatch_live(&state, &gui_request(&state, "POST", "/zoom", json!({}))).0,
             404,
             "a tokened write reaches the dispatch table (404 = no such arm today), \
              so the gate is refusing the CALLER, not the method"
@@ -3693,7 +3797,7 @@ mod tests {
     #[test]
     fn a_refusal_is_journalled_and_carries_no_token() {
         let presented = "s3cr3t-guess-the-attacker-sent";
-        let refusal = gui_only_refusal("POST", "/action", Some(presented));
+        let refusal = gui_only_refusal("POST", "/action", Some(presented), TokenCourier::Live);
         assert_eq!(refusal.event, "control_refused");
         assert_eq!(refusal.data["path"], "/action");
         assert_eq!(refusal.data["method"], "POST");
@@ -3745,6 +3849,99 @@ mod tests {
             !gate.contains("route_access(&req.path) == RouteAccess::GuiOnly"),
             "the gate is back to a path-only classification, so a `POST /zoom` arm \
              added later would be page-callable"
+        );
+    }
+
+    /// THE LIVE BUG, 2026-07-31: the user's vault and settings panes rendered
+    /// one line, `control endpoint returned 403`, and there was nothing in it to
+    /// act on. Three different failures wore that one message, and the one that
+    /// was actually happening — a `ychrome` CLI older than the gate, which can
+    /// never deliver the token however new the daemon and the GUI are — was the
+    /// one the message did not describe. A refusal that cannot be acted on is
+    /// only half a refusal.
+    #[test]
+    fn a_refusal_names_which_of_the_three_failures_it_is() {
+        let pre_gate = gui_only_refusal(
+            "GET",
+            "/pane/vault",
+            None,
+            TokenCourier::Absent { client_pid: 4242 },
+        );
+        let error = pre_gate.body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("predates the control-token gate"),
+            "the cause must be named: {error}"
+        );
+        assert!(
+            error.contains("Ctrl+C") && error.contains("run ychrome again"),
+            "the REMEDY must be named, and it is the only one that works: {error}"
+        );
+        assert!(
+            error.contains("restarting the daemon does not fix it"),
+            "the remedy people reach for first must be ruled out, or they will \
+             restart the daemon six times: {error}"
+        );
+        assert_eq!(pre_gate.body["cause"], "client_predates_control_token");
+        assert_eq!(pre_gate.data["client_pid"], 4242);
+
+        // The body is PAGE-REACHABLE — that is the whole reason this gate
+        // exists — so the pid rides the journal line and nothing else.
+        assert!(
+            !pre_gate.body.to_string().contains("4242"),
+            "a page must not learn host facts from a refusal: {}",
+            pre_gate.body
+        );
+
+        // A live courier and a wrong token is a transient, not a dead session:
+        // the client re-declares the current token within ~4s. Telling that
+        // reader to restart their browser would be wrong advice.
+        let mismatch = gui_only_refusal("POST", "/action", Some("old"), TokenCourier::Live);
+        let error = mismatch.body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("earlier daemon generation") && error.contains("~4s"),
+            "a stale token is self-healing and must say so: {error}"
+        );
+        assert_eq!(mismatch.body["cause"], "token_mismatch");
+        assert!(mismatch.data["client_pid"].is_null());
+
+        // And a page reaching a GUI-only route gets the page-facing answer.
+        let from_page = gui_only_refusal("POST", "/action", None, TokenCourier::Live);
+        assert_eq!(from_page.body["cause"], "token_absent");
+        assert!(
+            from_page.body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("yggterm-appctl bridge")
+        );
+    }
+
+    /// A CORS preflight is a PAGE asking to drive a GUI-only route
+    /// cross-origin. It must be refused whatever the session's client vintage
+    /// is, and — the part worth a lock — it must not answer with a fact about
+    /// the host's own CLI, which would hand the caller this gate exists to
+    /// refuse a piece of reconnaissance.
+    #[test]
+    fn a_preflight_never_reports_the_hosts_client_vintage() {
+        let refusal = gui_only_refusal("OPTIONS", "/action", None, TokenCourier::NotAsked);
+        let error = refusal.body["error"].as_str().unwrap_or_default();
+        assert!(
+            !error.contains("predates") && !error.contains("Ctrl+C"),
+            "a preflight answer must describe the ROUTE, not the host: {error}"
+        );
+        assert_eq!(refusal.data["token_courier"], "not_asked");
+
+        // ANCHOR: and the preflight responder must keep asking with `NotAsked`.
+        // Passing the session's real courier here is a one-word edit that no
+        // other lock in this file would notice.
+        let source = include_str!("sidebar.rs");
+        let body = source
+            .split("pub(crate) fn respond_preflight(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("respond_preflight body present");
+        assert!(
+            body.contains("TokenCourier::NotAsked"),
+            "the preflight must not consult the session's courier"
         );
     }
 
