@@ -533,24 +533,118 @@ six languages too.
 the 36 shapes it knows; a consent dialog inside a cross-origin iframe; a
 per-purpose preference form.
 
-### `sponsorblock` (v1.1.0)
+### `sponsorblock` (v2.0.0)
 
-Auto-skips sponsor/selfpromo/interaction segments. It asks by **hash prefix**,
-never by video id: `SHA-256(videoID)` truncated to four hex characters, which
-returns every video sharing that prefix (77 rows in 27 KB for a sample prefix,
-all 77 verified to really hash to it) and the match happens in the browser.
-Asking `?videoID=<id>` would tell sponsor.ajay.app exactly what you are
-watching, every time.
+Asks by **hash prefix**, never by video id: `SHA-256(videoID)` truncated to four
+hex characters, which returns every video sharing that prefix and the match
+happens in the browser. Asking `?videoID=<id>` would tell sponsor.ajay.app
+exactly what you are watching, every time. There is deliberately no fallback to
+the by-id endpoint: without `crypto.subtle` it makes no request at all.
 
-There is deliberately no fallback to the by-id endpoint: without
-`crypto.subtle` it makes no request at all.
+#### Why v1 looked broken, measured rather than guessed
 
-It honours `actionType` (only `skip` means seek past; a `mute` or `full` segment
-is left alone) and ignores segments with `votes < -1`.
+v1 was **not** failing to run. Driven in the ychrome engine on dev against
+`youtube.com/watch?v=vax8FCuQUsE`, it injected, hashed, fetched, matched the
+video out of the prefix answer, and seeked: `currentTime` went **157.88 →
+208.28**, exactly the segment's end. It then followed a real SPA autoplay
+navigation to the next video and re-fetched.
 
-**Not built, and named rather than implied:** segment submission, voting,
-chapter names, highlight jump, the unsubmitted-segment queue, mute-action
-support, and a per-category configuration UI.
+What it did wrong was **ask for almost nothing**. The API defaults to
+`categories=["sponsor"]` and `actionTypes=["skip"]`, and v1 sent
+`categories=["sponsor","selfpromo","interaction"]` with no `actionTypes` at all.
+So eight of the eleven categories, and every `mute`/`full`/`poi`/`chapter`
+segment, were invisible.
+
+Measured against the live API over **881 videos that have community segments**
+(six 4-char prefixes, all categories, all action types):
+
+| | |
+|---|---|
+| videos where v1's three categories had no segment at all | **429 = 48.7%** |
+| most-submitted category in the sample | **`intro`** (53 of 210 segments), which v1 never asked for |
+| response size, default query vs all categories + all action types | 9.0 KB → 48.1 KB per prefix |
+
+Half the time, on a video that SponsorBlock users would expect to be handled,
+v1 correctly did nothing. That is what "SponsorBlock is not working" looked
+like.
+
+#### What v2 does
+
+Eleven categories with **per-category behaviour**, set from the settings pane:
+
+| category | ychrome default | why |
+|---|---|---|
+| `sponsor`, `selfpromo`, `interaction` | **auto-skip** | what v1 already did; no user loses behaviour |
+| `intro`, `outro`, `preview`, `music_offtopic` | **skip button** | content some people want; a button adds an affordance, an automatic seek takes one away |
+| `filler` | **off** | highly subjective |
+| `poi_highlight` | **show** | a jump target, never a skip |
+| `exclusive_access` | **show** | a whole-video label |
+| `chapter` | **show** | named regions on the seek bar |
+
+Every one is settable to auto-skip / skip button / mute / off (label categories
+offer show / off). Upstream ships only `sponsor` auto-skipping and asks during
+onboarding; ychrome has no onboarding, so it inherits its own previous
+behaviour and offers the rest. `src/sponsorblock.rs` owns the catalogue.
+
+Beyond the category set:
+
+- **The skip is scheduled to the moment it is due**, not waited for on the next
+  `timeupdate` (which fires ~4 Hz, so up to a quarter-second of sponsor). The
+  `timeupdate` handler stays as the safety net.
+- **A skip notice with Undo.** Undo seeks back and marks that segment ignored
+  for the rest of the page's life. Undo is the *only* thing that disables a
+  segment: seeking into one re-skips it, as it does upstream.
+- **A manual skip button** while a `manual` segment is playing, and a **Jump to
+  the highlight** button before a `poi_highlight`.
+- **Seek-bar markers** in the extension's own colours, with the segment's
+  description as the tooltip. Chapters are markers, never skips.
+- **`mute` segments are muted** and the user's prior mute state restored after.
+  A `full` segment is a notice and can never become a seek.
+- **Duration matching** (±2 s) and **locked-segment precedence**: a segment
+  submitted against a different cut of the video is discarded, and where the
+  community has locked a category the unlocked submissions for it are dropped.
+- **It binds to `#movie_player`'s video**, not `document.querySelector('video')`.
+  YouTube spawns a `<video>` for every thumbnail you hover, and v1's
+  capture-phase `timeupdate` listener on `document` heard all of them.
+- **Nothing happens while an ad is showing** (`#movie_player.ad-showing`).
+- **A bounded in-memory session cache** so the back button and a page reload do
+  not re-ask. Not persisted: community segments get downvoted and retracted, and
+  a cache on disk turns that into a TTL knob. The licence permits either (see
+  `THIRD-PARTY-NOTICES.md`); this is a correctness choice.
+
+#### Settings, and how they reach the page
+
+`src/sponsorblock.rs` is the single owner of the catalogue, the defaults and the
+stored choices, which live in
+`~/.yggterm/web-userscripts/sponsorblock.config.json`. `webpolicy::policy()`
+renders them into a **synthetic userscript** — a bare `window.__ysbConfig = {…}`
+in the same isolated world, injected ahead of `sponsorblock.js`.
+
+It is not a file, deliberately. Splicing settings into `sponsorblock.js` would
+make the host's copy diverge from the bundled asset, which is exactly the state
+`provision` reads as "the user edited this, leave it alone" — and the next
+release would then never update the script. `policy_version` stamps the
+*decisions*, so a settings click reaches a running surface.
+
+#### Probing it
+
+⚠ **An isolated-world global is invisible to a page-world `eval`.** Reading
+`window.__ysb` through `ychrome ctl eval` returns `undefined` on a perfectly
+healthy script; that misread has already cost one investigation. The script
+publishes its state to the DOM instead, which both worlds share:
+
+```sh
+ychrome ctl eval page_id=<id> js='document.documentElement.getAttribute("data-ysb")'
+```
+
+#### Not built, named rather than implied
+
+**Segment submission and voting.** They need a persistent pseudonymous user id
+and they WRITE to a shared public database. If they are added they must be
+explicit, off by default, and the privacy consequence stated where the user
+turns them on. Also absent: the unsubmitted-segment queue, and renaming
+YouTube's own chapter list (community chapters are drawn as markers beside it,
+not merged into it).
 
 ## 8. Commands
 

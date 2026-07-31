@@ -1509,6 +1509,11 @@ const USERSCRIPT_ACTION_PREFIX: &str = "userscript:";
 const USERSCRIPT_DELETE_PREFIX: &str = "userscript-delete:";
 /// Install a bundled extension by its catalog stem (the "Add an extension" list).
 const INSTALL_ACTION_PREFIX: &str = "install:";
+/// Set one SponsorBlock category's behaviour: `sponsorblock:<category>:<behaviour>`.
+/// ⚠ It must not be a prefix of `USERSCRIPT_ACTION_PREFIX` or vice versa — the
+/// dispatch is a `starts_with` chain, and `sponsorblock:` deliberately does not
+/// collide with `userscript:sponsorblock`, which is the on/off toggle.
+const SPONSORBLOCK_ACTION_PREFIX: &str = "sponsorblock:";
 
 /// The per-site zoom controls' action ids.
 const ZOOM_IN_ACTION: &str = "zoom-in";
@@ -1928,8 +1933,14 @@ fn current_site_security_widgets(host: Option<&str>, secure: Option<bool>) -> Ve
 }
 
 /// The SponsorBlock section. Installed ⇒ a friendly toggle (its state is the
-/// `sponsorblock.js` vs `.js.disabled` rename, exactly like any userscript).
+/// `sponsorblock.js` vs `.js.disabled` rename, exactly like any userscript),
+/// then one row per category so the user can say what each one should do.
 /// Not installed ⇒ nothing here; it appears under "Add an extension" instead.
+///
+/// The category rows are drawn from `crate::sponsorblock`, which is the one
+/// owner of the catalogue, the defaults and the stored choices. The pane
+/// re-derives none of it: a category added there appears here with no change,
+/// and the buttons it offers are that category's own `options`.
 fn sponsorblock_widgets(state: &crate::webpolicy::PolicyState) -> Vec<Value> {
     let installed = state
         .userscripts
@@ -1954,7 +1965,89 @@ fn sponsorblock_widgets(state: &crate::webpolicy::PolicyState) -> Vec<Value> {
     if let Some(refusal) = &script.refusal {
         widgets.push(json!({ "kind": "label", "muted": true, "text": refusal }));
     }
+    // The per-category rows only when the script is on: offering a choice that
+    // nothing will act on is worse than offering none.
+    if !script.enabled {
+        return widgets;
+    }
+    for (category, behaviour) in crate::sponsorblock::effective() {
+        widgets.push(sponsorblock_category_row(category, behaviour));
+    }
+    widgets.push(json!({
+        "kind": "label",
+        "muted": true,
+        "text": "Segments come from the community database at sponsor.ajay.app, asked \
+                 for by hash prefix so it is never told which video you are watching. \
+                 ychrome submits nothing and votes on nothing.",
+    }));
     widgets
+}
+
+/// The action id for "put `<category>` into `<behaviour>`". One string, parsed
+/// back by `run_settings_action` — the row and the handler agree by
+/// construction rather than by two matching format strings.
+fn sponsorblock_action(category: &str, behaviour: &str) -> String {
+    format!("{SPONSORBLOCK_ACTION_PREFIX}{category}:{behaviour}")
+}
+
+/// One category as a list-row: what it does now in the subtitle, and a button
+/// for each state it is NOT in.
+///
+/// The current state is deliberately absent from the buttons rather than shown
+/// pressed: `list-row` actions render as plain buttons with no selected state,
+/// so a row offering "Auto-skip" while already auto-skipping is a control that
+/// appears to do nothing when clicked.
+fn sponsorblock_category_row(
+    category: &'static crate::sponsorblock::Category,
+    behaviour: &'static str,
+) -> Value {
+    let actions: Vec<Value> = category
+        .options
+        .iter()
+        .filter(|option| **option != behaviour)
+        .map(|option| {
+            json!({
+                "action": sponsorblock_action(category.id, option),
+                "label": sponsorblock_behaviour_label(option),
+                "title": format!(
+                    "{}: {}",
+                    category.label,
+                    sponsorblock_behaviour_title(option),
+                ),
+            })
+        })
+        .collect();
+    json!({
+        "kind": "list-row",
+        "id": format!("sponsorblock-{}", category.id),
+        "title": category.label,
+        "subtitle": format!(
+            "{} — {}",
+            sponsorblock_behaviour_label(behaviour),
+            category.description,
+        ),
+        "actions": actions,
+    })
+}
+
+fn sponsorblock_behaviour_label(behaviour: &str) -> &'static str {
+    match behaviour {
+        crate::sponsorblock::AUTO => "Auto-skip",
+        crate::sponsorblock::MANUAL => "Skip button",
+        crate::sponsorblock::MUTE => "Mute",
+        crate::sponsorblock::SHOW => "Show",
+        _ => "Off",
+    }
+}
+
+fn sponsorblock_behaviour_title(behaviour: &str) -> &'static str {
+    match behaviour {
+        crate::sponsorblock::AUTO => "seek past it without asking",
+        crate::sponsorblock::MANUAL => "offer a skip button while it plays",
+        crate::sponsorblock::MUTE => "mute it rather than seek past it",
+        crate::sponsorblock::SHOW => "mark it on the seek bar",
+        _ => "ignore it entirely",
+    }
 }
 
 /// One managed userscript as a list-row: its on/off state in the subtitle, an
@@ -2094,6 +2187,19 @@ fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
         script if script.starts_with(USERSCRIPT_DELETE_PREFIX) => {
             let stem = script.trim_start_matches(USERSCRIPT_DELETE_PREFIX);
             crate::webpolicy::delete_userscript(stem)
+        }
+        // `sponsorblock:<category>:<behaviour>`. Checked BEFORE the userscript
+        // arm even though the two prefixes cannot collide, so the ordering says
+        // out loud which one owns the string.
+        category if category.starts_with(SPONSORBLOCK_ACTION_PREFIX) => {
+            let rest = category.trim_start_matches(SPONSORBLOCK_ACTION_PREFIX);
+            match rest.split_once(':') {
+                Some((id, behaviour)) => crate::sponsorblock::set_behaviour(id, behaviour),
+                None => Err(anyhow::anyhow!(
+                    "malformed SponsorBlock action {category:?} \
+                     (want sponsorblock:<category>:<behaviour>)"
+                )),
+            }
         }
         install if install.starts_with(INSTALL_ACTION_PREFIX) => {
             let stem = install.trim_start_matches(INSTALL_ACTION_PREFIX);
@@ -2603,6 +2709,108 @@ mod tests {
         assert!(
             !widgets.iter().any(|w| w["id"] == "adblock-enabled"),
             "offered an adblock toggle with no ruleset installed"
+        );
+    }
+
+    // Every catalogued category gets a row, and the row offers exactly the
+    // states it is NOT in. Asserted structurally against
+    // `crate::sponsorblock`'s catalogue rather than against a hand-written list
+    // of eleven ids, so a category added there is covered the day it lands and
+    // a pane that quietly drops one goes red.
+    #[test]
+    fn every_sponsorblock_category_gets_a_row_offering_the_states_it_is_not_in() {
+        let schema = settings_schema_from(
+            "work",
+            &PageContext::default(),
+            &no_zoom(),
+            &policy_state(true, &[("sponsorblock", true)]),
+        );
+        let widgets = schema["widgets"].as_array().expect("widgets");
+        let live: std::collections::HashMap<&str, &str> = crate::sponsorblock::effective()
+            .into_iter()
+            .map(|(category, behaviour)| (category.id, behaviour))
+            .collect();
+        for category in crate::sponsorblock::catalog() {
+            let row = widgets
+                .iter()
+                .find(|w| w["id"] == format!("sponsorblock-{}", category.id))
+                .unwrap_or_else(|| panic!("no settings row for {}", category.id));
+            assert_eq!(row["kind"], "list-row");
+            assert_eq!(row["title"], category.label);
+            let current = live[category.id];
+            let offered: Vec<&str> = row["actions"]
+                .as_array()
+                .expect("actions")
+                .iter()
+                .map(|a| a["action"].as_str().expect("action id"))
+                .collect();
+            let expected: Vec<String> = category
+                .options
+                .iter()
+                .filter(|option| **option != current)
+                .map(|option| format!("sponsorblock:{}:{option}", category.id))
+                .collect();
+            assert_eq!(
+                offered, expected,
+                "{} offers the wrong states (it is currently {current})",
+                category.id
+            );
+            assert!(
+                !offered.contains(&format!("sponsorblock:{}:{current}", category.id).as_str()),
+                "{} offers a button for the state it is already in",
+                category.id
+            );
+        }
+    }
+
+    // The action id the row emits must be the one the dispatcher parses. These
+    // are two different pieces of code agreeing on one string, which is exactly
+    // where a format-string edit on one side ships a dead button.
+    #[test]
+    fn a_category_action_id_round_trips_through_the_dispatchers_parser() {
+        for category in crate::sponsorblock::catalog() {
+            for option in category.options {
+                let action = sponsorblock_action(category.id, option);
+                let rest = action
+                    .strip_prefix(SPONSORBLOCK_ACTION_PREFIX)
+                    .unwrap_or_else(|| panic!("{action} lost its prefix"));
+                let (id, behaviour) = rest
+                    .split_once(':')
+                    .unwrap_or_else(|| panic!("{action} has no behaviour half"));
+                assert_eq!(id, category.id);
+                assert_eq!(behaviour, *option);
+                assert!(
+                    crate::sponsorblock::find(id).is_some(),
+                    "{action} names a category the catalogue does not have"
+                );
+            }
+        }
+        // The on/off toggle's id must not be eaten by the category arm.
+        assert!(
+            !format!("{USERSCRIPT_ACTION_PREFIX}sponsorblock")
+                .starts_with(SPONSORBLOCK_ACTION_PREFIX),
+            "the SponsorBlock on/off toggle would be parsed as a category action"
+        );
+    }
+
+    // A disabled script offers no category rows: a control that nothing will
+    // act on is worse than no control.
+    #[test]
+    fn a_disabled_sponsorblock_offers_no_category_rows() {
+        let schema = settings_schema_from(
+            "work",
+            &PageContext::default(),
+            &no_zoom(),
+            &policy_state(true, &[("sponsorblock", false)]),
+        );
+        let widgets = schema["widgets"].as_array().expect("widgets");
+        assert!(
+            !widgets.iter().any(|w| {
+                w["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("sponsorblock-"))
+            }),
+            "category rows drawn for a script that is switched off"
         );
     }
 

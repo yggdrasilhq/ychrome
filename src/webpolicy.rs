@@ -203,7 +203,7 @@ pub fn policy(profile: &str) -> Policy {
     // the GUI never re-derives a `@match` and so can never disagree about one.
     // Every script then passes the promotion gate: an untranslatable @include
     // refuses the whole script, loudly, instead of shipping it half-scoped.
-    let userscripts = userscript_dirs(profile)
+    let mut userscripts: Vec<Userscript> = userscript_dirs(profile)
         .iter()
         .flat_map(|dir| enabled_scripts(dir))
         .filter_map(|path| {
@@ -211,6 +211,20 @@ pub fn policy(profile: &str) -> Policy {
             promote_or_refuse(&path, crate::userscript::parse(&body))
         })
         .collect();
+
+    // SponsorBlock's per-category settings, as a tiny synthetic script injected
+    // BEFORE the one that reads them. It is not a file: splicing settings into
+    // `sponsorblock.js` would make this host's copy diverge from the bundled
+    // asset, which is exactly the state `crate::provision` reads as "the user
+    // edited this, leave it alone" — and the next ychrome release would then
+    // never update the script. `crate::sponsorblock` owns the catalogue; this
+    // is only the delivery.
+    //
+    // Only when the script is actually enabled: a config for a script that is
+    // not running is a global on every YouTube page for nothing.
+    if userscript_enabled(crate::extensions::SPONSORBLOCK_STEM).unwrap_or(false) {
+        userscripts.insert(0, crate::sponsorblock::config_userscript());
+    }
 
     Policy {
         adblock_rules,
@@ -287,6 +301,11 @@ pub fn policy_version(profile: &str) -> String {
     ));
     // Same reason: the UA is a decision, not a file the GUI could stat.
     manifest.push_str(&crate::useragent::stamp());
+    // And SponsorBlock's per-category settings, which travel as an injected
+    // preamble rather than a file — a stat over the directory cannot see them,
+    // so a category the user just switched to auto-skip would not reach the
+    // page until something else in the policy happened to change.
+    manifest.push_str(&crate::sponsorblock::stamp());
     if let Ok(rules) = rules_path() {
         stamp(&mut manifest, &rules);
     }
@@ -929,6 +948,153 @@ mod tests {
             clean_row["refusal"].is_null(),
             "a promotable script must carry no refusal"
         );
+    }
+
+    const SPONSORBLOCK_PROBE_VAR: &str = "YCHROME_SPONSORBLOCK_POLICY_PROBE";
+    const SPONSORBLOCK_PROBE_PREFIX: &str = "ychrome-sponsorblock-policy-probe: ";
+
+    /// SponsorBlock's per-category settings are the ONE thing in the policy that
+    /// is not a file on disk — they ride as a synthetic preamble. That makes two
+    /// failure modes invisible to every other test here: the preamble not
+    /// shipping at all (the pane would offer settings that reach nothing), and
+    /// it shipping for a script that is switched off (a global on every YouTube
+    /// page for nothing). This drives the real disk→`policy()`→`to_json()`
+    /// pipeline over a scratch $HOME and asserts on what actually goes out.
+    #[test]
+    fn the_sponsorblock_settings_ride_the_wire_only_when_the_script_is_on() {
+        if std::env::var(SPONSORBLOCK_PROBE_VAR).is_ok() {
+            let facts = json!({
+                "wire": policy("default").to_json(),
+                "version": policy_version("default"),
+            });
+            println!("{SPONSORBLOCK_PROBE_PREFIX}{facts}");
+            return;
+        }
+
+        // ⚠ ONE scratch home per on/off state, and the SCRIPT IS WRITTEN ONCE.
+        // A first draft rebuilt the whole directory per probe, and the version
+        // assertion below passed against a mutant that had no stamp at all —
+        // because rewriting `sponsorblock.js` moved its mtime, which
+        // `policy_version` stats. Only the config JSON changes between probes,
+        // and a `.json` is invisible to `enabled_scripts`, so the version can
+        // only move if the decision itself is stamped.
+        let prepare = |enabled: bool| -> std::path::PathBuf {
+            let home = std::env::temp_dir().join(format!(
+                "ychrome-sponsorblock-policy-{}-{enabled}",
+                std::process::id()
+            ));
+            let scripts = home.join(".yggterm").join("web-userscripts");
+            let _ = std::fs::remove_dir_all(&home);
+            std::fs::create_dir_all(&scripts).expect("scratch userscript dir");
+            let name = if enabled {
+                "sponsorblock.js"
+            } else {
+                "sponsorblock.js.disabled"
+            };
+            std::fs::write(
+                scripts.join(name),
+                crate::extensions::find(crate::extensions::SPONSORBLOCK_STEM)
+                    .expect("sponsorblock in catalog")
+                    .body,
+            )
+            .expect("the bundled body");
+            home
+        };
+
+        let run = |home: &std::path::Path, intro: &str| -> Value {
+            let scripts = home.join(".yggterm").join("web-userscripts");
+            std::fs::write(
+                scripts.join("sponsorblock.config.json"),
+                json!({ "categories": { "intro": intro }, "kept": "by a future ychrome" })
+                    .to_string(),
+            )
+            .expect("the config");
+            let exe = std::env::current_exe().expect("test binary path");
+            let output = std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "webpolicy::tests::the_sponsorblock_settings_ride_the_wire_only_when_the_script_is_on",
+                    "--nocapture",
+                ])
+                .env("HOME", home)
+                .env(SPONSORBLOCK_PROBE_VAR, "1")
+                .output()
+                .expect("spawning the sponsorblock policy probe");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "the sponsorblock policy probe child failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let line = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(SPONSORBLOCK_PROBE_PREFIX))
+                .unwrap_or_else(|| panic!("no probe line in:\n{stdout}"));
+            serde_json::from_str(line).expect("probe facts parse")
+        };
+
+        let live = prepare(true);
+        let on = run(&live, "auto");
+        let scripts = on["wire"]["userscripts_v2"]
+            .as_array()
+            .expect("v2 array")
+            .clone();
+        let preamble = scripts
+            .iter()
+            .find(|entry| {
+                entry["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("window.__ysbConfig"))
+            })
+            .expect("the settings preamble must ship when SponsorBlock is on");
+        // It must be FIRST: the script reads the global lazily so order is not
+        // load-bearing, but a preamble that arrives after its reader is a trap
+        // for the next person who makes it eager.
+        assert!(
+            scripts[0]["body"]
+                .as_str()
+                .is_some_and(|body| body.contains("window.__ysbConfig")),
+            "the preamble did not lead the list"
+        );
+        assert_eq!(preamble["world"], "isolated");
+        assert!(
+            preamble["matches"].as_array().is_some_and(|list| list
+                .iter()
+                .any(|m| m.as_str().is_some_and(|m| m.contains("youtube.com")))),
+            "the preamble must be YouTube-scoped: {:?}",
+            preamble["matches"]
+        );
+        // The user's choice, not the default: `intro` defaults to a button.
+        assert_eq!(
+            crate::sponsorblock::find("intro").expect("intro").default,
+            "manual"
+        );
+        let body = preamble["body"].as_str().expect("preamble body");
+        assert!(
+            body.contains("\"intro\":{\"behaviour\":\"auto\""),
+            "the stored choice did not reach the page: {body}"
+        );
+
+        // Off: no preamble anywhere on either wire shape.
+        let dark = prepare(false);
+        let off = run(&dark, "auto");
+        assert!(
+            !off["wire"].to_string().contains("__ysbConfig"),
+            "the preamble shipped for a script that is switched off"
+        );
+
+        // And the policy version MOVES with the choice, or the GUI would keep
+        // serving the page the settings it fetched before the click.
+        // ⚠ SAME home, same untouched `sponsorblock.js` — only the stored
+        // choice differs.
+        let other = run(&live, "off");
+        assert_ne!(
+            on["version"], other["version"],
+            "policy_version is blind to a category change, so a settings click \
+             would never reach a running surface"
+        );
+        let _ = std::fs::remove_dir_all(&live);
+        let _ = std::fs::remove_dir_all(&dark);
     }
 
     // The passkey shim patches `navigator.credentials` for the PAGE to call, so

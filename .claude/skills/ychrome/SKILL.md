@@ -521,7 +521,9 @@ profiles — zoom is readability, not identity).
 `settings_schema_from` draws, in order: **This site** (per-site zoom + an honest
 HTTPS connection line from `values.secure`; full cert detail is future, needs
 WebKit's TLS cert), **Ad blocking**, **SponsorBlock** (the `sponsorblock`
-userscript promoted to its own friendly toggle), **Userscripts** (every OTHER
+userscript promoted to its own friendly toggle, plus one `list-row` per
+category from `src/sponsorblock.rs` whose buttons are the states it is NOT
+in), **Userscripts** (every OTHER
 script as a `list-row` with Enable/Disable + Delete actions), and **Add an
 extension** (the `extensions.rs` catalog, filtered to what is not installed).
 
@@ -608,6 +610,21 @@ ones are `@match`-scoped instead, so WebKit does the matching in the engine.
   of `SHA-256(videoID)`, matched in the browser. There is deliberately no
   fallback to the by-id endpoint — without `crypto.subtle` it makes no request.
   Do not "fix" that by restoring `?videoID=`.
+- **`sponsorblock` v2.0.0 asks for all ELEVEN categories and all five action
+  types.** v1 asked for three categories and took the API's default
+  `actionTypes` — measured over 881 videos with segments, **48.7% had nothing in
+  those three**, which is what "SponsorBlock is broken" was. Behaviour is
+  per-category (auto / button / mute / off), owned by `src/sponsorblock.rs`,
+  stored in `~/.yggterm/web-userscripts/sponsorblock.config.json`, and delivered
+  to the page as a synthetic `window.__ysbConfig` preamble that
+  `webpolicy::policy()` injects ahead of the script. It is NOT a file: splicing
+  settings into `sponsorblock.js` would fork the host's copy from the bundle and
+  `provision` would then never update it.
+- **⚠ PROBE SPONSORBLOCK BY `data-ysb`, NOT by a global.** It runs in the
+  isolated world, so `ychrome ctl eval js='window.__ysb'` reads `undefined` on a
+  perfectly healthy script — that is a property of worlds, not a diagnosis.
+  Use `js='document.documentElement.getAttribute("data-ysb")'`, which carries
+  videoId, lookups, skipped, duration, segments and their behaviours.
 
 ## Still open
 - **`restore`** (`PUT /api/ciphers/{id}/restore`) — `rm` has no undo, and because
@@ -795,10 +812,11 @@ true when `cf-mitigated` is present, or on a 403/503 carrying a `cf-ray`.
 - **The daemon's HOME must be shallow.** The socket path is bounded by
   `SUN_LEN` (~108 bytes); a deep `$HOME` fails with `path must be shorter than
   SUN_LEN`. This bites when testing under a scratch HOME.
-- **SponsorBlock's runtime state has never been observed in the engine.** Driven
-  at `youtube.com` under an isolated HOME, `window.__ysb` stayed `undefined`
-  after 15 s although the page loaded; its state looks watch-page-only. The
-  userscript plane itself IS proven. Do not assume this one works.
+- ~~**SponsorBlock's runtime state has never been observed in the engine.**~~
+  **CLOSED 2026-07-31.** The old note read `window.__ysb` from a page-world
+  `eval`, which cannot see an isolated-world global — the instrument was wrong,
+  not the script. Observed live in the engine on dev: segments fetched, and the
+  player jumped 157.88 → 208.28 past a sponsor. Probe with `data-ysb`.
 - **Stop the daemon with the `stop` op, not `kill`.** SIGTERM skips
   `engine::api::shutdown()`, so the engine's headless display is orphaned.
 
