@@ -277,13 +277,24 @@ mod tests {
         // would click the very button it exists to avoid (found by adversarial
         // review). "continue without accepting" is the case the negation clause
         // exists for: it carries "accepting" and is a REJECT phrase.
-        const NEGATIONS: [&str; 9] = [
-            "without", "non-", "only", "reject", "decline", "refuse", "deny", "no ", "never",
+        // "do not consent" and "do not sell my personal information" are
+        // REJECT phrases that carry a consent word; "not " is what makes them
+        // legible, exactly as "without" does for "continue without accepting".
+        // "sans" is French for "without" and carries the same weight in
+        // "continuer sans accepter"; a list that says no in six languages needs
+        // its negations in six languages too.
+        const NEGATIONS: [&str; 11] = [
+            "without", "sans ", "non-", "only", "reject", "decline", "refuse", "deny", "no ",
+            "not ", "never",
         ];
         for phrase in &phrases {
             let negated = NEGATIONS
                 .iter()
                 .any(|negation| phrase.contains(negation));
+            // English, plus the consent verbs of every language REJECT_TEXT
+            // now speaks. A list that says no in six languages and only
+            // recognises yes in one is a lock with a hole in it: "alle
+            // akzeptieren" is German for "accept all" and used to pass.
             for consent in [
                 "accept",
                 "agree",
@@ -294,11 +305,47 @@ mod tests {
                 "got it",
                 "okay",
                 "yes",
+                // German
+                "akzept",
+                "zustimm",
+                "einverstanden",
+                "erlauben",
+                // Spanish / Portuguese
+                "acept",
+                "aceit",
+                "permitir",
+                // Italian
+                "accett",
+                "accordo",
+                // Dutch
+                "akkoord",
+                "toestaan",
+                // Nordic
+                "godta",
+                "godkann",
+                "godkänn",
+                "tillad",
+                "tillat",
+                // Polish
+                "akcept",
+                "zgadzam",
             ] {
-                let carries = phrase
-                    .split(|ch: char| !ch.is_alphanumeric())
-                    .any(|word| word == consent)
-                    || phrase.contains(consent);
+                // A consent word counts when it stands as its own word, or
+                // when it BEGINS one — "acceptera alla" is Swedish for
+                // "accept all" and must be caught. It does not count when a
+                // letter runs into it from the left: "disagree" carries the
+                // letters of "agree" and means the opposite. This is a
+                // sharper rule than a bare substring, not a looser one; the
+                // adversarial case the comment above names ("i accept",
+                // which starts with "i") is still caught, because "accept"
+                // there begins a word.
+                let carries = phrase.match_indices(consent).any(|(at, _)| {
+                    at == 0
+                        || !phrase[..at]
+                            .chars()
+                            .next_back()
+                            .is_some_and(|ch| ch.is_alphanumeric())
+                });
                 assert!(
                     !(carries && !negated),
                     "idcac would click a consent button: REJECT_TEXT has {phrase:?} \
@@ -317,6 +364,32 @@ mod tests {
         assert!(
             phrases.iter().any(|phrase| phrase == "reject all"),
             "REJECT_TEXT lost 'reject all': {phrases:?}"
+        );
+        // The list's whole value is that it says no in more ways than the
+        // ruleset ever can, so it must stay broad and must stay multilingual.
+        assert!(
+            phrases.len() >= 45,
+            "REJECT_TEXT shrank to {} phrases — this list is the one job no \
+             content-blocker rule can do",
+            phrases.len()
+        );
+        for must in [
+            "decline all",
+            "alle ablehnen",
+            "tout refuser",
+            "rechazar todo",
+            "do not consent",
+        ] {
+            assert!(
+                phrases.iter().any(|phrase| phrase == must),
+                "REJECT_TEXT lost {must:?}"
+            );
+        }
+        // The precision rule above, pinned in both directions.
+        assert!(
+            phrases.iter().any(|phrase| phrase == "disagree"),
+            "'disagree' is a REJECT phrase; a substring rule that reads it as \
+             'agree' is the rule that is wrong"
         );
         // Hiding a banner without undoing its scroll lock leaves an unreadable
         // page — the third thing it does, and the easy one to drop.
