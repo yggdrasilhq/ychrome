@@ -4,6 +4,63 @@ Entries are removed in the same commit as their verified fix. Newest first.
 
 ---
 
+## ★★★ A DAEMON HANDOVER STRANDS THE GUI ON A DEAD CONTROL PORT, AND SURFACES SILENTLY LOSE ADBLOCK
+
+**User-reported 2026-07-31, immediately after a deploy + `ychrome daemon
+restart`.** The GUI raised:
+
+> **Web policy unavailable** — The app did not serve its ad-block and userscript
+> policy (connect 127.0.0.1:42687: Connection refused (os error 111)). Its
+> surfaces open unprotected.
+
+**The notice is honest and correct — that part is good design.** The defect is
+what it is honest *about*.
+
+### What is actually true, measured on the live host
+
+- The GUI was trying **42687**, a port from a daemon generation that no longer
+  exists. Nothing listens there.
+- **The policy was available the whole time.** The current daemon (pid 486744)
+  serves the session's control endpoint on the port recorded in the journal's
+  latest `register` — for `oi cfa` that is **34419**, and `curl
+  127.0.0.1:34419/policy` returns the full new ruleset (`/ping` → 200).
+- ⚠ **Do not misread the `ss` output**, as I did first: the ports the journal
+  registers are owned by the **daemon process**, not by the per-session
+  `ychrome --profile <name>` CLI. That is the design — the daemon hosts the
+  control endpoint. The CLI's own listener answers **404** and is not it.
+
+### The bug
+
+**A daemon handover invalidates every control port the GUI has cached, and the
+GUI does not re-resolve — it caches the dead port, warns once, and leaves the
+surface unprotected.** The remedy exists in the daemon's own journal (the new
+`register` line carries the live port); nothing consults it.
+
+Consequence, and why this is ★★★: the user's browsing continues with **no
+adblock and no userscripts** while the ruleset sits correctly installed and
+served. The failure is silent after the single toast, and it survives for the
+life of the surface.
+
+### The fix
+
+On a policy-fetch connection failure the GUI must **re-resolve the endpoint**
+(ask the daemon, or honour the next OSC re-declare) and retry, rather than
+pinning the port it first learned. A refusal is only honest when re-resolution
+is genuinely impossible. Consider also having the daemon push a policy-changed
+signal on handover so surfaces refresh without a fetch failing first.
+
+### Operator note — the deploy step that was skipped
+
+`docs/pending-bugs.md` in **yggterm** already warns that after any ychrome
+deploy the daemon is stale by definition and must be handed over **together with
+its clients** ("clients and daemon together per the round-29 mixed-version
+note"). The 2026-07-31 deploy handed over the daemon and did **not** cycle the
+clients, which is exactly how this surfaced. Until the fix lands, the manual
+remedy is to cycle each session's ychrome CLI so it re-declares its endpoint —
+at a moment the user is not mid-task, because it reloads their page.
+
+---
+
 ## ★★ A MISTYPED OR NOT-YET-BUILT SUBCOMMAND IS SILENTLY SWALLOWED AS A URL
 
 **Found on oc, 2026-07-31, while checking whether the engine had been deployed.
