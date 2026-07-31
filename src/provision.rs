@@ -377,6 +377,33 @@ pub fn reconcile() -> Vec<AssetStatus> {
         }
     }
     if let Some(dir) = adblock_dir() {
+        // THE GENERATED COSMETIC SCRIPT IS THE RULESET'S OTHER HALF, not an
+        // extension the user picked: one `abp::convert` produces both, and a
+        // host with the ruleset but not the script is missing the cosmetic
+        // filters WebKit cannot express. So it is installed on the launches
+        // where the ruleset itself is written — a fresh host, or an upgrade —
+        // and NOT reinstated on every launch, which is what keeps the pane's
+        // Delete button honest for the launches in between.
+        let ruleset_landing = !dir.join(crate::adblock::RULESET_FILE).is_file()
+            || crate::adblock::installed_ruleset_version(&dir.join(crate::adblock::RULESET_FILE))
+                .is_none_or(|installed| installed < crate::adblock::bundled_ruleset_version());
+        if ruleset_landing
+            && let Some(scripts) = userscript_dir()
+            && let Some(ext) = crate::extensions::find(crate::abp::COSMETIC_SCRIPT_STEM)
+        {
+            let path = scripts.join(format!("{}.js", ext.stem));
+            let disabled = scripts.join(format!("{}.js.disabled", ext.stem));
+            if !path.exists() && !disabled.exists() {
+                let error = write_with_backup(&path, ext.body).err().map(|e| e.to_string());
+                statuses.push(AssetStatus {
+                    id: ext.stem.to_string(),
+                    kind: AssetKind::Userscript,
+                    path,
+                    verdict: Verdict::Absent,
+                    error,
+                });
+            }
+        }
         statuses.push(reconcile_one(
             crate::adblock::RULESET_FILE,
             AssetKind::AdblockRuleset,

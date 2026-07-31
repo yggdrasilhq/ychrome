@@ -31,6 +31,12 @@ src/daemon.rs                   the HOST DAEMON: one per host, owns every sessio
                                 client spawns + supervises it (docs/host-daemon.md)
 src/sidebar.rs                  the control routes: vault + settings pane schemas, actions
 src/webpolicy.rs                adblock + userscripts (enable/disable/delete/install)
+src/abp.rs                      ABP/uBO filter syntax -> WebKit content-blocker JSON,
+                                gated on what the engine MEASURABLY accepts
+src/adblock.rs                  the filter-list roster, `ychrome adblock update|status|lists`,
+                                the ruleset's provenance sidecar
+src/provision.rs                the BUNDLED-ASSET RECONCILER: one owner of "is this
+                                host's copy current?" (docs/adblock.md §5)
 src/webzoom.rs                  per-site zoom overrides (web-zoom.json)
 src/extensions.rs               the bundled userscript catalog ("Add an extension")
 assets/web-userscripts/         bundled scripts embedded by extensions.rs
@@ -44,6 +50,8 @@ crates/ychrome-vault/src/
   matching.rs  the two asymmetric host rules (strict `match`, loose `suggest`)
   totp.rs generator.rs
 docs/vault.md        the vault's design + what is proven vs not   <- READ for vault work
+docs/adblock.md      the MEASURED WebKit content-blocker limits, the filter-list
+                     pipeline, provisioning, and the annoyance scripts  <- READ for adblock work
 docs/protocol.md     OSC 7717 from the app's side
 docs/architecture.md docs/product.md
 ```
@@ -410,6 +418,22 @@ GUI's webview, so we serve the *effective* policy and yggterm applies it:
   document-start, so yggterm holds the surface's creation until the policy
   lands. Open first and the surface is built unblocked — no userscripts, no
   adblock, silently, forever.
+- **The ruleset is 146,748 real rules now, not 60 hand-typed ones**, generated
+  from nine upstream lists by `src/abp.rs` and committed gzipped at
+  `assets/web-adblock/rules.json.gz`. **Read `docs/adblock.md` before touching
+  any of it** — it carries the measured WebKit limits, and they are the whole
+  design: 150,000 rules is a hard ceiling, the regex dialect has NO alternation,
+  and ONE bad network rule fails the entire compile (no ad blocking at all)
+  while one bad SELECTOR is dropped in silence. ⚠ It also carries the yggterm
+  companion change this ruleset needs: `web_surface.rs` calls
+  `webkit_user_content_filter_store_save` every process start, which recompiles
+  (measured 15.7 s, 476 MB), where `..._load` returns the same filter in 11 ms.
+- **Nothing bundled sits dead on a host any more.** `src/provision.rs` runs at
+  every launch, installs what is missing, replaces what is superseded (keeping a
+  `.superseded` backup) and KEEPS what the user edited or what is newer than the
+  bundle. `ychrome provision --json` runs the same call and prints the verdicts.
+  Every bundled asset declares a version (`@version`, or `ruleset_version` in
+  the sidecar) — a content hash cannot tell an old release from a user's edit.
 - An adblock RULESET change needs a yggterm restart (WebKit compiles the filter
   once per GUI process). Toggling it off, and every userscript change, take
   effect on the next surface (re)create — the pane's "Reload surface now" button
@@ -463,11 +487,23 @@ extension** (the `extensions.rs` catalog, filtered to what is not installed).
 
 ### The bundled catalog (`src/extensions.rs` + `assets/web-userscripts/`)
 
-Four entries: `sponsorblock`, `youtube-adblock`, `idcac`, `unblock-select`. The
+Five entries: `cosmetic-filters` (GENERATED — the cosmetic rules WebKit cannot
+express, `:has-text()` and `:style()`, 1,122 of them over 704 domains, produced
+by the same `abp::convert` that makes the ruleset and installed alongside it),
+`sponsorblock`, `youtube-adblock`, `idcac`, `unblock-select`. The
 catalog is the ONLY roster — nothing else enumerates them, so add here and every
 surface inherits. Every script self-guards by hostname, because the injection
 plane has no matching: document-start, top frame, MAIN world, every page.
 
+- **The 2x-ads bug, so it is never rediagnosed from scratch.** The user
+  reported "I still see youtube ads! They are sped up to 2x automatically!" The
+  copy of `youtube-adblock.js` on the GUI host predated the script's metadata block, so
+  it parsed to the DEFAULTS, so it ran in the ISOLATED world, where its
+  `window.fetch` patch is invisible to the page. The prune never ran; only the
+  DOM fallback did, and it forced `playbackRate = 16`, which WebKit clamps to
+  ~2x. The forced rate is now GONE (a fallback that degrades playback while
+  masking a dead primary path is worse than none) and the belt WARNS instead.
+  `src/provision.rs` exists so the stale-copy half cannot recur.
 - **`youtube-adblock` rots on YouTube's schedule, and that is expected.** YouTube
   ads are FIRST-PARTY, so no URL-matching filter can reach them; the script
   deletes the ad fields out of the `/youtubei/v1/player` response before the
@@ -482,9 +518,17 @@ plane has no matching: document-start, top frame, MAIN world, every page.
   response (`tests/fixtures/youtube-adblock-harness.js`), so a prune that stops
   pruning fails even when every source needle still matches. node is a test-time
   dependency; `YCHROME_ALLOW_NO_NODE=1` is the explicit opt-out.
-- `idcac` was deployed by hand to `~/.yggterm/web-userscripts/` on dev and the GUI host
-  long before it was in this repo. The asset is that file, byte-identical, so
-  `install` on those hosts correctly refuses to clobber an identical script.
+- **`idcac` is NOT feature complete and cannot be — the gap is closed from the
+  other side.** The three consent lists in the ruleset name 27,859 distinct
+  domains; the script knows 36 container selectors and zero domains, and all 19
+  of its original selectors are already upstream. Hiding is the RULESET's job
+  now. The script keeps the two things no declarative rule can do: press
+  "reject all" (53 phrases, six languages) and undo a scroll lock. Do not
+  re-propose growing its selector list; grow the ruleset instead.
+- **`sponsorblock` asks by HASH PREFIX, never by video id.** Four hex characters
+  of `SHA-256(videoID)`, matched in the browser. There is deliberately no
+  fallback to the by-id endpoint — without `crypto.subtle` it makes no request.
+  Do not "fix" that by restoring `?videoID=`.
 
 ## Still open
 - **`restore`** (`PUT /api/ciphers/{id}/restore`) — `rm` has no undo, and because

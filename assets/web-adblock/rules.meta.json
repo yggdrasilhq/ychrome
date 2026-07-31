@@ -6,6 +6,7 @@
     "cosmetic_domain_selectors": 27588,
     "cosmetic_generic_rules": 18,
     "cosmetic_generic_selectors": 35535,
+    "cosmetic_procedural_rules": 414,
     "cosmetic_unhide_applied": 545,
     "deduplicated": 191,
     "document_exception": 597,
@@ -42,13 +43,13 @@
         "why": "editing the response body is not a blocker action"
       },
       "procedural-selector": {
-        "count": 652,
+        "count": 238,
         "samples": [
           "deliveroo.*#?#a[role=\"button\"]:has(p:has-text(Sponsored))",
           "deliveroo.*#?#div[class^=\"HomeFeedScrollTracker-\"]:has(span[class^=\"HomeFeedUILines-\"]:has-text(Sponsored))",
-          "advocate.com,out.com,pride.com#?#.component.module-headline:has-text(FROM OUR SPONSORS)",
-          "character.ai#?#.space-y-4 > .w-full:has-text(Advertisement)",
-          "cjleo.com#?#.alt-widget-title:has-text(advertisement)"
+          "agoda.com#?#.PropertyCardItem:has(div:has-text(Promoted))",
+          "atlanticsuperstore.ca,fortinos.ca,loblaws.ca,maxi.ca,newfoundlandgrocerystores.ca,nofrills.ca,provigo.ca,realcanadiansuperstore.ca,valumart.ca,yourindependentgrocer.ca,zehrs.ca#?#.indiana-scroll-container > ul > li:has(.chakra-badge:has-text(/Sponsorisé|Sponsored/))",
+          "autotrader.co.uk#?#[data-testid=\"desktop-search\"] li:has(span:has-text(Ad))"
         ],
         "why": "not a CSS selector; WebKit drops it silently, so it is counted rather than shipped"
       },
@@ -137,7 +138,7 @@
         "why": "if-domain takes a lower-case ASCII domain — not a pattern, a regex or an IDN — and a bad one fails the ENTIRE ruleset compile"
       }
     },
-    "dropped_total": 7706,
+    "dropped_total": 7292,
     "emitted": 146748,
     "network_block": 122547,
     "network_exception": 2211,
