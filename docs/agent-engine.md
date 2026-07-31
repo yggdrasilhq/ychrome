@@ -568,9 +568,26 @@ when `event.isTrusted`, so a substrate with no trusted input fails it instead
 of quietly recording `false` twice. A unit test locks that property of the
 fixture.
 
-**Not yet proven on the GUI host.** The AC names the GUI host as the gate host. Headless is
-headless and dev is the harsher machine (no display server at all), but the
-letter of the AC wants `ychrome engine gate` re-run there.
+**Proven on the GUI host too, 2026-07-31.** The AC names the GUI host as the gate host, so the
+gate was re-run there: all five proofs PASS, exit 0, on display `:90` (the
+picker correctly skipped `:1`, `:95`, `:96` and `:98`, which other processes
+held). `ychrome engine flow` passes there as well, so Phase B's verbs are
+proven on both hosts.
+
+Run **non-invasively while the owner was working at the GUI host's GUI**, and that is
+the pattern to reuse: the binary went to a private `/tmp` path and was never
+installed; `HOME` was pointed at a private directory so nothing touched
+`~/.yggterm`; the engine owns its own Xvfb on a display nobody is looking at.
+Verified afterwards: no Xvfb of ours left running, the X lock files unchanged
+from before the run, three yggterm GUI processes and two ychrome daemons still
+up and untouched, and the private path removed. Nothing was deployed, restarted
+or retired.
+
+Worth noting from the the GUI host pixel: the same page renders with a different font
+stack than on dev. That is the machine, not the engine, and it is why proof 3
+counts INK inside the heading's own rect rather than comparing against a
+reference image — a golden-image check would have gone red across hosts for a
+reason that has nothing to do with the substrate.
 
 
 ## 10. Estimate
