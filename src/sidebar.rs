@@ -26,7 +26,6 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -475,9 +474,18 @@ pub(crate) struct ParsedRequest {
 /// Read one HTTP request off a control-endpoint connection. `None` on an IO
 /// error or a truncated body. A `/fido2/get` blocks up to two minutes awaiting
 /// the presence dialog, so the daemon serves each connection on its own thread.
-pub(crate) fn read_request(stream: &TcpStream) -> Option<ParsedRequest> {
-    let peek = stream.try_clone().ok()?;
-    let mut reader = BufReader::new(peek);
+///
+/// Generic over the transport, not tied to TCP. The per-session control
+/// endpoint is a loopback `TcpStream` (the surface's userscripts have to reach
+/// it from inside a page), but the agent engine mounts `/engine/*` on the
+/// daemon's UNIX socket per `docs/agent-engine.md` §3, and that is the same
+/// HTTP/1.1 wire over a different pipe. One parser for both: a second copy
+/// would be a second place for the fido2/control header gates to drift.
+///
+/// `&TcpStream` and `&UnixStream` both implement `Read`, so callers pass a
+/// borrow and keep the stream for the response.
+pub(crate) fn read_request(stream: impl Read) -> Option<ParsedRequest> {
+    let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).ok()?;
     let mut parts = line.split_whitespace();
@@ -737,11 +745,11 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-pub(crate) fn respond_json(stream: TcpStream, status: u16, body: &Value, path: &str) {
+pub(crate) fn respond_json(stream: impl Write, status: u16, body: &Value, path: &str) {
     write_json(stream, status, body, cors_headers(route_access(path)));
 }
 
-fn write_json(mut stream: TcpStream, status: u16, body: &Value, cors: &str) {
+fn write_json(mut stream: impl Write, status: u16, body: &Value, cors: &str) {
     let body = body.to_string();
     let reason = match status {
         200 => "OK",
@@ -793,7 +801,7 @@ fn cors_headers(access: RouteAccess) -> &'static str {
 /// else: the same 403 the real request would get, named — a preflight for
 /// `/action` is a page asking whether it may drive the settings pane, and the
 /// honest answer is no, said out loud rather than by silent omission.
-pub(crate) fn respond_preflight(mut stream: TcpStream, path: &str) {
+pub(crate) fn respond_preflight(mut stream: impl Write, path: &str) {
     let access = route_access(path);
     if access != RouteAccess::PageSigner {
         if access == RouteAccess::GuiOnly {
@@ -3420,5 +3428,55 @@ mod tests {
         assert_ne!(a.control_token, b.control_token);
         assert_ne!(a.control_token, a.signer.token);
         assert_eq!(a.control_token.len(), 64, "32 CSPRNG bytes, hex");
+    }
+
+    // The agent engine mounts /engine/* on the daemon's UNIX socket
+    // (docs/agent-engine.md §3 amendment), so the HTTP plumbing had to stop
+    // being TCP-only. This is the lock: the SAME parser and the SAME responder,
+    // driven end to end over a UnixStream pair, with the header gates intact.
+    // If someone re-types either signature back to TcpStream, this fails to
+    // compile rather than failing quietly at Phase B.
+    #[test]
+    fn the_control_http_plumbing_speaks_unix_sockets_too() {
+        use std::os::unix::net::UnixStream;
+
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        let body = br#"{"url":"https://example.com/"}"#;
+        let request = format!(
+            "POST /engine/open?profile=research HTTP/1.1\r\nContent-Type: application/json\r\n\
+             X-Ychrome-Control: deadbeef\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        {
+            let mut client = &client;
+            client.write_all(request.as_bytes()).unwrap();
+            client.write_all(body).unwrap();
+            client.flush().unwrap();
+        }
+
+        let parsed = read_request(&server).expect("a unix-socket request parses");
+        assert_eq!(parsed.method, "POST");
+        assert_eq!(parsed.path, "/engine/open");
+        assert_eq!(parsed.query, "profile=research");
+        assert_eq!(parsed.body["url"], "https://example.com/");
+        // The header gates are transport-independent: an engine route reached
+        // over the socket must still be able to see the control token.
+        assert_eq!(parsed.control_token.as_deref(), Some("deadbeef"));
+        assert!(parsed.fido2_token.is_none());
+
+        respond_json(&server, 200, &json!({ "page_id": "pg_1" }), &parsed.path);
+        drop(server);
+
+        let mut raw = String::new();
+        BufReader::new(&client).read_to_string(&mut raw).unwrap();
+        assert!(raw.starts_with("HTTP/1.1 200 OK\r\n"), "got {raw:?}");
+        assert!(raw.contains("Content-Type: application/json"));
+        assert!(raw.ends_with(r#"{"page_id":"pg_1"}"#), "got {raw:?}");
+        // An engine route is not a signer page route, so it gets no CORS
+        // wildcard just because it now shares the parser with one.
+        assert!(
+            !raw.contains("Access-Control-Allow-Origin"),
+            "an /engine/* reply must not advertise CORS: {raw:?}"
+        );
     }
 }
