@@ -583,6 +583,50 @@ Arguments are `key=value`; a value that parses as JSON is JSON, anything else is
 a string. Every verb is equally curl-able over the socket — the CLI is a thin
 client and holds no schema of its own.
 
+### ⚠ A SELECTOR CLICK EITHER LANDS OR REFUSES. It never reports a dispatch that hit nothing.
+
+`document.querySelector` returns the FIRST match and real pages carry hidden
+duplicates (IBKR's login has six-plus `button[type=submit]`, five dead, the live
+one third). `/engine/input` therefore resolves a selector to the **hittable**
+matches, in document order, and takes the first — never the first raw match.
+
+```sh
+# the default: first HITTABLE match
+ychrome ctl input page_id=$p events='[{"type":"click","selector":".go"}]'
+# -> {"ok":true,"dispatched":3,
+#     "resolved":[{"selector":".go","matches":2,"hittable":1,"hidden":1,
+#                  "zero_size":0,"nth":0,"ambiguous":false,"x":190.6,"y":21.5}]}
+```
+
+- **`"nth": k`** takes the k-th HITTABLE match (never the k-th raw match).
+- **`"require_unique": true`** refuses `ambiguous_selector` when more than one
+  match is hittable — for a caller who would rather stop than guess. It does
+  **not** fire on hidden duplicates: five corpses behind one live control is a
+  question with exactly one answer.
+- `resolved` is echoed on every selector click, so a caller that took the
+  default still learns it was one of nine.
+
+A click that cannot land is **`409`** with `{"dispatched":n,"failed_at":i}` and
+one of these named reasons — the same vocabulary the visible surface plane's
+`web do click` uses, so what you learn on one plane carries to the other:
+
+| reason | means |
+|---|---|
+| `no element matches …` | the selector matched nothing |
+| `no_hittable_match (… N zero_size_element, M hidden …)` | it matched, and nothing could receive a click |
+| `zero_size_element` | a `0x0` box (which is what `display:none` measures) |
+| `detached_node` | the node left the document mid-resolve (a re-render) |
+| `target_moved` | the post-scroll point does not reach it: covered, still offscreen, or nothing painted there |
+| `handle_lost` / `rect_not_reresolved` | the two-phase resolve's own contract failed |
+| `ambiguous_selector` | `require_unique` and more than one hittable match |
+
+**A batch resolves each event against the page as it is when that event is
+dispatched**, not up front — so `[{click "#open"},{click "#item"}]` works even
+though `#item` does not exist when the batch arrives. A mid-batch refusal
+answers with the count actually dispatched and the index that stopped it.
+
+Locked by `ychrome engine hit` (15 steps, fixture-backed).
+
 ### ⚠ THE RULE: after input, WAIT for the state you expect. Never read straight after.
 
 WebKitGTK acknowledges key events **one at a time** while `eval` is sent
@@ -647,6 +691,7 @@ of that, and the difference is the whole point.
 ychrome engine probe    # which substrate this host can run, and why
 ychrome engine gate     # Phase A: display, load, pixels, eval, isTrusted differential
 ychrome engine flow     # Phase B: nav/wait/dom and all five input events
+ychrome engine hit      # selector clicks: hittability, the refusals, nth/require_unique
 ychrome engine parity   # Phase C: jar, adblock differential, userscript world
 ychrome engine govern   # Phase D: 300 pages under budget, park/resume
 ychrome engine bench 10 # concurrency + shot latency
@@ -670,4 +715,8 @@ failure. Run them under a private `HOME` and they touch nothing of the user's.
 - Reformatting the crate to satisfy `cargo fmt --check`.
 - Reading a page straight after `ctl input` instead of waiting for the state you
   expect. It works most of the time, which is what makes it dangerous.
+- Treating an element's RECT as proof a click will land there. A
+  `visibility:hidden` decoy measures a perfectly good box; only
+  `elementFromPoint` knows. And an ancestor hit is not a hit — a click there
+  reaches the ancestor, and the node you named never hears about it.
 - Planning anything on per-page memory: it is not measurable here (see above).

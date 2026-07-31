@@ -20,6 +20,7 @@ pub mod api;
 pub mod ctl;
 pub mod flow;
 pub mod gate;
+pub mod hit;
 pub mod host;
 pub mod identity;
 pub mod js;
@@ -171,6 +172,32 @@ pub fn run_verb(sub: Option<&str>, as_json: bool) -> Result<()> {
             }
             Ok(())
         }
+        Some("hit") => {
+            let report = hit::run()?;
+            if as_json {
+                println!("{report}");
+            } else {
+                println!(
+                    "selector-click hittability ({} steps)",
+                    report["steps"].as_array().map(Vec::len).unwrap_or(0)
+                );
+                for step in report["steps"].as_array().into_iter().flatten() {
+                    println!(
+                        "  {} {}",
+                        if step["pass"].as_bool() == Some(true) {
+                            "PASS"
+                        } else {
+                            "FAIL"
+                        },
+                        step["step"].as_str().unwrap_or(""),
+                    );
+                }
+            }
+            if report["pass"].as_bool() != Some(true) {
+                bail!("selector-click hittability FAILED — see the journal and the report above");
+            }
+            Ok(())
+        }
         Some("parity") => {
             let report = parity::run()?;
             if as_json {
@@ -259,8 +286,11 @@ pub fn run_verb(sub: Option<&str>, as_json: bool) -> Result<()> {
             Ok(())
         }
         Some(other) => {
-            bail!("unknown engine verb {other:?} (known: probe, gate, flow, bench, govern, parity)")
+            bail!(
+                "unknown engine verb {other:?} \
+                 (known: probe, gate, flow, hit, bench, govern, parity)"
+            )
         }
-        None => bail!("usage: ychrome engine <probe|gate|flow|bench|govern|parity> [--json]"),
+        None => bail!("usage: ychrome engine <probe|gate|flow|hit|bench|govern|parity> [--json]"),
     }
 }
