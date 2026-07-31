@@ -476,7 +476,7 @@ engine and the surface are different browsers.
 |---|---|
 | identity comes from its owners | jar/UA/script-count all equal what the owners report |
 | **filter compiles once, loads thereafter** | cold store **17,855 ms compile**; second profile **0 ms load**; next process **1 ms load** |
-| same jar, zero re-auth | cookie set on page 1 read back on page 2, in `web-profiles/default` |
+| same jar, zero re-auth | cookie set on page 1 read back on page 2, in `web-profiles/default` — ⛔ **this check was passing on a jar that did not exist**, see below |
 | **adblock differential, headless** | `.Adsense` → `display:none` with blocking on, `block` with it off; control class visible on both |
 | userscript in the declared world | `window.__ychromeParity.world === "main"` via `/eval` |
 
@@ -501,6 +501,31 @@ and flushes before returning, which took it to five in six; the honest fix is
 that **a caller must `/engine/wait` on the state it expects**, which is what
 `wait` is for. With the wait, eight of eight. The mitigation is documented as a
 heuristic in `INPUT_FLUSH` rather than described as a solution.
+
+### ⛔ "Same jar, zero re-auth" was FALSE for three months, and its own test could not see it
+
+Found 2026-07-31. A `WebsiteDataManager` built with base directories still gets
+a **memory-only** cookie store; WebKitGTK persists only when someone calls
+`set_persistent_storage`. wry does that for the visible surface and the
+standalone window (`<profile>/cookies`, Netscape text); `identity.rs` built its
+manager by hand and never did. So every engine page started with an empty jar
+and discarded its cookies on exit — while the profile directory filled up with
+`cache/`, `storage/` and `mediakeys/` and looked perfectly alive.
+
+**The row above passed anyway**, because it set a cookie on one page and read it
+back on another *in the same process*, where an in-memory store is shared. A
+round trip inside one process was never evidence of a jar.
+
+Measured differential, identical steps under two private `HOME`s:
+
+| | `cookies` file after setting one | survives `daemon restart` |
+|---|---|---|
+| binary before the fix | **absent** | n/a |
+| binary after | present, Netscape text | **yes** |
+
+Consequence, and the reason this sat under a Cloudflare investigation: a
+bot-check clearance cookie (`cf_clearance`) could never be kept, so a site that
+issues one re-challenges every navigation and the loop never ends.
 
 **Two honest scope limits.** The visible yggterm GUI was NOT driven — the owner
 is working at the GUI host — so "zero re-auth" is proven as *the engine reads and writes

@@ -214,10 +214,14 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
             let loaded = if url == "about:blank" {
                 Ok(String::new())
             } else {
-                // Zoom is per SITE, so it is applied per navigation, from
-                // `webzoom`'s recorded sites — never remembered here.
+                // Identity BEFORE the navigation — the UA is a request header,
+                // so applying it after the load would identify the browser
+                // correctly only from the second load on. Zoom is per SITE too
+                // but it is a rendering fact, so it rides after.
+                let _ = engine.apply_identity(&id, url);
                 let done = engine.goto(&id, url, GOTO_TIMEOUT);
                 let _ = engine.apply_zoom(&id, url);
+                journal_main_frame(&engine, &id, "engine.load.open");
                 done
             };
             pool().unpin(&id);
@@ -267,9 +271,13 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
             else {
                 return Reply::bad(400, "goto needs a page_id and a url");
             };
+            // Same order as `open`: identity first (it is a request header),
+            // zoom after (it is a rendering fact), then the trace.
+            let _ = engine.apply_identity(&id, url);
             match engine.goto(&id, url, GOTO_TIMEOUT) {
                 Ok(_) => {
                     let _ = engine.apply_zoom(&id, url);
+                    journal_main_frame(&engine, &id, "engine.load.goto");
                     Reply::Json(200, page_status(&engine, &id))
                 }
                 Err(error) => Reply::bad(502, error.to_string()),
@@ -1111,6 +1119,26 @@ fn click_point_from_measure(
         ));
     }
     Ok((x, y))
+}
+
+/// Record what the main frame's load actually RETURNED, on the daemon journal.
+///
+/// ⭐ Nothing used to write this down, and that is why three completely
+/// different failures were indistinguishable from the outside: a bot-check
+/// challenge loop, an asset the content filter ate, and a cookie jar that never
+/// persisted all present as "the page came back and it is not the page". One
+/// line per main-frame load, carrying the status and Cloudflare's own headers,
+/// separates them without anybody having to reproduce the failure first.
+///
+/// Best-effort and silent on error: a trace that could break a navigation would
+/// be worse than no trace.
+fn journal_main_frame(engine: &Engine, id: &str, event: &str) {
+    if let Ok(mut trace) = engine.trace_main_frame(id) {
+        if let Some(object) = trace.as_object_mut() {
+            object.insert("page_id".to_string(), json!(id));
+        }
+        crate::daemon::journal(event, trace);
+    }
 }
 
 /// The one `page` status shape (§4), built in one place so no route grows its
