@@ -303,6 +303,22 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
             // Parse the WHOLE batch before dispatching any of it. A batch that
             // failed halfway would leave the page in a state no caller asked
             // for and none can name.
+            // ⛔ AN EMPTY BATCH IS A CALLER ERROR, NOT A SUCCESS. `raw` comes
+            // from `event["events"].as_array().unwrap_or_default()`, so any
+            // request whose shape does not produce that array arrives here as
+            // zero events — and used to answer `{"dispatched":0,"ok":true}`.
+            // That is a click reported as landed when nothing was even
+            // resolved, let alone dispatched, and it cost a reporting agent
+            // three wrong conclusions in one session, one of which blamed the
+            // operator. `dispatched: 0` must never be `ok: true`.
+            if raw.is_empty() {
+                return Reply::bad(
+                    400,
+                    "/input needs a non-empty `events` array — nothing was dispatched, \
+                     and an empty batch is a caller error rather than a no-op success"
+                        .to_string(),
+                );
+            }
             let mut events = Vec::with_capacity(raw.len());
             for event in &raw {
                 match parse_input(&engine, &id, event) {
@@ -769,26 +785,53 @@ fn parse_input(engine: &Engine, id: &str, event: &Value) -> Result<InputEvent> {
 
 /// Scroll a selector into view and return the viewport centre of its rect.
 fn resolve_selector(engine: &Engine, id: &str, selector: &str) -> Result<(f64, f64)> {
+    // ⛔ FIRST MATCH IS NOT GOOD ENOUGH, AND ZERO AREA IS NOT THE ONLY WAY TO
+    // MISS. A `display:none` duplicate ahead of the real control measures 0x0
+    // and is caught below — but a `visibility:hidden`, `opacity:0`, or simply
+    // COVERED duplicate measures a perfectly good rect, so the click dispatched
+    // into nothing and `{"dispatched":n,"ok":true}` described a click that hit
+    // no one. That lie-of-success cost a reporting agent three wrong
+    // conclusions in one session, one of which blamed the operator.
+    //
+    // So: walk every match and take the first that is genuinely hittable, and
+    // decide hittability the way the browser does — `elementFromPoint` at the
+    // centre must land on the element or inside it. That single test subsumes
+    // zero-area, off-screen, hidden AND covered, instead of enumerating the
+    // ways an element can be unclickable and missing one.
     let quoted = serde_json::to_string(selector)?;
     let value = engine.eval(
         id,
         &format!(
-            "(() => {{ const e = document.querySelector({quoted}); if (!e) return null; \
-             e.scrollIntoView({{block:'center', inline:'center', behavior:'instant'}}); \
-             const r = e.getBoundingClientRect(); \
-             return {{ x: r.x + r.width / 2, y: r.y + r.height / 2, \
-                       w: r.width, h: r.height }}; }})()"
+            "(() => {{ const all = Array.from(document.querySelectorAll({quoted})); \
+             if (!all.length) return null; \
+             let rejected = 0, reason = null; \
+             for (const e of all) {{ \
+               e.scrollIntoView({{block:'center', inline:'center', behavior:'instant'}}); \
+               const r = e.getBoundingClientRect(); \
+               if (r.width <= 0 || r.height <= 0) {{ rejected++; reason = reason || 'zero_size_element'; continue; }} \
+               const x = r.x + r.width / 2, y = r.y + r.height / 2; \
+               if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) {{ rejected++; reason = reason || 'offscreen_element'; continue; }} \
+               const hit = document.elementFromPoint(x, y); \
+               if (!hit || !(hit === e || e.contains(hit) || hit.contains(e))) {{ rejected++; reason = reason || 'element_not_hittable'; continue; }} \
+               return {{ x, y, ok: true, total: all.length, rejected }}; \
+             }} \
+             return {{ ok: false, total: all.length, rejected, reason }}; }})()"
         ),
     )?;
     if value.is_null() {
         bail!("selector {selector:?} matched nothing on this page");
     }
+    if value["ok"].as_bool() != Some(true) {
+        let total = value["total"].as_u64().unwrap_or(0);
+        let reason = value["reason"].as_str().unwrap_or("element_not_hittable");
+        bail!(
+            "selector {selector:?} matched {total} element(s) and NONE was clickable ({reason}) \
+             — refusing rather than dispatching into the void"
+        );
+    }
     let (Some(x), Some(y)) = (value["x"].as_f64(), value["y"].as_f64()) else {
         bail!("selector {selector:?} resolved to no rect");
     };
-    if value["w"].as_f64().unwrap_or(0.0) <= 0.0 || value["h"].as_f64().unwrap_or(0.0) <= 0.0 {
-        bail!("selector {selector:?} has zero area — it cannot be clicked");
-    }
     Ok((x, y))
 }
 
