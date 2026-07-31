@@ -104,6 +104,94 @@ at a moment the user is not mid-task, because it reloads their page.
 
 ---
 
+## ★★★ `/input` DISPATCHES A SELECTOR CLICK TO A ZERO-SIZE ELEMENT AND REPORTS SUCCESS
+
+**Cost three wrong conclusions in one session, one of which blamed the operator's
+vault for a failure that never happened.**
+
+`document.querySelector` returns the FIRST match, and real pages carry hidden
+duplicates. IBKR's login page has six-plus `button[type=submit]`, five of them
+hidden at `0x0`, the live one third in document order:
+
+```
+[{txt:"Login", vis:false, wh:[0,0]},   ← querySelector returns THIS
+ {txt:"Login", vis:false, wh:[0,0]},
+ {txt:"Login", vis:true,  wh:[414,48]},  ← the real one
+ {txt:"Authenticate", vis:false, wh:[0,0]}, …]
+```
+
+`ychrome ctl input page_id=… events='[{"type":"click","selector":"button[type=submit]"}]'`
+resolved that to a `0x0` rect, dispatched at **(0,0)**, and answered:
+
+    {"dispatched":3,"ok":true}
+
+Nothing was clicked. The page appeared to "reset", and I concluded a brokerage
+2FA had rejected a TOTP that had in fact never been submitted — then said so to
+the operator, about his vault.
+
+**The old surface plane already gets this right:** `web do` refuses with
+`"<selector> matched a zero-size element"`, alongside its siblings
+`detached_node` and `target_moved`. §4 of `agent-engine.md` says selector clicks
+are sugar that "resolves center, scrolls into view" — the resolver needs the same
+refusals the surface plane's has.
+
+**Fix:** refuse a `0x0` or offscreen target by default (`zero_size_element`),
+after attempting `scrollIntoView` and re-measuring. Consider preferring the first
+VISIBLE match over the first match, or requiring the caller to opt in to
+ambiguity. **`{"dispatched":n,"ok":true}` must never describe a click that hit
+nothing** — an engine that reports events dispatched into the void is the exact
+lie-of-success shape this codebase refuses everywhere else. Lock it with a
+fixture page carrying a hidden duplicate ahead of the real control.
+
+## ★★ THE ENGINE ONLY EXISTS ON the GUI host, SO AGENT BROWSING STILL BURNS THE OPERATOR'S LAPTOP
+
+The engine's whole purpose is that agent browsing stops costing the human. It is
+half-delivered: **headless means off-screen, not off-host.** `Xvfb :90` and every
+WebKitWebProcess run on **the GUI host — the operator's machine** — so the CPU, RAM and
+thermal cost are still his; only the pixels are hidden.
+
+`dev` and `oc` still have the OLD binary (`ychrome ctl pool --json` →
+`unexpected argument 'pool'`), so there is nowhere else to run it. dev is a
+container on mains power and is the documented preference for anything that
+renders (`data-fabric`: *"Prefer dev over the GUI host… the GUI host is the laptop the user is
+working on"*).
+
+**This is a bug, not a deployment chore**, because the feature's stated benefit
+does not exist until it lands: an engine that can only run on the operator's
+laptop has moved the problem, not solved it. It also blocks the fleet framing in
+`agent-engine.md` §5 (budgets, "hundreds of pages") — none of which belongs on a
+14 GB laptop that has already been driven into swap exhaustion and an OOM kill by
+agent browsing.
+
+**Wants:** ychrome deployed fleet-wide (it "deploys as a fleet" per standing
+practice), and the engine verified reachable from dev/oc, so `ctl` runs where
+nobody is sitting.
+
+## ★★ THE `dream-control-surfaces` ITEMS ARE BUGS, NOT ASPIRATIONS
+
+`docs/dream-control-surfaces.md` is filed as a dream document. The operator's
+ruling, 2026-07-31: **these are bugs.** Framing a missing capability as a dream
+puts it outside every process that would fix it — it is not in a bug list, it has
+no reproduction, and nobody triages it. Several of its items have now cost real
+sessions:
+
+- **§2 Headless surface-create — the OSC must not depend on window focus.** This
+  is precisely the gap that sent an agent toward revealing surfaces on the
+  operator's screen; it is the subject of `dream-detached-agent-surfaces.md` and
+  of the detached-by-default rule in `yggterm/docs/agent-surface-attachment.md`.
+- **§1 Unlock request** and **§6 Autofill-from-vault.** The vault is the standing
+  friction: it is LOCKED on oc and dev (as root it answers `not_configured`) and
+  resolves only on the GUI host, and `fill-vault` needs a mapped surface so it is
+  unavailable on exactly the detached surfaces agents are told to prefer. Every
+  run pays this toll by hand.
+- **§3 OTP from the data-fabric** and **§5 Extract surface** — the same shape.
+
+**Ask:** promote each numbered section into this file with a reproduction and an
+acceptance test, or state explicitly which are declined and why. The `dream-*`
+documents should hold *design*, never *the only record that something is
+missing*. Same applies to `dream-detached-agent-surfaces.md`, whose §5 control
+and §7 table are already bug-shaped.
+
 ## ★★★ THE ENGINE IS NOT HEADLESS — IT OPENS REAL WINDOWS ON THE OPERATOR'S DESKTOP
 
 **Found on the GUI host, 2026-07-31, by the operator, who watched an IBKR login window
