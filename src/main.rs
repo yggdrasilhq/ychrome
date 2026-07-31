@@ -1045,6 +1045,18 @@ fn main() -> Result<()> {
     // host-side truth for agents; `daemon <verb>` supervises the running one.
     let raw: Vec<String> = std::env::args().collect();
     if raw.get(1).map(String::as_str) == Some("--daemon") {
+        // ⛔ THE DAEMON MUST RECONCILE TOO, and this call is why. The reconcile
+        // below (before `policy()`) only runs on the open-a-url path, so a host
+        // whose ychrome is only ever *started as a daemon* — which is the normal
+        // case, since `ensure()` spawns it detached — would never notice that
+        // the binary on disk now carries newer bundled assets than the copies in
+        // ~/.yggterm. Caught live on 2026-07-31: after a fleet deploy and a
+        // `daemon restart`, the host still held the old 60-rule ruleset and no
+        // cosmetic script, and only a hand-run `ychrome provision` fixed it.
+        // A bundled asset that can sit dead on a host is the exact failure this
+        // module exists to end, so the daemon takes the same reconcile at the
+        // earliest moment after a binary swap that anything runs at all.
+        provision::reconcile_and_report();
         return daemon::run();
     }
     if raw.get(1).map(String::as_str) == Some("status") {
@@ -1369,6 +1381,45 @@ mod second_invocation_tests {
                 other => panic!("a free stream anchors here, got {other:?} for {reply:?}"),
             }
         }
+    }
+
+    /// ⛔ THE DAEMON RECONCILES ITS BUNDLED ASSETS BEFORE IT SERVES.
+    ///
+    /// This was live-broken on 2026-07-31 and no test noticed. `--daemon`
+    /// returned from `main()` long before the reconcile on the open-a-url path,
+    /// so a host whose ychrome is only ever *started as a daemon* — the normal
+    /// case, because `ensure()` spawns it detached — kept its old assets
+    /// forever. After a fleet deploy plus a `daemon restart`, the GUI host still held
+    /// the 60-rule ruleset and had no cosmetic script at all; only a hand-run
+    /// `ychrome provision` repaired it.
+    ///
+    /// The provision module exists precisely so a bundled asset cannot sit dead
+    /// on a host, and the daemon door was a hole straight through it. Asserting
+    /// the ORDER matters as much as the presence: reconciling after
+    /// `daemon::run()` would never run, since that call does not return.
+    #[test]
+    fn the_daemon_arm_reconciles_bundled_assets_before_it_starts_serving() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main() -> Result<()> {")
+            .nth(1)
+            .expect("main body present");
+        let arm = body
+            .split(r#"== Some("--daemon")"#)
+            .nth(1)
+            .expect("the --daemon arm is present");
+        let reconcile_at = arm.find("provision::reconcile_and_report();").expect(
+            "the --daemon arm MUST reconcile bundled assets — a daemon-only host \
+             never reaches the open-a-url reconcile, so without this a deployed \
+             ruleset sits dead on disk (live-caught 2026-07-31)",
+        );
+        let serve_at = arm
+            .find("return daemon::run();")
+            .expect("the --daemon arm serves via daemon::run()");
+        assert!(
+            reconcile_at < serve_at,
+            "reconcile must come BEFORE daemon::run(), which never returns"
+        );
     }
 
     // ANCHOR: the wiring in main(). The plan is only a lock if the
