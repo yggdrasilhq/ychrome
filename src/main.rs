@@ -285,6 +285,40 @@ fn print_site_lore(url: &str) {
     );
 }
 
+/// Register, then declare what THAT registration returned. The ONE way this
+/// program emits a `sidebar ; declare`, and the reason it takes no endpoint
+/// argument: there is no variable a caller could hand it, so it cannot publish
+/// an endpoint that is not the daemon's current answer. Returns whether it
+/// declared.
+///
+/// **Why by construction and not by a refresh someone remembers to call.** The
+/// declare carries the control url AND the control token, and both move together
+/// when a daemon is handed over (a fresh listener, a freshly minted token). The
+/// previous shape kept the last-known endpoint in a `control` local and
+/// re-declared it whenever the re-register failed — which is exactly what
+/// happens DURING a handover, so the client published a url+token pair belonging
+/// to a daemon that had already exited. If the successor happened to re-bind the
+/// same port, the GUI then held a live url with a dead token and every pane and
+/// action 403'd until the next declare corrected it.
+///
+/// A missed declare is cheap: it is the contribution's ~4s liveness signal
+/// against the GUI's 15s expiry, so one skipped tick costs nothing, and the
+/// honest silence lets a contribution expire rather than pinning the rail to an
+/// endpoint nobody serves.
+fn declare_current(session: &str, profile: &str) -> bool {
+    let Some(endpoint) = daemon::register_supervised(session, profile) else {
+        return false;
+    };
+    sidebar::emit_declare(
+        session,
+        &endpoint.url,
+        &endpoint.token,
+        &webpolicy::policy_version(profile),
+        &webzoom::zoom_version(),
+    );
+    true
+}
+
 fn drive_surface(
     session: &str,
     url: &str,
@@ -305,23 +339,9 @@ fn drive_surface(
     // document-start. Open first and the GUI's first apply pass sees a surface
     // with no contribution and builds it unblocked — no userscripts, no adblock,
     // silently, for the life of that webview.
-    let mut control: Option<daemon::ControlEndpoint> =
-        match daemon::register_supervised(session, profile) {
-            Some(endpoint) => {
-                sidebar::emit_declare(
-                    session,
-                    &endpoint.url,
-                    &endpoint.token,
-                    &webpolicy::policy_version(profile),
-                    &webzoom::zoom_version(),
-                );
-                Some(endpoint)
-            }
-            None => {
-                eprintln!("ychrome: sidebar unavailable (daemon did not come up)");
-                None
-            }
-        };
+    if !declare_current(session, profile) {
+        eprintln!("ychrome: sidebar unavailable (daemon did not come up)");
+    }
     emit_web_surface_osc("open", session, url, title, profile, start_page);
     eprintln!(
         "ychrome: web surface open — {url} [{profile}]  (Ctrl+C to close, Ctrl+Z / yggterm Zzz to suspend)"
@@ -329,24 +349,6 @@ fn drive_surface(
     print_site_lore(url);
     let mut ticks: u32 = 0;
     let mut last_tick = std::time::Instant::now();
-    // Re-declare with the CURRENT control url — it moves if the daemon respawned
-    // onto a fresh listener. The declare IS the contribution's liveness signal,
-    // and it must precede an "open" so a recreated surface never loads before its
-    // policy (userscripts inject at document-start).
-    // The declare carries the control TOKEN as well as the url — the GUI cannot
-    // drive a pane without it (see `sidebar::ControlState::control_token`), so a
-    // moved endpoint means both halves are re-declared together or neither is.
-    let redeclare = |control: &Option<daemon::ControlEndpoint>| {
-        if let Some(endpoint) = control {
-            sidebar::emit_declare(
-                session,
-                &endpoint.url,
-                &endpoint.token,
-                &webpolicy::policy_version(profile),
-                &webzoom::zoom_version(),
-            );
-        }
-    };
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(200));
         // A large gap between ticks means we were suspended (Ctrl+Z /
@@ -356,8 +358,7 @@ fn drive_surface(
         // deliberately cannot re-CREATE a surface, and an "open" with an
         // unchanged URL is liveness-idempotent GUI-side.
         if last_tick.elapsed() > Duration::from_secs(3) {
-            control = daemon::register_supervised(session, profile).or(control);
-            redeclare(&control);
+            declare_current(session, profile);
             emit_web_surface_osc("open", session, url, title, profile, start_page);
         }
         last_tick = std::time::Instant::now();
@@ -370,11 +371,7 @@ fn drive_surface(
             // reaper drops a session whose client goes quiet) and re-earns it
             // after a daemon respawn. A moved control url means a new listener —
             // re-declare so the GUI follows it.
-            let refreshed = daemon::register_supervised(session, profile);
-            if refreshed.is_some() && refreshed != control {
-                control = refreshed;
-            }
-            redeclare(&control);
+            declare_current(session, profile);
         }
     }
     sidebar::emit_close(session);
@@ -918,6 +915,35 @@ fn run_status(as_json: bool) -> Result<()> {
             println!(
                 "  {env}  profile={profile}  queue={depth}  routable={}",
                 if routable { "yes" } else { "no" }
+            );
+        }
+        // A session whose CLI predates the control-token gate keeps its ad
+        // blocking and its userscripts (those routes are open) and silently
+        // cannot open its vault or settings pane, forever. It is invisible
+        // everywhere else, so it is named here with the only thing that fixes
+        // it — the same standard as the [STALE] daemon lines above.
+        //
+        // EXPLICITLY false, never merely absent. A daemon older than this field
+        // omits it — and that daemon has no gate at all, so its panes work and a
+        // warning would be a false alarm on the one deploy where everything is
+        // fine. Silence means "not asked", not "no".
+        let no_courier: Vec<&str> = sessions
+            .iter()
+            .filter(|session| session["control_token_declared"].as_bool() == Some(false))
+            .filter_map(|session| session["env_id"].as_str())
+            .collect();
+        if !no_courier.is_empty() {
+            println!(
+                "  [NO PANES] {} session(s) run a ychrome CLI that predates the control-token \
+                 gate, so their vault and settings panes answer 403 and cannot open:",
+                no_courier.len()
+            );
+            for env in &no_courier {
+                println!("  [NO PANES]   {env}");
+            }
+            println!(
+                "  [NO PANES] ad blocking and userscripts are unaffected. A daemon restart does \
+                 NOT fix this. Press Ctrl+C in each session's terminal and run ychrome again."
             );
         }
     }
@@ -1583,6 +1609,56 @@ mod second_invocation_tests {
                 other => panic!("a free stream anchors here, got {other:?} for {reply:?}"),
             }
         }
+    }
+
+    /// THE STALE DECLARE, made impossible rather than merely avoided.
+    ///
+    /// The declare carries the control url AND the control token, and a daemon
+    /// handover moves both at once. The loop used to keep the last-known
+    /// endpoint in a local and re-declare it whenever the re-register failed —
+    /// which is exactly what happens DURING a handover — so it published a pair
+    /// belonging to a daemon that had already exited. This locks the shape that
+    /// removes the possibility: exactly one `emit_declare` in the whole program,
+    /// inside a function that registers first and takes no endpoint to be handed
+    /// a stale one.
+    #[test]
+    fn a_declare_can_only_carry_a_registration_it_just_made() {
+        let source = include_str!("main.rs");
+        let product = source
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("the product half of main.rs");
+        assert_eq!(
+            product.matches("sidebar::emit_declare(").count(),
+            1,
+            "a second declare call site is a second place a cached endpoint can \
+             be published; there is one, and it is `declare_current`"
+        );
+        let body = product
+            .split("fn declare_current(session: &str, profile: &str) -> bool {")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("declare_current body present");
+        assert!(
+            body.contains("daemon::register_supervised(session, profile)")
+                && body.contains("sidebar::emit_declare("),
+            "the declare must be fed by a registration made in the same call"
+        );
+        let drive = product
+            .split("fn drive_surface(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n/// The surface the picker").next())
+            .expect("drive_surface body present");
+        assert!(
+            !drive.contains("ControlEndpoint"),
+            "the surface loop is holding an endpoint across ticks again — that \
+             variable is the only way a dead url+token pair reaches the GUI"
+        );
+        assert!(
+            !drive.contains("emit_declare"),
+            "the loop declares directly again, bypassing the register-then-declare \
+             pairing that makes staleness impossible"
+        );
     }
 
     /// Every verb `main` actually dispatches must be in `RESERVED_SUBCOMMANDS`.

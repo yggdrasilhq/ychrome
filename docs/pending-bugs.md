@@ -4,6 +4,116 @@ Entries are removed in the same commit as their verified fix. Newest first.
 
 ---
 
+## ★★ (yggterm) THE PANE THROWS AWAY THE 403 THAT EXPLAINS ITSELF
+
+**Not in this repo. Filed here because it is the remaining half of the
+`control endpoint returned 403` report of 2026-07-31**, whose ychrome half is
+fixed (see `docs/protocol.md` §"The third mixed case").
+
+ychrome's GUI-only refusals now answer with the cause and the remedy in the body:
+
+```json
+{
+  "cause": "client_predates_control_token",
+  "error": "forbidden: /pane/vault is GUI-only and the ychrome CLI serving this
+            session predates the control-token gate, so it declares no token and
+            this route can never answer. restarting the daemon does not fix it
+            and neither does restarting the GUI: press Ctrl+C in that session's
+            terminal and run ychrome again. …"
+}
+```
+
+`yggterm-shell/src/shell.rs:2149` discards all of it:
+
+```rust
+if !(200..300).contains(&status) {
+    return Err(format!("control endpoint returned {status}"));
+}
+```
+
+That string is what `app_pane_apply_error` renders, so the user reads a bare
+status code while the app is answering in full sentences one function call away.
+**The fix is to carry the body's `error` when the response has one** (and it may
+key off `cause` for a structured recovery later). Until that lands, the actionable
+text is reachable only from the daemon journal, `ychrome status`, or curl.
+
+⚠ An ychrome-side workaround was considered and rejected: answering `GET
+/pane/<id>` with a 200 whose schema explains the failure would put the message
+where the user is, but it would also make a page-reachable GUI-only route answer
+200, which is the invariant the gate exists to hold. The 403 is right; the GUI
+should read it.
+
+---
+
+## ★★★ THE PASSKEY SHIM PATCHES `navigator.credentials` ON EVERY PAGE, INCLUDING A CHALLENGE PAGE
+
+**Found 2026-07-31 while investigating why a Cloudflare challenge on a
+brilliant.org login would not clear.** Not the cause of that report (the UA and
+the engine's cookie jar were, both fixed) but a real, measured incoherence that
+a bot check can read.
+
+`sidebar.rs`'s `/policy` prepends `passkey::shim_userscript()` to EVERY
+surface's userscripts, main world, document-start, unconditionally. On a page it
+touches:
+
+- `navigator.credentials` becomes a plain `Object.create(native || {})`, whose
+  methods stringify to JS source rather than `[native code]`;
+- `window.PublicKeyCredential` is DEFINED, and
+  `isUserVerifyingPlatformAuthenticatorAvailable()` answers `true`.
+
+**Measured on the engine plane (which does not install the shim), WebKitGTK
+2.52.5:** `typeof window.PublicKeyCredential === "undefined"` and
+`navigator.credentials === undefined`. WebKitGTK has no WebAuthn at all. So on
+the visible surface we claim a platform authenticator that this engine cannot
+have — an anomaly no real GNOME Web ever shows.
+
+**Why top-frame-only does not save it.** The shim is already `all_frames:
+false`, so the `challenges.cloudflare.com` iframe is clean. But an interstitial
+managed challenge is served as the TOP-FRAME document at the site's own URL, and
+its collector runs in exactly the environment the shim has already patched.
+
+**Why there is no cheap fix, stated so it is not re-attempted.** Since the
+engine genuinely lacks WebAuthn, ANY presence of these APIs is the anomaly —
+making the shim "look native" cannot work, and a URL-pattern exclusion cannot
+help because the challenge is served at the normal page URL. The only correct
+shape is **per-origin installation**: build the shim's `Userscript::matches`
+from the set of rpIds the vault actually holds passkeys for, so a page for a
+site you have no passkey for sees a pristine `navigator`.
+
+That needs a vault op this client does not have — `passkeys <item>` resolves one
+item and there is no way to enumerate rpIds. The work is:
+
+1. add a `passkey-hosts` op to `ychrome-vault`'s agent (metadata only: rpIds, no
+   credential ids, no keys);
+2. call it from `sidebar.rs` through `ychrome-vault-proto` (already linked, no
+   subprocess) and set `matches` to `*://*.<rpId>/*` per host;
+3. a LOCKED vault answers nothing, and installing no shim is then CORRECT rather
+   than a regression — a ceremony needs an unlocked agent anyway;
+4. ⚠ do not put the rpId probe on the `policy_version` path: that stamp is
+   recomputed on the ~4 s heartbeat and must not grow a socket round trip.
+
+---
+
+## ★★ (yggterm) A PROFILE WHOSE WRITE-LOCK IS HELD ELSEWHERE OPENS EPHEMERAL, SILENTLY
+
+**Not in this repo — filed here because it is the other half of the cookie-jar
+failure ychrome just fixed on its own engine plane, and an ychrome user meets it
+as "the login will not stick".**
+
+`yggterm-shell/src/shell.rs` (~:10672) comments that a surface whose profile
+write-lock is held elsewhere "opens READ-ONLY (ephemeral, no jar)". Ephemeral is
+not read-only: an ephemeral `WebContext` reads NOTHING from the jar and writes
+nothing back. A second surface on a profile another surface already holds
+therefore starts logged out and cannot keep a cookie — including a bot-check
+clearance cookie, which is why a challenged login can loop forever with nothing
+on screen explaining it.
+
+Two things are owed there: make the degradation match its comment (a genuinely
+read-only jar), and **stop degrading silently** — the surface has to say which
+mode it opened in.
+
+---
+
 ## ★★★ A DAEMON HANDOVER STRANDS THE GUI ON A DEAD CONTROL PORT, AND SURFACES SILENTLY LOSE ADBLOCK
 
 **User-reported 2026-07-31, immediately after a deploy + `ychrome daemon
@@ -101,6 +211,18 @@ note"). The 2026-07-31 deploy handed over the daemon and did **not** cycle the
 clients, which is exactly how this surfaced. Until the fix lands, the manual
 remedy is to cycle each session's ychrome CLI so it re-declares its endpoint —
 at a moment the user is not mid-task, because it reloads their page.
+
+⚠ **Measured while fixing the sibling token bug, 2026-07-31 — one fact that
+narrows this one.** The CLIENT does re-declare the moved control url on every
+~4s heartbeat, and has since 2026-07-18; a real client was driven through a real
+`ychrome daemon restart` on dev and followed the new port every time. So the
+dead-port window is one heartbeat, not the life of the session, and the durable
+damage named above ("no userscripts, permanently") comes from the SURFACE that
+was created unblocked during that window rather than from a declare that never
+arrives. That makes fix (2) — repair a surface that opened unblocked — the
+load-bearing half. Which sessions are still on a pre-gate CLI is now visible in
+`ychrome status`; that marker is about the token, not about this port, but it
+answers "did anyone forget to cycle the clients" in one command.
 
 ---
 

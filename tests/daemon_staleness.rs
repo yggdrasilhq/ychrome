@@ -19,12 +19,13 @@
 //! and the daemon's socket API is a contract other programs (the yggterm GUI's
 //! host side, agents) read too.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
@@ -161,6 +162,61 @@ impl Host {
         assert!(done.success(), "could not move the binary's mtime");
     }
 
+    /// Attach a surface the way a **PRE-GATE** view client does: the same
+    /// register, without the `declares_control_token` claim, because a binary
+    /// built before 2026-07-28 had never heard of it. This is the shape that
+    /// produced the live 403s, so it is worth being able to write down.
+    fn attach_pre_gate_surface(&self, env_id: &str, profile: &str) -> Value {
+        let reply = self.ask(json!({
+            "op": "register",
+            "env_id": env_id,
+            "profile": profile,
+            "pid": std::process::id(),
+        }));
+        assert_eq!(reply["ok"], json!(true), "register refused: {reply}");
+        reply
+    }
+
+    /// Run the REAL surface client, in thin-client mode, with its OSC stream
+    /// captured. This is the only way to see what a live browser actually
+    /// declares — and the declare is the token's one and only courier, so
+    /// nothing short of reading it off the client's own stdout proves anything
+    /// about the token the GUI ends up holding.
+    fn spawn_client(&self, env_id: &str, profile: &str) -> ClientProcess {
+        let mut child = Command::new(&self.exe)
+            .args(["--profile", profile, "https://example.com/"])
+            .env("HOME", &self.home)
+            .env("YGGTERM_SESSION_ID", env_id)
+            // A display would send it down the standalone GTK path instead.
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the ychrome client runs");
+        let declares = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let stdout = child.stdout.take().expect("stdout is piped");
+        {
+            let declares = Arc::clone(&declares);
+            std::thread::spawn(move || {
+                let mut reader = stdout;
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while let Ok(read) = reader.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    while let Some(declare) = take_declare(&mut buffer) {
+                        declares.lock().unwrap().push(declare);
+                    }
+                }
+            });
+        }
+        ClientProcess { child, declares }
+    }
+
     /// Daemons spawned from OUR copy, found by cmdline. Matching on the copy's
     /// path is what makes the cleanup incapable of killing the user's daemon.
     fn daemon_pids(&self) -> Vec<u32> {
@@ -182,6 +238,109 @@ impl Host {
         }
         pids
     }
+}
+
+/// A live surface client, and the declares it has emitted so far.
+struct ClientProcess {
+    child: Child,
+    declares: Arc<Mutex<Vec<Value>>>,
+}
+
+impl ClientProcess {
+    /// The most recent declare, or `None` if it has not spoken yet.
+    fn latest(&self) -> Option<Value> {
+        self.declares.lock().unwrap().last().cloned()
+    }
+
+    /// Wait for a declare whose control endpoint differs from `previous`. That
+    /// is the client following a daemon handover: a new listener, and a freshly
+    /// minted token that moves with it.
+    fn wait_for_moved_endpoint(&self, previous: &Value, within: Duration) -> Value {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(latest) = self.latest()
+                && latest["control"] != previous["control"]
+            {
+                return latest;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the client never re-declared a moved endpoint after the handover; \
+                 last declare was {:?}",
+                self.latest()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+impl Drop for ClientProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Pull one complete `OSC 7717 ; sidebar ; declare ; <base64>` BEL out of the
+/// buffer, leaving anything after it. `None` when no complete one is there yet.
+///
+/// The client's stream also carries `web-surface` OSCs on the same 7717
+/// dispatcher, so the verb is matched, not the prefix.
+fn take_declare(buffer: &mut Vec<u8>) -> Option<Value> {
+    use base64::Engine as _;
+    const HEAD: &[u8] = b"]7717;sidebar;declare;";
+    let start = buffer
+        .windows(HEAD.len())
+        .position(|window| window == HEAD)?;
+    let payload_at = start + HEAD.len();
+    let bel = buffer[payload_at..].iter().position(|byte| *byte == 0x07)?;
+    let encoded = buffer[payload_at..payload_at + bel].to_vec();
+    buffer.drain(..payload_at + bel + 1);
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(&encoded)
+        .expect("a declare's payload is base64");
+    Some(serde_json::from_slice(&raw).expect("a declare's payload is json"))
+}
+
+/// One request against a session's control endpoint, spoken by hand for the
+/// same reason the unix ops are: this is the wire the yggterm GUI speaks, and a
+/// round trip through our own client code would pass even if both halves
+/// drifted. Returns `(status, body)`.
+fn control_get(control_url: &str, path: &str, token: Option<&str>) -> (u16, Value) {
+    let addr = control_url
+        .strip_prefix("http://")
+        .expect("a loopback control url");
+    let mut stream = std::net::TcpStream::connect(addr)
+        .unwrap_or_else(|error| panic!("connecting to {addr}: {error}"));
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let auth = match token {
+        Some(token) => format!("X-Ychrome-Control: {token}\r\n"),
+        None => String::new(),
+    };
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Connection: close\r\n\r\n"
+    )
+    .expect("the control endpoint takes a request");
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).expect("a control response");
+    let (head, body) = raw.split_once("\r\n\r\n").expect("a response has a body");
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("a status line");
+    (status, serde_json::from_str(body).unwrap_or(Value::Null))
+}
+
+/// Is this control endpoint still answering at all? A handed-over daemon takes
+/// its listeners with it, so the old port stops connecting.
+fn control_is_dead(control_url: &str) -> bool {
+    let addr = control_url
+        .strip_prefix("http://")
+        .expect("a loopback control url");
+    std::net::TcpStream::connect(addr).is_err()
 }
 
 /// A failing assertion must not leave a real daemon running on a real socket:
@@ -436,4 +595,156 @@ fn retire_if_idle_refuses_while_a_surface_is_attached_and_names_it() {
     let after = host.status();
     assert_ne!(after["pid"].as_u64().expect("a daemon pid"), pid, "{after}");
     assert_eq!(after["ok"], json!(true), "{after}");
+}
+
+// ---------------------------------------------------------------------------
+// THE CONTROL TOKEN ACROSS A HANDOVER
+//
+// Reported live 2026-07-31: the vault and settings panes rendered one line,
+// `control endpoint returned 403`, while ad blocking and SponsorBlock kept
+// working — after the ychrome daemon had been handed over six times without the
+// per-session CLIs being cycled.
+//
+// The token's only courier is the client's `sidebar ; declare` OSC. A daemon
+// handover mints a NEW token, so a client that publishes anything other than its
+// current registration hands the GUI a credential the endpoint will refuse.
+// Nothing in-process can show that: it needs a real client process, a real
+// handover, and a real gated request over the real wire.
+// ---------------------------------------------------------------------------
+
+// THE ACCEPTANCE. A gated route answers the GUI, the daemon is handed over
+// underneath it, and the same gated route answers again — using only what the
+// client re-declared, with no restart of the client and nobody remembering to
+// refresh anything.
+#[test]
+fn a_gated_route_survives_a_daemon_handover_on_what_the_client_re_declares() {
+    let host = Host::new("token");
+    let first = host.status();
+    host.assert_isolated(&first);
+
+    let client = host.spawn_client("env-token", "tokprobe");
+    let before = {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(declare) = client.latest() {
+                break declare;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the client never declared its sidebar contribution"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let old_url = before["control"]
+        .as_str()
+        .expect("a control url")
+        .to_string();
+    let old_token = before["control_token"]
+        .as_str()
+        .expect("a declared control token")
+        .to_string();
+    assert!(!old_token.is_empty(), "the declare must carry a token");
+
+    // The GUI's call, before anything moves.
+    let (status, _) = control_get(&old_url, "/pane/settings", Some(&old_token));
+    assert_eq!(status, 200, "the declared token must drive the pane");
+    // And the same call without it is the 403 the user saw, so the 200 above is
+    // the token's doing and not an absent gate.
+    let (refused, body) = control_get(&old_url, "/pane/settings", None);
+    assert_eq!(refused, 403, "the gate must be live: {body}");
+
+    // Hand the daemon over, exactly as the deploy step does.
+    let out = host.run(&["daemon", "restart"]);
+    assert!(
+        out.status.success(),
+        "restart failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The client follows on its own heartbeat. Both halves move together: a new
+    // listener AND a new token.
+    let after = client.wait_for_moved_endpoint(&before, Duration::from_secs(20));
+    let new_url = after["control"]
+        .as_str()
+        .expect("a control url")
+        .to_string();
+    let new_token = after["control_token"]
+        .as_str()
+        .expect("a declared control token")
+        .to_string();
+    assert_ne!(new_token, old_token, "a new daemon mints a new token");
+
+    // ⭐ THE PROOF: the gated route answers again, on nothing but what the client
+    // re-declared. This is what 403'd for the life of the session before.
+    let (status, schema) = control_get(&new_url, "/pane/settings", Some(&new_token));
+    assert_eq!(
+        status, 200,
+        "the pane must answer across a handover: {schema}"
+    );
+
+    // And it is genuinely a new generation, not the same endpoint under a new
+    // name: the old token is refused, and the old port is gone with its daemon.
+    let (stale, body) = control_get(&new_url, "/pane/settings", Some(&old_token));
+    assert_eq!(stale, 403, "the retired daemon's token must not still work");
+    assert_eq!(body["cause"], "token_mismatch", "{body}");
+    assert!(
+        control_is_dead(&old_url) || old_url == new_url,
+        "the retired daemon's listener outlived it: {old_url}"
+    );
+}
+
+// THE BUG AS THE USER MET IT, and the thing that was missing when they did: a
+// client that cannot carry the token is a session whose panes can never open,
+// and until now nothing said so. The 403 named neither the cause nor the cure,
+// `ychrome status` showed a perfectly healthy row, and `/policy` kept answering
+// — so ad blocking worked and the panes did not, with no way to connect the two.
+#[test]
+fn a_pre_gate_client_is_named_as_such_by_the_refusal_and_by_status() {
+    let host = Host::new("pregate");
+    let first = host.status();
+    host.assert_isolated(&first);
+
+    let registered = host.attach_pre_gate_surface("env-pregate", "oldcli");
+    let control_url = registered["control_url"].as_str().expect("a control url");
+
+    // What still works, and is exactly why this hid: the open routes.
+    let (status, _) = control_get(control_url, "/policy", None);
+    assert_eq!(status, 200, "ad blocking and userscripts keep working");
+
+    // What does not, and what it now says about it.
+    let (status, body) = control_get(control_url, "/pane/vault", None);
+    assert_eq!(status, 403);
+    assert_eq!(body["cause"], "client_predates_control_token", "{body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("predates the control-token gate")
+            && error.contains("Ctrl+C")
+            && error.contains("restarting the daemon does not fix it"),
+        "the refusal must carry the cause AND the remedy: {error}"
+    );
+
+    // The registry says it too, so this is findable without provoking a 403.
+    let status_json = host.status();
+    let row = status_json["sessions"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["env_id"] == "env-pregate"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        row["control_token_declared"],
+        json!(false),
+        "the registry must mark a session whose panes cannot open: {row}"
+    );
+
+    // And a human reading `ychrome status` is told, with the one fix that works.
+    let printed = String::from_utf8_lossy(&host.run(&["status"]).stdout).to_string();
+    assert!(
+        printed.contains("[NO PANES]") && printed.contains("env-pregate"),
+        "status must name the session: {printed}"
+    );
+    assert!(
+        printed.contains("A daemon restart does NOT fix this"),
+        "status must rule out the remedy people reach for first: {printed}"
+    );
 }
