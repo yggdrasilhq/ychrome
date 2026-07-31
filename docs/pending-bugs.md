@@ -104,6 +104,75 @@ at a moment the user is not mid-task, because it reloads their page.
 
 ---
 
+## ★★★ THE ENGINE IS NOT HEADLESS — IT OPENS REAL WINDOWS ON THE OPERATOR'S DESKTOP
+
+**Found on the GUI host, 2026-07-31, by the operator, who watched an IBKR login window
+appear over the video he was watching.** He sent a screenshot. This is the
+feature's central promise inverted: the engine exists so agent browsing stops
+touching the human's screen, and instead it puts a titled `ychrome` toplevel in
+front of them — **with a filled-in brokerage login visible on it.**
+
+### Reproduction
+
+```
+ychrome ctl open url=https://… profile=finance viewport='{"w":1400,"h":950}'
+  → {"ok":true,"page_id":"pg_00000N","state":"live"}       ← reports success
+  → and a real window appears on the operator's Wayland session
+```
+
+`ychrome ctl close page_id=…` removes the window, so the lifecycle is at least
+honest; the window simply should never have existed.
+
+### Cause (diagnosed, not guessed)
+
+The daemon's environment has **no `WAYLAND_DISPLAY` and no `DISPLAY`**:
+
+```
+$ tr '\0' '\n' < /proc/$(pgrep -f 'ychrome --daemon')/environ | grep -icE 'wayland|display'
+0
+$ ls /run/user/1000/wayland-*
+/run/user/1000/wayland-0   /run/user/1000/wayland-0.lock   /run/user/1000/wayland-1
+```
+
+**GDK's Wayland backend defaults to `wayland-0` when `WAYLAND_DISPLAY` is
+unset**, and `XDG_RUNTIME_DIR` still points at the operator's runtime dir — so
+"no display configured" does not mean "no display". It means *the operator's
+compositor*. Unsetting the variable is not isolation; it is the default path to
+their screen.
+
+This is the same family as two failures already recorded in this fleet's memory:
+x11vnc refusing to start because it saw an inherited `WAYLAND_DISPLAY`, and the
+daemon's frozen environment poisoning every session it spawns. **An inherited —
+or absent — variable that describes a different world.**
+
+### What `docs/agent-engine.md` promises
+
+§9.1 Decision 1 settles the substrate as *"WebKitGTK on an engine-owned headless
+display."* The **engine-owned headless display is the half that is missing.**
+Either it was never wired, or it is not reached on this path.
+
+### Shape of a fix
+
+- The engine must **own its display**, explicitly and positively: start (or
+  attach to) a headless compositor — `wlheadless`/`cage`/a nested sway, or
+  `WAYLAND_DISPLAY=<engine-owned>` — and set it in the environment of the
+  webviews it creates. Never inherit, never default.
+- **Fail closed.** If the engine cannot get its own display it must refuse to
+  open a page, with a named error, rather than silently borrowing the seat. An
+  engine that quietly renders on the operator's compositor is worse than an
+  engine that does not start: the whole point of the plane is that the human's
+  screen is not ours.
+- **Lock it**: assert the webview's display is not the session's — compare
+  against `XDG_RUNTIME_DIR`'s `wayland-0`, or assert an engine-owned value is
+  set — and mutate it to prove the test red.
+
+### Until it is fixed
+
+**Agent browsing through `ctl` is NOT safe to run on a host the operator is
+using.** It is not a background row (the earlier `--no-activate` complaint) — it
+is a focused window over their work. Treat the engine as usable only on a
+headless host until this closes.
+
 ## ★★ A MISTYPED OR NOT-YET-BUILT SUBCOMMAND IS SILENTLY SWALLOWED AS A URL
 
 **Found on oc, 2026-07-31, while checking whether the engine had been deployed.
