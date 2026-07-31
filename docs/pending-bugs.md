@@ -301,6 +301,34 @@ what blocked building a page-of-my-own control for the injection question — se
 
 ---
 
+## ⚠ FLAKY TEST — `daemon_staleness` fails on a busy host, and it is NOT the code
+
+**Characterised 2026-08-01 on dev, after it cost a session real time twice.**
+Two tests in `tests/daemon_staleness.rs` fail intermittently:
+
+```
+a_pre_gate_client_is_named_as_such_by_the_refusal_and_by_status
+a_gated_route_survives_a_daemon_handover_on_what_the_client_re_declares
+  → panicked at tests/daemon_staleness.rs:326: a control response:
+    Os { code: 11, kind: WouldBlock }        ← a 5s read timeout, not a bug
+```
+
+`control_get` gives a spawned real binary **5 s** to answer over TCP. dev is a
+32-core LXC that regularly sits at load 45-112 (the yggterm test binaries alone
+were measured at 1208% and 1144% CPU), and under that the budget is simply not
+enough.
+
+**Proven to be load, not a regression, by a controlled A/B under the same load:**
+at load 112 the *baseline* (HEAD with the change stashed) failed **3/3**; at
+load ~44 the same tree passed **8/8 in 8.2 s**. Anything that changes the
+daemon's startup path will look like it caused this. It did not.
+
+**Want:** make the budget generous (or adaptive) rather than a wall clock a
+loaded CI host cannot meet — a timing test that fails on a busy machine teaches
+agents to ignore red, which is worse than the flake.
+
+---
+
 ## ⚠ MINOR — `ychrome ctl --help` asks the engine to run `--help` as a verb
 
 Found while verifying the subcommand-swallow fix, 2026-08-01. The important
