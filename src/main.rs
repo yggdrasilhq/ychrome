@@ -34,6 +34,7 @@ mod sitehost;
 mod sponsorblock;
 mod useragent;
 mod userscript;
+mod webmedia;
 mod webpolicy;
 mod webzoom;
 use clap::Parser;
