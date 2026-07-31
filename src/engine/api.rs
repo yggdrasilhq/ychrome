@@ -72,6 +72,28 @@ fn engine() -> Result<Arc<Engine>> {
     Ok(engine)
 }
 
+/// Stop the engine if one was ever started, taking its display down with it.
+///
+/// Rust never drops a `static`, and the engine CLI deliberately ends with
+/// `_exit`, which skips even the atexit chain — so `Engine::drop` would never
+/// run for the registry's engine and its Xvfb would outlive the process.
+/// Measured before this existed: one orphaned Xvfb per `ychrome engine bench`,
+/// while `engine gate` (whose Engine is a local) cleaned up fine. The lesson is
+/// that owning your own exit means owning your own teardown too.
+pub fn shutdown() {
+    let Some(slot) = ENGINE.get() else {
+        return;
+    };
+    let taken = slot.lock().ok().and_then(|mut guard| guard.take());
+    if let Some(engine) = taken {
+        crate::daemon::journal("engine.stop", json!({ "display": engine.display_name() }));
+        // An Arc: this reaps the display only if no request thread still holds
+        // a handle, which is the correct order — the last caller out turns the
+        // lights off.
+        drop(engine);
+    }
+}
+
 /// Does this path belong to the engine? The daemon asks before parsing
 /// anything else, so `/engine/*` and the legacy verbs can never collide.
 pub fn owns(path: &str) -> bool {
