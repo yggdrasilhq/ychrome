@@ -1,0 +1,3463 @@
+{
+ "adBreakHeartbeatParams": "Q0FBJTNE",
+ "adPlacements": [
+  {
+   "adPlacementRenderer": {
+    "adSlotLoggingData": {
+     "serializedSlotAdServingDataEntry": "<scrubbed>"
+    },
+    "config": {
+     "adPlacementConfig": {
+      "adTimeOffset": {
+       "offsetEndMilliseconds": "-1",
+       "offsetStartMilliseconds": "0"
+      },
+      "hideCueRangeMarker": true,
+      "kind": "AD_PLACEMENT_KIND_START"
+     }
+    },
+    "renderer": {
+     "clientForecastingAdRenderer": {}
+    }
+   }
+  }
+ ],
+ "annotations": [
+  {
+   "playerAnnotationsExpandedRenderer": {
+    "allowSwipeDismiss": true,
+    "annotationId": "5dad8f5d-0000-20c2-8451-883d24f8e7cc",
+    "featuredChannel": {
+     "channelName": "Rick Astley",
+     "endTimeMs": "193000",
+     "navigationEndpoint": {
+      "browseEndpoint": {
+       "browseId": "UCuAXFkgsw1L7xaCfnd5JJOw"
+      },
+      "clickTrackingParams": "<scrubbed>",
+      "commandMetadata": {
+       "webCommandMetadata": {
+        "apiUrl": "/youtubei/v1/browse",
+        "rootVe": 3611,
+        "url": "<scrubbed>",
+        "webPageType": "WEB_PAGE_TYPE_CHANNEL"
+       }
+      }
+     },
+     "startTimeMs": "0",
+     "subscribeButton": {
+      "subscribeButtonRenderer": {
+       "buttonText": {
+        "runs": [
+         {
+          "text": "SUBSCRIBE"
+         }
+        ]
+       },
+       "channelId": "UCuAXFkgsw1L7xaCfnd5JJOw",
+       "enabled": true,
+       "serviceEndpoints": [
+        {
+         "clickTrackingParams": "<scrubbed>",
+         "commandMetadata": {
+          "webCommandMetadata": {
+           "apiUrl": "/youtubei/v1/subscription/subscribe",
+           "sendPost": true
+          }
+         },
+         "subscribeEndpoint": {
+          "channelIds": [
+           "UCuAXFkgsw1L7xaCfnd5JJOw"
+          ],
+          "params": "<scrubbed>"
+         }
+        },
+        {
+         "clickTrackingParams": "<scrubbed>",
+         "commandMetadata": {
+          "webCommandMetadata": {
+           "sendPost": true
+          }
+         },
+         "signalServiceEndpoint": {
+          "actions": [
+           {
+            "clickTrackingParams": "<scrubbed>",
+            "openPopupAction": {
+             "popup": {
+              "confirmDialogRenderer": {
+               "cancelButton": {
+                "buttonRenderer": {
+                 "accessibility": {
+                  "label": "Cancel"
+                 },
+                 "isDisabled": false,
+                 "size": "SIZE_DEFAULT",
+                 "style": "STYLE_TEXT",
+                 "text": {
+                  "runs": [
+                   {
+                    "text": "Cancel"
+                   }
+                  ]
+                 },
+                 "trackingParams": "<scrubbed>"
+                }
+               },
+               "confirmButton": {
+                "buttonRenderer": {
+                 "accessibility": {
+                  "label": "Unsubscribe"
+                 },
+                 "isDisabled": false,
+                 "serviceEndpoint": {
+                  "clickTrackingParams": "<scrubbed>",
+                  "commandMetadata": {
+                   "webCommandMetadata": {
+                    "apiUrl": "/youtubei/v1/subscription/unsubscribe",
+                    "sendPost": true
+                   }
+                  },
+                  "unsubscribeEndpoint": {
+                   "channelIds": [
+                    "UCuAXFkgsw1L7xaCfnd5JJOw"
+                   ],
+                   "params": "<scrubbed>"
+                  }
+                 },
+                 "size": "SIZE_DEFAULT",
+                 "style": "STYLE_BLUE_TEXT",
+                 "text": {
+                  "runs": [
+                   {
+                    "text": "Unsubscribe"
+                   }
+                  ]
+                 },
+                 "trackingParams": "<scrubbed>"
+                }
+               },
+               "dialogMessages": [
+                {
+                 "runs": [
+                  {
+                   "text": "Unsubscribe from "
+                  },
+                  {
+                   "text": "Rick Astley"
+                  },
+                  {
+                   "text": "?"
+                  }
+                 ]
+                }
+               ],
+               "primaryIsCancel": false,
+               "trackingParams": "<scrubbed>"
+              }
+             },
+             "popupType": "DIALOG"
+            }
+           }
+          ],
+          "signal": "CLIENT_SIGNAL"
+         }
+        }
+       ],
+       "showPreferences": false,
+       "signInEndpoint": {
+        "clickTrackingParams": "<scrubbed>",
+        "commandMetadata": {
+         "webCommandMetadata": {
+          "url": "<scrubbed>"
+         }
+        }
+       },
+       "subscribeAccessibility": {
+        "accessibilityData": {
+         "label": "Subscribe to Rick Astley."
+        }
+       },
+       "subscribed": false,
+       "subscribedButtonText": {
+        "runs": [
+         {
+          "text": "SUBSCRIBED"
+         }
+        ]
+       },
+       "trackingParams": "<scrubbed>",
+       "type": "FREE",
+       "unsubscribeAccessibility": {
+        "accessibilityData": {
+         "label": "Unsubscribe from Rick Astley."
+        }
+       },
+       "unsubscribeButtonText": {
+        "runs": [
+         {
+          "text": "UNSUBSCRIBE"
+         }
+        ]
+       },
+       "unsubscribedButtonText": {
+        "runs": [
+         {
+          "text": "SUBSCRIBE"
+         }
+        ]
+       }
+      }
+     },
+     "trackingParams": "<scrubbed>",
+     "watermark": {
+      "thumbnails": [
+       {
+        "height": 40,
+        "url": "<scrubbed>",
+        "width": 40
+       }
+      ]
+     }
+    }
+   }
+  }
+ ],
+ "captions": {
+  "playerCaptionsTracklistRenderer": {
+   "audioTracks": [
+    {
+     "captionTrackIndices": [
+      0,
+      2,
+      3,
+      4,
+      5,
+      1
+     ],
+     "captionsInitialState": "CAPTIONS_INITIAL_STATE_OFF_RECOMMENDED",
+     "defaultCaptionTrackIndex": 0,
+     "hasDefaultTrack": true
+    }
+   ],
+   "captionTracks": [
+    {
+     "baseUrl": "<scrubbed>",
+     "isTranslatable": true,
+     "languageCode": "en",
+     "name": {
+      "simpleText": "English"
+     },
+     "trackName": "",
+     "vssId": ".en"
+    },
+    {
+     "baseUrl": "<scrubbed>",
+     "isTranslatable": true,
+     "kind": "asr",
+     "languageCode": "en",
+     "name": {
+      "simpleText": "English (auto-generated)"
+     },
+     "trackName": "",
+     "vssId": "a.en"
+    },
+    {
+     "baseUrl": "<scrubbed>",
+     "isTranslatable": true,
+     "languageCode": "de-DE",
+     "name": {
+      "simpleText": "German (Germany)"
+     },
+     "trackName": "",
+     "vssId": ".de-DE"
+    },
+    {
+     "baseUrl": "<scrubbed>",
+     "isTranslatable": true,
+     "languageCode": "ja",
+     "name": {
+      "simpleText": "Japanese"
+     },
+     "trackName": "",
+     "vssId": ".ja"
+    },
+    {
+     "baseUrl": "<scrubbed>",
+     "isTranslatable": true,
+     "languageCode": "pt-BR",
+     "name": {
+      "simpleText": "Portuguese (Brazil)"
+     },
+     "trackName": "",
+     "vssId": ".pt-BR"
+    },
+    {
+     "baseUrl": "<scrubbed>",
+     "isTranslatable": true,
+     "languageCode": "es-419",
+     "name": {
+      "simpleText": "Spanish (Latin America)"
+     },
+     "trackName": "",
+     "vssId": ".es-419"
+    }
+   ],
+   "defaultAudioTrackIndex": 0,
+   "translationLanguages": [
+    {
+     "languageCode": "ab",
+     "languageName": {
+      "simpleText": "Abkhazian"
+     }
+    },
+    {
+     "languageCode": "aa",
+     "languageName": {
+      "simpleText": "Afar"
+     }
+    },
+    {
+     "languageCode": "af",
+     "languageName": {
+      "simpleText": "Afrikaans"
+     }
+    },
+    {
+     "languageCode": "ak",
+     "languageName": {
+      "simpleText": "Akan"
+     }
+    },
+    {
+     "languageCode": "sq",
+     "languageName": {
+      "simpleText": "Albanian"
+     }
+    },
+    {
+     "languageCode": "am",
+     "languageName": {
+      "simpleText": "Amharic"
+     }
+    },
+    {
+     "languageCode": "ar",
+     "languageName": {
+      "simpleText": "Arabic"
+     }
+    },
+    {
+     "languageCode": "hy",
+     "languageName": {
+      "simpleText": "Armenian"
+     }
+    },
+    {
+     "languageCode": "as",
+     "languageName": {
+      "simpleText": "Assamese"
+     }
+    },
+    {
+     "languageCode": "ay",
+     "languageName": {
+      "simpleText": "Aymara"
+     }
+    },
+    {
+     "languageCode": "az",
+     "languageName": {
+      "simpleText": "Azerbaijani"
+     }
+    },
+    {
+     "languageCode": "bn",
+     "languageName": {
+      "simpleText": "Bangla"
+     }
+    },
+    {
+     "languageCode": "ba",
+     "languageName": {
+      "simpleText": "Bashkir"
+     }
+    },
+    {
+     "languageCode": "eu",
+     "languageName": {
+      "simpleText": "Basque"
+     }
+    },
+    {
+     "languageCode": "be",
+     "languageName": {
+      "simpleText": "Belarusian"
+     }
+    },
+    {
+     "languageCode": "bho",
+     "languageName": {
+      "simpleText": "Bhojpuri"
+     }
+    },
+    {
+     "languageCode": "bs",
+     "languageName": {
+      "simpleText": "Bosnian"
+     }
+    },
+    {
+     "languageCode": "br",
+     "languageName": {
+      "simpleText": "Breton"
+     }
+    },
+    {
+     "languageCode": "bg",
+     "languageName": {
+      "simpleText": "Bulgarian"
+     }
+    },
+    {
+     "languageCode": "my",
+     "languageName": {
+      "simpleText": "Burmese"
+     }
+    },
+    {
+     "languageCode": "ca",
+     "languageName": {
+      "simpleText": "Catalan"
+     }
+    },
+    {
+     "languageCode": "ceb",
+     "languageName": {
+      "simpleText": "Cebuano"
+     }
+    },
+    {
+     "languageCode": "zh-Hans",
+     "languageName": {
+      "simpleText": "Chinese (Simplified)"
+     }
+    },
+    {
+     "languageCode": "zh-Hant",
+     "languageName": {
+      "simpleText": "Chinese (Traditional)"
+     }
+    },
+    {
+     "languageCode": "co",
+     "languageName": {
+      "simpleText": "Corsican"
+     }
+    },
+    {
+     "languageCode": "hr",
+     "languageName": {
+      "simpleText": "Croatian"
+     }
+    },
+    {
+     "languageCode": "cs",
+     "languageName": {
+      "simpleText": "Czech"
+     }
+    },
+    {
+     "languageCode": "da",
+     "languageName": {
+      "simpleText": "Danish"
+     }
+    },
+    {
+     "languageCode": "dv",
+     "languageName": {
+      "simpleText": "Divehi"
+     }
+    },
+    {
+     "languageCode": "nl",
+     "languageName": {
+      "simpleText": "Dutch"
+     }
+    },
+    {
+     "languageCode": "dz",
+     "languageName": {
+      "simpleText": "Dzongkha"
+     }
+    },
+    {
+     "languageCode": "en",
+     "languageName": {
+      "simpleText": "English"
+     }
+    },
+    {
+     "languageCode": "eo",
+     "languageName": {
+      "simpleText": "Esperanto"
+     }
+    },
+    {
+     "languageCode": "et",
+     "languageName": {
+      "simpleText": "Estonian"
+     }
+    },
+    {
+     "languageCode": "ee",
+     "languageName": {
+      "simpleText": "Ewe"
+     }
+    },
+    {
+     "languageCode": "fo",
+     "languageName": {
+      "simpleText": "Faroese"
+     }
+    },
+    {
+     "languageCode": "fj",
+     "languageName": {
+      "simpleText": "Fijian"
+     }
+    },
+    {
+     "languageCode": "fil",
+     "languageName": {
+      "simpleText": "Filipino"
+     }
+    },
+    {
+     "languageCode": "fi",
+     "languageName": {
+      "simpleText": "Finnish"
+     }
+    },
+    {
+     "languageCode": "fr",
+     "languageName": {
+      "simpleText": "French"
+     }
+    },
+    {
+     "languageCode": "gaa",
+     "languageName": {
+      "simpleText": "Ga"
+     }
+    },
+    {
+     "languageCode": "gl",
+     "languageName": {
+      "simpleText": "Galician"
+     }
+    },
+    {
+     "languageCode": "lg",
+     "languageName": {
+      "simpleText": "Ganda"
+     }
+    },
+    {
+     "languageCode": "ka",
+     "languageName": {
+      "simpleText": "Georgian"
+     }
+    },
+    {
+     "languageCode": "de",
+     "languageName": {
+      "simpleText": "German"
+     }
+    },
+    {
+     "languageCode": "el",
+     "languageName": {
+      "simpleText": "Greek"
+     }
+    },
+    {
+     "languageCode": "gn",
+     "languageName": {
+      "simpleText": "Guarani"
+     }
+    },
+    {
+     "languageCode": "gu",
+     "languageName": {
+      "simpleText": "Gujarati"
+     }
+    },
+    {
+     "languageCode": "ht",
+     "languageName": {
+      "simpleText": "Haitian Creole"
+     }
+    },
+    {
+     "languageCode": "ha",
+     "languageName": {
+      "simpleText": "Hausa"
+     }
+    },
+    {
+     "languageCode": "haw",
+     "languageName": {
+      "simpleText": "Hawaiian"
+     }
+    },
+    {
+     "languageCode": "iw",
+     "languageName": {
+      "simpleText": "Hebrew"
+     }
+    },
+    {
+     "languageCode": "hi",
+     "languageName": {
+      "simpleText": "Hindi"
+     }
+    },
+    {
+     "languageCode": "hmn",
+     "languageName": {
+      "simpleText": "Hmong"
+     }
+    },
+    {
+     "languageCode": "hu",
+     "languageName": {
+      "simpleText": "Hungarian"
+     }
+    },
+    {
+     "languageCode": "is",
+     "languageName": {
+      "simpleText": "Icelandic"
+     }
+    },
+    {
+     "languageCode": "ig",
+     "languageName": {
+      "simpleText": "Igbo"
+     }
+    },
+    {
+     "languageCode": "id",
+     "languageName": {
+      "simpleText": "Indonesian"
+     }
+    },
+    {
+     "languageCode": "iu",
+     "languageName": {
+      "simpleText": "Inuktitut"
+     }
+    },
+    {
+     "languageCode": "ga",
+     "languageName": {
+      "simpleText": "Irish"
+     }
+    },
+    {
+     "languageCode": "it",
+     "languageName": {
+      "simpleText": "Italian"
+     }
+    },
+    {
+     "languageCode": "ja",
+     "languageName": {
+      "simpleText": "Japanese"
+     }
+    },
+    {
+     "languageCode": "jv",
+     "languageName": {
+      "simpleText": "Javanese"
+     }
+    },
+    {
+     "languageCode": "kl",
+     "languageName": {
+      "simpleText": "Kalaallisut"
+     }
+    },
+    {
+     "languageCode": "kn",
+     "languageName": {
+      "simpleText": "Kannada"
+     }
+    },
+    {
+     "languageCode": "kk",
+     "languageName": {
+      "simpleText": "Kazakh"
+     }
+    },
+    {
+     "languageCode": "kha",
+     "languageName": {
+      "simpleText": "Khasi"
+     }
+    },
+    {
+     "languageCode": "km",
+     "languageName": {
+      "simpleText": "Khmer"
+     }
+    },
+    {
+     "languageCode": "rw",
+     "languageName": {
+      "simpleText": "Kinyarwanda"
+     }
+    },
+    {
+     "languageCode": "ko",
+     "languageName": {
+      "simpleText": "Korean"
+     }
+    },
+    {
+     "languageCode": "kri",
+     "languageName": {
+      "simpleText": "Krio"
+     }
+    },
+    {
+     "languageCode": "ku",
+     "languageName": {
+      "simpleText": "Kurdish"
+     }
+    },
+    {
+     "languageCode": "ky",
+     "languageName": {
+      "simpleText": "Kyrgyz"
+     }
+    },
+    {
+     "languageCode": "lo",
+     "languageName": {
+      "simpleText": "Lao"
+     }
+    },
+    {
+     "languageCode": "la",
+     "languageName": {
+      "simpleText": "Latin"
+     }
+    },
+    {
+     "languageCode": "lv",
+     "languageName": {
+      "simpleText": "Latvian"
+     }
+    },
+    {
+     "languageCode": "ln",
+     "languageName": {
+      "simpleText": "Lingala"
+     }
+    },
+    {
+     "languageCode": "lt",
+     "languageName": {
+      "simpleText": "Lithuanian"
+     }
+    },
+    {
+     "languageCode": "lua",
+     "languageName": {
+      "simpleText": "Luba-Lulua"
+     }
+    },
+    {
+     "languageCode": "luo",
+     "languageName": {
+      "simpleText": "Luo"
+     }
+    },
+    {
+     "languageCode": "lb",
+     "languageName": {
+      "simpleText": "Luxembourgish"
+     }
+    },
+    {
+     "languageCode": "mk",
+     "languageName": {
+      "simpleText": "Macedonian"
+     }
+    },
+    {
+     "languageCode": "mg",
+     "languageName": {
+      "simpleText": "Malagasy"
+     }
+    },
+    {
+     "languageCode": "ms",
+     "languageName": {
+      "simpleText": "Malay"
+     }
+    },
+    {
+     "languageCode": "ml",
+     "languageName": {
+      "simpleText": "Malayalam"
+     }
+    },
+    {
+     "languageCode": "mt",
+     "languageName": {
+      "simpleText": "Maltese"
+     }
+    },
+    {
+     "languageCode": "gv",
+     "languageName": {
+      "simpleText": "Manx"
+     }
+    },
+    {
+     "languageCode": "mi",
+     "languageName": {
+      "simpleText": "M\u0101ori"
+     }
+    },
+    {
+     "languageCode": "mr",
+     "languageName": {
+      "simpleText": "Marathi"
+     }
+    },
+    {
+     "languageCode": "mn",
+     "languageName": {
+      "simpleText": "Mongolian"
+     }
+    },
+    {
+     "languageCode": "mfe",
+     "languageName": {
+      "simpleText": "Morisyen"
+     }
+    },
+    {
+     "languageCode": "ne",
+     "languageName": {
+      "simpleText": "Nepali"
+     }
+    },
+    {
+     "languageCode": "new",
+     "languageName": {
+      "simpleText": "Newari"
+     }
+    },
+    {
+     "languageCode": "nso",
+     "languageName": {
+      "simpleText": "Northern Sotho"
+     }
+    },
+    {
+     "languageCode": "no",
+     "languageName": {
+      "simpleText": "Norwegian"
+     }
+    },
+    {
+     "languageCode": "ny",
+     "languageName": {
+      "simpleText": "Nyanja"
+     }
+    },
+    {
+     "languageCode": "oc",
+     "languageName": {
+      "simpleText": "Occitan"
+     }
+    },
+    {
+     "languageCode": "or",
+     "languageName": {
+      "simpleText": "Odia"
+     }
+    },
+    {
+     "languageCode": "om",
+     "languageName": {
+      "simpleText": "Oromo"
+     }
+    },
+    {
+     "languageCode": "os",
+     "languageName": {
+      "simpleText": "Ossetic"
+     }
+    },
+    {
+     "languageCode": "pam",
+     "languageName": {
+      "simpleText": "Pampanga"
+     }
+    },
+    {
+     "languageCode": "ps",
+     "languageName": {
+      "simpleText": "Pashto"
+     }
+    },
+    {
+     "languageCode": "fa",
+     "languageName": {
+      "simpleText": "Persian"
+     }
+    },
+    {
+     "languageCode": "pl",
+     "languageName": {
+      "simpleText": "Polish"
+     }
+    },
+    {
+     "languageCode": "pt",
+     "languageName": {
+      "simpleText": "Portuguese"
+     }
+    },
+    {
+     "languageCode": "pt-PT",
+     "languageName": {
+      "simpleText": "Portuguese (Portugal)"
+     }
+    },
+    {
+     "languageCode": "pa",
+     "languageName": {
+      "simpleText": "Punjabi"
+     }
+    },
+    {
+     "languageCode": "qu",
+     "languageName": {
+      "simpleText": "Quechua"
+     }
+    },
+    {
+     "languageCode": "ro",
+     "languageName": {
+      "simpleText": "Romanian"
+     }
+    },
+    {
+     "languageCode": "rn",
+     "languageName": {
+      "simpleText": "Rundi"
+     }
+    },
+    {
+     "languageCode": "ru",
+     "languageName": {
+      "simpleText": "Russian"
+     }
+    },
+    {
+     "languageCode": "sm",
+     "languageName": {
+      "simpleText": "Samoan"
+     }
+    },
+    {
+     "languageCode": "sg",
+     "languageName": {
+      "simpleText": "Sango"
+     }
+    },
+    {
+     "languageCode": "sa",
+     "languageName": {
+      "simpleText": "Sanskrit"
+     }
+    },
+    {
+     "languageCode": "gd",
+     "languageName": {
+      "simpleText": "Scottish Gaelic"
+     }
+    },
+    {
+     "languageCode": "sr",
+     "languageName": {
+      "simpleText": "Serbian"
+     }
+    },
+    {
+     "languageCode": "crs",
+     "languageName": {
+      "simpleText": "Seselwa Creole French"
+     }
+    },
+    {
+     "languageCode": "sn",
+     "languageName": {
+      "simpleText": "Shona"
+     }
+    },
+    {
+     "languageCode": "sd",
+     "languageName": {
+      "simpleText": "Sindhi"
+     }
+    },
+    {
+     "languageCode": "si",
+     "languageName": {
+      "simpleText": "Sinhala"
+     }
+    },
+    {
+     "languageCode": "sk",
+     "languageName": {
+      "simpleText": "Slovak"
+     }
+    },
+    {
+     "languageCode": "sl",
+     "languageName": {
+      "simpleText": "Slovenian"
+     }
+    },
+    {
+     "languageCode": "so",
+     "languageName": {
+      "simpleText": "Somali"
+     }
+    },
+    {
+     "languageCode": "st",
+     "languageName": {
+      "simpleText": "Southern Sotho"
+     }
+    },
+    {
+     "languageCode": "es",
+     "languageName": {
+      "simpleText": "Spanish"
+     }
+    },
+    {
+     "languageCode": "su",
+     "languageName": {
+      "simpleText": "Sundanese"
+     }
+    },
+    {
+     "languageCode": "sw",
+     "languageName": {
+      "simpleText": "Swahili"
+     }
+    },
+    {
+     "languageCode": "ss",
+     "languageName": {
+      "simpleText": "Swati"
+     }
+    },
+    {
+     "languageCode": "sv",
+     "languageName": {
+      "simpleText": "Swedish"
+     }
+    },
+    {
+     "languageCode": "tg",
+     "languageName": {
+      "simpleText": "Tajik"
+     }
+    },
+    {
+     "languageCode": "ta",
+     "languageName": {
+      "simpleText": "Tamil"
+     }
+    },
+    {
+     "languageCode": "tt",
+     "languageName": {
+      "simpleText": "Tatar"
+     }
+    },
+    {
+     "languageCode": "te",
+     "languageName": {
+      "simpleText": "Telugu"
+     }
+    },
+    {
+     "languageCode": "th",
+     "languageName": {
+      "simpleText": "Thai"
+     }
+    },
+    {
+     "languageCode": "bo",
+     "languageName": {
+      "simpleText": "Tibetan"
+     }
+    },
+    {
+     "languageCode": "ti",
+     "languageName": {
+      "simpleText": "Tigrinya"
+     }
+    },
+    {
+     "languageCode": "to",
+     "languageName": {
+      "simpleText": "Tongan"
+     }
+    },
+    {
+     "languageCode": "ts",
+     "languageName": {
+      "simpleText": "Tsonga"
+     }
+    },
+    {
+     "languageCode": "tn",
+     "languageName": {
+      "simpleText": "Tswana"
+     }
+    },
+    {
+     "languageCode": "tum",
+     "languageName": {
+      "simpleText": "Tumbuka"
+     }
+    },
+    {
+     "languageCode": "tr",
+     "languageName": {
+      "simpleText": "Turkish"
+     }
+    },
+    {
+     "languageCode": "tk",
+     "languageName": {
+      "simpleText": "Turkmen"
+     }
+    },
+    {
+     "languageCode": "uk",
+     "languageName": {
+      "simpleText": "Ukrainian"
+     }
+    },
+    {
+     "languageCode": "ur",
+     "languageName": {
+      "simpleText": "Urdu"
+     }
+    },
+    {
+     "languageCode": "ug",
+     "languageName": {
+      "simpleText": "Uyghur"
+     }
+    },
+    {
+     "languageCode": "uz",
+     "languageName": {
+      "simpleText": "Uzbek"
+     }
+    },
+    {
+     "languageCode": "ve",
+     "languageName": {
+      "simpleText": "Venda"
+     }
+    },
+    {
+     "languageCode": "vi",
+     "languageName": {
+      "simpleText": "Vietnamese"
+     }
+    },
+    {
+     "languageCode": "war",
+     "languageName": {
+      "simpleText": "Waray"
+     }
+    },
+    {
+     "languageCode": "cy",
+     "languageName": {
+      "simpleText": "Welsh"
+     }
+    },
+    {
+     "languageCode": "fy",
+     "languageName": {
+      "simpleText": "Western Frisian"
+     }
+    },
+    {
+     "languageCode": "wo",
+     "languageName": {
+      "simpleText": "Wolof"
+     }
+    },
+    {
+     "languageCode": "xh",
+     "languageName": {
+      "simpleText": "Xhosa"
+     }
+    },
+    {
+     "languageCode": "yi",
+     "languageName": {
+      "simpleText": "Yiddish"
+     }
+    },
+    {
+     "languageCode": "yo",
+     "languageName": {
+      "simpleText": "Yoruba"
+     }
+    },
+    {
+     "languageCode": "zu",
+     "languageName": {
+      "simpleText": "Zulu"
+     }
+    }
+   ]
+  }
+ },
+ "cards": {
+  "cardCollectionRenderer": {
+   "allowTeaserDismiss": true,
+   "cards": [
+    {
+     "cardRenderer": {
+      "cueRanges": [
+       {
+        "endCardActiveMs": "5000",
+        "iconAfterTeaserMs": "5000",
+        "startCardActiveMs": "0",
+        "teaserDurationMs": "6000"
+       }
+      ],
+      "teaser": {
+       "simpleCardTeaserRenderer": {
+        "logVisibilityUpdates": true,
+        "message": {
+         "simpleText": "View corrections"
+        },
+        "onTapCommand": {
+         "changeEngagementPanelVisibilityAction": {
+          "targetId": "engagement-panel-error-corrections",
+          "visibility": "ENGAGEMENT_PANEL_VISIBILITY_EXPANDED"
+         },
+         "clickTrackingParams": "<scrubbed>"
+        },
+        "prominent": true,
+        "trackingParams": "<scrubbed>"
+       }
+      },
+      "trackingParams": "<scrubbed>"
+     }
+    }
+   ],
+   "closeButton": {
+    "infoCardIconRenderer": {
+     "trackingParams": "<scrubbed>"
+    }
+   },
+   "headerText": {
+    "simpleText": "From Rick Astley"
+   },
+   "icon": {
+    "infoCardIconRenderer": {
+     "trackingParams": "<scrubbed>"
+    }
+   },
+   "logIconVisibilityUpdates": true,
+   "trackingParams": "<scrubbed>"
+  }
+ },
+ "endscreen": {
+  "endscreenRenderer": {
+   "elements": [
+    {
+     "endscreenElementRenderer": {
+      "aspectRatio": 1,
+      "callToAction": {
+       "simpleText": "VISIT CHANNEL"
+      },
+      "dismiss": {
+       "simpleText": "CANCEL"
+      },
+      "endMs": "212040",
+      "endpoint": {
+       "browseEndpoint": {
+        "browseId": "UCuAXFkgsw1L7xaCfnd5JJOw"
+       },
+       "clickTrackingParams": "<scrubbed>",
+       "commandMetadata": {
+        "webCommandMetadata": {
+         "apiUrl": "/youtubei/v1/browse",
+         "rootVe": 3611,
+         "url": "<scrubbed>",
+         "webPageType": "WEB_PAGE_TYPE_CHANNEL"
+        }
+       }
+      },
+      "hovercardButton": {
+       "subscribeButtonRenderer": {
+        "buttonText": {
+         "runs": [
+          {
+           "text": "SUBSCRIBE"
+          }
+         ]
+        },
+        "channelId": "UCuAXFkgsw1L7xaCfnd5JJOw",
+        "enabled": true,
+        "serviceEndpoints": [
+         {
+          "clickTrackingParams": "<scrubbed>",
+          "commandMetadata": {
+           "webCommandMetadata": {
+            "apiUrl": "/youtubei/v1/subscription/subscribe",
+            "sendPost": true
+           }
+          },
+          "subscribeEndpoint": {
+           "channelIds": [
+            "UCuAXFkgsw1L7xaCfnd5JJOw"
+           ],
+           "params": "<scrubbed>"
+          }
+         },
+         {
+          "clickTrackingParams": "<scrubbed>",
+          "commandMetadata": {
+           "webCommandMetadata": {
+            "sendPost": true
+           }
+          },
+          "signalServiceEndpoint": {
+           "actions": [
+            {
+             "clickTrackingParams": "<scrubbed>",
+             "openPopupAction": {
+              "popup": {
+               "confirmDialogRenderer": {
+                "cancelButton": {
+                 "buttonRenderer": {
+                  "accessibility": {
+                   "label": "Cancel"
+                  },
+                  "isDisabled": false,
+                  "size": "SIZE_DEFAULT",
+                  "style": "STYLE_TEXT",
+                  "text": {
+                   "runs": [
+                    {
+                     "text": "Cancel"
+                    }
+                   ]
+                  },
+                  "trackingParams": "<scrubbed>"
+                 }
+                },
+                "confirmButton": {
+                 "buttonRenderer": {
+                  "accessibility": {
+                   "label": "Unsubscribe"
+                  },
+                  "isDisabled": false,
+                  "serviceEndpoint": {
+                   "clickTrackingParams": "<scrubbed>",
+                   "commandMetadata": {
+                    "webCommandMetadata": {
+                     "apiUrl": "/youtubei/v1/subscription/unsubscribe",
+                     "sendPost": true
+                    }
+                   },
+                   "unsubscribeEndpoint": {
+                    "channelIds": [
+                     "UCuAXFkgsw1L7xaCfnd5JJOw"
+                    ],
+                    "params": "<scrubbed>"
+                   }
+                  },
+                  "size": "SIZE_DEFAULT",
+                  "style": "STYLE_BLUE_TEXT",
+                  "text": {
+                   "runs": [
+                    {
+                     "text": "Unsubscribe"
+                    }
+                   ]
+                  },
+                  "trackingParams": "<scrubbed>"
+                 }
+                },
+                "dialogMessages": [
+                 {
+                  "runs": [
+                   {
+                    "text": "Unsubscribe from "
+                   },
+                   {
+                    "text": "Rick Astley"
+                   },
+                   {
+                    "text": "?"
+                   }
+                  ]
+                 }
+                ],
+                "primaryIsCancel": false,
+                "trackingParams": "<scrubbed>"
+               }
+              },
+              "popupType": "DIALOG"
+             }
+            }
+           ],
+           "signal": "CLIENT_SIGNAL"
+          }
+         }
+        ],
+        "showPreferences": false,
+        "signInEndpoint": {
+         "clickTrackingParams": "<scrubbed>",
+         "commandMetadata": {
+          "webCommandMetadata": {
+           "url": "<scrubbed>"
+          }
+         }
+        },
+        "subscribeAccessibility": {
+         "accessibilityData": {
+          "label": "Subscribe to Rick Astley."
+         }
+        },
+        "subscribed": false,
+        "subscribedButtonText": {
+         "runs": [
+          {
+           "text": "SUBSCRIBED"
+          }
+         ]
+        },
+        "trackingParams": "<scrubbed>",
+        "type": "FREE",
+        "unsubscribeAccessibility": {
+         "accessibilityData": {
+          "label": "Unsubscribe from Rick Astley."
+         }
+        },
+        "unsubscribeButtonText": {
+         "runs": [
+          {
+           "text": "UNSUBSCRIBE"
+          }
+         ]
+        },
+        "unsubscribedButtonText": {
+         "runs": [
+          {
+           "text": "SUBSCRIBE"
+          }
+         ]
+        }
+       }
+      },
+      "icon": {
+       "thumbnails": [
+        {
+         "url": "<scrubbed>"
+        }
+       ]
+      },
+      "id": "720b1b77-5167-4d00-a42e-b8e715efaef1",
+      "image": {
+       "thumbnails": [
+        {
+         "height": 250,
+         "url": "<scrubbed>",
+         "width": 250
+        },
+        {
+         "height": 400,
+         "url": "<scrubbed>",
+         "width": 400
+        }
+       ]
+      },
+      "isSubscribe": true,
+      "left": 0.035802968,
+      "metadata": {
+       "simpleText": "<scrubbed>"
+      },
+      "startMs": "201451",
+      "style": "CHANNEL",
+      "title": {
+       "accessibility": {
+        "accessibilityData": {
+         "label": "Rick Astley, channel"
+        }
+       },
+       "simpleText": "Rick Astley"
+      },
+      "top": 0.14801845,
+      "trackingParams": "<scrubbed>",
+      "width": 0.15438597
+     }
+    },
+    {
+     "endscreenElementRenderer": {
+      "aspectRatio": 1.7777778,
+      "endMs": "212040",
+      "endpoint": {
+       "clickTrackingParams": "<scrubbed>",
+       "commandMetadata": {
+        "interactionLoggingCommandMetadata": {
+         "loggingExpectations": {
+          "screenCreatedLoggingExpectations": {
+           "expectedParentScreens": [
+            {
+             "screenVeType": 3832
+            }
+           ]
+          }
+         }
+        },
+        "webCommandMetadata": {
+         "rootVe": 3832,
+         "url": "<scrubbed>",
+         "webPageType": "WEB_PAGE_TYPE_WATCH"
+        }
+       },
+       "watchEndpoint": {
+        "videoId": "qQDrqV5Hw4c",
+        "watchEndpointSupportedOnesieConfig": {
+         "html5PlaybackOnesieConfig": {
+          "commonConfig": {
+           "url": "<scrubbed>"
+          }
+         }
+        }
+       }
+      },
+      "id": "2267387294768269328",
+      "image": {
+       "thumbnails": [
+        {
+         "height": 94,
+         "url": "<scrubbed>",
+         "width": 168
+        },
+        {
+         "height": 110,
+         "url": "<scrubbed>",
+         "width": 196
+        },
+        {
+         "height": 138,
+         "url": "<scrubbed>",
+         "width": 246
+        },
+        {
+         "height": 188,
+         "url": "<scrubbed>",
+         "width": 336
+        },
+        {
+         "height": 1080,
+         "url": "<scrubbed>",
+         "width": 1920
+        }
+       ]
+      },
+      "left": 0.65438598,
+      "metadata": {
+       "simpleText": "105,055 views"
+      },
+      "startMs": "201451",
+      "style": "VIDEO",
+      "thumbnailOverlays": [
+       {
+        "thumbnailOverlayTimeStatusRenderer": {
+         "style": "DEFAULT",
+         "text": {
+          "accessibility": {
+           "accessibilityData": {
+            "label": "12 minutes"
+           }
+          },
+          "simpleText": "12:00"
+         }
+        }
+       }
+      ],
+      "title": {
+       "accessibility": {
+        "accessibilityData": {
+         "label": "<scrubbed>"
+        }
+       },
+       "simpleText": "<scrubbed>"
+      },
+      "top": 0.52454501,
+      "trackingParams": "<scrubbed>",
+      "width": 0.32280701
+     }
+    },
+    {
+     "endscreenElementRenderer": {
+      "aspectRatio": 1.7777778,
+      "endMs": "212040",
+      "endpoint": {
+       "clickTrackingParams": "<scrubbed>",
+       "commandMetadata": {
+        "interactionLoggingCommandMetadata": {
+         "loggingExpectations": {
+          "screenCreatedLoggingExpectations": {
+           "expectedParentScreens": [
+            {
+             "screenVeType": 3832
+            }
+           ]
+          }
+         }
+        },
+        "webCommandMetadata": {
+         "rootVe": 3832,
+         "url": "<scrubbed>",
+         "webPageType": "WEB_PAGE_TYPE_WATCH"
+        }
+       },
+       "watchEndpoint": {
+        "videoId": "yi6fWPV6qXg",
+        "watchEndpointSupportedOnesieConfig": {
+         "html5PlaybackOnesieConfig": {
+          "commonConfig": {
+           "url": "<scrubbed>"
+          }
+         }
+        }
+       }
+      },
+      "id": "6974177256580774925",
+      "image": {
+       "thumbnails": [
+        {
+         "height": 94,
+         "url": "<scrubbed>",
+         "width": 168
+        },
+        {
+         "height": 110,
+         "url": "<scrubbed>",
+         "width": 196
+        },
+        {
+         "height": 138,
+         "url": "<scrubbed>",
+         "width": 246
+        },
+        {
+         "height": 188,
+         "url": "<scrubbed>",
+         "width": 336
+        },
+        {
+         "height": 1080,
+         "url": "<scrubbed>",
+         "width": 1920
+        }
+       ]
+      },
+      "left": 0.65438598,
+      "metadata": {
+       "simpleText": "112,793 views"
+      },
+      "startMs": "201451",
+      "style": "VIDEO",
+      "thumbnailOverlays": [
+       {
+        "thumbnailOverlayTimeStatusRenderer": {
+         "style": "DEFAULT",
+         "text": {
+          "accessibility": {
+           "accessibilityData": {
+            "label": "40 seconds"
+           }
+          },
+          "simpleText": "0:40"
+         }
+        }
+       }
+      ],
+      "title": {
+       "accessibility": {
+        "accessibilityData": {
+         "label": "Rick Astley - The Reflection Tour 2026 - Trailer, video"
+        }
+       },
+       "simpleText": "Rick Astley - The Reflection Tour 2026 - Trailer"
+      },
+      "top": 0.13084112,
+      "trackingParams": "<scrubbed>",
+      "width": 0.32280701
+     }
+    },
+    {
+     "endscreenElementRenderer": {
+      "aspectRatio": 1.7777778,
+      "endMs": "212040",
+      "endpoint": {
+       "clickTrackingParams": "<scrubbed>",
+       "commandMetadata": {
+        "webCommandMetadata": {
+         "rootVe": 3832,
+         "url": "<scrubbed>",
+         "webPageType": "WEB_PAGE_TYPE_WATCH"
+        }
+       },
+       "watchEndpoint": {
+        "loggingContext": {
+         "vssLoggingContext": {
+          "serializedContextData": "GiJQTGxhTjg4YTd5Ml9wbGVjWW9KeHZSRlRMSFZiSVZBT29j"
+         }
+        },
+        "playlistId": "PLlaN88a7y2_plecYoJxvRFTLHVbIVAOoc",
+        "videoId": "zRVjZ2DJ9Cg",
+        "watchEndpointSupportedOnesieConfig": {
+         "html5PlaybackOnesieConfig": {
+          "commonConfig": {
+           "url": "<scrubbed>"
+          }
+         }
+        }
+       }
+      },
+      "id": "277763988111692989",
+      "image": {
+       "thumbnails": [
+        {
+         "height": 94,
+         "url": "<scrubbed>",
+         "width": 168
+        },
+        {
+         "height": 110,
+         "url": "<scrubbed>",
+         "width": 196
+        },
+        {
+         "height": 138,
+         "url": "<scrubbed>",
+         "width": 246
+        },
+        {
+         "height": 188,
+         "url": "<scrubbed>",
+         "width": 336
+        },
+        {
+         "height": 1080,
+         "url": "<scrubbed>",
+         "width": 1920
+        }
+       ]
+      },
+      "left": 0.035802968,
+      "metadata": {
+       "simpleText": "by Rick Astley"
+      },
+      "playlistLength": {
+       "simpleText": "41 videos"
+      },
+      "startMs": "201451",
+      "style": "PLAYLIST",
+      "title": {
+       "accessibility": {
+        "accessibilityData": {
+         "label": "41 videos, Rick Astley: Official Music Videos"
+        }
+       },
+       "simpleText": "Rick Astley: Official Music Videos"
+      },
+      "top": 0.50776422,
+      "trackingParams": "<scrubbed>",
+      "width": 0.32280701
+     }
+    }
+   ],
+   "hideButton": {
+    "toggleButtonViewModel": {
+     "defaultButtonViewModel": {
+      "buttonViewModel": {
+       "accessibilityText": "Hide end screen cards",
+       "buttonSize": "BUTTON_VIEW_MODEL_SIZE_XSMALL",
+       "iconName": "VISIBILITY_OFF",
+       "onTap": {
+        "innertubeCommand": {
+         "changeCreatorEndscreenVisibilityCommand": {
+          "hide": true
+         },
+         "clickTrackingParams": "<scrubbed>"
+        }
+       },
+       "style": "BUTTON_VIEW_MODEL_STYLE_OVERLAY",
+       "title": "Hide",
+       "trackingParams": "<scrubbed>",
+       "type": "BUTTON_VIEW_MODEL_TYPE_FILLED"
+      }
+     },
+     "rendererContext": {
+      "loggingContext": {
+       "loggingDirectives": {
+        "trackingParams": "<scrubbed>",
+        "visibility": {
+         "types": "12"
+        }
+       }
+      }
+     },
+     "toggledButtonViewModel": {
+      "buttonViewModel": {
+       "accessibilityText": "Show end screen cards",
+       "buttonSize": "BUTTON_VIEW_MODEL_SIZE_XSMALL",
+       "iconName": "VISIBILITY",
+       "onTap": {
+        "innertubeCommand": {
+         "changeCreatorEndscreenVisibilityCommand": {
+          "hide": false
+         },
+         "clickTrackingParams": "<scrubbed>"
+        }
+       },
+       "style": "BUTTON_VIEW_MODEL_STYLE_OVERLAY",
+       "title": "Show",
+       "trackingParams": "<scrubbed>",
+       "type": "BUTTON_VIEW_MODEL_TYPE_FILLED"
+      }
+     }
+    }
+   },
+   "startMs": "201451",
+   "trackingParams": "<scrubbed>"
+  }
+ },
+ "frameworkUpdates": {
+  "entityBatchUpdate": {
+   "mutations": [
+    {
+     "entityKey": "Eg0KC2RRdzR3OVdnWGNRIPYBKAE%3D",
+     "payload": {
+      "offlineabilityEntity": {
+       "addToOfflineButtonState": "ADD_TO_OFFLINE_BUTTON_STATE_UNKNOWN",
+       "key": "Eg0KC2RRdzR3OVdnWGNRIPYBKAE%3D"
+      }
+     },
+     "type": "ENTITY_MUTATION_TYPE_REPLACE"
+    }
+   ],
+   "timestamp": {
+    "nanos": 599300451,
+    "seconds": "1785485681"
+   }
+  }
+ },
+ "messages": [
+  {
+   "mealbarPromoRenderer": {
+    "actionButton": {
+     "buttonRenderer": {
+      "command": {
+       "clickTrackingParams": "<scrubbed>",
+       "commandExecutorCommand": {
+        "commands": [
+         {
+          "clickTrackingParams": "<scrubbed>",
+          "commandMetadata": {
+           "webCommandMetadata": {
+            "rootVe": 83769,
+            "url": "<scrubbed>",
+            "webPageType": "WEB_PAGE_TYPE_UNKNOWN"
+           }
+          },
+          "urlEndpoint": {
+           "target": "TARGET_NEW_WINDOW",
+           "url": "<scrubbed>"
+          }
+         },
+         {
+          "commandMetadata": {
+           "webCommandMetadata": {
+            "apiUrl": "/youtubei/v1/feedback",
+            "sendPost": true
+           }
+          },
+          "feedbackEndpoint": {
+           "feedbackToken": "<scrubbed>",
+           "uiActions": {
+            "hideEnclosingContainer": true
+           }
+          }
+         }
+        ]
+       }
+      },
+      "size": "SIZE_DEFAULT",
+      "style": "STYLE_MONO_FILLED",
+      "text": {
+       "runs": [
+        {
+         "text": "Check it out"
+        }
+       ]
+      },
+      "trackingParams": "<scrubbed>"
+     }
+    },
+    "dismissButton": {
+     "buttonRenderer": {
+      "command": {
+       "clickTrackingParams": "<scrubbed>",
+       "commandExecutorCommand": {
+        "commands": [
+         {
+          "clickTrackingParams": "<scrubbed>",
+          "commandMetadata": {
+           "webCommandMetadata": {
+            "apiUrl": "/youtubei/v1/feedback",
+            "sendPost": true
+           }
+          },
+          "feedbackEndpoint": {
+           "feedbackToken": "<scrubbed>",
+           "uiActions": {
+            "hideEnclosingContainer": true
+           }
+          }
+         }
+        ]
+       }
+      },
+      "size": "SIZE_DEFAULT",
+      "style": "STYLE_MONO_TONAL",
+      "text": {
+       "runs": [
+        {
+         "text": "No thanks"
+        }
+       ]
+      },
+      "trackingParams": "<scrubbed>"
+     }
+    },
+    "impressionEndpoints": [
+     {
+      "clickTrackingParams": "<scrubbed>",
+      "commandMetadata": {
+       "webCommandMetadata": {
+        "apiUrl": "/youtubei/v1/feedback",
+        "sendPost": true
+       }
+      },
+      "feedbackEndpoint": {
+       "feedbackToken": "<scrubbed>",
+       "uiActions": {
+        "hideEnclosingContainer": false
+       }
+      }
+     }
+    ],
+    "isVisible": true,
+    "messageTexts": [
+     {
+      "runs": [
+       {
+        "text": "<scrubbed>"
+       }
+      ]
+     }
+    ],
+    "messageTitle": {
+     "runs": [
+      {
+       "text": "Did you know..."
+      }
+     ]
+    },
+    "style": "STYLE_MODERN",
+    "supplementalText": {
+     "runs": [
+      {
+       "text": "Terms apply. Monthly paid subscription. Cancel anytime"
+      }
+     ]
+    },
+    "trackingParams": "<scrubbed>",
+    "triggerCondition": "TRIGGER_CONDITION_POST_AD"
+   }
+  }
+ ],
+ "microformat": {
+  "playerMicroformatRenderer": {
+   "availableCountries": [
+    "AD",
+    "AE",
+    "AF",
+    "AG",
+    "AI",
+    "AL",
+    "AM",
+    "AO",
+    "AQ",
+    "AR",
+    "AS",
+    "AT",
+    "AU",
+    "AW",
+    "AX",
+    "AZ",
+    "BA",
+    "BB",
+    "BD",
+    "BE",
+    "BF",
+    "BG",
+    "BH",
+    "BI",
+    "BJ",
+    "BL",
+    "BM",
+    "BN",
+    "BO",
+    "BQ",
+    "BR",
+    "BS",
+    "BT",
+    "BV",
+    "BW",
+    "BY",
+    "BZ",
+    "CA",
+    "CC",
+    "CD",
+    "CF",
+    "CG",
+    "CH",
+    "CI",
+    "CK",
+    "CL",
+    "CM",
+    "CN",
+    "CO",
+    "CR",
+    "CU",
+    "CV",
+    "CW",
+    "CX",
+    "CY",
+    "CZ",
+    "DE",
+    "DJ",
+    "DK",
+    "DM",
+    "DO",
+    "DZ",
+    "EC",
+    "EE",
+    "EG",
+    "EH",
+    "ER",
+    "ES",
+    "ET",
+    "FI",
+    "FJ",
+    "FK",
+    "FM",
+    "FO",
+    "FR",
+    "GA",
+    "GB",
+    "GD",
+    "GE",
+    "GF",
+    "GG",
+    "GH",
+    "GI",
+    "GL",
+    "GM",
+    "GN",
+    "GP",
+    "GQ",
+    "GR",
+    "GS",
+    "GT",
+    "GU",
+    "GW",
+    "GY",
+    "HK",
+    "HM",
+    "HN",
+    "HR",
+    "HT",
+    "HU",
+    "ID",
+    "IE",
+    "IL",
+    "IM",
+    "IN",
+    "IO",
+    "IQ",
+    "IR",
+    "IS",
+    "IT",
+    "JE",
+    "JM",
+    "JO",
+    "JP",
+    "KE",
+    "KG",
+    "KH",
+    "KI",
+    "KM",
+    "KN",
+    "KP",
+    "KR",
+    "KW",
+    "KY",
+    "KZ",
+    "LA",
+    "LB",
+    "LC",
+    "LI",
+    "LK",
+    "LR",
+    "LS",
+    "LT",
+    "LU",
+    "LV",
+    "LY",
+    "MA",
+    "MC",
+    "MD",
+    "ME",
+    "MF",
+    "MG",
+    "MH",
+    "MK",
+    "ML",
+    "MM",
+    "MN",
+    "MO",
+    "MP",
+    "MQ",
+    "MR",
+    "MS",
+    "MT",
+    "MU",
+    "MV",
+    "MW",
+    "MX",
+    "MY",
+    "MZ",
+    "NA",
+    "NC",
+    "NE",
+    "NF",
+    "NG",
+    "NI",
+    "NL",
+    "NO",
+    "NP",
+    "NR",
+    "NU",
+    "NZ",
+    "OM",
+    "PA",
+    "PE",
+    "PF",
+    "PG",
+    "PH",
+    "PK",
+    "PL",
+    "PM",
+    "PN",
+    "PR",
+    "PS",
+    "PT",
+    "PW",
+    "PY",
+    "QA",
+    "RE",
+    "RO",
+    "RS",
+    "RU",
+    "RW",
+    "SA",
+    "SB",
+    "SC",
+    "SD",
+    "SE",
+    "SG",
+    "SH",
+    "SI",
+    "SJ",
+    "SK",
+    "SL",
+    "SM",
+    "SN",
+    "SO",
+    "SR",
+    "SS",
+    "ST",
+    "SV",
+    "SX",
+    "SY",
+    "SZ",
+    "TC",
+    "TD",
+    "TF",
+    "TG",
+    "TH",
+    "TJ",
+    "TK",
+    "TL",
+    "TM",
+    "TN",
+    "TO",
+    "TR",
+    "TT",
+    "TV",
+    "TW",
+    "TZ",
+    "UA",
+    "UG",
+    "UM",
+    "US",
+    "UY",
+    "UZ",
+    "VA",
+    "VC",
+    "VE",
+    "VG",
+    "VI",
+    "VN",
+    "VU",
+    "WF",
+    "WS",
+    "YE",
+    "YT",
+    "ZA",
+    "ZM",
+    "ZW"
+   ],
+   "canonicalUrl": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+   "category": "Music",
+   "description": {
+    "simpleText": "<scrubbed>"
+   },
+   "embed": {
+    "height": 720,
+    "iframeUrl": "https://www.youtube.com/embed/dQw4w9WgXcQ",
+    "width": 1280
+   },
+   "externalChannelId": "UCuAXFkgsw1L7xaCfnd5JJOw",
+   "externalVideoId": "dQw4w9WgXcQ",
+   "hasYpcMetadata": false,
+   "isFamilySafe": true,
+   "isShortsEligible": false,
+   "isUnlisted": false,
+   "lengthSeconds": "214",
+   "likeCount": "19287406",
+   "ownerChannelName": "Rick Astley",
+   "ownerProfileUrl": "http://www.youtube.com/@RickAstleyYT",
+   "publishDate": "2009-10-24T23:57:33-07:00",
+   "thumbnail": {
+    "thumbnails": [
+     {
+      "height": 720,
+      "url": "<scrubbed>",
+      "width": 1280
+     }
+    ]
+   },
+   "title": {
+    "simpleText": "<scrubbed>"
+   },
+   "uploadDate": "2009-10-24T23:57:33-07:00",
+   "viewCount": "1798452505"
+  }
+ },
+ "playabilityStatus": {
+  "contextParams": "Q0FFU0FnZ0I=",
+  "miniplayer": {
+   "miniplayerRenderer": {
+    "playbackMode": "PLAYBACK_MODE_ALLOW"
+   }
+  },
+  "playableInEmbed": true,
+  "status": "OK"
+ },
+ "playbackTracking": {
+  "atrUrl": {
+   "baseUrl": "<scrubbed>",
+   "elapsedMediaTimeSeconds": 5
+  },
+  "googleRemarketingUrl": {
+   "baseUrl": "<scrubbed>",
+   "elapsedMediaTimeSeconds": 0
+  },
+  "ptrackingUrl": {
+   "baseUrl": "<scrubbed>"
+  },
+  "qoeUrl": {
+   "baseUrl": "<scrubbed>"
+  },
+  "videostatsDefaultFlushIntervalSeconds": 40,
+  "videostatsDelayplayUrl": {
+   "baseUrl": "<scrubbed>"
+  },
+  "videostatsPlaybackUrl": {
+   "baseUrl": "<scrubbed>"
+  },
+  "videostatsScheduledFlushWalltimeSeconds": [
+   10,
+   20,
+   30
+  ],
+  "videostatsWatchtimeUrl": {
+   "baseUrl": "<scrubbed>"
+  },
+  "youtubeRemarketingUrl": {
+   "baseUrl": "<scrubbed>",
+   "elapsedMediaTimeSeconds": 0
+  }
+ },
+ "playerConfig": {
+  "audioConfig": {
+   "enablePerFormatLoudness": true,
+   "loudnessDb": 0.98999977,
+   "loudnessNormalizationConfig": {
+    "applyStatefulNormalization": false,
+    "maxStatefulTimeThresholdSec": 300,
+    "minimumLoudnessTargetLkfs": -31,
+    "preserveStatefulLoudnessTarget": true
+   },
+   "loudnessTargetLkfs": -14,
+   "perceptualLoudnessDb": -13.01,
+   "trackAbsoluteLoudnessLkfs": -13.01
+  },
+  "daiConfig": {
+   "sendSsdaiMissingAdBreakReasons": true
+  },
+  "granularVariableSpeedConfig": {
+   "defaultPlaybackRateOptions": [
+    {
+     "isPremiumUpsell": false,
+     "label": "1.0",
+     "priority": 5,
+     "value": 100
+    },
+    {
+     "isPremiumUpsell": false,
+     "label": "1.25",
+     "priority": 2,
+     "value": 125
+    },
+    {
+     "isPremiumUpsell": false,
+     "label": "1.5",
+     "priority": 3,
+     "value": 150
+    },
+    {
+     "isPremiumUpsell": false,
+     "label": "1.75",
+     "priority": 0,
+     "value": 175
+    },
+    {
+     "isPremiumUpsell": false,
+     "label": "2.0",
+     "priority": 4,
+     "value": 200
+    },
+    {
+     "isPremiumUpsell": true,
+     "label": "3.0",
+     "priority": 1,
+     "value": 300
+    }
+   ],
+   "maximumPlaybackRate": 200,
+   "minimumPlaybackRate": 25,
+   "stepSize": 5
+  },
+  "mediaCommonConfig": {
+   "dynamicReadaheadConfig": {
+    "maxReadAheadMediaTimeMs": 120000,
+    "minReadAheadMediaTimeMs": 15000,
+    "readAheadGrowthRateMs": 1000
+   },
+   "fixLivePlaybackModelDefaultPosition": false,
+   "mediaUstreamerRequestConfig": {
+    "videoPlaybackUstreamerConfig": "<scrubbed>"
+   },
+   "platypusUseEnvoyNetFetch": false,
+   "serverPlaybackStartConfig": {
+    "enable": true,
+    "playbackStartPolicy": {
+     "startMinReadaheadPolicy": [
+      {
+       "minReadaheadMs": 1200
+      }
+     ]
+    }
+   },
+   "useServerDrivenAbr": true
+  },
+  "playerControlsConfig": {
+   "showCachedInTimebar": true
+  },
+  "streamSelectionConfig": {
+   "maxBitrate": "11340000"
+  },
+  "vssClientConfig": {
+   "vssUsePostRequest": true
+  },
+  "webPlayerConfig": {
+   "useCobaltTvosDash": true,
+   "webPlayerActionsPorting": {
+    "addToWatchLaterCommand": {
+     "clickTrackingParams": "<scrubbed>",
+     "commandMetadata": {
+      "webCommandMetadata": {
+       "apiUrl": "/youtubei/v1/browse/edit_playlist",
+       "sendPost": true
+      }
+     },
+     "playlistEditEndpoint": {
+      "actions": [
+       {
+        "action": "ACTION_ADD_VIDEO",
+        "addedVideoId": "dQw4w9WgXcQ"
+       }
+      ],
+      "playlistId": "WL"
+     }
+    },
+    "getSharePanelCommand": {
+     "clickTrackingParams": "<scrubbed>",
+     "commandMetadata": {
+      "webCommandMetadata": {
+       "apiUrl": "/youtubei/v1/share/get_web_player_share_panel",
+       "sendPost": true
+      }
+     },
+     "webPlayerShareEntityServiceEndpoint": {
+      "serializedShareEntity": "CgtkUXc0dzlXZ1hjUQ%3D%3D"
+     }
+    },
+    "removeFromWatchLaterCommand": {
+     "clickTrackingParams": "<scrubbed>",
+     "commandMetadata": {
+      "webCommandMetadata": {
+       "apiUrl": "/youtubei/v1/browse/edit_playlist",
+       "sendPost": true
+      }
+     },
+     "playlistEditEndpoint": {
+      "actions": [
+       {
+        "action": "ACTION_REMOVE_VIDEO_BY_VIDEO_ID",
+        "removedVideoId": "dQw4w9WgXcQ"
+       }
+      ],
+      "playlistId": "WL"
+     }
+    },
+    "subscribeCommand": {
+     "clickTrackingParams": "<scrubbed>",
+     "commandMetadata": {
+      "webCommandMetadata": {
+       "apiUrl": "/youtubei/v1/subscription/subscribe",
+       "sendPost": true
+      }
+     },
+     "subscribeEndpoint": {
+      "channelIds": [
+       "UCuAXFkgsw1L7xaCfnd5JJOw"
+      ],
+      "params": "<scrubbed>"
+     }
+    },
+    "unsubscribeCommand": {
+     "clickTrackingParams": "<scrubbed>",
+     "commandMetadata": {
+      "webCommandMetadata": {
+       "apiUrl": "/youtubei/v1/subscription/unsubscribe",
+       "sendPost": true
+      }
+     },
+     "unsubscribeEndpoint": {
+      "channelIds": [
+       "UCuAXFkgsw1L7xaCfnd5JJOw"
+      ],
+      "params": "<scrubbed>"
+     }
+    }
+   }
+  }
+ },
+ "responseContext": {
+  "mainAppWebResponseContext": {
+   "loggedOut": true,
+   "trackingParam": "<scrubbed>"
+  },
+  "maxAgeSeconds": 0,
+  "responseId": "IhMI9Pyxvrz8lQMVfousAh1BdycK",
+  "serviceTrackingParams": [
+   {
+    "params": [
+     {
+      "key": "is_viewed_live",
+      "value": "False"
+     },
+     {
+      "key": "ipcc",
+      "value": "0"
+     },
+     {
+      "key": "is_alc_surface",
+      "value": "false"
+     },
+     {
+      "key": "logged_in",
+      "value": "0"
+     },
+     {
+      "key": "visitor_data",
+      "value": "<scrubbed>"
+     }
+    ],
+    "service": "GFEEDBACK"
+   },
+   {
+    "params": [
+     {
+      "key": "yt_ad",
+      "value": "1"
+     },
+     {
+      "key": "c",
+      "value": "WEB"
+     },
+     {
+      "key": "cver",
+      "value": "2.20260730.01.00"
+     },
+     {
+      "key": "yt_li",
+      "value": "0"
+     },
+     {
+      "key": "GetPlayer_rid",
+      "value": "0x3a6f3fd9c9c298f5"
+     }
+    ],
+    "service": "CSI"
+   },
+   {
+    "params": [
+     {
+      "key": "logged_in",
+      "value": "0"
+     }
+    ],
+    "service": "GUIDED_HELP"
+   },
+   {
+    "params": [
+     {
+      "key": "client.version",
+      "value": "2.20260730"
+     },
+     {
+      "key": "client.name",
+      "value": "WEB"
+     }
+    ],
+    "service": "ECATCHER"
+   }
+  ],
+  "webResponseContextExtensionData": {
+   "hasDecorated": true,
+   "webResponseContextPreloadData": {
+    "preloadMessageNames": [
+     "miniplayerRenderer",
+     "adPlacementRenderer",
+     "clientForecastingAdRenderer",
+     "playerCaptionsTracklistRenderer",
+     "playerAnnotationsExpandedRenderer",
+     "subscribeButtonRenderer",
+     "confirmDialogRenderer",
+     "buttonRenderer",
+     "playerStoryboardSpecRenderer",
+     "playerMicroformatRenderer",
+     "cardCollectionRenderer",
+     "cardRenderer",
+     "simpleCardTeaserRenderer",
+     "infoCardIconRenderer",
+     "mealbarPromoRenderer",
+     "endscreenRenderer",
+     "endscreenElementRenderer",
+     "thumbnailOverlayTimeStatusRenderer",
+     "toggleButtonViewModel",
+     "buttonViewModel"
+    ]
+   }
+  }
+ },
+ "storyboards": {
+  "playerStoryboardSpecRenderer": {
+   "fineScrubbingRecommendedLevel": 2,
+   "highResolutionRecommendedLevel": 3,
+   "recommendedLevel": 3,
+   "spec": "<scrubbed>"
+  }
+ },
+ "streamingData": {
+  "adaptiveFormats": [
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 13466333,
+    "bitrate": 18076636,
+    "colorInfo": {
+     "matrixCoefficients": "COLOR_MATRIX_COEFFICIENTS_BT709",
+     "primaries": "COLOR_PRIMARIES_BT709",
+     "transferCharacteristics": "COLOR_TRANSFER_CHARACTERISTICS_BT709"
+    },
+    "contentLength": "358608461",
+    "fps": 25,
+    "height": 2160,
+    "indexRange": {
+     "end": "893",
+     "start": "221"
+    },
+    "initRange": {
+     "end": "220",
+     "start": "0"
+    },
+    "itag": 313,
+    "lastModified": "1766963492248817",
+    "mimeType": "video/webm; codecs=\"vp9\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "hd2160",
+    "qualityLabel": "2160p",
+    "qualityOrdinal": "QUALITY_ORDINAL_2160P",
+    "width": 3840
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 9024958,
+    "bitrate": 17400774,
+    "colorInfo": {
+     "matrixCoefficients": "COLOR_MATRIX_COEFFICIENTS_BT709",
+     "primaries": "COLOR_PRIMARIES_BT709",
+     "transferCharacteristics": "COLOR_TRANSFER_CHARACTERISTICS_BT709"
+    },
+    "contentLength": "240334643",
+    "fps": 25,
+    "height": 2160,
+    "indexRange": {
+     "end": "1188",
+     "start": "701"
+    },
+    "initRange": {
+     "end": "700",
+     "start": "0"
+    },
+    "itag": 401,
+    "lastModified": "1766961226342025",
+    "mimeType": "video/mp4; codecs=\"av01.0.12M.08\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "hd2160",
+    "qualityLabel": "2160p",
+    "qualityOrdinal": "QUALITY_ORDINAL_2160P",
+    "width": 3840
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 5674177,
+    "bitrate": 8978328,
+    "colorInfo": {
+     "matrixCoefficients": "COLOR_MATRIX_COEFFICIENTS_BT709",
+     "primaries": "COLOR_PRIMARIES_BT709",
+     "transferCharacteristics": "COLOR_TRANSFER_CHARACTERISTICS_BT709"
+    },
+    "contentLength": "151103346",
+    "fps": 25,
+    "height": 1440,
+    "indexRange": {
+     "end": "889",
+     "start": "220"
+    },
+    "initRange": {
+     "end": "219",
+     "start": "0"
+    },
+    "itag": 271,
+    "lastModified": "1766962756705951",
+    "mimeType": "video/webm; codecs=\"vp9\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "hd1440",
+    "qualityLabel": "1440p",
+    "qualityOrdinal": "QUALITY_ORDINAL_1440P",
+    "width": 2560
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 4587618,
+    "bitrate": 7755221,
+    "colorInfo": {
+     "matrixCoefficients": "COLOR_MATRIX_COEFFICIENTS_BT709",
+     "primaries": "COLOR_PRIMARIES_BT709",
+     "transferCharacteristics": "COLOR_TRANSFER_CHARACTERISTICS_BT709"
+    },
+    "contentLength": "122168277",
+    "fps": 25,
+    "height": 1440,
+    "indexRange": {
+     "end": "1188",
+     "start": "701"
+    },
+    "initRange": {
+     "end": "700",
+     "start": "0"
+    },
+    "itag": 400,
+    "lastModified": "1766961246255689",
+    "mimeType": "video/mp4; codecs=\"av01.0.12M.08\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "hd1440",
+    "qualityLabel": "1440p",
+    "qualityOrdinal": "QUALITY_ORDINAL_1440P",
+    "width": 2560
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 3038377,
+    "bitrate": 4334157,
+    "contentLength": "80911999",
+    "fps": 25,
+    "height": 1080,
+    "indexRange": {
+     "end": "1229",
+     "start": "742"
+    },
+    "initRange": {
+     "end": "741",
+     "start": "0"
+    },
+    "itag": 137,
+    "lastModified": "1766957926174250",
+    "mimeType": "video/mp4; codecs=\"avc1.640028\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "hd1080",
+    "qualityLabel": "1080p",
+    "qualityOrdinal": "QUALITY_ORDINAL_1080P",
+    "width": 1920
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 1158339,
+    "bitrate": 1549172,
+    "colorInfo": {
+     "matrixCoefficients": "COLOR_MATRIX_COEFFICIENTS_BT709",
+     "primaries": "COLOR_PRIMARIES_BT709",
+     "transferCharacteristics": "COLOR_TRANSFER_CHARACTERISTICS_BT709"
+    },
+    "contentLength": "30846580",
+    "fps": 25,
+    "height": 1080,
+    "indexRange": {
+     "end": "874",
+     "start": "220"
+    },
+    "initRange": {
+     "end": "219",
+     "start": "0"
+    },
+    "itag": 248,
+    "lastModified": "1766963494258902",
+    "mimeType": "video/webm; codecs=\"vp9\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "hd1080",
+    "qualityLabel": "1080p",
+    "qualityOrdinal": "QUALITY_ORDINAL_1080P",
+    "width": 1920
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 1142170,
+    "bitrate": 1594543,
+    "colorInfo": {
+     "matrixCoefficients": "COLOR_MATRIX_COEFFICIENTS_BT709",
+     "primaries": "COLOR_PRIMARIES_BT709",
+     "transferCharacteristics": "COLOR_TRANSFER_CHARACTERISTICS_BT709"
+    },
+    "contentLength": "30415996",
+    "fps": 25,
+    "height": 1080,
+    "indexRange": {
+     "end": "1187",
+     "start": "700"
+    },
+    "initRange": {
+     "end": "699",
+     "start": "0"
+    },
+    "itag": 399,
+    "lastModified": "1766970905427393",
+    "mimeType": "video/mp4; codecs=\"av01.0.08M.08\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "hd1080",
+    "qualityLabel": "1080p",
+    "qualityOrdinal": "QUALITY_ORDINAL_1080P",
+    "width": 1920
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 993461,
+    "bitrate": 1058310,
+    "contentLength": "26455880",
+    "fps": 25,
+    "height": 720,
+    "indexRange": {
+     "end": "1227",
+     "start": "740"
+    },
+    "initRange": {
+     "end": "739",
+     "start": "0"
+    },
+    "itag": 136,
+    "lastModified": "1766958204135500",
+    "mimeType": "video/mp4; codecs=\"avc1.4d401f\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "hd720",
+    "qualityLabel": "720p",
+    "qualityOrdinal": "QUALITY_ORDINAL_720P",
+    "width": 1280
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 664165,
+    "bitrate": 867871,
+    "colorInfo": {
+     "matrixCoefficients": "COLOR_MATRIX_COEFFICIENTS_BT709",
+     "primaries": "COLOR_PRIMARIES_BT709",
+     "transferCharacteristics": "COLOR_TRANSFER_CHARACTERISTICS_BT709"
+    },
+    "contentLength": "17686717",
+    "fps": 25,
+    "height": 720,
+    "indexRange": {
+     "end": "860",
+     "start": "220"
+    },
+    "initRange": {
+     "end": "219",
+     "start": "0"
+    },
+    "itag": 247,
+    "lastModified": "1766962272813700",
+    "mimeType": "video/webm; codecs=\"vp9\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "hd720",
+    "qualityLabel": "720p",
+    "qualityOrdinal": "QUALITY_ORDINAL_720P",
+    "width": 1280
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 660648,
+    "bitrate": 1012348,
+    "colorInfo": {
+     "matrixCoefficients": "COLOR_MATRIX_COEFFICIENTS_BT709",
+     "primaries": "COLOR_PRIMARIES_BT709",
+     "transferCharacteristics": "COLOR_TRANSFER_CHARACTERISTICS_BT709"
+    },
+    "contentLength": "17593076",
+    "fps": 25,
+    "height": 720,
+    "indexRange": {
+     "end": "1187",
+     "start": "700"
+    },
+    "initRange": {
+     "end": "699",
+     "start": "0"
+    },
+    "itag": 398,
+    "lastModified": "1766960928964543",
+    "mimeType": "video/mp4; codecs=\"av01.0.05M.08\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "hd720",
+    "qualityLabel": "720p",
+    "qualityOrdinal": "QUALITY_ORDINAL_720P",
+    "width": 1280
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 529610,
+    "bitrate": 690764,
+    "contentLength": "14103519",
+    "fps": 25,
+    "height": 480,
+    "indexRange": {
+     "end": "1228",
+     "start": "741"
+    },
+    "initRange": {
+     "end": "740",
+     "start": "0"
+    },
+    "itag": 135,
+    "lastModified": "1766958212394312",
+    "mimeType": "video/mp4; codecs=\"avc1.4d401e\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "large",
+    "qualityLabel": "480p",
+    "qualityOrdinal": "QUALITY_ORDINAL_480P",
+    "width": 854
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 352289,
+    "bitrate": 466632,
+    "colorInfo": {
+     "matrixCoefficients": "COLOR_MATRIX_COEFFICIENTS_BT709",
+     "primaries": "COLOR_PRIMARIES_BT709",
+     "transferCharacteristics": "COLOR_TRANSFER_CHARACTERISTICS_BT709"
+    },
+    "contentLength": "9381481",
+    "fps": 25,
+    "height": 480,
+    "indexRange": {
+     "end": "857",
+     "start": "220"
+    },
+    "initRange": {
+     "end": "219",
+     "start": "0"
+    },
+    "itag": 244,
+    "lastModified": "1766961781254744",
+    "mimeType": "video/webm; codecs=\"vp9\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "large",
+    "qualityLabel": "480p",
+    "qualityOrdinal": "QUALITY_ORDINAL_480P",
+    "width": 854
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 370815,
+    "bitrate": 525728,
+    "colorInfo": {
+     "matrixCoefficients": "COLOR_MATRIX_COEFFICIENTS_BT709",
+     "primaries": "COLOR_PRIMARIES_BT709",
+     "transferCharacteristics": "COLOR_TRANSFER_CHARACTERISTICS_BT709"
+    },
+    "contentLength": "9874826",
+    "fps": 25,
+    "height": 480,
+    "indexRange": {
+     "end": "1187",
+     "start": "700"
+    },
+    "initRange": {
+     "end": "699",
+     "start": "0"
+    },
+    "itag": 397,
+    "lastModified": "1766961026797508",
+    "mimeType": "video/mp4; codecs=\"av01.0.04M.08\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "large",
+    "qualityLabel": "480p",
+    "qualityOrdinal": "QUALITY_ORDINAL_480P",
+    "width": 854
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 315092,
+    "bitrate": 450863,
+    "contentLength": "8390921",
+    "fps": 25,
+    "height": 360,
+    "highReplication": true,
+    "indexRange": {
+     "end": "1228",
+     "start": "741"
+    },
+    "initRange": {
+     "end": "740",
+     "start": "0"
+    },
+    "itag": 134,
+    "lastModified": "1766960771651324",
+    "mimeType": "video/mp4; codecs=\"avc1.4d401e\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "medium",
+    "qualityLabel": "360p",
+    "qualityOrdinal": "QUALITY_ORDINAL_360P",
+    "width": 640
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 225864,
+    "bitrate": 288453,
+    "colorInfo": {
+     "matrixCoefficients": "COLOR_MATRIX_COEFFICIENTS_BT709",
+     "primaries": "COLOR_PRIMARIES_BT709",
+     "transferCharacteristics": "COLOR_TRANSFER_CHARACTERISTICS_BT709"
+    },
+    "contentLength": "6014765",
+    "fps": 25,
+    "height": 360,
+    "indexRange": {
+     "end": "857",
+     "start": "220"
+    },
+    "initRange": {
+     "end": "219",
+     "start": "0"
+    },
+    "itag": 243,
+    "lastModified": "1766962597390784",
+    "mimeType": "video/webm; codecs=\"vp9\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "medium",
+    "qualityLabel": "360p",
+    "qualityOrdinal": "QUALITY_ORDINAL_360P",
+    "width": 640
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 213502,
+    "bitrate": 304466,
+    "colorInfo": {
+     "matrixCoefficients": "COLOR_MATRIX_COEFFICIENTS_BT709",
+     "primaries": "COLOR_PRIMARIES_BT709",
+     "transferCharacteristics": "COLOR_TRANSFER_CHARACTERISTICS_BT709"
+    },
+    "contentLength": "5685561",
+    "fps": 25,
+    "height": 360,
+    "indexRange": {
+     "end": "1187",
+     "start": "700"
+    },
+    "initRange": {
+     "end": "699",
+     "start": "0"
+    },
+    "itag": 396,
+    "lastModified": "1766958935473272",
+    "mimeType": "video/mp4; codecs=\"av01.0.01M.08\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "medium",
+    "qualityLabel": "360p",
+    "qualityOrdinal": "QUALITY_ORDINAL_360P",
+    "width": 640
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 161852,
+    "bitrate": 236224,
+    "contentLength": "4310122",
+    "fps": 25,
+    "height": 240,
+    "indexRange": {
+     "end": "1227",
+     "start": "740"
+    },
+    "initRange": {
+     "end": "739",
+     "start": "0"
+    },
+    "itag": 133,
+    "lastModified": "1766961065074107",
+    "mimeType": "video/mp4; codecs=\"avc1.4d4015\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "small",
+    "qualityLabel": "240p",
+    "qualityOrdinal": "QUALITY_ORDINAL_240P",
+    "width": 426
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 101649,
+    "bitrate": 131647,
+    "colorInfo": {
+     "matrixCoefficients": "COLOR_MATRIX_COEFFICIENTS_BT709",
+     "primaries": "COLOR_PRIMARIES_BT709",
+     "transferCharacteristics": "COLOR_TRANSFER_CHARACTERISTICS_BT709"
+    },
+    "contentLength": "2706929",
+    "fps": 25,
+    "height": 240,
+    "indexRange": {
+     "end": "856",
+     "start": "219"
+    },
+    "initRange": {
+     "end": "218",
+     "start": "0"
+    },
+    "itag": 242,
+    "lastModified": "1766963772564266",
+    "mimeType": "video/webm; codecs=\"vp9\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "small",
+    "qualityLabel": "240p",
+    "qualityOrdinal": "QUALITY_ORDINAL_240P",
+    "width": 426
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 116239,
+    "bitrate": 159709,
+    "colorInfo": {
+     "matrixCoefficients": "COLOR_MATRIX_COEFFICIENTS_BT709",
+     "primaries": "COLOR_PRIMARIES_BT709",
+     "transferCharacteristics": "COLOR_TRANSFER_CHARACTERISTICS_BT709"
+    },
+    "contentLength": "3095447",
+    "fps": 25,
+    "height": 240,
+    "indexRange": {
+     "end": "1187",
+     "start": "700"
+    },
+    "initRange": {
+     "end": "699",
+     "start": "0"
+    },
+    "itag": 395,
+    "lastModified": "1766960927930211",
+    "mimeType": "video/mp4; codecs=\"av01.0.00M.08\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "small",
+    "qualityLabel": "240p",
+    "qualityOrdinal": "QUALITY_ORDINAL_240P",
+    "width": 426
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 77286,
+    "bitrate": 109973,
+    "contentLength": "2058142",
+    "fps": 25,
+    "height": 144,
+    "indexRange": {
+     "end": "1226",
+     "start": "739"
+    },
+    "initRange": {
+     "end": "738",
+     "start": "0"
+    },
+    "itag": 160,
+    "lastModified": "1766961162303498",
+    "mimeType": "video/mp4; codecs=\"avc1.4d400c\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "tiny",
+    "qualityLabel": "144p",
+    "qualityOrdinal": "QUALITY_ORDINAL_144P",
+    "width": 256
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 57861,
+    "bitrate": 68500,
+    "colorInfo": {
+     "matrixCoefficients": "COLOR_MATRIX_COEFFICIENTS_BT709",
+     "primaries": "COLOR_PRIMARIES_BT709",
+     "transferCharacteristics": "COLOR_TRANSFER_CHARACTERISTICS_BT709"
+    },
+    "contentLength": "1540844",
+    "fps": 25,
+    "height": 144,
+    "indexRange": {
+     "end": "854",
+     "start": "218"
+    },
+    "initRange": {
+     "end": "217",
+     "start": "0"
+    },
+    "itag": 278,
+    "lastModified": "1766962598503008",
+    "mimeType": "video/webm; codecs=\"vp9\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "tiny",
+    "qualityLabel": "144p",
+    "qualityOrdinal": "QUALITY_ORDINAL_144P",
+    "width": 256
+   },
+   {
+    "approxDurationMs": "213040",
+    "averageBitrate": 56534,
+    "bitrate": 83289,
+    "colorInfo": {
+     "matrixCoefficients": "COLOR_MATRIX_COEFFICIENTS_BT709",
+     "primaries": "COLOR_PRIMARIES_BT709",
+     "transferCharacteristics": "COLOR_TRANSFER_CHARACTERISTICS_BT709"
+    },
+    "contentLength": "1505504",
+    "fps": 25,
+    "height": 144,
+    "indexRange": {
+     "end": "1187",
+     "start": "700"
+    },
+    "initRange": {
+     "end": "699",
+     "start": "0"
+    },
+    "itag": 394,
+    "lastModified": "1766961689433204",
+    "mimeType": "video/mp4; codecs=\"av01.0.00M.08\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "tiny",
+    "qualityLabel": "144p",
+    "qualityOrdinal": "QUALITY_ORDINAL_144P",
+    "width": 256
+   },
+   {
+    "approxDurationMs": "213089",
+    "audioChannels": 2,
+    "audioQuality": "AUDIO_QUALITY_MEDIUM",
+    "audioSampleRate": "44100",
+    "averageBitrate": 129502,
+    "bitrate": 130677,
+    "contentLength": "3449447",
+    "highReplication": true,
+    "indexRange": {
+     "end": "1018",
+     "start": "723"
+    },
+    "initRange": {
+     "end": "722",
+     "start": "0"
+    },
+    "itag": 140,
+    "lastModified": "1766955925572207",
+    "loudnessDb": 0.98999977,
+    "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "tiny",
+    "qualityOrdinal": "QUALITY_ORDINAL_UNKNOWN",
+    "trackAbsoluteLoudnessLkfs": -13.01
+   },
+   {
+    "approxDurationMs": "213061",
+    "audioChannels": 2,
+    "audioQuality": "AUDIO_QUALITY_LOW",
+    "audioSampleRate": "48000",
+    "averageBitrate": 46234,
+    "bitrate": 49496,
+    "contentLength": "1231355",
+    "indexRange": {
+     "end": "628",
+     "start": "259"
+    },
+    "initRange": {
+     "end": "258",
+     "start": "0"
+    },
+    "itag": 249,
+    "lastModified": "1766955883595299",
+    "loudnessDb": 0.97999954,
+    "mimeType": "audio/webm; codecs=\"opus\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "tiny",
+    "qualityOrdinal": "QUALITY_ORDINAL_UNKNOWN",
+    "trackAbsoluteLoudnessLkfs": -13.02
+   },
+   {
+    "approxDurationMs": "213061",
+    "audioChannels": 2,
+    "audioQuality": "AUDIO_QUALITY_LOW",
+    "audioSampleRate": "48000",
+    "averageBitrate": 61149,
+    "bitrate": 65508,
+    "contentLength": "1628559",
+    "indexRange": {
+     "end": "629",
+     "start": "259"
+    },
+    "initRange": {
+     "end": "258",
+     "start": "0"
+    },
+    "itag": 250,
+    "lastModified": "1766955884018742",
+    "loudnessDb": 0.97999954,
+    "mimeType": "audio/webm; codecs=\"opus\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "tiny",
+    "qualityOrdinal": "QUALITY_ORDINAL_UNKNOWN",
+    "trackAbsoluteLoudnessLkfs": -13.02
+   },
+   {
+    "approxDurationMs": "213061",
+    "audioChannels": 2,
+    "audioQuality": "AUDIO_QUALITY_MEDIUM",
+    "audioSampleRate": "48000",
+    "averageBitrate": 128930,
+    "bitrate": 136544,
+    "contentLength": "3433755",
+    "indexRange": {
+     "end": "629",
+     "start": "259"
+    },
+    "initRange": {
+     "end": "258",
+     "start": "0"
+    },
+    "itag": 251,
+    "lastModified": "1766955883819090",
+    "loudnessDb": 0.97999954,
+    "mimeType": "audio/webm; codecs=\"opus\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "tiny",
+    "qualityOrdinal": "QUALITY_ORDINAL_UNKNOWN",
+    "trackAbsoluteLoudnessLkfs": -13.02
+   }
+  ],
+  "expiresInSeconds": "21540",
+  "formats": [
+   {
+    "approxDurationMs": "213089",
+    "audioChannels": 2,
+    "audioQuality": "AUDIO_QUALITY_LOW",
+    "audioSampleRate": "44100",
+    "bitrate": 444226,
+    "fps": 25,
+    "height": 360,
+    "itag": 18,
+    "lastModified": "1766960953317159",
+    "mimeType": "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"",
+    "projectionType": "RECTANGULAR",
+    "quality": "medium",
+    "qualityLabel": "360p",
+    "qualityOrdinal": "QUALITY_ORDINAL_360P",
+    "signatureCipher": "<scrubbed>",
+    "width": 640
+   }
+  ],
+  "serverAbrStreamingUrl": "<scrubbed>"
+ },
+ "trackingParams": "<scrubbed>",
+ "videoDetails": {
+  "allowRatings": true,
+  "author": "Rick Astley",
+  "channelId": "UCuAXFkgsw1L7xaCfnd5JJOw",
+  "isCrawlable": true,
+  "isLiveContent": false,
+  "isOwnerViewing": false,
+  "isPrivate": false,
+  "isTvfilmVideo": false,
+  "isUnpluggedCorpus": false,
+  "keywords": [
+   "rick astley",
+   "Never Gonna Give You Up",
+   "nggyu",
+   "never gonna give you up lyrics",
+   "rick rolled",
+   "Rick Roll",
+   "rick astley official",
+   "rickrolled",
+   "Fortnite song",
+   "Fortnite event",
+   "Fortnite dance",
+   "fortnite never gonna give you up",
+   "rick roll",
+   "rickrolling",
+   "rick rolling",
+   "never gonna give you up",
+   "80s music",
+   "rick astley new",
+   "animated video",
+   "rickroll",
+   "meme songs",
+   "never gonna give u up lyrics",
+   "Rick Astley 2022",
+   "never gonna let you down",
+   "animated",
+   "rick rolls 2022",
+   "never gonna give you up karaoke"
+  ],
+  "lengthSeconds": "213",
+  "shortDescription": "<scrubbed>",
+  "thumbnail": {
+   "thumbnails": [
+    {
+     "height": 94,
+     "url": "<scrubbed>",
+     "width": 168
+    },
+    {
+     "height": 110,
+     "url": "<scrubbed>",
+     "width": 196
+    },
+    {
+     "height": 138,
+     "url": "<scrubbed>",
+     "width": 246
+    },
+    {
+     "height": 188,
+     "url": "<scrubbed>",
+     "width": 336
+    },
+    {
+     "height": 1080,
+     "url": "<scrubbed>",
+     "width": 1920
+    }
+   ]
+  },
+  "title": "<scrubbed>",
+  "videoId": "dQw4w9WgXcQ",
+  "viewCount": "1798452505"
+ }
+}

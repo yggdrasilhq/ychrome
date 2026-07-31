@@ -21,10 +21,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+mod abp;
+mod adblock;
 mod daemon;
 mod extensions;
 mod manifest;
 mod passkey;
+mod provision;
 mod sidebar;
 mod useragent;
 mod userscript;
@@ -1051,6 +1054,18 @@ fn main() -> Result<()> {
         let as_json = raw.iter().any(|arg| arg == "--json");
         return run_daemon_verb(raw.get(2).map(String::as_str), as_json);
     }
+    // `adblock <verb>` is maintenance on THIS host's ruleset: refresh it from
+    // the upstream lists, or say what is installed. Same pre-clap dispatch as
+    // the verbs above, so the open-a-url arg shape is untouched.
+    // `provision` runs the bundled-asset reconcile on demand and reports it.
+    // The same call `main` makes at launch, so an agent can see exactly what a
+    // launch would do without opening a surface.
+    if raw.get(1).map(String::as_str) == Some("provision") {
+        return provision::run(raw.iter().any(|arg| arg == "--json"));
+    }
+    if raw.get(1).map(String::as_str) == Some("adblock") {
+        return adblock::run(raw.get(2).map(String::as_str), &raw[2.min(raw.len())..]);
+    }
 
     let args = Args::parse();
 
@@ -1060,6 +1075,14 @@ fn main() -> Result<()> {
     if let Err(error) = manifest::write() {
         eprintln!("ychrome: could not register launcher manifest ({error})");
     }
+
+    // Bring this host's copies of the bundled assets up to date BEFORE the
+    // policy is built, because `policy()` is a read of the disk and a GET must
+    // not mutate it. This is where a userscript that predates its metadata
+    // block gets replaced, and where a host that never had an adblock ruleset
+    // gets one — both silently degraded states until now, and both loud from
+    // here on (crate::provision).
+    provision::reconcile_and_report();
 
     let raw_url = args.url.clone().unwrap_or_else(|| "about:blank".into());
     let raw_url = if raw_url.contains("://") || raw_url == "about:blank" {

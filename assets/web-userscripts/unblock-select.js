@@ -1,5 +1,6 @@
 // ==UserScript==
 // @name        Re-enable selection & right-click
+// @version     1.0.0
 // @world       isolated
 // @all-frames
 // @run-at      document-start
