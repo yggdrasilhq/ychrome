@@ -560,6 +560,101 @@ trigger a ceremony, never answer one. Do not propose an auto-consent path.
 
 ⚠ Still owed: full crypto E2E against a real relying party.
 
+
+## The agent engine (`src/engine/`) — headless browsing, `ychrome ctl`
+
+Host-resident headless browser, mounted on the daemon socket at `/engine/*`.
+No window, no terminal session, no OSC. `docs/agent-engine.md` is the spec;
+this is what you need to drive it.
+
+```sh
+ychrome ctl open url=https://example.com/ [profile=work]   # -> {page_id, ...}
+ychrome ctl goto  page_id=pg_000001 url=…
+ychrome ctl eval  page_id=pg_000001 js=document.title
+ychrome ctl dom   page_id=pg_000001 mode=snapshot           # the structured read
+ychrome ctl shot  page_id=pg_000001 --out shot.png          # image/png bytes
+ychrome ctl input page_id=pg_000001 events='[{"type":"click","selector":"#go"}]'
+ychrome ctl wait  page_id=pg_000001 until='{"js":"…"}' timeout_ms=8000
+ychrome ctl batch open='[{"url":"…"},…]' concurrency=8      # streams NDJSON
+ychrome ctl pool | metrics | pages | park | resume | budget | identity | close
+```
+
+Arguments are `key=value`; a value that parses as JSON is JSON, anything else is
+a string. Every verb is equally curl-able over the socket — the CLI is a thin
+client and holds no schema of its own.
+
+### ⚠ THE RULE: after input, WAIT for the state you expect. Never read straight after.
+
+WebKitGTK acknowledges key events **one at a time** while `eval` is sent
+immediately, so a read issued right after typing can overtake the last
+keystroke and see the field one character short. This is not exotic: it
+reproduced on **two runs in three**.
+
+```sh
+ychrome ctl input page_id=$p events='[{"type":"type","text":"ada lovelace"}]'
+ychrome ctl wait  page_id=$p until='{"js":"document.getElementById(\"name\").value === \"ada lovelace\""}'
+#            ^^^^ this line is not optional
+```
+
+`/engine/input` drains and flushes before returning, which helps and does not
+fix it. **`wait` is the fix.** The same rule covers navigation, lazy content and
+anything a framework renders asynchronously. An unmet wait returns
+`{"met": false, "reason": …}` — a fact to branch on, never an exception.
+
+Worked examples: `assets/engine-recipes/{crawl-and-extract,form-fill,watch-page-until}.sh`.
+`run-all.sh` runs all three; green on dev, the GUI host and oc.
+
+### What the engine gives you that a lab browser cannot
+
+It browses as **the user**: the same profile jar, adblock ruleset, userscripts,
+UA and per-site zoom the visible browser uses, consumed from their owners
+(`profile_dir`, `webpolicy::policy`, `webzoom`). A page logged in under profile
+X in the visible surface is logged in here.
+
+Input is **real**: `GdkEvent`s through `gtk_main_do_event`, so `isTrusted` is
+true, `:hover` applies and default actions fire. A `dispatchEvent` cannot do any
+of that, and the difference is the whole point.
+
+### What a future agent must NOT assume
+
+- **`page.rss_mb` and `cpu_pct_1m` are always `null`, permanently.** webkit2gtk
+  2.0.2 exposes no web-process identifier, so per-page memory is not
+  attributable on this substrate. They are `null` rather than `0` because a zero
+  would read as a measurement. **`per_page_rss_mb` is therefore NOT implemented
+  and is not schedulable** — do not plan work that depends on it. The
+  *aggregate* (`max_rss_mb`) IS measured, from `smaps_rollup` PSS across the
+  whole process tree, and IS enforced.
+- **WPE is not the substrate**, whatever §3 of the spec says. Debian's
+  wpe-webkit-2.0 2.52.5 ships no WPEPlatform at all. `ychrome engine probe`
+  reports it live; believe the probe, not the prose.
+- **A parked page resumes transparently.** Touch any verb and it comes back —
+  including its scroll offset and form state, not just its URL.
+- **`/engine/open` can answer `429 pool_saturated`** with the pressure numbers.
+  That is the governor refusing, not an error to retry blindly.
+- **The daemon's HOME must be shallow.** The socket path is bounded by
+  `SUN_LEN` (~108 bytes); a deep `$HOME` fails with `path must be shorter than
+  SUN_LEN`. This bites when testing under a scratch HOME.
+- **SponsorBlock's runtime state has never been observed in the engine.** Driven
+  at `youtube.com` under an isolated HOME, `window.__ysb` stayed `undefined`
+  after 15 s although the page loaded; its state looks watch-page-only. The
+  userscript plane itself IS proven. Do not assume this one works.
+- **Stop the daemon with the `stop` op, not `kill`.** SIGTERM skips
+  `engine::api::shutdown()`, so the engine's headless display is orphaned.
+
+### Proving a change
+
+```sh
+ychrome engine probe    # which substrate this host can run, and why
+ychrome engine gate     # Phase A: display, load, pixels, eval, isTrusted differential
+ychrome engine flow     # Phase B: nav/wait/dom and all five input events
+ychrome engine parity   # Phase C: jar, adblock differential, userscript world
+ychrome engine govern   # Phase D: 300 pages under budget, park/resume
+ychrome engine bench 10 # concurrency + shot latency
+```
+
+Each journals to `~/.yggterm/ychrome/journal.jsonl` and exits non-zero on
+failure. Run them under a private `HOME` and they touch nothing of the user's.
+
 ## Anti-patterns
 
 - Rebuilding a cipher from parsed fields for a PUT. → patch `RawCipher::raw`.
@@ -573,3 +668,6 @@ trigger a ceremony, never answer one. Do not propose an auto-consent path.
 - Two implementations of one vault rule (yggterm had the host matchers; they were
   deleted when `matching.rs` took ownership). One owner per concept.
 - Reformatting the crate to satisfy `cargo fmt --check`.
+- Reading a page straight after `ctl input` instead of waiting for the state you
+  expect. It works most of the time, which is what makes it dangerous.
+- Planning anything on per-page memory: it is not measurable here (see above).
