@@ -300,9 +300,6 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            // Parse the WHOLE batch before dispatching any of it. A batch that
-            // failed halfway would leave the page in a state no caller asked
-            // for and none can name.
             // ⛔ AN EMPTY BATCH IS A CALLER ERROR, NOT A SUCCESS. `raw` comes
             // from `event["events"].as_array().unwrap_or_default()`, so any
             // request whose shape does not produce that array arrives here as
@@ -319,17 +316,57 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
                         .to_string(),
                 );
             }
-            let mut events = Vec::with_capacity(raw.len());
+            // PASS 1 — shape. Pure, no page access, so a malformed batch is
+            // refused with nothing dispatched, which is what the old
+            // "parse the whole batch first" rule was protecting.
+            let mut pending = Vec::with_capacity(raw.len());
             for event in &raw {
-                match parse_input(&engine, &id, event) {
-                    Ok(parsed) => events.push(parsed),
+                match parse_input(event) {
+                    Ok(parsed) => pending.push(parsed),
                     Err(error) => return Reply::bad(400, error.to_string()),
                 }
             }
-            match engine.input(&id, events) {
-                Ok(dispatched) => Reply::Json(200, json!({ "ok": true, "dispatched": dispatched })),
-                Err(error) => Reply::bad(400, error.to_string()),
+            // PASS 2 — resolve each selector against the page AS IT IS when its
+            // own event is dispatched, then dispatch it. Resolving the batch up
+            // front measured event 2 before event 1 had moved anything, so a
+            // click that opened a menu was followed by a click at where the menu
+            // item used to be — the exact stale-rect click `target_moved`
+            // exists to refuse. A mid-batch refusal is a fact about the PAGE,
+            // and it is answered with the count actually dispatched and the
+            // index that stopped it, so the resulting state has a name.
+            let mut dispatched = 0u32;
+            let mut resolved: Vec<Value> = Vec::new();
+            for (index, item) in pending.into_iter().enumerate() {
+                let outcome = resolve_pending(&engine, &id, item)
+                    .and_then(|(event, report)| Ok((engine.input(&id, vec![event])?, report)));
+                match outcome {
+                    Ok((count, report)) => {
+                        dispatched += count;
+                        if let Some(report) = report {
+                            resolved.push(report);
+                        }
+                    }
+                    Err(error) => {
+                        // 409, not 400: the batch was well-formed and the PAGE
+                        // refused it. A caller retries a 409 after a
+                        // `/engine/wait`; a 400 means fix the request.
+                        return Reply::Json(
+                            409,
+                            json!({
+                                "ok": false,
+                                "error": error.to_string(),
+                                "dispatched": dispatched,
+                                "failed_at": index,
+                                "resolved": resolved,
+                            }),
+                        );
+                    }
+                }
             }
+            Reply::Json(
+                200,
+                json!({ "ok": true, "dispatched": dispatched, "resolved": resolved }),
+            )
         }
         "nav" => {
             let (Some(id), Some(action)) = (
@@ -707,13 +744,33 @@ fn wait(engine: &Engine, id: &str, until: &Value, timeout: Duration) -> Result<V
     }
 }
 
-/// Parse one `/engine/input` event.
+/// A parsed `/engine/input` event, before the page has been consulted.
 ///
-/// Selector-addressed clicks are sugar (§4): the engine resolves the selector's
-/// centre in the page, scrolls it into view, and dispatches REAL coordinates.
-/// One resolver, shared by `/input` and `/dom`, so a selector means the same
-/// thing to both.
-fn parse_input(engine: &Engine, id: &str, event: &Value) -> Result<InputEvent> {
+/// The split exists so the WHOLE batch can be shape-checked without touching
+/// the page, and every selector can then be resolved against the page **as it
+/// is at the moment its own event is dispatched**. Resolving a batch up front
+/// meant event 2's coordinates were measured before event 1 had moved anything,
+/// which is precisely the stale-rect click `target_moved` exists to refuse.
+enum PendingInput {
+    /// Nothing left to decide: coordinates, text or a keyval, all from the
+    /// caller.
+    Ready(InputEvent),
+    /// Sugar (§4): the engine resolves the selector in the page, scrolls it
+    /// into view, and dispatches REAL coordinates.
+    SelectorClick {
+        selector: String,
+        /// Which HITTABLE match to take. `None` walks from the first.
+        nth: Option<usize>,
+        /// Refuse instead of choosing when more than one match is hittable.
+        require_unique: bool,
+        button: u32,
+        count: u32,
+    },
+}
+
+/// Parse one `/engine/input` event. **Pure** — it never reads the page, so a
+/// malformed batch is refused before anything at all is dispatched.
+fn parse_input(event: &Value) -> Result<PendingInput> {
     let kind = event["type"].as_str().unwrap_or("");
     let point = |event: &Value| -> Result<(f64, f64)> {
         match (event["x"].as_f64(), event["y"].as_f64()) {
@@ -723,10 +780,6 @@ fn parse_input(engine: &Engine, id: &str, event: &Value) -> Result<InputEvent> {
     };
     match kind {
         "click" => {
-            let (x, y) = match event["selector"].as_str() {
-                Some(selector) => resolve_selector(engine, id, selector)?,
-                None => point(event)?,
-            };
             let button = match event["button"].as_str().unwrap_or("left") {
                 "left" => 1,
                 "middle" => 2,
@@ -734,31 +787,50 @@ fn parse_input(engine: &Engine, id: &str, event: &Value) -> Result<InputEvent> {
                 other => bail!("unknown mouse button {other:?} (left|middle|right)"),
             };
             let count = event["count"].as_u64().unwrap_or(1).clamp(1, 3) as u32;
-            Ok(InputEvent::Click {
-                x,
-                y,
-                button,
-                count,
-            })
+            match event["selector"].as_str() {
+                Some(selector) => Ok(PendingInput::SelectorClick {
+                    selector: selector.to_string(),
+                    nth: match event.get("nth") {
+                        None | Some(Value::Null) => None,
+                        Some(value) => {
+                            Some(value.as_u64().map(|n| n as usize).ok_or_else(|| {
+                                anyhow::anyhow!("`nth` must be a non-negative integer, got {value}")
+                            })?)
+                        }
+                    },
+                    require_unique: event["require_unique"].as_bool().unwrap_or(false),
+                    button,
+                    count,
+                }),
+                None => {
+                    let (x, y) = point(event)?;
+                    Ok(PendingInput::Ready(InputEvent::Click {
+                        x,
+                        y,
+                        button,
+                        count,
+                    }))
+                }
+            }
         }
         "move" => {
             let (x, y) = point(event)?;
-            Ok(InputEvent::Move { x, y })
+            Ok(PendingInput::Ready(InputEvent::Move { x, y }))
         }
         "scroll" => {
             let x = event["x"].as_f64().unwrap_or(0.0);
             let y = event["y"].as_f64().unwrap_or(0.0);
-            Ok(InputEvent::Scroll {
+            Ok(PendingInput::Ready(InputEvent::Scroll {
                 x,
                 y,
                 dx: event["dx"].as_f64().unwrap_or(0.0),
                 dy: event["dy"].as_f64().unwrap_or(0.0),
-            })
+            }))
         }
         "type" => match event["text"].as_str() {
-            Some(text) => Ok(InputEvent::Text {
+            Some(text) => Ok(PendingInput::Ready(InputEvent::Text {
                 text: text.to_string(),
-            }),
+            })),
             None => bail!("a type event needs text"),
         },
         "key" => {
@@ -774,64 +846,270 @@ fn parse_input(engine: &Engine, id: &str, event: &Value) -> Result<InputEvent> {
                         .collect()
                 })
                 .unwrap_or_default();
-            Ok(InputEvent::Key {
+            Ok(PendingInput::Ready(InputEvent::Key {
                 keyval: super::host::keyval_from_name(name)?,
                 mods: super::host::modifier_mask(&mods)?,
-            })
+            }))
         }
         other => bail!("unknown input event type {other:?} (click|move|scroll|type|key)"),
     }
 }
 
-/// Scroll a selector into view and return the viewport centre of its rect.
-fn resolve_selector(engine: &Engine, id: &str, selector: &str) -> Result<(f64, f64)> {
-    // ⛔ FIRST MATCH IS NOT GOOD ENOUGH, AND ZERO AREA IS NOT THE ONLY WAY TO
-    // MISS. A `display:none` duplicate ahead of the real control measures 0x0
-    // and is caught below — but a `visibility:hidden`, `opacity:0`, or simply
-    // COVERED duplicate measures a perfectly good rect, so the click dispatched
-    // into nothing and `{"dispatched":n,"ok":true}` described a click that hit
-    // no one. That lie-of-success cost a reporting agent three wrong
-    // conclusions in one session, one of which blamed the operator.
-    //
-    // So: walk every match and take the first that is genuinely hittable, and
-    // decide hittability the way the browser does — `elementFromPoint` at the
-    // centre must land on the element or inside it. That single test subsumes
-    // zero-area, off-screen, hidden AND covered, instead of enumerating the
-    // ways an element can be unclickable and missing one.
-    let quoted = serde_json::to_string(selector)?;
-    let value = engine.eval(
-        id,
-        &format!(
-            "(() => {{ const all = Array.from(document.querySelectorAll({quoted})); \
-             if (!all.length) return null; \
-             let rejected = 0, reason = null; \
-             for (const e of all) {{ \
-               e.scrollIntoView({{block:'center', inline:'center', behavior:'instant'}}); \
-               const r = e.getBoundingClientRect(); \
-               if (r.width <= 0 || r.height <= 0) {{ rejected++; reason = reason || 'zero_size_element'; continue; }} \
-               const x = r.x + r.width / 2, y = r.y + r.height / 2; \
-               if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) {{ rejected++; reason = reason || 'offscreen_element'; continue; }} \
-               const hit = document.elementFromPoint(x, y); \
-               if (!hit || !(hit === e || e.contains(hit) || hit.contains(e))) {{ rejected++; reason = reason || 'element_not_hittable'; continue; }} \
-               return {{ x, y, ok: true, total: all.length, rejected }}; \
-             }} \
-             return {{ ok: false, total: all.length, rejected, reason }}; }})()"
-        ),
-    )?;
-    if value.is_null() {
-        bail!("selector {selector:?} matched nothing on this page");
+/// Turn a parsed event into a dispatchable one, consulting the page only for
+/// the selector-addressed clicks that need it. The second return is the
+/// resolution report `/engine/input` echoes back, so ambiguity is never silent.
+fn resolve_pending(
+    engine: &Engine,
+    id: &str,
+    pending: PendingInput,
+) -> Result<(InputEvent, Option<Value>)> {
+    match pending {
+        PendingInput::Ready(event) => Ok((event, None)),
+        PendingInput::SelectorClick {
+            selector,
+            nth,
+            require_unique,
+            button,
+            count,
+        } => {
+            let target = resolve_selector(engine, id, &selector, nth, require_unique)?;
+            Ok((
+                InputEvent::Click {
+                    x: target.x,
+                    y: target.y,
+                    button,
+                    count,
+                },
+                Some(target.report),
+            ))
+        }
     }
-    if value["ok"].as_bool() != Some(true) {
-        let total = value["total"].as_u64().unwrap_or(0);
-        let reason = value["reason"].as_str().unwrap_or("element_not_hittable");
+}
+
+/// How long a scroll gets to settle before the rect is RE-measured.
+///
+/// `scrollIntoView` is not reliably synchronous — a container with CSS
+/// `scroll-behavior: smooth` animates it — so a rect read in the same tick is
+/// the PRE-scroll box. The visible surface plane measured this on a MUI listbox
+/// and settled on 120 ms (`WEB_DO_SCROLL_SETTLE`); the same number is used here
+/// so the two planes agree about when a scroll is done instead of each guessing.
+const CLICK_SCROLL_SETTLE: Duration = Duration::from_millis(120);
+
+/// How many hittable candidates the resolver will try before giving up.
+///
+/// Bounded because each attempt costs a scroll settle. A page where the first
+/// eight hittable matches all fail re-measurement is not a page a ninth attempt
+/// is going to rescue, and the refusal says the walk was capped.
+const CLICK_WALK_CAP: usize = 8;
+
+/// Where a selector-addressed click will land, and the account of how it was
+/// chosen.
+struct ClickTarget {
+    x: f64,
+    y: f64,
+    /// Echoed in `/engine/input`'s reply. Reporting a `matches: 1` costs
+    /// nothing and reporting a `matches: 9` is the whole point.
+    report: Value,
+}
+
+/// Resolve a selector to the point a click should be dispatched at.
+///
+/// ## Why this is not `querySelector`
+///
+/// `document.querySelector` returns the FIRST match and real pages carry hidden
+/// duplicates: IBKR's login page has six-plus `button[type=submit]`, five of
+/// them dead, the live one third in document order. Clicking the first is a
+/// click into the void, and reporting `{"dispatched":3,"ok":true}` for it cost a
+/// reporting agent three wrong conclusions in one session, one of which blamed
+/// the operator's vault for a 2FA failure that had never been submitted.
+///
+/// ## The semantics, decided (2026-07-31)
+///
+/// **The pool is the HITTABLE matches, in document order, and the default is the
+/// first of them.** Not the first match, and not a refusal on ambiguity.
+///
+/// The reasoning: hidden duplicates are *noise*, not *ambiguity*. A page with
+/// five dead submit buttons and one live one poses a question that has exactly
+/// one answer, and refusing it would be refusing to answer an unambiguous
+/// question. The visible surface plane already settled this the same way — its
+/// matcher filters to live nodes, takes `nth` (default 0), and reports the
+/// counts rather than refusing — and two planes answering the same question
+/// differently is the divergence this codebase forbids.
+///
+/// Both alternatives the bug report asked about stay reachable, on the request,
+/// **before** the click rather than after it:
+///
+/// - `"nth": k` takes the k-th HITTABLE match (never the k-th raw match — a
+///   caller counting from a `/engine/dom` snapshot is counting visible things);
+/// - `"require_unique": true` refuses `ambiguous_selector` when more than one
+///   match is hittable, for a caller who would rather stop than guess.
+///
+/// And the reply always carries `{matches, hittable, hidden, zero_size, nth,
+/// ambiguous}`, so a caller that took the default still learns it was one of
+/// nine.
+fn resolve_selector(
+    engine: &Engine,
+    id: &str,
+    selector: &str,
+    nth: Option<usize>,
+    require_unique: bool,
+) -> Result<ClickTarget> {
+    let quoted = serde_json::to_string(selector)?;
+    let pool = engine.eval(id, &format!("({})({quoted})", js::CLICK_POOL))?;
+    if let Some(reason) = pool["bad_selector"].as_str() {
+        bail!("{selector:?} is not a valid CSS selector ({reason})");
+    }
+    let matches = pool["matches"].as_u64().unwrap_or(0);
+    let hittable = pool["hittable"].as_u64().unwrap_or(0) as usize;
+    let hidden = pool["hidden"].as_u64().unwrap_or(0);
+    let zero_size = pool["zero_size"].as_u64().unwrap_or(0);
+
+    if matches == 0 {
+        bail!("no element matches {selector:?}");
+    }
+    if hittable == 0 {
+        // The counts are named with the tokens the visible surface plane uses
+        // for the same conditions — `zero_size_element` for a `0x0` box (which
+        // is what `display:none` measures) and `hidden` for the aria/style
+        // kind — so a caller reads one vocabulary across both planes.
         bail!(
-            "selector {selector:?} matched {total} element(s) and NONE was clickable ({reason}) \
-             — refusing rather than dispatching into the void"
+            "no_hittable_match ({selector:?} matched {matches} element(s) and NONE could receive \
+             a click: {zero_size} zero_size_element, {hidden} hidden — refusing rather than \
+             dispatching into the void)"
         );
     }
-    let (Some(x), Some(y)) = (value["x"].as_f64(), value["y"].as_f64()) else {
-        bail!("selector {selector:?} resolved to no rect");
+    if require_unique && hittable > 1 {
+        bail!(
+            "ambiguous_selector ({selector:?} has {hittable} hittable match(es) of {matches} and \
+             the caller required exactly one — pass `nth` to choose between them)"
+        );
+    }
+
+    let candidates: Vec<usize> = match nth {
+        Some(index) if index >= hittable => bail!(
+            "no element matches {selector:?} at hittable index {index} — it has {hittable} \
+             hittable match(es) of {matches}"
+        ),
+        // An explicit `nth` is an instruction, not a hint: walking past it would
+        // hand the caller a DIFFERENT element than the one they named.
+        Some(index) => vec![index],
+        None => (0..hittable.min(CLICK_WALK_CAP)).collect(),
     };
+    let walked = candidates.len();
+
+    let mut first_refusal: Option<String> = None;
+    for index in candidates {
+        let pinned = engine.eval(id, &format!("({})({index})", js::CLICK_PIN))?;
+        if pinned["found"].as_bool() != Some(true) {
+            first_refusal.get_or_insert(format!(
+                "handle_lost ({selector:?} hittable match {index} left the pool before it could \
+                 be pinned)"
+            ));
+            continue;
+        }
+        // The scroll must SETTLE before the rect is read again. See
+        // `CLICK_SCROLL_SETTLE` — this sleeps the request thread, not the engine
+        // thread, so other pages keep loading through it.
+        std::thread::sleep(CLICK_SCROLL_SETTLE);
+        let measured = engine.eval(id, js::CLICK_MEASURE)?;
+        match click_point_from_measure(selector, index, &measured) {
+            Ok((x, y)) => {
+                return Ok(ClickTarget {
+                    x,
+                    y,
+                    report: json!({
+                        "selector": selector,
+                        "matches": matches,
+                        "hittable": hittable,
+                        "hidden": hidden,
+                        "zero_size": zero_size,
+                        "nth": index,
+                        // Ambiguity is counted over the HITTABLE pool: five dead
+                        // duplicates and one live control is not an ambiguous
+                        // question. `matches` is right there for a caller who
+                        // wants the stricter reading.
+                        "ambiguous": hittable > 1,
+                        "x": x,
+                        "y": y,
+                        "tag": measured["tag"],
+                    }),
+                });
+            }
+            Err(refusal) => {
+                first_refusal.get_or_insert(refusal);
+            }
+        }
+    }
+    let capped = if walked < hittable {
+        format!(" (the walk stopped after {walked} of {hittable} hittable candidates)")
+    } else {
+        String::new()
+    };
+    bail!(
+        "{}{capped}",
+        first_refusal.unwrap_or_else(|| format!("no_hittable_match ({selector:?})"))
+    );
+}
+
+/// PURE half of the resolver: turn the page's post-scroll report into a point or
+/// a refusal.
+///
+/// Kept pure, exactly as the visible surface plane keeps
+/// `web_do_resolved_from_info` pure, so every interesting failure of a
+/// selector-addressed click is decided here and unit-testable without a webview.
+///
+/// The refusal vocabulary is the surface plane's, deliberately: `handle_lost`,
+/// `rect_not_reresolved`, `detached_node`, `zero-size element`, `target_moved`.
+/// A second set of words for the same failures would leave an agent unable to
+/// carry what it learned on one plane over to the other.
+fn click_point_from_measure(
+    selector: &str,
+    index: usize,
+    info: &Value,
+) -> std::result::Result<(f64, f64), String> {
+    if info["found"].as_bool() != Some(true) {
+        return Err(format!(
+            "handle_lost ({selector:?} hittable match {index} was replaced between the scroll and \
+             the re-measure)"
+        ));
+    }
+    // THE RECT MUST BE THE POST-SCROLL ONE. Only the phase-B script stamps this
+    // token, so a payload without it is by construction a rect measured in the
+    // same tick as the scroll that moved the node.
+    if info["phase"].as_str() != Some("post_scroll") {
+        return Err(format!(
+            "rect_not_reresolved ({selector:?} was measured before the scroll settled)"
+        ));
+    }
+    if info["isConnected"].as_bool() != Some(true) {
+        return Err(format!(
+            "detached_node ({selector:?} resolved to a node that is not in the document)"
+        ));
+    }
+    if info["visible"].as_bool() != Some(true) {
+        return Err(format!("{selector:?} matched a zero-size element"));
+    }
+    let (Some(x), Some(y)) = (info["x"].as_f64(), info["y"].as_f64()) else {
+        return Err(format!("{selector:?} resolved to no rect"));
+    };
+    if info["onTarget"].as_bool() != Some(true) {
+        // One token, three flavours, and the message says which — an element
+        // still outside the viewport after being scrolled to, a point where
+        // nothing paints, and a point another element sits on top of are all
+        // "the resolved point does not reach this node".
+        let detail = if info["in_viewport"].as_bool() != Some(true) {
+            "it is still outside the viewport after being scrolled into view".to_string()
+        } else {
+            match info["hit"].as_str() {
+                Some(hit) => format!("`{hit}` is what receives a click there"),
+                None => "nothing is painted there".to_string(),
+            }
+        };
+        return Err(format!(
+            "target_moved (the resolved point ({x:.0},{y:.0}) no longer hits {selector:?} — \
+             {detail})"
+        ));
+    }
     Ok((x, y))
 }
 
@@ -1190,5 +1468,160 @@ mod tests {
         assert_eq!(built.body["url"], "https://example.com/");
         // No token: the socket's permissions are the authority (§4 as corrected).
         assert!(built.control_token.is_none());
+    }
+
+    /// A post-scroll payload for a node that is genuinely clickable, with
+    /// `overrides` merged over it. Every refusal below is one field away from
+    /// this, which is what makes the tests about the DECISION rather than about
+    /// the payload shape.
+    fn measured(overrides: Value) -> Value {
+        let mut info = json!({
+            "found": true, "phase": "post_scroll", "isConnected": true,
+            "x": 120.0, "y": 44.0, "w": 90.0, "h": 30.0,
+            "visible": true, "in_viewport": true, "onTarget": true,
+            "hit": "button#real", "tag": "button"
+        });
+        for (key, value) in overrides.as_object().cloned().unwrap_or_default() {
+            info[key] = value;
+        }
+        info
+    }
+
+    // The happy path first, or every refusal below could be passing because the
+    // function refuses everything.
+    #[test]
+    fn a_hittable_node_resolves_to_its_centre() {
+        let point = click_point_from_measure(".go", 0, &measured(json!({})))
+            .expect("a hittable node resolves");
+        assert_eq!(point, (120.0, 44.0));
+    }
+
+    // ⛔ THE REPORTED BUG, as a pure decision. Each of these once came back as a
+    // dispatched click that hit nothing and an `{"ok":true}` that described it.
+    // The tokens are the visible surface plane's, deliberately: an agent that
+    // learned `detached_node` there must not meet a second word for it here.
+    #[test]
+    fn every_way_a_click_can_miss_is_refused_by_name() {
+        let cases = [
+            (json!({ "isConnected": false }), "detached_node"),
+            (json!({ "visible": false }), "matched a zero-size element"),
+            (json!({ "onTarget": false }), "target_moved"),
+            (json!({ "found": false }), "handle_lost"),
+            (json!({ "phase": "pre_scroll" }), "rect_not_reresolved"),
+        ];
+        for (overrides, token) in cases {
+            let Err(error) = click_point_from_measure(".go", 0, &measured(overrides.clone()))
+            else {
+                panic!("{overrides} must refuse, it describes a click that cannot land");
+            };
+            assert!(
+                error.contains(token),
+                "expected {token:?} for {overrides}, got {error:?}"
+            );
+        }
+    }
+
+    // A refusal that does not say WHAT the point hit is a refusal an agent
+    // cannot act on. The three flavours of `target_moved` must be
+    // distinguishable in the message even though they share one token.
+    #[test]
+    fn target_moved_says_which_flavour_it_is() {
+        let covered = click_point_from_measure(
+            ".numb",
+            0,
+            &measured(json!({ "onTarget": false, "hit": "div#deaf" })),
+        )
+        .expect_err("a covered node refuses");
+        assert!(covered.contains("div#deaf"), "{covered}");
+
+        let offscreen = click_point_from_measure(
+            ".parked",
+            0,
+            &measured(json!({ "onTarget": false, "in_viewport": false, "hit": null })),
+        )
+        .expect_err("an unreachable node refuses");
+        assert!(offscreen.contains("outside the viewport"), "{offscreen}");
+
+        let empty = click_point_from_measure(
+            ".ghost",
+            0,
+            &measured(json!({ "onTarget": false, "hit": null })),
+        )
+        .expect_err("a point where nothing paints refuses");
+        assert!(empty.contains("nothing is painted"), "{empty}");
+    }
+
+    // The parser must be PURE — it is what lets a malformed batch be refused
+    // with nothing dispatched — so a selector click leaves the page untouched
+    // and comes back as a job to do later.
+    #[test]
+    fn a_selector_click_is_parsed_without_touching_the_page() {
+        let parsed = parse_input(&json!({
+            "type": "click", "selector": ".go", "nth": 2, "require_unique": true,
+            "button": "right", "count": 2
+        }))
+        .expect("a selector click parses");
+        match parsed {
+            PendingInput::SelectorClick {
+                selector,
+                nth,
+                require_unique,
+                button,
+                count,
+            } => {
+                assert_eq!(selector, ".go");
+                assert_eq!(nth, Some(2));
+                assert!(require_unique);
+                assert_eq!(button, 3);
+                assert_eq!(count, 2);
+            }
+            PendingInput::Ready(_) => panic!("a selector click must not resolve at parse time"),
+        }
+        // Coordinates need nothing from the page and must stay Ready.
+        assert!(matches!(
+            parse_input(&json!({ "type": "click", "x": 1, "y": 2 })).expect("a point click parses"),
+            PendingInput::Ready(_)
+        ));
+        // A malformed `nth` is a caller error, caught before anything moves.
+        assert!(parse_input(&json!({ "type": "click", "selector": ".go", "nth": -1 })).is_err());
+        assert!(parse_input(&json!({ "type": "click" })).is_err());
+    }
+
+    // The three scripts must agree on the globals they hand each other. Two
+    // spellings of one page-side key is the same class of silent divergence as
+    // two spellings of a refusal.
+    #[test]
+    fn the_click_scripts_share_one_page_side_vocabulary() {
+        assert!(js::CLICK_POOL.contains(js::CLICK_POOL_KEY));
+        assert!(js::CLICK_PIN.contains(js::CLICK_POOL_KEY));
+        assert!(js::CLICK_PIN.contains(js::CLICK_PIN_KEY));
+        assert!(js::CLICK_MEASURE.contains(js::CLICK_PIN_KEY));
+        // Phase B must not re-run the selector: measuring a twin is how the
+        // surface plane once verified a node it had not acted on.
+        assert!(
+            !js::CLICK_MEASURE.contains("querySelector"),
+            "the re-measure must read the PIN, never the selector again"
+        );
+        // Only phase B stamps the contract token.
+        assert!(js::CLICK_MEASURE.contains("phase: 'post_scroll'"));
+        assert!(!js::CLICK_PIN.contains("post_scroll"));
+        // And phase A2 must not report geometry — a rect read in the same tick
+        // as the scroll is the PRE-scroll rect.
+        assert!(!js::CLICK_PIN.contains("getBoundingClientRect"));
+    }
+
+    // ⛔ THE CLAUSE THAT WAS THE BUG. `elementFromPoint` over a
+    // `visibility:hidden` element returns `<body>`, and `<body>.contains(el)` is
+    // true for every element on the page — so accepting an ancestor hit accepted
+    // the first match unconditionally and made the walk a no-op. The live proof
+    // (`ychrome engine hit`, the `.numb` step) catches it too; this catches it
+    // without a browser, in a second.
+    #[test]
+    fn an_ancestor_hit_is_never_accepted_as_hittability() {
+        assert!(
+            !js::CLICK_MEASURE.contains("hit.contains(el)"),
+            "an ancestor that contains the target is not the target: a click there reaches the \
+             ANCESTOR, and this clause is exactly how a hidden decoy passed for a live control"
+        );
     }
 }
