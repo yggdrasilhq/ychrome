@@ -30,6 +30,7 @@ mod manifest;
 mod passkey;
 mod provision;
 mod sidebar;
+mod sitehost;
 mod useragent;
 mod userscript;
 mod webpolicy;
@@ -766,7 +767,14 @@ fn run_thin_client_picker(session: &str) -> Result<()> {
     // `drive_surface`, the ONE loop that declares the sidebar before it opens.
     {
         let t = target.lock().unwrap();
-        emit_web_surface_osc(t.action, session, &t.url, &t.title, &t.profile, t.start_page);
+        emit_web_surface_osc(
+            t.action,
+            session,
+            &t.url,
+            &t.title,
+            &t.profile,
+            t.start_page,
+        );
         eprintln!("ychrome: profile picker open — {picker_url}  (Ctrl+C to close)");
     }
     let mut ticks: u32 = 0;
@@ -781,7 +789,12 @@ fn run_thin_client_picker(session: &str) -> Result<()> {
         {
             let t = target.lock().unwrap();
             if t.action == "open" {
-                break Some((t.url.clone(), t.title.clone(), t.profile.clone(), t.start_page));
+                break Some((
+                    t.url.clone(),
+                    t.title.clone(),
+                    t.profile.clone(),
+                    t.start_page,
+                ));
             }
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -790,7 +803,14 @@ fn run_thin_client_picker(session: &str) -> Result<()> {
         // re-announce the picker.
         if last_tick.elapsed() > Duration::from_secs(3) {
             let t = target.lock().unwrap();
-            emit_web_surface_osc(t.action, session, &t.url, &t.title, &t.profile, t.start_page);
+            emit_web_surface_osc(
+                t.action,
+                session,
+                &t.url,
+                &t.title,
+                &t.profile,
+                t.start_page,
+            );
         }
         last_tick = std::time::Instant::now();
         ticks += 1;
@@ -870,7 +890,9 @@ fn run_status(as_json: bool) -> Result<()> {
     // which it only does when surfaces are attached. Say which of the two facts
     // is keeping the old code alive, and name the verb that ends it.
     if stale {
-        println!("  [STALE] this daemon is serving old code: the binary on disk changed after it started.");
+        println!(
+            "  [STALE] this daemon is serving old code: the binary on disk changed after it started."
+        );
         if held > 0 {
             println!(
                 "  [STALE] {held} live surface(s) are attached, so nothing retired it for you."
@@ -918,8 +940,12 @@ fn run_daemon_verb(sub: Option<&str>, as_json: bool) -> Result<()> {
             }
             let new_pid = done["pid"].as_u64().unwrap_or(0);
             match done["old_pid"].as_u64() {
-                Some(old) => println!("ychrome daemon restarted: pid {old} retired, pid {new_pid} now serving"),
-                None => println!("ychrome daemon started: pid {new_pid} now serving (none was running)"),
+                Some(old) => println!(
+                    "ychrome daemon restarted: pid {old} retired, pid {new_pid} now serving"
+                ),
+                None => {
+                    println!("ychrome daemon started: pid {new_pid} now serving (none was running)")
+                }
             }
             let rows = done["sessions_reattaching"]
                 .as_array()
@@ -1052,7 +1078,93 @@ const RESERVED_SUBCOMMANDS: &[&str] = &[
     "adblock",
     "ctl",
     "engine",
+    "identity",
 ];
+
+/// `ychrome identity [<host>] [--set <preset>|--reset] [--json]`.
+///
+/// With no host it reports the browser-wide decision and every per-site
+/// override. With a host it reports what that ONE site gets, which is the
+/// question a user actually has ("why does this login keep looping?").
+///
+/// The warning is printed on every `--set`, not tucked into `--help`: a spoofed
+/// identity that breaks a fingerprint-gated login fails as a challenge that
+/// never clears, and nothing on screen would otherwise connect the two.
+fn run_identity_verb(args: &[String]) -> Result<()> {
+    let as_json = args.iter().any(|arg| arg == "--json");
+    let host = args
+        .iter()
+        .find(|arg| !arg.starts_with("--"))
+        .map(String::as_str);
+    let set = args
+        .iter()
+        .position(|arg| arg == "--set")
+        .and_then(|index| args.get(index + 1))
+        .map(String::as_str);
+    let reset = args.iter().any(|arg| arg == "--reset");
+
+    if set.is_some() || reset {
+        match host {
+            Some(host) => {
+                useragent::set_site(host, set)?;
+                if set.is_some() {
+                    eprintln!("ychrome: {}", useragent::OVERRIDE_WARNING);
+                }
+            }
+            // No host means the browser-wide decision. `--reset` there is the
+            // engine preset, which IS the default — spelled out rather than
+            // silently doing nothing.
+            None => useragent::set_preset(set.unwrap_or("engine"))?,
+        }
+    }
+
+    let global = useragent::preset();
+    let sites = useragent::sites();
+    if as_json {
+        let effective = host.map(|host| {
+            serde_json::json!({
+                "host": host,
+                "preset": useragent::preset_for_host(&sites, global, host).id(),
+                "user_agent": useragent::effective_for_host(host),
+            })
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "preset": global.id(),
+                "user_agent": useragent::effective(),
+                "sites": useragent::sites_json(),
+                "site": effective,
+            }))?
+        );
+        return Ok(());
+    }
+    // `(engine default)` rather than an invented string: WebKitGTK owns its own
+    // UA, and printing a copy here is how a stale constant gets born.
+    let show = |ua: Option<String>| ua.unwrap_or_else(|| "(engine default)".to_string());
+    println!(
+        "browser-wide: {} — {}",
+        global.label(),
+        show(useragent::effective())
+    );
+    if sites.is_empty() {
+        println!("per-site overrides: none");
+    } else {
+        println!("per-site overrides:");
+        for (site, preset) in &sites {
+            println!("  {site}: {}", preset.label());
+        }
+    }
+    if let Some(host) = host {
+        println!(
+            "\n{host}: {} — {}",
+            useragent::preset_for_host(&sites, global, host).label(),
+            show(useragent::effective_for_host(host))
+        );
+    }
+    Ok(())
+}
 
 /// Whether `token` is subcommand-shaped rather than URL-shaped: a single bare
 /// label with no scheme, no dot, no port and no path.
@@ -1127,6 +1239,14 @@ fn main() -> Result<()> {
     if raw.get(1).map(String::as_str) == Some("engine") {
         let as_json = raw.iter().any(|arg| arg == "--json");
         engine::run_verb_and_exit(raw.get(2).map(String::as_str), as_json);
+    }
+    // `identity` — read or set what this browser says it is. The settings pane
+    // is the same decision through a different door; this one exists because a
+    // host with no GUI still has to be able to answer "what am I sending, and to
+    // whom", and because an override is a thing an agent should be able to
+    // PROVE it set rather than click and hope.
+    if raw.get(1).map(String::as_str) == Some("identity") {
+        return run_identity_verb(&raw[2..]);
     }
 
     // ⛔ A SUBCOMMAND-SHAPED TOKEN MUST NEVER FALL THROUGH INTO THE URL.
@@ -1316,9 +1436,21 @@ fn main() -> Result<()> {
         builder = builder.with_proxy_config(proxy_config);
     }
     // The same identity the thin-client surfaces get (yggterm applies it there,
-    // from `/policy`). A standalone window is the same browser: it must not be the
-    // one place claude.ai still answers "Request not allowed".
-    if let Some(user_agent) = crate::useragent::effective() {
+    // from `/policy`). A standalone window is the same browser.
+    //
+    // Resolved against THIS window's host, so a per-site override applies here
+    // too: wry fixes the UA at webview creation and a standalone window opens on
+    // exactly one URL, so the host is known at the only moment that matters.
+    // With no override and no global preset this is `None` — WebKitGTK's own
+    // identity, which is the coherent one (see `useragent`).
+    let identity_host = Url::parse(&final_url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_string));
+    let user_agent = match identity_host.as_deref() {
+        Some(host) => crate::useragent::effective_for_host(host),
+        None => crate::useragent::effective(),
+    };
+    if let Some(user_agent) = user_agent {
         builder = builder.with_user_agent(&user_agent);
     }
 
@@ -1466,7 +1598,10 @@ mod second_invocation_tests {
             .next()
             .expect("the pre-clap dispatch region");
         let mut dispatched: Vec<String> = Vec::new();
-        for piece in body.split("raw.get(1).map(String::as_str) == Some(\"").skip(1) {
+        for piece in body
+            .split("raw.get(1).map(String::as_str) == Some(\"")
+            .skip(1)
+        {
             let name = piece.split('"').next().expect("verb literal closes");
             dispatched.push(name.to_string());
         }

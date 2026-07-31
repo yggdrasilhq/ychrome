@@ -115,36 +115,20 @@ pub fn set(host: &str, percent: Option<f64>) -> Result<()> {
 /// The effective override for a host, most specific first: an exact
 /// `music.youtube.com` entry beats a `youtube.com` entry, which beats none. This
 /// mirrors the match yggterm does on the live page, so the CLI and the GUI agree.
-/// A bare TLD (`com`) is never consulted — an override there would swallow the
-/// whole web — so the walk stops at the last two labels.
+///
+/// The WALK itself is [`crate::sitehost`]'s — one owner, shared with the
+/// per-site browser-identity map, so "which entry covers this page" can only
+/// ever mean one thing. The tests below stay here because they are the zoom
+/// side's contract with yggterm's matcher.
 pub fn zoom_for_host(sites: &BTreeMap<String, f64>, host: &str) -> Option<f64> {
-    let host = normalize_host(host);
-    if host.is_empty() {
-        return None;
-    }
-    let mut candidate = host.as_str();
-    loop {
-        if let Some(percent) = sites.get(candidate) {
-            return Some(*percent);
-        }
-        match candidate.split_once('.') {
-            // Strip the leftmost label and try the parent domain, but only while
-            // at least two labels remain — never fall through to a bare TLD.
-            Some((_, rest)) if rest.contains('.') => candidate = rest,
-            _ => return None,
-        }
-    }
+    crate::sitehost::lookup(sites, host).copied()
 }
 
 /// Lowercase, port-stripped host. `normalize_host("WWW.YouTube.com:443")` ->
 /// `"www.youtube.com"`. `www` is deliberately kept: it is its own host, and the
 /// longest-suffix walk already lets a `youtube.com` override reach it.
 fn normalize_host(host: &str) -> String {
-    host.split(':')
-        .next()
-        .unwrap_or(host)
-        .trim()
-        .to_ascii_lowercase()
+    crate::sitehost::normalize(host)
 }
 
 fn clamp(percent: f64) -> f64 {
