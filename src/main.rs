@@ -24,6 +24,7 @@ use anyhow::{Context, Result, bail};
 mod abp;
 mod adblock;
 mod daemon;
+mod engine;
 mod extensions;
 mod manifest;
 mod passkey;
@@ -1065,6 +1066,13 @@ fn main() -> Result<()> {
     }
     if raw.get(1).map(String::as_str) == Some("adblock") {
         return adblock::run(raw.get(2).map(String::as_str), &raw[2.min(raw.len())..]);
+    }
+    // The agent engine (docs/agent-engine.md). Headless by construction: it
+    // never opens a window on the invoking terminal's display and never emits
+    // OSC 7717, so it is a peer of the surface path rather than a mode of it.
+    if raw.get(1).map(String::as_str) == Some("engine") {
+        let as_json = raw.iter().any(|arg| arg == "--json");
+        engine::run_verb_and_exit(raw.get(2).map(String::as_str), as_json);
     }
 
     let args = Args::parse();

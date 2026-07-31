@@ -1,0 +1,998 @@
+//! The engine host: one GTK thread, N pages, blocking page verbs.
+//!
+//! ## The loop story (the thing Phase A had to settle, not hand-wave)
+//!
+//! A WebKit view needs a running `GMainContext` on the thread that created it,
+//! and every call against that view must happen on that thread. ychrome
+//! already has a GTK loop — `tao`'s — but it is owned by the BROWSER process's
+//! main thread and there can only be one per process. So the engine does not
+//! borrow it. The engine runs inside the **daemon** process, which owns no
+//! windows and no tao loop, and there it takes a dedicated thread:
+//!
+//! - the engine thread calls `gtk::init()` and then `gtk::main()`, which
+//!   acquires the global default `GMainContext` for that thread;
+//! - every page object lives in a `thread_local` on that thread and is never
+//!   sent anywhere;
+//! - callers on any other thread submit a closure with `glib::idle_add_once`
+//!   (which posts to the global default context from any thread) and block on
+//!   an `mpsc` reply.
+//!
+//! That last hop is what makes the verbs look synchronous to a control-plane
+//! handler while WebKit's API stays callback-shaped underneath: the closure
+//! carries a `Responder` that it can move into WebKit's own callback and fire
+//! whenever the answer actually arrives. `goto` returning means the load
+//! finished; it does not mean a request was posted.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::mpsc::{self, Sender};
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use cairo::ImageSurface;
+use gdk::prelude::*;
+use glib::translate::{ToGlibPtr, ToGlibPtrMut};
+use gtk::prelude::*;
+use javascriptcore::ValueExt;
+use serde_json::Value;
+use webkit2gtk::{LoadEvent, SnapshotOptions, SnapshotRegion, WebView, WebViewExt};
+
+use super::substrate::{self, HeadlessDisplay, Probe, Substrate};
+
+/// One logical page's engine resources. Lives only on the engine thread.
+struct Page {
+    window: gtk::Window,
+    view: WebView,
+}
+
+thread_local! {
+    /// The page table. `thread_local` rather than a mutex because these are
+    /// GTK objects: they are not `Send`, and the ONLY thread that may touch
+    /// them is the one running `gtk::main()`. Every closure below arrives via
+    /// `idle_add_once`, so it is already on that thread by construction.
+    static PAGES: RefCell<HashMap<String, Page>> = RefCell::new(HashMap::new());
+}
+
+/// A one-shot reply channel handed to a job on the engine thread. The job may
+/// fire it immediately, or move it into a WebKit callback and fire it later.
+pub struct Responder<T> {
+    tx: Sender<Result<T, String>>,
+}
+
+impl<T> Responder<T> {
+    pub fn ok(self, value: T) {
+        let _ = self.tx.send(Ok(value));
+    }
+
+    pub fn fail(self, message: impl Into<String>) {
+        let _ = self.tx.send(Err(message.into()));
+    }
+}
+
+/// A `Responder` that two signal handlers can race for. Whoever gets there
+/// first wins; the loser finds `None` and does nothing. Both `load-changed`
+/// and `load-failed` can fire for one navigation.
+type Shared<T> = Rc<RefCell<Option<Responder<T>>>>;
+
+/// Submit a job to the engine thread and block for its reply.
+fn on_engine<T, F>(timeout: Duration, job: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Responder<T>) + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    glib::idle_add_once(move || job(Responder { tx }));
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => bail!("{error}"),
+        Err(_) => bail!("engine call did not answer within {timeout:?}"),
+    }
+}
+
+/// Run `f` against a page, or fail with a uniform not-found message. Always
+/// called from inside a job, i.e. already on the engine thread.
+fn with_page<T>(id: &str, responder: Responder<T>, f: impl FnOnce(&Page, Responder<T>)) {
+    let view = PAGES.with(|pages| {
+        pages.borrow().get(id).map(|page| Page {
+            window: page.window.clone(),
+            view: page.view.clone(),
+        })
+    });
+    match view {
+        Some(page) => f(&page, responder),
+        None => responder.fail(format!("no page {id:?}")),
+    }
+}
+
+/// A viewport readback: the PNG bytes AND the raw pixels behind them.
+///
+/// Both, deliberately. The PNG is the artifact a human looks at; the raw
+/// buffer is what a pixel assertion reads, because re-decoding our own PNG to
+/// check it would only prove the encoder round-trips. Cairo hands us
+/// premultiplied BGRA (`ARGB32`, little-endian).
+pub struct Shot {
+    pub width: i32,
+    pub height: i32,
+    pub stride: i32,
+    pub png: Vec<u8>,
+    pub bgra: Vec<u8>,
+}
+
+impl Shot {
+    /// Count pixels darker than `threshold` luminance inside a rect. The
+    /// engine's answer to "did those words actually paint" — a blank canvas
+    /// scores zero no matter what the DOM claims.
+    pub fn dark_pixels(&self, x: i32, y: i32, w: i32, h: i32, threshold: u32) -> u32 {
+        let mut count = 0;
+        for row in y.max(0)..(y + h).min(self.height) {
+            for col in x.max(0)..(x + w).min(self.width) {
+                let offset = (row * self.stride + col * 4) as usize;
+                let Some(pixel) = self.bgra.get(offset..offset + 4) else {
+                    continue;
+                };
+                // Rec. 601 luma on the premultiplied BGRA byte order.
+                let luma =
+                    (pixel[2] as u32 * 299 + pixel[1] as u32 * 587 + pixel[0] as u32 * 114) / 1000;
+                if luma < threshold {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+}
+
+/// The engine. Owns the substrate's display and the GTK thread; dropping it
+/// stops the loop and tears the display down.
+pub struct Engine {
+    substrate: Substrate,
+    probes: Vec<Probe>,
+    display: Option<HeadlessDisplay>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Engine {
+    /// Select a substrate, bring up its display, and start the engine thread.
+    /// Returns only once GTK is initialised and the loop is accepting jobs.
+    pub fn start(width: i32, height: i32) -> Result<Engine> {
+        let (substrate, probes) = substrate::select()?;
+        if substrate != Substrate::WebKitGtkHeadless {
+            bail!(
+                "substrate {} is selected but only {} is implemented — \
+                 add its driver in engine::host before selecting it",
+                substrate.id(),
+                Substrate::WebKitGtkHeadless.id()
+            );
+        }
+
+        let display = HeadlessDisplay::start(width, height)?;
+        display.install_env();
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("ychrome-engine".into())
+            .spawn(move || {
+                if let Err(error) = gtk::init() {
+                    let _ = ready_tx.send(Err(format!("gtk::init failed: {error}")));
+                    return;
+                }
+                // Announce readiness from INSIDE the loop, not before entering
+                // it: a caller that starts submitting jobs while the context is
+                // unowned gets them queued but never run.
+                glib::idle_add_once(move || {
+                    let _ = ready_tx.send(Ok(()));
+                });
+                gtk::main();
+            })
+            .context("spawning the engine thread")?;
+
+        match ready_rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => bail!("{error}"),
+            Err(_) => bail!("the engine thread did not reach its main loop within 20s"),
+        }
+
+        Ok(Engine {
+            substrate,
+            probes,
+            display: Some(display),
+            thread: Some(thread),
+        })
+    }
+
+    pub fn substrate(&self) -> Substrate {
+        self.substrate
+    }
+
+    pub fn probes(&self) -> &[Probe] {
+        &self.probes
+    }
+
+    pub fn display_name(&self) -> String {
+        self.display
+            .as_ref()
+            .map(|d| d.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// The headless display's screen size. Worth reporting next to a
+    /// snapshot's size: a readback smaller than the screen is the squish class
+    /// of bug, and the two numbers side by side is how you see it.
+    pub fn display_size(&self) -> (i32, i32) {
+        self.display
+            .as_ref()
+            .map(|d| (d.width, d.height))
+            .unwrap_or((0, 0))
+    }
+
+    /// Create a page: a mapped window of the requested size with one WebView
+    /// filling it.
+    ///
+    /// The window is mapped rather than offscreen because WebKit only paints a
+    /// view that is realised and visible, and a snapshot of an unpainted view
+    /// is the blank-canvas lie this engine exists to end. "Headless" here means
+    /// the DISPLAY has no screen anyone can see, not that the view is unmapped.
+    pub fn open(&self, id: &str, width: i32, height: i32) -> Result<()> {
+        let id = id.to_string();
+        on_engine(Duration::from_secs(20), move |responder| {
+            let exists = PAGES.with(|pages| pages.borrow().contains_key(&id));
+            if exists {
+                responder.fail(format!("page {id:?} is already open"));
+                return;
+            }
+            let window = gtk::Window::new(gtk::WindowType::Toplevel);
+            window.set_default_size(width, height);
+            let view = WebView::new();
+            window.add(&view);
+            window.show_all();
+            PAGES.with(|pages| {
+                pages.borrow_mut().insert(id, Page { window, view });
+            });
+            responder.ok(())
+        })
+    }
+
+    pub fn close(&self, id: &str) -> Result<()> {
+        let id = id.to_string();
+        on_engine(Duration::from_secs(20), move |responder| {
+            let removed = PAGES.with(|pages| pages.borrow_mut().remove(&id));
+            match removed {
+                Some(page) => {
+                    unsafe { page.window.destroy() };
+                    responder.ok(())
+                }
+                None => responder.fail(format!("no page {id:?}")),
+            }
+        })
+    }
+
+    pub fn page_ids(&self) -> Result<Vec<String>> {
+        on_engine(Duration::from_secs(10), |responder| {
+            let mut ids = PAGES.with(|pages| pages.borrow().keys().cloned().collect::<Vec<_>>());
+            ids.sort();
+            responder.ok(ids)
+        })
+    }
+
+    /// Navigate and wait for the load to FINISH. Returns the committed URL.
+    pub fn goto(&self, id: &str, url: &str, timeout: Duration) -> Result<String> {
+        let id = id.to_string();
+        let url = url.to_string();
+        on_engine(timeout, move |responder| {
+            with_page(&id, responder, move |page, responder| {
+                arm_load_wait(&page.view, responder);
+                page.view.load_uri(&url);
+            })
+        })
+    }
+
+    /// Load literal HTML under `base_uri` and wait for the load to finish. The
+    /// gate's trusted-input page uses this so the differential needs no
+    /// network and no fixture server.
+    pub fn load_html(&self, id: &str, html: &str, base_uri: &str, timeout: Duration) -> Result<()> {
+        let id = id.to_string();
+        let html = html.to_string();
+        let base_uri = base_uri.to_string();
+        on_engine(timeout, move |responder| {
+            with_page(&id, responder, move |page, responder| {
+                arm_load_wait_unit(&page.view, responder);
+                page.view.load_html(&html, Some(&base_uri));
+            })
+        })
+    }
+
+    /// Evaluate JS and return the result as JSON.
+    ///
+    /// JSON, not a display string: `JSCValue::to_json` is the engine's own
+    /// serialiser, so `/eval` hands back a typed value instead of a string a
+    /// caller has to guess the shape of.
+    pub fn eval(&self, id: &str, js: &str) -> Result<Value> {
+        let id = id.to_string();
+        let js = js.to_string();
+        let raw = on_engine(Duration::from_secs(30), move |responder| {
+            with_page(&id, responder, move |page, responder| {
+                page.view.evaluate_javascript(
+                    &js,
+                    None,
+                    None,
+                    None::<&gio::Cancellable>,
+                    move |result| match result {
+                        Ok(value) => match value.to_json(0) {
+                            Some(json) => responder.ok(json.to_string()),
+                            // `undefined` has no JSON form; say so rather than
+                            // inventing null, which a caller could not tell
+                            // apart from a real null.
+                            None => responder.ok("undefined".to_string()),
+                        },
+                        Err(error) => responder.fail(error.to_string()),
+                    },
+                );
+            })
+        })?;
+        if raw == "undefined" {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str(&raw).with_context(|| format!("engine eval returned non-JSON: {raw}"))
+    }
+
+    /// Snapshot the visible viewport.
+    pub fn shot(&self, id: &str) -> Result<Shot> {
+        let id = id.to_string();
+        on_engine(Duration::from_secs(30), move |responder| {
+            with_page(&id, responder, move |page, responder| {
+                page.view.snapshot(
+                    SnapshotRegion::Visible,
+                    SnapshotOptions::NONE,
+                    None::<&gio::Cancellable>,
+                    move |result| {
+                        let surface = match result {
+                            Ok(surface) => surface,
+                            Err(error) => return responder.fail(error.to_string()),
+                        };
+                        surface.flush();
+                        let mut image = match ImageSurface::try_from(surface) {
+                            Ok(image) => image,
+                            Err(_) => {
+                                return responder.fail("snapshot was not an image surface");
+                            }
+                        };
+                        let (width, height, stride) =
+                            (image.width(), image.height(), image.stride());
+                        let mut png = Vec::new();
+                        if let Err(error) = image.write_to_png(&mut png) {
+                            return responder.fail(format!("PNG encode failed: {error}"));
+                        }
+                        let bgra = match image.data() {
+                            Ok(data) => data.to_vec(),
+                            Err(error) => {
+                                return responder.fail(format!("pixel borrow failed: {error}"));
+                            }
+                        };
+                        responder.ok(Shot {
+                            width,
+                            height,
+                            stride,
+                            png,
+                            bgra,
+                        })
+                    },
+                );
+            })
+        })
+    }
+
+    /// Dispatch a REAL pointer click at viewport coordinates.
+    ///
+    /// The events go in as `GdkEvent`s through `gtk_main_do_event`, which is
+    /// the same path a physical mouse takes: WebKitGTK builds its
+    /// `NativeWebMouseEvent` from the GdkEvent, so the page sees
+    /// `isTrusted === true`, focus moves, and default actions fire. A
+    /// `dispatchEvent` from injected JS cannot do any of that — that
+    /// difference is Phase A's fifth proof and the reason the engine exists.
+    pub fn click_trusted(&self, id: &str, x: f64, y: f64) -> Result<u32> {
+        let id = id.to_string();
+        on_engine(Duration::from_secs(20), move |responder| {
+            with_page(
+                &id,
+                responder,
+                move |page, responder| match dispatch_click(&page.view, x, y) {
+                    Ok(count) => responder.ok(count),
+                    Err(error) => responder.fail(error.to_string()),
+                },
+            )
+        })
+    }
+
+    /// Dispatch a batch of REAL input events.
+    ///
+    /// Every variant below goes in as a `GdkEvent` through `gtk_main_do_event`,
+    /// exactly like [`click_trusted`](Self::click_trusted). None of them is a
+    /// `dispatchEvent`: an engine that reached for synthetic DOM events for the
+    /// "easy" verbs would reintroduce, one verb at a time, precisely the
+    /// instrument-lying that gate proof 5 exists to close. `isTrusted` is true
+    /// for all of them, hover really hovers, and a key press produces text.
+    pub fn input(&self, id: &str, events: Vec<InputEvent>) -> Result<u32> {
+        // Text becomes individual key events HERE, so every event below is one
+        // job, and the engine loop gets to spin between them.
+        let mut expanded = Vec::new();
+        for event in events {
+            match event {
+                InputEvent::Text { text } => {
+                    for ch in text.chars() {
+                        // SAFETY: a pure value conversion in gdk, no pointers
+                        // and no display involved.
+                        let keyval = unsafe { gdk::ffi::gdk_unicode_to_keyval(ch as u32) };
+                        expanded.push(InputEvent::Key { keyval, mods: 0 });
+                    }
+                }
+                other => expanded.push(other),
+            }
+        }
+
+        let mut dispatched = 0;
+        for event in expanded {
+            dispatched += self.input_one(id, event)?;
+            // The engine loop MUST run between events.
+            //
+            // WebKitGTK hands a key event to the web process and waits to hear
+            // whether the page consumed it before it will take the next one.
+            // Dispatching a whole batch inside one job never lets that reply
+            // arrive, so the queue collapses: measured, typing "ada lovelace"
+            // dispatched all 24 events and landed exactly ONE character. This
+            // is a settle, not a sleep on the engine thread — other pages keep
+            // loading through it.
+            self.settle(INPUT_SETTLE)?;
+        }
+        Ok(dispatched)
+    }
+
+    /// One input event, one job on the engine thread.
+    fn input_one(&self, id: &str, event: InputEvent) -> Result<u32> {
+        let id = id.to_string();
+        on_engine(Duration::from_secs(20), move |responder| {
+            with_page(&id, responder, move |page, responder| match dispatch_input(
+                &page.view, &event,
+            ) {
+                Ok(count) => responder.ok(count),
+                Err(error) => responder.fail(error.to_string()),
+            })
+        })
+    }
+
+    /// History and reload (`/engine/nav`). `Stop` returns at once; the others
+    /// wait for the load they start, so a caller that gets a reply has a page
+    /// that has actually settled.
+    pub fn nav(&self, id: &str, action: NavAction, timeout: Duration) -> Result<String> {
+        let id = id.to_string();
+        on_engine(timeout, move |responder| {
+            with_page(&id, responder, move |page, responder| {
+                let view = &page.view;
+                match action {
+                    NavAction::Back if !view.can_go_back() => {
+                        responder.fail("cannot go back: no earlier entry in this page's history")
+                    }
+                    NavAction::Forward if !view.can_go_forward() => {
+                        responder.fail("cannot go forward: no later entry in this page's history")
+                    }
+                    NavAction::Stop => {
+                        view.stop_loading();
+                        responder.ok(view.uri().map(|uri| uri.to_string()).unwrap_or_default())
+                    }
+                    NavAction::Back => {
+                        arm_load_wait(view, responder);
+                        view.go_back();
+                    }
+                    NavAction::Forward => {
+                        arm_load_wait(view, responder);
+                        view.go_forward();
+                    }
+                    NavAction::Reload => {
+                        arm_load_wait(view, responder);
+                        view.reload();
+                    }
+                }
+            })
+        })
+    }
+
+    /// Is WebKit still loading this page? The signal behind `/engine/wait`'s
+    /// `load` form, read as a property so a poll can ask cheaply.
+    pub fn is_loading(&self, id: &str) -> Result<bool> {
+        let id = id.to_string();
+        on_engine(Duration::from_secs(10), move |responder| {
+            with_page(&id, responder, move |page, responder| {
+                responder.ok(page.view.is_loading())
+            })
+        })
+    }
+
+    /// Wait for the CURRENT navigation to finish, without starting one.
+    pub fn wait_load(&self, id: &str, timeout: Duration) -> Result<String> {
+        let id = id.to_string();
+        on_engine(timeout, move |responder| {
+            with_page(&id, responder, move |page, responder| {
+                if !page.view.is_loading() {
+                    return responder.ok(page
+                        .view
+                        .uri()
+                        .map(|uri| uri.to_string())
+                        .unwrap_or_default());
+                }
+                arm_load_wait(&page.view, responder);
+            })
+        })
+    }
+
+    /// Let the engine thread run for a while without blocking a verb on it —
+    /// used after input, so the page's handlers and any resulting layout land
+    /// before the next read.
+    pub fn settle(&self, duration: Duration) -> Result<()> {
+        on_engine(duration + Duration::from_secs(10), move |responder| {
+            glib::timeout_add_once(duration, move || responder.ok(()));
+        })
+    }
+}
+
+/// How long the engine loop is given to deliver one input event to the web
+/// process before the next is dispatched. See [`Engine::input`].
+const INPUT_SETTLE: Duration = Duration::from_millis(12);
+
+/// What `/engine/nav` can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavAction {
+    Back,
+    Forward,
+    Reload,
+    Stop,
+}
+
+impl NavAction {
+    pub fn parse(name: &str) -> Option<NavAction> {
+        match name {
+            "back" => Some(NavAction::Back),
+            "forward" => Some(NavAction::Forward),
+            "reload" => Some(NavAction::Reload),
+            "stop" => Some(NavAction::Stop),
+            _ => None,
+        }
+    }
+}
+
+/// One input event, already validated. `/engine/input`'s JSON is parsed into
+/// these in `api`, so this layer never sees a half-checked event.
+#[derive(Debug, Clone)]
+pub enum InputEvent {
+    Click {
+        x: f64,
+        y: f64,
+        button: u32,
+        count: u32,
+    },
+    Move {
+        x: f64,
+        y: f64,
+    },
+    Scroll {
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+    },
+    Key {
+        keyval: u32,
+        mods: u32,
+    },
+    Text {
+        text: String,
+    },
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // Quit from INSIDE the loop; `gtk::main_quit` from another thread is
+        // not sound. Once the loop returns, the thread drops its pages (GTK
+        // objects, on their own thread) and exits, and only then is it safe to
+        // kill the display out from under them.
+        glib::idle_add_once(|| {
+            PAGES.with(|pages| pages.borrow_mut().clear());
+            gtk::main_quit();
+        });
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        drop(self.display.take());
+    }
+}
+
+/// Arm a one-shot wait for the next load to settle, resolving to the committed
+/// URL. `load-failed` resolves it too, so a dead network is an error rather
+/// than a timeout.
+fn arm_load_wait(view: &WebView, responder: Responder<String>) {
+    let slot: Shared<String> = Rc::new(RefCell::new(Some(responder)));
+    let handlers: Rc<RefCell<Vec<glib::SignalHandlerId>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let finished = view.connect_load_changed({
+        let slot = slot.clone();
+        let handlers = handlers.clone();
+        move |view, event| {
+            if event != LoadEvent::Finished {
+                return;
+            }
+            if let Some(responder) = slot.borrow_mut().take() {
+                responder.ok(view.uri().map(|uri| uri.to_string()).unwrap_or_default());
+            }
+            disconnect_all(view, &handlers);
+        }
+    });
+    let failed = view.connect_load_failed({
+        let slot = slot.clone();
+        let handlers = handlers.clone();
+        move |view, _event, uri, error| {
+            if let Some(responder) = slot.borrow_mut().take() {
+                responder.fail(format!("load of {uri} failed: {error}"));
+            }
+            disconnect_all(view, &handlers);
+            false
+        }
+    });
+    handlers.borrow_mut().extend([finished, failed]);
+}
+
+/// The `()`-valued twin of `arm_load_wait`, for `load_html`.
+fn arm_load_wait_unit(view: &WebView, responder: Responder<()>) {
+    let slot: Shared<()> = Rc::new(RefCell::new(Some(responder)));
+    let handlers: Rc<RefCell<Vec<glib::SignalHandlerId>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let finished = view.connect_load_changed({
+        let slot = slot.clone();
+        let handlers = handlers.clone();
+        move |view, event| {
+            if event != LoadEvent::Finished {
+                return;
+            }
+            if let Some(responder) = slot.borrow_mut().take() {
+                responder.ok(());
+            }
+            disconnect_all(view, &handlers);
+        }
+    });
+    let failed = view.connect_load_failed({
+        let slot = slot.clone();
+        let handlers = handlers.clone();
+        move |view, _event, uri, error| {
+            if let Some(responder) = slot.borrow_mut().take() {
+                responder.fail(format!("load of {uri} failed: {error}"));
+            }
+            disconnect_all(view, &handlers);
+            false
+        }
+    });
+    handlers.borrow_mut().extend([finished, failed]);
+}
+
+/// Drop every handler this wait armed, so a second navigation on the same page
+/// does not resolve a stale responder.
+fn disconnect_all(view: &WebView, handlers: &Rc<RefCell<Vec<glib::SignalHandlerId>>>) {
+    for handler in handlers.borrow_mut().drain(..) {
+        view.disconnect(handler);
+    }
+}
+
+/// Everything an event needs to look like it came from the seat.
+struct Seat {
+    window: gdk::Window,
+    pointer: gdk::Device,
+    keyboard: Option<gdk::Device>,
+    keymap: gdk::Keymap,
+    time: u32,
+}
+
+/// A strictly increasing event timestamp.
+///
+/// `g_get_monotonic_time() / 1000` gave a whole batch of events the SAME
+/// timestamp, because they are built well inside one millisecond. That was my
+/// first hypothesis for the one-character typing bug and it was WRONG — fixing
+/// it changed nothing, and the real cause was the main loop (see
+/// [`Engine::input`]). It is kept anyway because duplicate timestamps are
+/// independently wrong: multi-click detection is defined in terms of the gap
+/// between press times, so `count: 2` needs two distinct ones. The clock starts
+/// at the real monotonic time and then only moves forward.
+fn next_event_time() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CLOCK: AtomicU32 = AtomicU32::new(0);
+    let now = (unsafe { glib::ffi::g_get_monotonic_time() } / 1000) as u32;
+    // Two steps per call: every event kind here spends at most two ticks
+    // (press then release) before the next `seat()`.
+    CLOCK
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            Some(if now > last.saturating_add(2) {
+                now
+            } else {
+                last.saturating_add(2)
+            })
+        })
+        .unwrap_or(now)
+}
+
+fn seat(view: &WebView) -> Result<Seat> {
+    let window = view
+        .window()
+        .context("the view has no GdkWindow yet — it was never realised")?;
+    let display = gdk::Display::default().context("no gdk display")?;
+    let gdk_seat = display.default_seat().context("no default seat")?;
+    let pointer = gdk_seat
+        .pointer()
+        .context("no pointer device on the engine's display")?;
+    Ok(Seat {
+        window,
+        pointer,
+        keyboard: gdk_seat.keyboard(),
+        keymap: gdk::Keymap::for_display(&display).context("no keymap for the engine's display")?,
+        time: next_event_time(),
+    })
+}
+
+/// Dispatch one input event as real seat input.
+fn dispatch_input(view: &WebView, event: &InputEvent) -> Result<u32> {
+    match event {
+        InputEvent::Click {
+            x,
+            y,
+            button,
+            count,
+        } => {
+            // A click begins with the pointer ARRIVING. Without the motion,
+            // WebKit's last-known pointer position is stale, so `:hover` never
+            // applies and a menu that opens on hover is never open by the time
+            // the press lands. This is the difference between "the click was
+            // delivered" and "the click did what a user's click does".
+            let mut dispatched = dispatch_motion(view, *x, *y)?;
+            for _ in 0..(*count).max(1) {
+                dispatched += dispatch_button(view, *x, *y, *button)?;
+            }
+            Ok(dispatched)
+        }
+        InputEvent::Move { x, y } => dispatch_motion(view, *x, *y),
+        InputEvent::Scroll { x, y, dx, dy } => dispatch_scroll(view, *x, *y, *dx, *dy),
+        InputEvent::Key { keyval, mods } => dispatch_key(view, *keyval, *mods),
+        InputEvent::Text { text } => {
+            let mut dispatched = 0;
+            for ch in text.chars() {
+                // SAFETY: a pure value conversion in gdk, no pointers involved.
+                let keyval = unsafe { gdk::ffi::gdk_unicode_to_keyval(ch as u32) };
+                dispatched += dispatch_key(view, keyval, 0)?;
+            }
+            Ok(dispatched)
+        }
+    }
+}
+
+/// Fill the fields every GdkEvent shares. Returns the raw pointer for the
+/// caller to finish filling as its own union member.
+///
+/// # Safety
+/// `event` must have been created by `gdk_event_new` with a type whose union
+/// member starts with these fields — which is every event type here.
+unsafe fn fill_common(event: &mut gdk::Event, seat: &Seat) -> *mut gdk::ffi::GdkEvent {
+    let ptr: *mut gdk::ffi::GdkEvent = event.to_glib_none_mut().0;
+    let any = ptr as *mut gdk::ffi::GdkEventAny;
+    unsafe {
+        (*any).window = seat.window.to_glib_full();
+        // `send_event: 0` says "this came from the server". WebKit does not
+        // read it, but a GTK widget in the chain might, and an event that
+        // claims to be synthetic invites exactly the special-casing this
+        // engine exists to avoid.
+        (*any).send_event = 0;
+    }
+    ptr
+}
+
+fn dispatch_motion(view: &WebView, x: f64, y: f64) -> Result<u32> {
+    let seat = seat(view)?;
+    let mut event = gdk::Event::new(gdk::EventType::MotionNotify);
+    // SAFETY: freshly created MotionNotify event; the motion union member is
+    // the live one, and every pointer we store is either owned (`to_glib_full`)
+    // or null.
+    unsafe {
+        let raw = fill_common(&mut event, &seat) as *mut gdk::ffi::GdkEventMotion;
+        (*raw).time = seat.time;
+        (*raw).x = x;
+        (*raw).y = y;
+        (*raw).axes = std::ptr::null_mut();
+        (*raw).state = 0;
+        (*raw).is_hint = 0;
+        (*raw).x_root = x;
+        (*raw).y_root = y;
+    }
+    event.set_device(Some(&seat.pointer));
+    gtk::main_do_event(&mut event);
+    Ok(1)
+}
+
+fn dispatch_scroll(view: &WebView, x: f64, y: f64, dx: f64, dy: f64) -> Result<u32> {
+    let seat = seat(view)?;
+    let mut event = gdk::Event::new(gdk::EventType::Scroll);
+    // SAFETY: freshly created Scroll event; the scroll union member is live.
+    unsafe {
+        let raw = fill_common(&mut event, &seat) as *mut gdk::ffi::GdkEventScroll;
+        (*raw).time = seat.time;
+        (*raw).x = x;
+        (*raw).y = y;
+        (*raw).state = 0;
+        // Smooth scrolling, which is what a modern seat sends and what lets a
+        // page read fractional deltas instead of quantised clicks.
+        (*raw).direction = gdk::ffi::GDK_SCROLL_SMOOTH;
+        (*raw).x_root = x;
+        (*raw).y_root = y;
+        (*raw).delta_x = dx;
+        (*raw).delta_y = dy;
+        (*raw).is_stop = 0;
+    }
+    event.set_device(Some(&seat.pointer));
+    gtk::main_do_event(&mut event);
+    Ok(1)
+}
+
+/// A key press/release pair.
+///
+/// `hardware_keycode` is looked up in the real keymap rather than left zero:
+/// WebKit derives the DOM `code` and much of its text input from it, and a
+/// zero keycode is how "the key arrived but nothing was typed" happens.
+fn dispatch_key(view: &WebView, keyval: u32, mods: u32) -> Result<u32> {
+    let seat = seat(view)?;
+    let entry = seat.keymap.entries_for_keyval(keyval).into_iter().next();
+    let (keycode, group) = entry
+        .map(|key| (key.keycode() as u16, key.group() as u8))
+        .unwrap_or((0, 0));
+    if keycode == 0 {
+        bail!(
+            "no key on this keymap produces keyval {keyval} \
+             (0x{keyval:04x}) — the engine will not pretend it typed it"
+        );
+    }
+
+    let mut dispatched = 0;
+    for (step, kind) in [gdk::EventType::KeyPress, gdk::EventType::KeyRelease]
+        .into_iter()
+        .enumerate()
+    {
+        let mut event = gdk::Event::new(kind);
+        // SAFETY: freshly created key event; the key union member is live and
+        // `string` is left null (it is deprecated; WebKit reads keyval).
+        unsafe {
+            let raw = fill_common(&mut event, &seat) as *mut gdk::ffi::GdkEventKey;
+            (*raw).time = seat.time + step as u32;
+            (*raw).state = mods;
+            (*raw).keyval = keyval;
+            (*raw).length = 0;
+            (*raw).string = std::ptr::null_mut();
+            (*raw).hardware_keycode = keycode;
+            (*raw).group = group;
+            (*raw).is_modifier = 0;
+        }
+        if let Some(keyboard) = &seat.keyboard {
+            event.set_device(Some(keyboard));
+        }
+        gtk::main_do_event(&mut event);
+        dispatched += 1;
+    }
+    Ok(dispatched)
+}
+
+/// Modifier names to GDK's mask bits. One owner, so `/engine/input` and any
+/// future keyboard caller cannot disagree about what "ctrl" means.
+pub fn modifier_mask(names: &[String]) -> Result<u32> {
+    let mut mask = 0;
+    for name in names {
+        mask |= match name.to_ascii_lowercase().as_str() {
+            "shift" => gdk::ModifierType::SHIFT_MASK.bits(),
+            "ctrl" | "control" => gdk::ModifierType::CONTROL_MASK.bits(),
+            "alt" => gdk::ModifierType::MOD1_MASK.bits(),
+            "meta" | "super" | "cmd" => gdk::ModifierType::SUPER_MASK.bits(),
+            other => bail!("unknown modifier {other:?} (known: shift, ctrl, alt, meta)"),
+        };
+    }
+    Ok(mask)
+}
+
+/// A key NAME (`Enter`, `Tab`, `a`, `F5`) to its GDK keyval.
+pub fn keyval_from_name(name: &str) -> Result<u32> {
+    let c_name = std::ffi::CString::new(name).context("key name has an interior NUL")?;
+    // SAFETY: `gdk_keyval_from_name` takes a NUL-terminated string and returns
+    // a plain value; `c_name` outlives the call.
+    let keyval = unsafe { gdk::ffi::gdk_keyval_from_name(c_name.as_ptr()) };
+    if keyval == gdk::ffi::GDK_KEY_VoidSymbol as u32 || keyval == 0 {
+        bail!("unknown key name {name:?}");
+    }
+    Ok(keyval)
+}
+
+/// Build and deliver a press/release pair as seat input. Returns how many
+/// events were dispatched.
+///
+/// `gdk_event_new` returns a zeroed GdkEvent whose union is already tagged with
+/// the type, so filling the matching member is the documented way to build one.
+/// gdk-rs 0.18 exposes getters for `GdkEventButton` but no setters, and the
+/// adblock FFI in the surface path is the same precedent. `to_glib_full` hands
+/// the event an owned reference on the window, which `gdk_event_free` releases.
+fn dispatch_button(view: &WebView, x: f64, y: f64, button: u32) -> Result<u32> {
+    let seat = seat(view)?;
+    let mut dispatched = 0;
+    for (step, kind) in [gdk::EventType::ButtonPress, gdk::EventType::ButtonRelease]
+        .into_iter()
+        .enumerate()
+    {
+        let mut event = gdk::Event::new(kind);
+        // SAFETY: freshly created button event; the button union member is
+        // live and `axes` is left null.
+        unsafe {
+            let raw = fill_common(&mut event, &seat) as *mut gdk::ffi::GdkEventButton;
+            (*raw).time = seat.time + step as u32;
+            (*raw).x = x;
+            (*raw).y = y;
+            (*raw).axes = std::ptr::null_mut();
+            (*raw).state = 0;
+            (*raw).button = button;
+            (*raw).x_root = x;
+            (*raw).y_root = y;
+        }
+        event.set_device(Some(&seat.pointer));
+        gtk::main_do_event(&mut event);
+        dispatched += 1;
+    }
+    Ok(dispatched)
+}
+
+/// The Phase A gate's click, now one case of [`dispatch_input`].
+fn dispatch_click(view: &WebView, x: f64, y: f64) -> Result<u32> {
+    dispatch_input(
+        view,
+        &InputEvent::Click {
+            x,
+            y,
+            button: 1,
+            count: 1,
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The ink metric is what turns "the DOM says the heading is there" into
+    // "the heading PAINTED". It must count only inside the rect and must score
+    // a blank buffer zero, or the pixel proof proves nothing.
+    fn solid(width: i32, height: i32, value: u8) -> Shot {
+        Shot {
+            width,
+            height,
+            stride: width * 4,
+            png: Vec::new(),
+            bgra: vec![value; (width * height * 4) as usize],
+        }
+    }
+
+    #[test]
+    fn a_blank_canvas_has_no_ink() {
+        let shot = solid(16, 16, 0xff);
+        assert_eq!(shot.dark_pixels(0, 0, 16, 16, 128), 0);
+    }
+
+    #[test]
+    fn dark_pixels_are_counted_only_inside_the_rect() {
+        let mut shot = solid(16, 16, 0xff);
+        for row in 0..4 {
+            for col in 0..4 {
+                let offset = ((row * shot.stride) + col * 4) as usize;
+                shot.bgra[offset..offset + 4].copy_from_slice(&[0, 0, 0, 0xff]);
+            }
+        }
+        assert_eq!(shot.dark_pixels(0, 0, 4, 4, 128), 16);
+        assert_eq!(shot.dark_pixels(8, 8, 8, 8, 128), 0);
+        // Out-of-bounds rects clamp rather than panic: a selector can report a
+        // rect that runs past the viewport and that must not kill the engine.
+        assert_eq!(shot.dark_pixels(-8, -8, 64, 64, 128), 16);
+    }
+}
