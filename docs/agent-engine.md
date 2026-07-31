@@ -331,10 +331,19 @@ are wired into `handle_unix_conn` and unit-tested over a `UnixStream` pair, but
 they have not run against a deployed daemon — this branch does not deploy, and
 dev has live ychrome daemons serving real browsing.
 
-Still owed for Phase B: `/nav`, `/wait` (all four `until` forms), `/dom`, and
-the non-click `/input` event types (`move`/`type`/`key`/`scroll` — refused BY
-NAME today rather than silently dropped, so no script can believe an event
-fired that did not).
+✅ **COMPLETE 2026-07-31.** `/nav`, `/wait` (all four `until` forms), `/dom`
+(html/text/snapshot) and the full `/input` set landed, proven by
+`ychrome engine flow` — 11 steps, all through `dispatch`, all PASS. Every input
+event is a real `GdkEvent`; not one is a `dispatchEvent`, so the Phase A
+property holds across the whole verb surface (the fixture logs `isTrusted` for
+every event kind and the flow asserts none is `false`).
+
+`/dom snapshot` carries a contract rather than a hope: **every selector it
+emits is verified in the page to resolve to exactly the element it describes**,
+and one that does not comes back `null` and counted. Mutation-tested — an
+ambiguous selector turns the step red. Password inputs are redacted
+(`value: null, redacted: true`); mutation-tested too, the un-redacted build
+leaks the literal value and the step goes red.
 
 **Phase C — identity parity.** Profiles/jars, SOCKS egress, adblock filters,
 userscripts, UA, zoom; vault /fill. The engine and the visible surface must be
