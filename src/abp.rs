@@ -1604,12 +1604,20 @@ pub fn convert(sources: &[Source<'_>]) -> Conversion {
     // Assemble in section order, then enforce the ceiling. Cosmetic is trimmed
     // first because losing a hidden element degrades the page; losing a block
     // rule lets a tracker through, and losing an exception BREAKS a site.
+    //
+    // The bot-check guard is held back and appended AFTER the trim, and the
+    // ceiling budget is reduced by its size, so a ruleset that arrives at the
+    // limit can never be the one that drops it: `ignore-previous-rules` only
+    // cancels what precedes it, so the guard is worth nothing unless it is last
+    // AND present.
+    let guard = bot_check_guard_rules();
+    let budget = WEBKIT_RULE_CEILING - guard.len();
     let mut rules: Vec<Value> = Vec::new();
     for section in &sections {
         rules.extend(section.iter().cloned());
     }
-    if rules.len() > WEBKIT_RULE_CEILING {
-        let over = rules.len() - WEBKIT_RULE_CEILING;
+    if rules.len() > budget {
+        let over = rules.len() - budget;
         let cosmetic_len = sections[Section::Cosmetic as usize].len();
         let trim = over.min(cosmetic_len);
         sections[Section::Cosmetic as usize].truncate(cosmetic_len - trim);
@@ -1620,8 +1628,9 @@ pub fn convert(sources: &[Source<'_>]) -> Conversion {
         for _ in 0..over {
             report.drop(DropReason::OverCeiling, "(cosmetic rule trimmed)");
         }
-        rules.truncate(WEBKIT_RULE_CEILING);
+        rules.truncate(budget);
     }
+    rules.extend(guard);
     report.emitted = rules.len();
     // `#@#+js(...)`: honoured last, because an exception may be written above
     // the filter it cancels. Dropping the whole domain would be wrong — the
@@ -1641,6 +1650,46 @@ pub fn convert(sources: &[Source<'_>]) -> Conversion {
         scriptlets,
         report,
     }
+}
+
+/// ⭐ THE BOT-CHECK GUARD: OURS, appended after every upstream rule.
+///
+/// A bot check is the last thing on the web that may be blocked by accident.
+/// When it is, the failure has no symptom a user can read: the login page comes
+/// back, and comes back, and comes back, with nothing on screen saying an asset
+/// was refused. The user hit exactly this on a login and filed a ticket with
+/// Cloudflare rather than with us, which is the shape of a failure nobody can
+/// attribute.
+///
+/// Audited on the shipped ruleset (146,817 rules, 2026-07-31): **nothing blocks
+/// the challenge platform today.** Of the 79 rules mentioning cloudflare or
+/// `cdn-cgi`, the four that touch a challenge are already `ignore-previous-rules`
+/// (upstream's own allowlist), and the blocking ones are analytics on different
+/// paths — `/cdn-cgi/rum`, `/cdn-cgi/beacon/`, `/cdn-cgi/zaraz/` — which stay
+/// blocked and should. So this is not a fix for a live break; it is the lock
+/// that stops the next list update from becoming one, and it costs two rules.
+///
+/// The two paths, and nothing wider:
+///
+/// - `/cdn-cgi/challenge-platform/` — the first-party orchestrator, JS detector
+///   and its XHRs, served from the challenged site's OWN origin;
+/// - `challenges.cloudflare.com` — Turnstile's script and its iframe document.
+///
+/// Deliberately NOT `/cdn-cgi/` wholesale: that would un-block the RUM and
+/// beacon endpoints that have nothing to do with getting a user logged in.
+fn bot_check_guard_rules() -> Vec<Value> {
+    vec![
+        json!({
+            "trigger": { "url-filter": "/cdn-cgi/challenge-platform/" },
+            "action": { "type": "ignore-previous-rules" },
+        }),
+        json!({
+            "trigger": {
+                "url-filter": "^[^:]+:(//)?([^/]+\\.)?challenges\\.cloudflare\\.com[^a-zA-Z0-9_%.-]"
+            },
+            "action": { "type": "ignore-previous-rules" },
+        }),
+    ]
 }
 
 /// The stem the generated cosmetic userscript is installed under, in the
@@ -2159,16 +2208,23 @@ mod tests {
             .iter()
             .map(|rule| rule["action"]["type"].as_str().unwrap())
             .collect();
-        assert_eq!(
-            kinds,
-            vec![
-                "block",                 // 1. the block
-                "ignore-previous-rules", // 2. the subresource exception
-                "block",                 // 3. the $important block, past the exceptions
-                "css-display-none",      // 4. cosmetic, after subresource exceptions
-                "ignore-previous-rules", // 5. the document exception, last of all
-            ]
+        // The upstream sections, in order — then OUR bot-check guard, which is
+        // appended after all of them (see `bot_check_guard_rules`). It is part
+        // of the ordering contract, not noise on the end: an allowlist entry
+        // that is not last does not protect what follows it.
+        let mut expected = vec![
+            "block",                 // 1. the block
+            "ignore-previous-rules", // 2. the subresource exception
+            "block",                 // 3. the $important block, past the exceptions
+            "css-display-none",      // 4. cosmetic, after subresource exceptions
+            "ignore-previous-rules", // 5. the document exception, last of the upstream ones
+        ];
+        expected.extend(
+            bot_check_guard_rules()
+                .iter()
+                .map(|_| "ignore-previous-rules"),
         );
+        assert_eq!(kinds, expected);
         assert_eq!(conversion.report.network_block, 1);
         assert_eq!(conversion.report.network_exception, 1);
         assert_eq!(conversion.report.network_important, 1);
@@ -2604,6 +2660,60 @@ mod tests {
                 .iter()
                 .any(|rule| rule["action"]["type"] == "css-display-none"),
             "cosmetic must be trimmed before any network rule is"
+        );
+    }
+
+    /// ⭐ THE BOT-CHECK GUARD, locked three ways.
+    ///
+    /// A user could not get through a Cloudflare challenge on a login and had no
+    /// way to tell whether an asset had been eaten — this is the rule that makes
+    /// the answer permanently "no". All three assertions are load-bearing:
+    ///
+    /// 1. the guard is PRESENT (an upstream refresh cannot lose it);
+    /// 2. it is LAST (`ignore-previous-rules` cancels only what precedes it, so
+    ///    a guard in the middle protects nothing that follows);
+    /// 3. it survives the CEILING (the trim runs against a reduced budget, so a
+    ///    ruleset that arrives at 150,000 cannot be the one that drops it).
+    #[test]
+    fn a_bot_check_is_allowlisted_last_and_survives_the_ceiling() {
+        // Overshoot on network rules so the trim path definitely runs.
+        let mut corpus = String::new();
+        for index in 0..(WEBKIT_RULE_CEILING + 10) {
+            corpus.push_str(&format!("||ads{index}.test^\n"));
+        }
+        // ...and a rule that WOULD block the challenge platform, so the guard
+        // has something real to cancel.
+        corpus.push_str("||brilliant.org/cdn-cgi/challenge-platform/\n");
+        let conversion = convert_one(&corpus);
+
+        let guard = bot_check_guard_rules();
+        assert!(
+            conversion.rules.len() <= WEBKIT_RULE_CEILING,
+            "the guard pushed the ruleset over the ceiling, which compiles to \
+             NOTHING: {} rules",
+            conversion.rules.len()
+        );
+        let tail = &conversion.rules[conversion.rules.len() - guard.len()..];
+        assert_eq!(
+            tail,
+            guard.as_slice(),
+            "the bot-check guard must be the LAST rules in the array — \
+             `ignore-previous-rules` cancels only what comes before it"
+        );
+        for rule in &guard {
+            assert_eq!(rule["action"]["type"], "ignore-previous-rules");
+        }
+        // And it is narrow: the analytics endpoints on the same `/cdn-cgi/`
+        // prefix are a different path and stay blockable.
+        let filters: Vec<&str> = guard
+            .iter()
+            .filter_map(|rule| rule["trigger"]["url-filter"].as_str())
+            .collect();
+        assert!(filters.iter().any(|f| f.contains("challenge-platform")));
+        assert!(filters.iter().any(|f| f.contains("challenges")));
+        assert!(
+            !filters.iter().any(|f| *f == "/cdn-cgi/"),
+            "allowlisting /cdn-cgi/ wholesale would un-block RUM and beacon too"
         );
     }
 

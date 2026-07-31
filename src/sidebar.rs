@@ -562,7 +562,13 @@ pub fn emit_declare(
     policy_version: &str,
     zoom_version: &str,
 ) {
-    let payload = declare_payload(session, control, control_token, policy_version, zoom_version);
+    let payload = declare_payload(
+        session,
+        control,
+        control_token,
+        policy_version,
+        zoom_version,
+    );
     emit_osc("declare", &payload.to_string());
 }
 
@@ -1514,8 +1520,15 @@ const ZOOM_RESET_ACTION: &str = "zoom-reset";
 /// them (`surface_prefs` on the reply). ychrome stores neither.
 const VERTICAL_TABS_ACTION: &str = "tabs-vertical";
 const RESTORE_TABS_ACTION: &str = "tabs-restore";
-/// Pick the browser identity. Carries the preset id after the prefix.
+/// Pick the browser-wide identity. Carries the preset id after the prefix.
 const USER_AGENT_ACTION_PREFIX: &str = "user-agent:";
+/// Pick the identity for the LIVE PAGE'S HOST only. Carries the preset id after
+/// the prefix. Separate from [`USER_AGENT_ACTION_PREFIX`] because they write
+/// different keys of the same config and a shared prefix would make the
+/// narrower, safer one reachable by a typo in the broader one.
+const SITE_IDENTITY_ACTION_PREFIX: &str = "site-identity:";
+/// Drop this site's identity override; it falls back to the browser default.
+const SITE_IDENTITY_RESET_ACTION: &str = "site-identity-reset";
 
 /// What the GUI reports about the live surface, on the schema GET (as query
 /// params) and on every action (as `values`). All non-secret, and none of it is
@@ -1598,14 +1611,79 @@ fn browsing_widgets(page: &PageContext) -> Vec<Value> {
     ]
 }
 
-/// The browser identity. The default UA a WebKitGTK build sends describes Safari
-/// on Linux — a browser that does not exist — and UA-allowlisting edges refuse
-/// it outright (claude.ai answers "Request not allowed"). Presented as a row per
-/// preset rather than a free-text field: the failure mode of a hand-typed UA is a
-/// site quietly serving you the wrong code, which is worse than not offering it.
+/// The per-site browser identity row, drawn in "This site".
+///
+/// This is where an identity override BELONGS: a badly-coded portal that gates
+/// on the UA string is one site, and making the whole browser lie for it is what
+/// puts an inconsistent fingerprint in front of every OTHER site's bot check.
+/// The default row is "WebKit (this engine)", which sets nothing.
+fn current_site_identity_widgets(
+    host: Option<&str>,
+    sites: &std::collections::BTreeMap<String, crate::useragent::Preset>,
+    global: crate::useragent::Preset,
+) -> Vec<Value> {
+    let Some(host) = host.filter(|host| !host.is_empty()) else {
+        return Vec::new();
+    };
+    let effective = crate::useragent::preset_for_host(sites, global, host);
+    let overridden = crate::sitehost::lookup(sites, host).is_some();
+    let subtitle = if overridden {
+        format!("{} · this site", effective.label())
+    } else {
+        format!("{} · browser default", effective.label())
+    };
+    // One "Use" per OTHER preset, plus Reset once an override exists — the same
+    // vocabulary as the zoom row directly above it.
+    let mut actions: Vec<Value> = crate::useragent::Preset::ALL
+        .iter()
+        .filter(|preset| **preset != effective)
+        .map(|preset| {
+            json!({
+                "action": format!("{SITE_IDENTITY_ACTION_PREFIX}{}", preset.id()),
+                "label": preset.label(),
+                "title": format!("Identify as {} on {host} only", preset.label()),
+            })
+        })
+        .collect();
+    if overridden {
+        actions.push(json!({
+            "action": SITE_IDENTITY_RESET_ACTION,
+            "label": "Reset",
+            "title": "Use the browser default identity here",
+        }));
+    }
+    vec![
+        json!({
+            "kind": "list-row",
+            "id": "site-identity",
+            "title": format!("Identity on {host}"),
+            "subtitle": subtitle,
+            "actions": actions,
+        }),
+        json!({
+            "kind": "label",
+            "muted": true,
+            "text": crate::useragent::OVERRIDE_WARNING,
+        }),
+    ]
+}
+
+/// The browser-wide identity. The default is the engine's OWN UA, which is the
+/// coherent one: a bot check that scores consistency (Cloudflare's managed
+/// challenge) passes a browser whose UA, JS environment and TLS all agree, and
+/// challenges one whose UA claims a platform the page contradicts. Presented as
+/// a row per preset rather than a free-text field: the failure mode of a
+/// hand-typed UA is a site quietly serving you the wrong code.
 fn user_agent_widgets() -> Vec<Value> {
     let current = crate::useragent::preset();
     let mut widgets = vec![json!({"kind": "section", "text": "Browser identity"})];
+    widgets.push(json!({
+        "kind": "label",
+        "muted": true,
+        "text": "This is the identity every site gets. Prefer a per-site override in \
+                 “This site” above — a browser-wide spoof puts the same inconsistency in \
+                 front of every login you have.",
+    }));
     for preset in crate::useragent::Preset::ALL {
         let selected = preset == current;
         // "This is the one in use" is SELECTION, not a status dot — yggterm
@@ -1706,6 +1784,14 @@ fn settings_schema_from(
     let mut widgets = vec![json!({"kind": "section", "text": "This site"})];
     widgets.extend(current_site_zoom_widgets(host, live_zoom, zoom_sites));
     widgets.extend(current_site_security_widgets(host, secure));
+    // The per-site identity override, beside the per-site zoom: both are "this
+    // one site behaves differently", both keyed by host, both matched by
+    // `sitehost`. A user looking for either finds them in one place.
+    widgets.extend(current_site_identity_widgets(
+        host,
+        &crate::useragent::sites(),
+        crate::useragent::preset(),
+    ));
 
     // Tabs first among the browser-wide settings: it is the one that changes what
     // the window looks like.
@@ -1948,6 +2034,31 @@ fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
             "schema": settings_schema(&profile, &next),
             "surface_prefs": patch,
         });
+    }
+
+    // The per-site identity, checked BEFORE the browser-wide one so the narrower
+    // action can never be swallowed by a prefix match on the broader.
+    if action == SITE_IDENTITY_RESET_ACTION || action.starts_with(SITE_IDENTITY_ACTION_PREFIX) {
+        let Some(host) = page.host() else {
+            return json!({ "toast": "No site is open to set an identity for." });
+        };
+        let wanted = action.strip_prefix(SITE_IDENTITY_ACTION_PREFIX);
+        let outcome = crate::useragent::set_site(host, wanted);
+        let toast = match wanted {
+            // ⚠ Say the cost at the moment of the choice, not in a doc nobody
+            // reads. A spoof that breaks a fingerprint-gated login fails as a
+            // challenge that never clears, which reads like the SITE being
+            // broken — so the user has to be told it was this switch.
+            Some(_) => format!(
+                "Identity for {host} changed. Reloading. {}",
+                crate::useragent::OVERRIDE_WARNING
+            ),
+            None => format!("{host} is back on the browser default identity. Reloading."),
+        };
+        return match outcome {
+            Ok(()) => redraw(json!({ "reload_surface": true, "toast": toast })),
+            Err(error) => redraw(json!({ "toast": error.to_string() })),
+        };
     }
 
     if let Some(preset) = action.strip_prefix(USER_AGENT_ACTION_PREFIX) {
@@ -3043,7 +3154,10 @@ mod tests {
                 json!({"pane": SETTINGS_PANE, "action": "reload-surface", "values": {}}),
             ),
         );
-        assert_eq!(status, 403, "an untokened /action must be refused: {body:?}");
+        assert_eq!(
+            status, 403,
+            "an untokened /action must be refused: {body:?}"
+        );
         assert_eq!(body["route"], "/action");
         let error = body["error"].as_str().unwrap_or_default();
         assert!(
@@ -3065,7 +3179,11 @@ mod tests {
         let stolen = ParsedRequest {
             fido2_token: Some(state.signer.token.clone()),
             control_token: Some(state.signer.token.clone()),
-            ..page_request("POST", "/action", json!({"pane": SETTINGS_PANE, "action": "x"}))
+            ..page_request(
+                "POST",
+                "/action",
+                json!({"pane": SETTINGS_PANE, "action": "x"}),
+            )
         };
         let (status, body) = dispatch(&state, &stolen);
         assert_eq!(
@@ -3178,7 +3296,10 @@ mod tests {
     /// someone deliberately writes it into the open list.
     #[test]
     fn an_unclassified_route_is_gui_only_by_default() {
-        assert_eq!(route_access("/some-route-added-later"), RouteAccess::GuiOnly);
+        assert_eq!(
+            route_access("/some-route-added-later"),
+            RouteAccess::GuiOnly
+        );
         assert_eq!(route_access("/action"), RouteAccess::GuiOnly);
         assert_eq!(route_access("/pane/vault"), RouteAccess::GuiOnly);
         let state = control_state();
