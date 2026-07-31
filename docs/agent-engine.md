@@ -139,7 +139,14 @@ POST /goto      {page_id, url}                                      → {page}
 POST /nav       {page_id, action: back|forward|reload|stop}         → {page}
 ```
 
-`page` (the one status shape, everywhere):
+`page` (the one status shape, everywhere).
+
+⚠ **`rss_mb` and `cpu_pct_1m` are always `null`, and that is permanent on this
+substrate.** webkit2gtk 2.0.2 exposes no web-process identifier, so there is no
+honest way to say which `WebKitWebProcess` belongs to which view. They are
+`null` rather than `0` because a zero would read as a measurement. Aggregate
+memory IS measured and IS enforced — see `/engine/metrics` and `max_rss_mb` in
+§5.
 
 ```json
 {
@@ -149,7 +156,7 @@ POST /nav       {page_id, action: back|forward|reload|stop}         → {page}
   "state": "live" | "parked" | "crashed",
   "loading": false,
   "viewport": {"w": 1280, "h": 900, "scale": 1.0},
-  "rss_mb": 187.4, "cpu_pct_1m": 2.1,
+  "rss_mb": null, "cpu_pct_1m": null,
   "opened_at_ms": 0, "last_used_ms": 0,
   "tags": ["crawl-batch-3"]
 }
@@ -226,6 +233,10 @@ POST /batch {open: [{url, profile, tags}…], concurrency?: 8}
 Batch is a convenience loop over /open + /wait with the governor in charge;
 it must not bypass budgets.
 
+⚠ **`/engine/batch` returns a JSON array today, not an NDJSON stream.** Chunked
+responses need a streaming responder the control endpoint does not have; Phase E
+owns it. An honest array beats a half-stream.
+
 ## 5. Resource governance — how "hundreds of pages" actually works
 
 The RAM truth: a real page's WebKitWebProcess costs **80–300 MB PSS**. A
@@ -246,6 +257,9 @@ hundred *live* engine views would be 10–30 GB. Nobody gets that. So:
   Over `max_rss_mb` (default 4096) → park LRU until under. A single page over
   `per_page_rss_mb` (default 1500) → `webkit_web_view_terminate_web_process`,
   state `crashed`, journaled — a leaky page may not sink the fleet.
+  ⚠ **NOT IMPLEMENTED, and not schedulable**: it needs per-page attribution
+  this substrate cannot give (see §4). `max_rss_mb` is enforced on the measured
+  aggregate and is what keeps the fleet inside its budget.
 - **WebKit's own knobs**: memory-pressure settings tuned conservative;
   process-per-view is the default (isolation), with a documented
   `views_per_process` dial if measurement ever justifies sharing.
@@ -351,6 +365,51 @@ the SAME browser to a website.
 *AC: a page logged-in under profile X in the visible surface is logged-in in
 the engine with zero re-auth; the cdn.taboola.com adblock differential passes
 headless; SponsorBlock userscript state visible via /eval on a YouTube page.*
+
+✅ **DONE 2026-07-31 (dev).** `ychrome engine parity`, five checks, all PASS.
+`src/engine/identity.rs` is an ADAPTER that owns nothing: the jar comes from
+`crate::profile_dir`, adblock + userscripts + UA from `webpolicy::policy`, zoom
+from `webzoom`, the ruleset stamp from `adblock::rules_stamp`. A unit test locks
+that, because a forked jar path would still WORK and would silently mean the
+engine and the surface are different browsers.
+
+| check | evidence |
+|---|---|
+| identity comes from its owners | jar/UA/script-count all equal what the owners report |
+| **filter compiles once, loads thereafter** | cold store **17,855 ms compile**; second profile **0 ms load**; next process **1 ms load** |
+| same jar, zero re-auth | cookie set on page 1 read back on page 2, in `web-profiles/default` |
+| **adblock differential, headless** | `.Adsense` → `display:none` with blocking on, `block` with it off; control class visible on both |
+| userscript in the declared world | `window.__ychromeParity.world === "main"` via `/eval` |
+
+**The rule named**: EasyList `##.Adsense`, emitted as `css-display-none` with
+`"url-filter": ".*"` and no `if-domain` — one of 971 generic cosmetic rules
+covering 36,028 selectors. The differential is deterministic and needs no ad
+server: the same markup, the same page, two profiles.
+
+**The filter-cost trap was real and is handled.** `..._save` recompiles
+unconditionally (17.9 s measured here, 15.7 s by the adblock lane); the engine
+loads first, keyed by `adblock::rules_stamp` over the ruleset's own bytes, and
+saves only on a miss. A hand-edited `rules.json` therefore gets a new identifier
+and a fresh compile instead of silently serving stale bytecode. **Per profile
+per store, not per page and not per launch.**
+
+**A real race, named rather than tuned away.** WebKitGTK queues key events in
+the UI process and only sends the next after the previous is acknowledged,
+while `evaluate_javascript` is sent at once — so a read issued straight after a
+`/engine/input type` can overtake the final keystroke and see `"ada lovelac"`.
+It reproduced on roughly two runs in three. `/engine/input` now drains the loop
+and flushes before returning, which took it to five in six; the honest fix is
+that **a caller must `/engine/wait` on the state it expects**, which is what
+`wait` is for. With the wait, eight of eight. The mitigation is documented as a
+heuristic in `INPUT_FLUSH` rather than described as a solution.
+
+**Two honest scope limits.** The visible yggterm GUI was NOT driven — the owner
+is working at the GUI host — so "zero re-auth" is proven as *the engine reads and writes
+the very directory `profile_dir` gives the surface, and a cookie survives across
+pages*, not as a GUI login replayed headlessly. And **SponsorBlock was not
+exercised**: it is not installed on dev, so there was no state to read. The
+userscript plane itself is proven, including world placement, by the probe
+script.
 
 **Phase D — fleet governance.** Pool, park/resume, budgets, governor,
 /metrics, /batch, bench.

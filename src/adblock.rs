@@ -182,10 +182,20 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// sidecar that does not parse, and a sidecar whose hash does not match the
 /// rules.json beside it. A hand-copied ruleset has no sidecar at all, and that
 /// is exactly the population that needs healing once.
+/// The content stamp of a ruleset: FNV-1a over its exact bytes, hex.
+///
+/// One encoding, three consumers — `write_meta` records it, `ruleset_version_from`
+/// checks a sidecar against it, and the engine keys its compiled-filter cache on
+/// it so a hand-edited `rules.json` is recompiled instead of silently serving the
+/// previous bytecode. It was spelled out twice before this existed.
+pub fn rules_stamp(rules: &str) -> String {
+    format!("{:016x}", fnv1a(rules.as_bytes()))
+}
+
 pub fn ruleset_version_from(meta: Option<&str>, rules: &str) -> Option<ScriptVersion> {
     let meta: Value = serde_json::from_str(meta?).ok()?;
     let recorded = meta["rules_fnv1a"].as_str()?;
-    if recorded != format!("{:016x}", fnv1a(rules.as_bytes())) {
+    if recorded != rules_stamp(rules) {
         return None;
     }
     ScriptVersion::parse(meta["ruleset_version"].as_str()?)
@@ -214,7 +224,7 @@ pub fn write_meta(dir: &Path, rules: &str, meta: &str) -> Result<()> {
     // The sidecar's own hash field must describe the bytes actually written,
     // or the next launch reads the pair as drifted and re-heals forever.
     let mut value: Value = serde_json::from_str(meta).context("parsing ruleset meta")?;
-    value["rules_fnv1a"] = json!(format!("{:016x}", fnv1a(rules.as_bytes())));
+    value["rules_fnv1a"] = json!(rules_stamp(rules));
     std::fs::write(
         dir.join(RULESET_META_FILE),
         serde_json::to_string_pretty(&value)?,

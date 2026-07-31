@@ -1,0 +1,435 @@
+//! Phase C — identity parity (`docs/agent-engine.md` §8).
+//!
+//! **This module owns nothing.** It is an ADAPTER: it asks the existing owners
+//! what this profile's identity is and turns their answer into WebKit objects.
+//! Every concept below already has exactly one owner elsewhere, and AGENTS.md's
+//! reuse-never-fork rule means the engine may consume them but never keep a
+//! second copy:
+//!
+//! | concept | owner | consumed as |
+//! |---|---|---|
+//! | profile jar | `crate::profile_dir` | `WebsiteDataManager` base dirs |
+//! | adblock ruleset | `webpolicy::policy().adblock_rules` | a compiled `WebKitUserContentFilter` |
+//! | userscripts + placement | `webpolicy::policy().userscripts` | `WebKitUserScript` per script |
+//! | UA | `webpolicy::policy().user_agent` (from `useragent`) | `Settings::set_user_agent` |
+//! | per-site zoom | `webzoom::zoom_for_host` | `WebViewExt::set_zoom_level` |
+//! | egress | the caller's SOCKS endpoint | `NetworkProxySettings` |
+//!
+//! The engine and the visible surface must be the SAME browser to a website.
+//! That is why the jar directory is `crate::profile_dir`'s, unmodified: a page
+//! logged in under profile X in the visible surface is logged in here with no
+//! re-auth, because it is literally the same cookie jar on disk.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::time::Instant;
+
+use anyhow::{Result, bail};
+use glib::translate::{IntoGlib, ToGlibPtr, from_glib_full};
+use serde_json::json;
+use webkit2gtk::{
+    NetworkProxyMode, NetworkProxySettings, UserContentInjectedFrames, UserContentManager,
+    UserContentManagerExt, UserScript, UserScriptInjectionTime, WebContext, WebsiteDataManager,
+    WebsiteDataManagerExt,
+};
+
+use crate::userscript::ScriptWorld;
+
+/// The name of the isolated world engine userscripts run in.
+///
+/// A NAME is what makes a world isolated in WebKit; there is no "anonymous
+/// isolated world". One constant so every isolated script shares one world and
+/// can see each other's globals, exactly as they do on the visible surface.
+const ISOLATED_WORLD: &str = "ychrome";
+
+/// One profile's WebKit identity, built once and reused for every page on that
+/// profile.
+///
+/// Reused rather than rebuilt because a second `WebContext` over the same jar
+/// directory is a second writer to it, and because attaching the content filter
+/// is the expensive step this whole module has to be careful about.
+#[derive(Clone)]
+pub struct ProfileIdentity {
+    pub context: WebContext,
+    pub data: WebsiteDataManager,
+    pub content: UserContentManager,
+    pub user_agent: Option<String>,
+    /// What actually got attached, for the journal. Claims here are checked
+    /// against reality by `engine identity`.
+    pub applied: serde_json::Value,
+}
+
+thread_local! {
+    /// Per-profile identities, on the engine thread that owns the GTK objects.
+    static IDENTITIES: RefCell<HashMap<String, ProfileIdentity>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Build (or reuse) a profile's identity. Engine thread only.
+pub fn for_profile(profile: &str) -> Result<ProfileIdentity> {
+    if let Some(existing) = IDENTITIES.with(|map| map.borrow().get(profile).cloned()) {
+        return Ok(existing);
+    }
+    let built = build(profile)?;
+    IDENTITIES.with(|map| {
+        map.borrow_mut().insert(profile.to_string(), built.clone());
+    });
+    Ok(built)
+}
+
+fn build(profile: &str) -> Result<ProfileIdentity> {
+    let started = Instant::now();
+    // THE profile jar — the same directory the visible surface uses. Not a
+    // copy, not an engine-specific sibling: the point of Phase C is that these
+    // are one identity.
+    let dir = crate::profile_dir(profile)?;
+    let manager = WebsiteDataManager::builder()
+        .base_data_directory(dir.to_string_lossy().as_ref())
+        .base_cache_directory(dir.join("cache").to_string_lossy().as_ref())
+        .build();
+    let context = WebContext::with_website_data_manager(&manager);
+
+    // THE policy — one call, one owner. The engine does not decide whether ad
+    // blocking is on, which scripts are enabled, or what the UA is; it asks.
+    let policy = crate::webpolicy::policy(profile);
+    let content = UserContentManager::new();
+
+    let mut scripts_attached = 0;
+    let mut script_detail = Vec::new();
+    for script in &policy.userscripts {
+        attach_script(&content, script)?;
+        scripts_attached += 1;
+        script_detail.push(json!({
+            "matches": script.matches.len(),
+            "world": script.world.as_str(),
+            "all_frames": script.all_frames,
+            "bytes": script.body.len(),
+        }));
+    }
+
+    let filter = match &policy.adblock_rules {
+        None => {
+            json!({ "attached": false, "reason": "policy says no ad blocking for this profile" })
+        }
+        Some(rules) => attach_filter(&content, rules)?,
+    };
+
+    let identity = ProfileIdentity {
+        context,
+        data: manager,
+        content,
+        user_agent: policy.user_agent.clone(),
+        applied: json!({
+            "profile": profile,
+            "jar": dir.display().to_string(),
+            "user_agent": policy.user_agent,
+            "userscripts": scripts_attached,
+            "userscript_detail": script_detail,
+            "adblock": filter,
+            "build_ms": started.elapsed().as_millis(),
+        }),
+    };
+    crate::daemon::journal("engine.identity.built", identity.applied.clone());
+    Ok(identity)
+}
+
+/// Attach one userscript, honouring the placement its own metadata block
+/// declared.
+///
+/// The WORLD is load-bearing, and getting it backwards is silent.
+/// `docs/adblock.md` §5 records the cost: `youtube-adblock` ran in the isolated
+/// world, so its `window.fetch` patch was invisible to the page, so the user
+/// saw every ad and nothing said so. A script that asked for the main world and
+/// quietly got an isolated one is a lie the engine must not tell.
+///
+/// The two constructors are the opposite way round from what the names suggest,
+/// and WebKit says so loudly rather than silently — see the comment on the
+/// match below.
+fn attach_script(
+    content: &UserContentManager,
+    script: &crate::userscript::Userscript,
+) -> Result<()> {
+    let frames = if script.all_frames {
+        UserContentInjectedFrames::AllFrames
+    } else {
+        UserContentInjectedFrames::TopFrame
+    };
+    // Every surface injects at document-start today; `run_at` travels but is
+    // not yet honoured anywhere (see `userscript::Userscript::run_at`), and the
+    // engine does not get to be the exception that disagrees with the GUI.
+    let when = UserScriptInjectionTime::Start;
+
+    let allow: Vec<&str> = script.matches.iter().map(String::as_str).collect();
+    let block: Vec<&str> = script.exclude_matches.iter().map(String::as_str).collect();
+
+    let user_script = match script.world {
+        // `webkit_user_script_new` injects into the page's OWN world. It is the
+        // plain constructor precisely because that is WebKit's default.
+        //
+        // I had this backwards and WebKit said so immediately: passing NULL to
+        // `..._new_for_world` to mean "the main one" trips
+        // `assertion 'worldName' failed`, returns NULL, and every script is
+        // refused. `..._for_world` does not take an optional name — a NAME is
+        // what makes a world isolated.
+        ScriptWorld::Main => UserScript::new(&script.body, frames, when, &allow, &block),
+        // A named world: the page shares the DOM but not the globals.
+        ScriptWorld::Isolated => unsafe {
+            let raw = webkit2gtk::ffi::webkit_user_script_new_for_world(
+                script.body.to_glib_none().0,
+                frames.into_glib(),
+                when.into_glib(),
+                ISOLATED_WORLD.to_glib_none().0,
+                allow.to_glib_none().0,
+                block.to_glib_none().0,
+            );
+            if raw.is_null() {
+                bail!("WebKit refused an isolated-world userscript");
+            }
+            from_glib_full::<_, UserScript>(raw)
+        },
+    };
+    content.add_script(&user_script);
+    Ok(())
+}
+
+/// Attach the ad-blocking content filter, **loading before compiling**.
+///
+/// This is the expensive one and the reason the whole module caches. Measured
+/// by the adblock lane on WebKitGTK 2.52.5 with the shipped 146,748-rule set:
+/// `..._save` recompiles unconditionally at **15.7 s and 476 MB**, while
+/// `..._load` against a populated store returns the same filter in **0.011 s**.
+/// So: load first, keyed by a stamp over the ruleset's own bytes, and save only
+/// on a miss. A changed ruleset gets a new identifier and therefore a new
+/// compile; an unchanged one never recompiles at all.
+///
+/// `WebKitUserContentFilter` and its store are absent from the gir bindings —
+/// `add_filter` is literally commented out as `/*Ignored*/` — so this is FFI,
+/// the same route the surface path's adblock already takes.
+fn attach_filter(content: &UserContentManager, rules: &str) -> Result<serde_json::Value> {
+    let dir = crate::adblock::adblock_dir()?.join("store");
+    std::fs::create_dir_all(&dir)?;
+    // The identifier IS the content stamp, from the ruleset's one owner. A
+    // hand-edited rules.json therefore gets a different identifier and is
+    // recompiled, instead of silently serving the previous bytecode.
+    let identifier = format!("ychrome-{}", crate::adblock::rules_stamp(rules));
+
+    let started = Instant::now();
+    let store = unsafe {
+        let raw = webkit2gtk::ffi::webkit_user_content_filter_store_new(
+            dir.to_string_lossy().to_glib_none().0,
+        );
+        if raw.is_null() {
+            bail!(
+                "could not open the content-filter store at {}",
+                dir.display()
+            );
+        }
+        raw
+    };
+
+    let (filter, path) = match load_filter(store, &identifier) {
+        Some(filter) => (filter, "load"),
+        None => {
+            let compiled = save_filter(store, &identifier, rules)?;
+            (compiled, "compile")
+        }
+    };
+    let elapsed_ms = started.elapsed().as_millis();
+
+    // SAFETY: `filter` is a full reference from the load/save finish call, and
+    // `add_filter` takes its own. We release ours below.
+    unsafe {
+        webkit2gtk::ffi::webkit_user_content_manager_add_filter(content.to_glib_none().0, filter);
+        webkit2gtk::ffi::webkit_user_content_filter_unref(filter);
+        glib::gobject_ffi::g_object_unref(store as *mut _);
+    }
+
+    let detail = json!({
+        "attached": true,
+        "identifier": identifier,
+        "path": path,
+        "elapsed_ms": elapsed_ms,
+        "rule_bytes": rules.len(),
+        "store": dir.display().to_string(),
+    });
+    crate::daemon::journal("engine.identity.adblock", detail.clone());
+    Ok(detail)
+}
+
+/// Drive one async filter-store call to completion on this thread's main
+/// context.
+///
+/// The store API is async-only, and the engine thread is already inside the
+/// main loop when it builds an identity — so this spins a nested
+/// `MainContext::iteration` until the callback lands, rather than blocking the
+/// loop it depends on. Without the nesting the callback could never run and the
+/// call would deadlock.
+fn await_async<T>(mut poll: impl FnMut() -> Option<T>) -> Option<T> {
+    let context = glib::MainContext::default();
+    let deadline = Instant::now() + std::time::Duration::from_secs(180);
+    loop {
+        if let Some(value) = poll() {
+            return Some(value);
+        }
+        if Instant::now() > deadline {
+            return None;
+        }
+        context.iteration(true);
+    }
+}
+
+type FilterPtr = *mut webkit2gtk::ffi::WebKitUserContentFilter;
+
+fn load_filter(
+    store: *mut webkit2gtk::ffi::WebKitUserContentFilterStore,
+    id: &str,
+) -> Option<FilterPtr> {
+    let slot: std::rc::Rc<RefCell<Option<Option<FilterPtr>>>> =
+        std::rc::Rc::new(RefCell::new(None));
+    unsafe extern "C" fn done(
+        source: *mut glib::gobject_ffi::GObject,
+        result: *mut gio::ffi::GAsyncResult,
+        data: glib::ffi::gpointer,
+    ) {
+        let slot =
+            unsafe { std::rc::Rc::from_raw(data as *const RefCell<Option<Option<FilterPtr>>>) };
+        let mut error = std::ptr::null_mut();
+        let filter = unsafe {
+            webkit2gtk::ffi::webkit_user_content_filter_store_load_finish(
+                source as *mut _,
+                result,
+                &mut error,
+            )
+        };
+        if !error.is_null() {
+            unsafe { glib::ffi::g_error_free(error) };
+            *slot.borrow_mut() = Some(None);
+        } else {
+            *slot.borrow_mut() = Some(Some(filter));
+        }
+    }
+    unsafe {
+        webkit2gtk::ffi::webkit_user_content_filter_store_load(
+            store,
+            id.to_glib_none().0,
+            std::ptr::null_mut(),
+            Some(done),
+            std::rc::Rc::into_raw(std::rc::Rc::clone(&slot)) as glib::ffi::gpointer,
+        );
+    }
+    await_async(|| slot.borrow_mut().take()).flatten()
+}
+
+fn save_filter(
+    store: *mut webkit2gtk::ffi::WebKitUserContentFilterStore,
+    id: &str,
+    rules: &str,
+) -> Result<FilterPtr> {
+    let slot: std::rc::Rc<RefCell<Option<std::result::Result<FilterPtr, String>>>> =
+        std::rc::Rc::new(RefCell::new(None));
+    unsafe extern "C" fn done(
+        source: *mut glib::gobject_ffi::GObject,
+        result: *mut gio::ffi::GAsyncResult,
+        data: glib::ffi::gpointer,
+    ) {
+        type Slot = RefCell<Option<std::result::Result<FilterPtr, String>>>;
+        let slot = unsafe { std::rc::Rc::from_raw(data as *const Slot) };
+        let mut error = std::ptr::null_mut();
+        let filter = unsafe {
+            webkit2gtk::ffi::webkit_user_content_filter_store_save_finish(
+                source as *mut _,
+                result,
+                &mut error,
+            )
+        };
+        if !error.is_null() {
+            let message: String = unsafe {
+                std::ffi::CStr::from_ptr((*error).message)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            unsafe { glib::ffi::g_error_free(error) };
+            *slot.borrow_mut() = Some(Err(message));
+        } else {
+            *slot.borrow_mut() = Some(Ok(filter));
+        }
+    }
+    let bytes = glib::Bytes::from(rules.as_bytes());
+    unsafe {
+        webkit2gtk::ffi::webkit_user_content_filter_store_save(
+            store,
+            id.to_glib_none().0,
+            bytes.to_glib_none().0,
+            std::ptr::null_mut(),
+            Some(done),
+            std::rc::Rc::into_raw(std::rc::Rc::clone(&slot)) as glib::ffi::gpointer,
+        );
+    }
+    match await_async(|| slot.borrow_mut().take()) {
+        Some(Ok(filter)) => Ok(filter),
+        // A compile failure is TOTAL — one bad rule means no ad blocking at
+        // all, not one missing filter (docs/adblock.md §1). Say so loudly
+        // rather than carrying on with an unfiltered view that looks fine.
+        Some(Err(message)) => bail!("the content filter did not compile: {message}"),
+        None => bail!("the content filter compile did not finish within 180s"),
+    }
+}
+
+/// Point a profile's network through an ssh SOCKS endpoint.
+///
+/// Egress is the caller's decision (`--via` on the browser side); the engine
+/// only applies it. Same tunnel-reuse rule as the surface path: a context keeps
+/// its proxy for its whole life, because churning it mid-session is what breaks
+/// a login loop.
+pub fn set_egress(identity: &ProfileIdentity, socks: Option<&str>) {
+    match socks {
+        // The WebsiteDataManager is the owner at 2.52 — the WebContext form is
+        // deprecated, and the manager is the object that actually holds the
+        // network session for this jar.
+        None => identity
+            .data
+            .set_network_proxy_settings(NetworkProxyMode::Default, None),
+        Some(endpoint) => {
+            let mut settings = NetworkProxySettings::new(Some(endpoint), &[]);
+            identity
+                .data
+                .set_network_proxy_settings(NetworkProxyMode::Custom, Some(&mut settings));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // The engine must never grow its own copy of an identity concept. This is
+    // a source-level lock because the failure is architectural, not behavioural:
+    // a forked jar path or a second UA decision would still WORK, and would
+    // silently mean the engine and the visible surface are different browsers —
+    // exactly what Phase C exists to prevent.
+    #[test]
+    fn identity_is_consumed_from_its_owners_never_reimplemented() {
+        // The MODULE, not this test module. `include_str!` hands back the whole
+        // file, so a scan that forgot to cut its own tests off would match the
+        // very strings the assertions below are looking for — which is exactly
+        // how this test first failed.
+        let source = include_str!("identity.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the module body precedes its tests");
+        for (owner, what) in [
+            ("crate::profile_dir(", "the profile jar"),
+            ("crate::webpolicy::policy(", "adblock + userscripts + UA"),
+            ("crate::adblock::rules_stamp(", "the ruleset content stamp"),
+        ] {
+            assert!(
+                source.contains(owner),
+                "{what} must come from {owner} — the engine may not re-derive it"
+            );
+        }
+        // The jar directory in particular: a literal web-profiles path here
+        // would mean the engine and the surface could drift apart.
+        assert!(
+            !source.contains("web-profiles"),
+            "the jar path belongs to crate::profile_dir, not to this module"
+        );
+    }
+}

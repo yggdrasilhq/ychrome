@@ -187,9 +187,16 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
                 .get("url")
                 .and_then(Value::as_str)
                 .unwrap_or("about:blank");
+            // The profile is the identity the page browses under (§4). Default
+            // is `default`, the same jar the visible browser opens with.
+            let profile = request
+                .body
+                .get("profile")
+                .and_then(Value::as_str)
+                .unwrap_or("default");
             // The pool makes room FIRST (§5): parking LRU views until this one
             // fits the budget, or refusing with the pressure numbers.
-            if let Err(error) = pool::open(&engine, &id, url, tags, (width, height)) {
+            if let Err(error) = pool::open(&engine, &id, url, profile, tags, (width, height)) {
                 return saturated_or_bad(&error);
             }
             // The page is PINNED until this first load settles, so the
@@ -199,7 +206,11 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
             let loaded = if url == "about:blank" {
                 Ok(String::new())
             } else {
-                engine.goto(&id, url, GOTO_TIMEOUT)
+                // Zoom is per SITE, so it is applied per navigation, from
+                // `webzoom`'s recorded sites — never remembered here.
+                let done = engine.goto(&id, url, GOTO_TIMEOUT);
+                let _ = engine.apply_zoom(&id, url);
+                done
             };
             pool().unpin(&id);
             if let Err(error) = loaded {
@@ -249,7 +260,10 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
                 return Reply::bad(400, "goto needs a page_id and a url");
             };
             match engine.goto(&id, url, GOTO_TIMEOUT) {
-                Ok(_) => Reply::Json(200, page_status(&engine, &id)),
+                Ok(_) => {
+                    let _ = engine.apply_zoom(&id, url);
+                    Reply::Json(200, page_status(&engine, &id))
+                }
                 Err(error) => Reply::bad(502, error.to_string()),
             }
         }
@@ -366,6 +380,34 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
             },
         },
         "pool" | "metrics" => Reply::Json(200, pool().metrics()),
+        "egress" => {
+            // Egress is the CALLER's decision; the engine only applies it, and
+            // applies it per profile rather than per page — the same
+            // tunnel-reuse rule the surface path has, because churning a proxy
+            // mid-session is what breaks a login loop.
+            let profile = request.body["profile"]
+                .as_str()
+                .unwrap_or("default")
+                .to_string();
+            let socks = request.body["socks"].as_str().map(str::to_string);
+            match engine.set_egress(&profile, socks.clone()) {
+                Ok(()) => Reply::Json(
+                    200,
+                    json!({ "ok": true, "profile": profile, "socks": socks }),
+                ),
+                Err(error) => Reply::bad(400, error.to_string()),
+            }
+        }
+        "identity" => {
+            let profile = request.body["profile"]
+                .as_str()
+                .unwrap_or("default")
+                .to_string();
+            match engine.identity(&profile) {
+                Ok(applied) => Reply::Json(200, applied),
+                Err(error) => Reply::bad(500, error.to_string()),
+            }
+        }
         "budget" => {
             let budget = pool().set_budget(
                 request.body["max_live"]
@@ -726,6 +768,7 @@ fn page_status(engine: &Engine, id: &str) -> Value {
         "url": url,
         "title": title,
         "state": "live",
+        "profile": engine.page_profile(id).ok(),
         "loading": engine.is_loading(id).unwrap_or(false),
     })
 }

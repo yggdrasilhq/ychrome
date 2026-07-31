@@ -126,7 +126,7 @@ pub fn run() -> Result<Value> {
     // ---- Proof 1: a headless display and one view on it ------------------
     let engine = Engine::start(VIEWPORT_W, VIEWPORT_H)?;
     let open_started = Instant::now();
-    engine.open("gate-main", VIEWPORT_W, VIEWPORT_H)?;
+    engine.open("gate-main", VIEWPORT_W, VIEWPORT_H, "default")?;
     let ids = engine.page_ids()?;
     record(
         &mut proofs,
@@ -229,7 +229,7 @@ pub fn run() -> Result<Value> {
     //
     // A SECOND live page, concurrently with the first: the gate doubles as the
     // smallest possible down payment on Phase B's "10 concurrent live pages".
-    engine.open("gate-trust", VIEWPORT_W, VIEWPORT_H)?;
+    engine.open("gate-trust", VIEWPORT_W, VIEWPORT_H, "default")?;
     engine.load_html(
         "gate-trust",
         TRUST_PAGE,
