@@ -103,7 +103,7 @@ fn with_page<T>(id: &str, responder: Responder<T>, f: impl FnOnce(&Page, Respond
     });
     match view {
         Some(page) => f(&page, responder),
-        None => responder.fail(format!("no page {id:?}")),
+        None => responder.fail(super::pool::no_such_page(id).to_string()),
     }
 }
 
@@ -406,7 +406,7 @@ impl Engine {
                     unsafe { page.window.destroy() };
                     responder.ok(())
                 }
-                None => responder.fail(format!("no page {id:?}")),
+                None => responder.fail(super::pool::no_such_page(&id).to_string()),
             }
         })
     }
