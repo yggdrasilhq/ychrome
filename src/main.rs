@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+mod abp;
 mod daemon;
 mod extensions;
 mod manifest;
