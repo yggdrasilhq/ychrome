@@ -358,6 +358,35 @@ headless; SponsorBlock userscript state visible via /eval on a YouTube page.*
 max_rss_mb=4096; run completes; journal shows parking honoring LRU and budget;
 peak engine PSS within budget +10%; bench numbers recorded.*
 
+✅ **DONE 2026-07-31 (on dev, not the GUI host — same caveat as Phase A).**
+`ychrome engine govern 300`, six checks, all PASS:
+
+| Check | Measured |
+|---|---|
+| run completed | 300/300 opened, 133 s |
+| live never exceeded `max_live` | **12** seen, budget 12 |
+| LRU parking happened | **289** parks, 288 finally parked |
+| peak PSS within budget +10% | **438 MB** of 4505 MB allowed |
+| every page still accounted for | 300 logical pages |
+| resume restores the PLACE, not the URL | read back `["RESTORE-MARKER", 1234]` |
+
+The last row is the one worth reading twice. The fixture's own markup says
+`state-N` and its inline script scrolls somewhere else on load, so a `resume`
+that merely re-fetched the URL would come back with `state-N` — and does,
+exactly, when the restore path is mutated. Only a real place-restore returns
+the marker and the scroll offset.
+
+**`per_page_rss_mb` is NOT implemented**, and the reason is a measurement gap
+rather than a schedule one: webkit2gtk 2.0.2 exposes no web-process identifier,
+so there is no honest way to attribute a WebKitWebProcess to a view. The
+aggregate budget (`max_rss_mb`) is what the governor enforces, which is what
+this AC measures. `page.rss_mb` is `null` rather than `0` — a zero would read
+as a measurement.
+
+**`/batch` returns a JSON array, not the NDJSON stream §4 describes.** Chunked
+responses need a streaming responder the control endpoint does not have; Phase
+E owns it. A JSON array is honest, a half-stream would not be.
+
 **Phase E — agent ergonomics.** `ychrome ctl` polish, SKILL.md section with
 recipes (crawl-and-extract, form-fill, watch-page-until), /dom snapshot
 extractor hardening, NDJSON streaming.
