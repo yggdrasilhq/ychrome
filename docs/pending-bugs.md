@@ -4,75 +4,6 @@ Entries are removed in the same commit as their verified fix. Newest first.
 
 ---
 
-## ★★★ THE PASSKEY SHIM PATCHES `navigator.credentials` ON EVERY PAGE, INCLUDING A CHALLENGE PAGE
-
-**Found 2026-07-31 while investigating why a Cloudflare challenge on a
-brilliant.org login would not clear.** Not the cause of that report (the UA and
-the engine's cookie jar were, both fixed) but a real, measured incoherence that
-a bot check can read.
-
-`sidebar.rs`'s `/policy` prepends `passkey::shim_userscript()` to EVERY
-surface's userscripts, main world, document-start, unconditionally. On a page it
-touches:
-
-- `navigator.credentials` becomes a plain `Object.create(native || {})`, whose
-  methods stringify to JS source rather than `[native code]`;
-- `window.PublicKeyCredential` is DEFINED, and
-  `isUserVerifyingPlatformAuthenticatorAvailable()` answers `true`.
-
-**Measured on the engine plane (which does not install the shim), WebKitGTK
-2.52.5:** `typeof window.PublicKeyCredential === "undefined"` and
-`navigator.credentials === undefined`. WebKitGTK has no WebAuthn at all. So on
-the visible surface we claim a platform authenticator that this engine cannot
-have — an anomaly no real GNOME Web ever shows.
-
-**Why top-frame-only does not save it.** The shim is already `all_frames:
-false`, so the `challenges.cloudflare.com` iframe is clean. But an interstitial
-managed challenge is served as the TOP-FRAME document at the site's own URL, and
-its collector runs in exactly the environment the shim has already patched.
-
-**Why there is no cheap fix, stated so it is not re-attempted.** Since the
-engine genuinely lacks WebAuthn, ANY presence of these APIs is the anomaly —
-making the shim "look native" cannot work, and a URL-pattern exclusion cannot
-help because the challenge is served at the normal page URL. The only correct
-shape is **per-origin installation**: build the shim's `Userscript::matches`
-from the set of rpIds the vault actually holds passkeys for, so a page for a
-site you have no passkey for sees a pristine `navigator`.
-
-That needs a vault op this client does not have — `passkeys <item>` resolves one
-item and there is no way to enumerate rpIds. The work is:
-
-1. add a `passkey-hosts` op to `ychrome-vault`'s agent (metadata only: rpIds, no
-   credential ids, no keys);
-2. call it from `sidebar.rs` through `ychrome-vault-proto` (already linked, no
-   subprocess) and set `matches` to `*://*.<rpId>/*` per host;
-3. a LOCKED vault answers nothing, and installing no shim is then CORRECT rather
-   than a regression — a ceremony needs an unlocked agent anyway;
-4. ⚠ do not put the rpId probe on the `policy_version` path: that stamp is
-   recomputed on the ~4 s heartbeat and must not grow a socket round trip.
-
----
-
-## ★★ (yggterm) A PROFILE WHOSE WRITE-LOCK IS HELD ELSEWHERE OPENS EPHEMERAL, SILENTLY
-
-**Not in this repo — filed here because it is the other half of the cookie-jar
-failure ychrome just fixed on its own engine plane, and an ychrome user meets it
-as "the login will not stick".**
-
-`yggterm-shell/src/shell.rs` (~:10672) comments that a surface whose profile
-write-lock is held elsewhere "opens READ-ONLY (ephemeral, no jar)". Ephemeral is
-not read-only: an ephemeral `WebContext` reads NOTHING from the jar and writes
-nothing back. A second surface on a profile another surface already holds
-therefore starts logged out and cannot keep a cookie — including a bot-check
-clearance cookie, which is why a challenged login can loop forever with nothing
-on screen explaining it.
-
-Two things are owed there: make the degradation match its comment (a genuinely
-read-only jar), and **stop degrading silently** — the surface has to say which
-mode it opened in.
-
----
-
 ## ★★★ A DAEMON HANDOVER STRANDS THE GUI ON A DEAD CONTROL PORT, AND SURFACES SILENTLY LOSE ADBLOCK
 
 **User-reported 2026-07-31, immediately after a deploy + `ychrome daemon
@@ -173,24 +104,61 @@ at a moment the user is not mid-task, because it reloads their page.
 
 ---
 
-## ★★ THE ENGINE ONLY EXISTS ON the GUI host, SO AGENT BROWSING STILL BURNS THE OPERATOR'S LAPTOP
+## ★★ SEVERAL DAEMONS RACE FOR ONE SOCKET, AND EVERY ENGINE PAGE DIES WITH THE LOSER
+
+**Measured on dev 2026-07-31**, while live-verifying SponsorBlock. Symptom, from
+an agent's side:
+
+```
+$ ychrome ctl open profile=sbv2 url=…        → {"ok":true,"page_id":"pg_000001"}
+$ ychrome ctl eval page_id=pg_000001 …       → {"error":"no page \"pg_000001\""}
+```
+
+The journal explains it: `daemon_start pid 2797950` at T, then a **second**
+`daemon_start pid 2801025` fifteen seconds later, then `engine.start` on
+`display :101` where the first had been on `:100`. `pgrep -f "ychrome --daemon"`
+showed **five** live daemons. The page really was opened; it belonged to an
+engine whose daemon no longer owns `daemon.sock`.
+
+**Why it compounds.** Every surface CLI calls `daemon::ensure` on its heartbeat,
+so a single failed connect makes each of them spawn a daemon, and they then
+alternate ownership of the socket. Displays climbed `:100 → :105` across one
+session; the orphaned `Xvfb` processes from `:90`-`:99` were still resident from
+earlier rounds.
+
+**Why it matters beyond tidiness:** an agent cannot hold a page across two `ctl`
+calls, which is the entire premise of the engine's verb surface. Every recipe in
+`assets/engine-recipes/` is a sequence of `ctl` calls against one `page_id`. The
+workaround that got the SponsorBlock proof through was to poll `ctl status`
+until the `display` stopped changing, then run the whole drive inside one script.
+
+**Wants:** one owner of `daemon.sock` (an advisory lock or an atomic bind, so a
+loser exits instead of rebinding), a reaped `Xvfb` when a daemon retires, and
+`ctl` reporting which daemon generation answered so "no page" can say *why*.
+
+⚠ Distinct from the ★★★ handover entry above, which is about the GUI caching a
+dead control port. This one is about the daemons multiplying in the first place.
+
+---
+
+## ★★ THE ENGINE ONLY EXISTS ON jojo, SO AGENT BROWSING STILL BURNS THE OPERATOR'S LAPTOP
 
 The engine's whole purpose is that agent browsing stops costing the human. It is
 half-delivered: **headless means off-screen, not off-host.** `Xvfb :90` and every
-WebKitWebProcess run on **the GUI host — the operator's machine** — so the CPU, RAM and
+WebKitWebProcess run on **jojo — the operator's machine** — so the CPU, RAM and
 thermal cost are still his; only the pixels are hidden.
 
-**HALF-CLOSED 2026-07-31 (a headless host).** `fleet-binary-sync` pulled the engine binary to
-**a headless host**, where `ychrome ctl pool --json` now answers for real and the whole IBKR
+**HALF-CLOSED 2026-07-31 (oc).** `fleet-binary-sync` pulled the engine binary to
+**oc**, where `ychrome ctl pool --json` now answers for real and the whole IBKR
 login flow was driven off the operator's laptop. **`dev` is still uncovered, and
 worse than before: `ychrome` is `command not found` there** — not an old binary,
 no binary. dev is a container on mains power and is the documented preference for
-anything that renders (`data-fabric`: *"Prefer dev over the GUI host… the GUI host is the laptop
+anything that renders (`data-fabric`: *"Prefer dev over jojo… jojo is the laptop
 the user is working on"*), so it is the one host that most needs it.
 
-⚠ **a headless host can run the engine but CANNOT mint a TOTP** — see the clock-skew entry
-below. Any flow that needs a second factor has to source the code from the GUI host even
-when the browsing itself happens on a headless host.
+⚠ **oc can run the engine but CANNOT mint a TOTP** — see the clock-skew entry
+below. Any flow that needs a second factor has to source the code from jojo even
+when the browsing itself happens on oc.
 
 **This is a bug, not a deployment chore**, because the feature's stated benefit
 does not exist until it lands: an engine that can only run on the operator's
@@ -200,12 +168,12 @@ laptop has moved the problem, not solved it. It also blocks the fleet framing in
 agent browsing.
 
 **Wants:** ychrome deployed fleet-wide (it "deploys as a fleet" per standing
-practice), and the engine verified reachable from dev/a headless host, so `ctl` runs where
+practice), and the engine verified reachable from dev/oc, so `ctl` runs where
 nobody is sitting.
 
-## ★★★ the hypervisor host's CLOCK IS 72 s SLOW, SO `ychrome-vault totp` CANNOT WORK ON dev OR a headless host
+## ★★★ manin's CLOCK IS 72 s SLOW, SO `ychrome-vault totp` CANNOT WORK ON dev OR oc
 
-**Measured 2026-07-31 on a headless host.** Three independent servers agree, and so does the
+**Measured 2026-07-31 on oc.** Three independent servers agree, and so does the
 host's own chrony:
 
 ```
@@ -214,14 +182,14 @@ chronyc tracking → System time : 71.908782959 seconds slow of NTP time
 timedatectl      → System clock synchronized: no   (NTP service: active)
 ```
 
-Epoch compared across the fleet: **the GUI host `…997` (correct); dev `…925`; a headless host `…925`.**
-dev and a headless host are LXCs on **the hypervisor host** and share its `CLOCK_REALTIME`, so this is one
-clock, wrong, serving two of the three hosts. the GUI host is a separate machine and is
+Epoch compared across the fleet: **jojo `…997` (correct); dev `…925`; oc `…925`.**
+dev and oc are LXCs on **manin** and share its `CLOCK_REALTIME`, so this is one
+clock, wrong, serving two of the three hosts. jojo is a separate machine and is
 fine.
 
 **Why it is a ychrome bug and not just infra trivia:** a TOTP window is 30 s, so
 72 s is **2.4 windows stale** and servers accept at most ±1. `ychrome-vault totp`
-on dev/a headless host therefore emits a code that is *always* wrong, while looking perfectly
+on dev/oc therefore emits a code that is *always* wrong, while looking perfectly
 well-formed — six digits, stable within its window, no error. It is a
 lie-of-success in the same family as the click-into-the-void: the instrument
 reports a confident answer that cannot be right. **Waiting does not help** — the
@@ -235,13 +203,13 @@ the `System time :` line, or a comparison against a real server's `Date` header,
 shows the truth.**
 
 **Also at risk:** `fleet-memory-sync.sh` is newest-**mtime**-wins with no
-`--delete`. With a 72 s offset between the GUI host and the hypervisor host, two edits to the same
+`--delete`. With a 72 s offset between jojo and manin, two edits to the same
 memory inside a 72 s window resolve by the wrong winner — a file genuinely newer
-on the GUI host can lose to a stale the hypervisor host copy.
+on jojo can lose to a stale manin copy.
 
-**Wants:** the hypervisor host's clock stepped and kept in sync (a headless host *does* hold `cap_sys_time`
+**Wants:** manin's clock stepped and kept in sync (oc *does* hold `cap_sys_time`
 and sudo, but the clock is the shared host's — stepping it from inside a
-container hits the hypervisor host and dev's running agents, so it is the operator's call);
+container hits manin and dev's running agents, so it is the operator's call);
 and `ychrome-vault totp` should **refuse, not guess**, when the host clock is
 further than one window from a trusted reference.
 
@@ -258,8 +226,8 @@ sessions:
   operator's screen; it is the subject of `dream-detached-agent-surfaces.md` and
   of the detached-by-default rule in `yggterm/docs/agent-surface-attachment.md`.
 - **§1 Unlock request** and **§6 Autofill-from-vault.** The vault is the standing
-  friction: it is LOCKED on a headless host and dev (as root it answers `not_configured`) and
-  resolves only on the GUI host, and `fill-vault` needs a mapped surface so it is
+  friction: it is LOCKED on oc and dev (as root it answers `not_configured`) and
+  resolves only on jojo, and `fill-vault` needs a mapped surface so it is
   unavailable on exactly the detached surfaces agents are told to prefer. Every
   run pays this toll by hand.
 - **§3 OTP from the data-fabric** and **§5 Extract surface** — the same shape.
@@ -272,7 +240,7 @@ and §7 table are already bug-shaped.
 
 ## ★★★ THE ENGINE IS NOT HEADLESS — IT OPENS REAL WINDOWS ON THE OPERATOR'S DESKTOP
 
-**Found on the GUI host, 2026-07-31, by the operator, who watched an IBKR login window
+**Found on jojo, 2026-07-31, by the operator, who watched an IBKR login window
 appear over the video he was watching.** He sent a screenshot. This is the
 feature's central promise inverted: the engine exists so agent browsing stops
 touching the human's screen, and instead it puts a titled `ychrome` toplevel in
@@ -341,7 +309,7 @@ headless host until this closes.
 
 ## ★★ A MISTYPED OR NOT-YET-BUILT SUBCOMMAND IS SILENTLY SWALLOWED AS A URL
 
-**Found on a headless host, 2026-07-31, while checking whether the engine had been deployed.
+**Found on oc, 2026-07-31, while checking whether the engine had been deployed.
 It produced a false deployment report.**
 
 `ychrome` takes a positional `[URL]`, so **any bare word in argv position 1 is
@@ -404,8 +372,8 @@ re-test it before running out of room, so this is a sighting, not a bug report.
 It matters because it is what blocked building a page-of-my-own control for the
 injection question — see `dream-detached-agent-surfaces.md` §5.
 
-**Deploy state at time of writing:** the GUI host has the new binary with a **stale
+**Deploy state at time of writing:** jojo has the new binary with a **stale
 daemon** (pid 3857563, up 54,310 s, answering `{"error":"unknown op","stale":
-true}`); dev and a headless host still have the old binary. `ychrome status` diagnoses this
+true}`); dev and oc still have the old binary. `ychrome status` diagnoses this
 correctly and refuses to retire under the operator's 3 live surfaces —
 `ychrome daemon restart` is the handover and is the operator's call.

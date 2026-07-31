@@ -31,6 +31,7 @@ mod passkey;
 mod provision;
 mod sidebar;
 mod sitehost;
+mod sponsorblock;
 mod useragent;
 mod userscript;
 mod webpolicy;
