@@ -207,6 +207,18 @@ stale-daemon class ("2.10.3 running for 19h while the fix sat on disk")
 cannot silently recur in ychrome. The same staleness rides the /ping reply
 so the GUI settings pane can show "daemon outdated, restart".
 
+**Per-session `control_token_declared` (BUILT 2026-07-31).** `register` carries
+`declares_control_token: true` from every client that can courier the GUI's
+control token in its `sidebar ; declare`; a client older than the gate cannot
+send the field, so its absence defaults to `false` and is trustworthy. The
+daemon re-records it on the heartbeat arm as well as the fresh-bind arm — one
+lucky first registration must not make a session look drivable for its whole
+life — and reports it per row. `false` means that session's vault and settings
+panes answer 403 and **can never open**, no matter what the daemon or the GUI
+do, while its ad blocking and userscripts are unaffected. The human `status`
+prints a `[NO PANES]` block naming each such session and the one remedy: cycle
+that session's CLI. See `docs/protocol.md` §"The third mixed case".
+
 ### 6.1 The staleness handover (BUILT 2026-07-27)
 
 A stamp nothing acts on is a stamp that watches the bug happen. `status` has
@@ -272,6 +284,14 @@ campaign inherits a home instead of building one.
 - **Mixed fleet mid-deploy**: old per-invocation ychrome processes keep
   declaring their own URLs; the GUI follows whatever a declare carries.
   No flag day.
+- **A client too old to carry the control token** (measured live 2026-07-31):
+  its declare has no `control_token`, so the GUI holds none and every GUI-only
+  route 403s **for the life of that process** — while `/policy`, `/zoom` and
+  `/ping` keep answering, so ad blocking looks fine and the panes are dead.
+  A daemon handover neither causes nor cures it. `status` marks the session
+  (`control_token_declared: false`), the 403 names the cause
+  (`cause: client_predates_control_token`) and the remedy, and the remedy is:
+  cycle that CLI.
 - **Daemon outdated after a rebuild**: idle ⇒ the next invocation hands it
   over and nobody notices; attached ⇒ it keeps serving, every invocation
   says so on stderr, and `ychrome daemon restart` ends it (§6.1). A client

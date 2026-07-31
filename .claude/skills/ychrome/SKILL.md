@@ -382,6 +382,14 @@ prerequisite).
   daemon running while the fix sits on disk cannot silently recur. Every reply on
   the socket carries `pid`, `stale` and `live_sessions`, whatever the op, so a
   verb cannot answer without saying whether it is old code.
+- ⚠ **`control_token_declared: false` on a row means that session's vault and
+  settings panes CANNOT open** — its CLI predates the control-token gate and
+  never declares the GUI's credential, so every GUI-only route 403s for the life
+  of that process while ad blocking and userscripts keep working. Neither a
+  daemon restart nor a GUI restart fixes it; only cycling that CLI does. The
+  human `status` prints a `[NO PANES]` block naming each one. First diagnostic
+  for "the panes will not open" (2026-07-31). Detail: `docs/protocol.md`
+  §"The third mixed case".
 
 Proven end-to-end on dev via socket + curl (register → skew-honest refuse →
 `?session=` ping → route → envelope drain → at-least-once re-send → ack →

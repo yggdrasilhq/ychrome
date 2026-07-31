@@ -241,6 +241,11 @@ struct SessionMeta {
     /// Registration order; the routing tie-break ("most recently registered
     /// wins") picks the highest.
     registered_seq: u64,
+    /// Did this session's client claim, in its `register`, that it declares the
+    /// control token? See [`crate::sidebar::TokenCourier`]. Asserted by the
+    /// client rather than inferred, and re-asserted on every ~4s heartbeat, so
+    /// it can never describe a client that is no longer the one attached.
+    declares_control_token: bool,
 }
 
 /// One anchored session: its control state (pane + signer), its dedicated control
@@ -312,7 +317,18 @@ impl Daemon {
     /// and spawn its accept loop; existing ⇒ refresh profile/pid/heartbeat and
     /// hand back the same control url (idempotent, so the client's ~4s heartbeat
     /// costs nothing and re-registration after a daemon respawn just works).
-    fn register(self: &Arc<Self>, env_id: &str, profile: &str, pid: i32) -> Result<Value> {
+    ///
+    /// `declares_control_token` is the client saying it will carry the token we
+    /// are about to hand it. Recorded on BOTH arms: a pre-gate client that keeps
+    /// heartbeating must not be able to look capable just because it registered
+    /// once against a generous default.
+    fn register(
+        self: &Arc<Self>,
+        env_id: &str,
+        profile: &str,
+        pid: i32,
+        declares_control_token: bool,
+    ) -> Result<Value> {
         {
             let sessions = self.sessions.lock().unwrap();
             if let Some(entry) = sessions.get(env_id) {
@@ -320,6 +336,7 @@ impl Daemon {
                 meta.profile = profile.to_string();
                 meta.pid = pid;
                 meta.last_heartbeat = Instant::now();
+                meta.declares_control_token = declares_control_token;
                 return Ok(json!({
                     "ok": true,
                     "control_url": entry.control_url,
@@ -359,6 +376,7 @@ impl Daemon {
                 last_heartbeat: Instant::now(),
                 last_session_ping: None,
                 registered_seq,
+                declares_control_token,
             }),
             queue: Mutex::new(Queue::default()),
             stop: Arc::new(AtomicBool::new(false)),
@@ -369,7 +387,19 @@ impl Daemon {
             .insert(env_id.to_string(), Arc::clone(&entry));
         let control_token = entry.control.control_token.clone();
         self.spawn_session_accept_loop(Arc::clone(&entry), listener);
-        journal("register", json!({ "env_id": env_id, "profile": profile, "pid": pid, "port": port }));
+        journal(
+            "register",
+            json!({
+                "env_id": env_id,
+                "profile": profile,
+                "pid": pid,
+                "port": port,
+                // A session whose client cannot carry the token is diagnosable
+                // from the journal alone, at the moment it attaches, rather than
+                // only from the 403s it will produce later.
+                "declares_control_token": declares_control_token,
+            }),
+        );
         Ok(json!({
             "ok": true,
             "control_url": control_url,
@@ -463,6 +493,11 @@ impl Daemon {
                     "last_heartbeat_ms_ago": meta.last_heartbeat.elapsed().as_millis(),
                     "policy_version": crate::webpolicy::policy_version(&profile),
                     "zoom_version": crate::webzoom::zoom_version(),
+                    // False ⇒ this session's vault and settings panes CANNOT
+                    // open, no matter what the GUI or the daemon do, because its
+                    // CLI predates the control-token gate and never declares
+                    // one. The one place to see it without reading 403s.
+                    "control_token_declared": meta.declares_control_token,
                 })
             })
             .collect();
@@ -612,7 +647,20 @@ fn handle_control_conn(daemon: &Daemon, entry: &SessionEntry, stream: TcpStream)
         sidebar::respond_json(stream, 200, &reply, &request.path);
         return;
     }
-    let (status, body) = sidebar::dispatch(&entry.control, &request);
+    // The session's registration fact, read HERE because only the daemon holds
+    // it: a refusal that cannot say "this session's CLI can never deliver the
+    // token" is the bare 403 the user could do nothing with.
+    let courier = {
+        let meta = entry.meta.lock().unwrap();
+        if meta.declares_control_token {
+            sidebar::TokenCourier::Live
+        } else {
+            sidebar::TokenCourier::Absent {
+                client_pid: meta.pid,
+            }
+        }
+    };
+    let (status, body) = sidebar::dispatch(&entry.control, &request, courier);
     sidebar::respond_json(stream, status, &body, &request.path);
 }
 
@@ -707,11 +755,18 @@ fn handle_unix_conn(daemon: &Arc<Daemon>, stream: UnixStream) -> bool {
             let env_id = request.get("env_id").and_then(Value::as_str).unwrap_or("");
             let profile = request.get("profile").and_then(Value::as_str).unwrap_or("default");
             let pid = request.get("pid").and_then(Value::as_i64).unwrap_or(0) as i32;
+            // Absent ⇒ false, and that is the load-bearing default: a client too
+            // old to know the field is exactly the client that cannot carry the
+            // token, so silence means "no courier" rather than "assume the best".
+            let declares_control_token = request
+                .get("declares_control_token")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             if env_id.is_empty() {
                 json!({ "ok": false, "error": "register needs env_id" })
             } else {
                 daemon
-                    .register(env_id, profile, pid)
+                    .register(env_id, profile, pid, declares_control_token)
                     .unwrap_or_else(|error| json!({ "ok": false, "error": error.to_string() }))
             }
         }
@@ -1188,6 +1243,12 @@ fn register_reply(env_id: &str, profile: &str) -> Result<Value> {
         "env_id": env_id,
         "profile": profile,
         "pid": std::process::id(),
+        // We are the token's only courier, so we say so in the same round trip
+        // that mints it. A binary older than the gate cannot send this field,
+        // which is precisely what makes its absence trustworthy: the daemon then
+        // knows the session's panes can never open and can say so instead of
+        // answering 403 forever with no explanation.
+        "declares_control_token": true,
     }))
     .context("registering with the ychrome daemon")?;
     if reply.get("ok").and_then(Value::as_bool) != Some(true) {
@@ -1451,6 +1512,7 @@ mod tests {
                 last_heartbeat,
                 last_session_ping: None,
                 registered_seq: 0,
+                declares_control_token: true,
             }),
             queue: Mutex::new(Queue::default()),
             stop: Arc::new(AtomicBool::new(false)),
@@ -1713,7 +1775,7 @@ mod tests {
         // an endpoint it cannot drive.
         let source = include_str!("daemon.rs");
         let body = source
-            .split("fn register(self: &Arc<Self>, env_id: &str, profile: &str, pid: i32)")
+            .split("    fn register(\n")
             .nth(1)
             .and_then(|rest| rest.split("\n    fn deregister").next())
             .expect("register body present");
@@ -1721,6 +1783,56 @@ mod tests {
             body.matches("\"control_token\":").count(),
             2,
             "both the heartbeat reply and the fresh-session reply must carry the token"
+        );
+        // And both arms must record the COURIER fact. The heartbeat arm is the
+        // one that matters: a pre-gate client re-registers every ~4s, and an
+        // arm that only set the flag on first bind would let one lucky
+        // registration make a session look drivable for the rest of its life.
+        assert!(
+            body.contains("meta.declares_control_token = declares_control_token;"),
+            "the HEARTBEAT arm must re-record the courier fact, or a session keeps \
+             whatever its first registration said forever"
+        );
+        assert!(
+            body.contains(
+                "                registered_seq,\n                declares_control_token,\n"
+            ),
+            "the fresh-session arm must record the courier fact on the entry it builds"
+        );
+        assert!(
+            body.contains("\"declares_control_token\": declares_control_token,"),
+            "the journal's register line must carry it, so a session that can never \
+             open its panes is diagnosable at the moment it attaches"
+        );
+    }
+
+    /// The client asserts its own capability, in the same round trip that mints
+    /// the token it would have to carry. Nothing infers a binary's vintage.
+    #[test]
+    fn the_client_claims_the_courier_and_silence_means_it_cannot() {
+        let source = include_str!("daemon.rs");
+        let body = source
+            .split("fn register_reply(env_id: &str, profile: &str)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n/// What a client needs").next())
+            .expect("register_reply body present");
+        assert!(
+            body.contains("\"declares_control_token\": true"),
+            "this binary declares the token, so its register must say so — without \
+             the claim the daemon would report every session of ours as un-drivable"
+        );
+
+        // The DEFAULT is the load-bearing half: a client too old to send the
+        // field must read as "no courier", never as "assume the best".
+        let arm = source
+            .split("        \"register\" => {")
+            .nth(1)
+            .and_then(|rest| rest.split("        \"deregister\"").next())
+            .expect("the register op arm");
+        assert!(
+            arm.contains(".and_then(Value::as_bool)\n                .unwrap_or(false)"),
+            "an absent `declares_control_token` must default to FALSE: the clients \
+             that cannot send it are exactly the ones that cannot carry the token"
         );
     }
 
