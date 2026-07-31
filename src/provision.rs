@@ -394,7 +394,9 @@ pub fn reconcile() -> Vec<AssetStatus> {
             let path = scripts.join(format!("{}.js", ext.stem));
             let disabled = scripts.join(format!("{}.js.disabled", ext.stem));
             if !path.exists() && !disabled.exists() {
-                let error = write_with_backup(&path, ext.body).err().map(|e| e.to_string());
+                let error = write_with_backup(&path, ext.body)
+                    .err()
+                    .map(|e| e.to_string());
                 statuses.push(AssetStatus {
                     id: ext.stem.to_string(),
                     kind: AssetKind::Userscript,
