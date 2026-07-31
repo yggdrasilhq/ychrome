@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        YouTube Ad Defense
-// @version     1.0.0
+// @version     1.1.0
 // @match       https://*.youtube.com/*
 // @match       https://youtube.com/*
 // @world       main
@@ -21,9 +21,12 @@
 //      player response is pruned on the way in. The same prune runs over the
 //      inline `ytInitialPlayerResponse` the first page load ships in its HTML.
 //   2. DOM FALLBACK (the belt). If the response shape shifts and an ad reaches
-//      the screen anyway, click the skip button, and fast-forward the ad video
-//      when there is no skip button. This layer exists for the day layer 1
-//      stops matching; it is not expected to fire.
+//      the screen anyway, click the skip button, or seek past an unskippable
+//      one. It also WARNS on the console the first time it fires, because an ad
+//      on screen means layer 1 did not cover it, and that is the thing worth
+//      knowing. It deliberately does NOT force playbackRate any more: WebKit
+//      clamps a forced rate to about 2x, so the user watched every ad anyway,
+//      faster and weirder, while the dead primary path stayed invisible.
 //
 // Injected at document-start into the top frame; self-guards to YouTube.
 // Deploy to ~/.yggterm/web-userscripts/ (shared) or a per-profile userscripts/
@@ -259,21 +262,41 @@
     var boundPlayer = null;
     var playerObserver = null;
     var adPoll = null;
-    var forcedRate = false;
+    var warnedUnpruned = false;
+
+    // AN AD ON SCREEN MEANS LAYER 1 DID NOT FIRE. Layer 2 exists to soften
+    // that, never to hide it — this warning is the difference between a user
+    // who knows the blocker needs attention and one who just thinks it is
+    // broken in a weird way. `state.pruned` separates the two failures a
+    // maintainer would chase:
+    //   pruned === 0  -> the hooks never bit. Either AD_FIELDS has been renamed
+    //                    by YouTube, or the script is running in the ISOLATED
+    //                    world, where its window.fetch patch is invisible to
+    //                    the page (see crate::provision for how that happened).
+    //   pruned  >  0  -> the prune works and this particular break arrived by a
+    //                    route AD_BEARING_PATHS does not cover.
+    function warnLayerOneMissed() {
+        if (warnedUnpruned) return;
+        warnedUnpruned = true;
+        try {
+            console.warn(
+                '[ychrome youtube-adblock] an ad reached the player, so the network prune ' +
+                'did not cover it. Pruned fields so far: ' + state.pruned + '. ' +
+                (state.pruned === 0
+                    ? 'NOTHING has been pruned this session — check that this script runs in ' +
+                      'the MAIN world (@world main) and that AD_FIELDS still matches a live ' +
+                      '/youtubei/v1/player response.'
+                    : 'The prune is working, so this break arrived on a path ' +
+                      'AD_BEARING_PATHS does not list.')
+            );
+        } catch (e) { /* no console: the counters still carry it */ }
+    }
 
     function defuse() {
         var player = boundPlayer;
         if (!player || !player.isConnected) return;
-        var video = player.querySelector('video');
-        if (!player.classList.contains('ad-showing')) {
-            // The SAME <video> element plays the content once the ad ends, so a
-            // forced rate MUST be handed back or the video itself runs fast.
-            if (forcedRate && video) {
-                forcedRate = false;
-                video.playbackRate = 1;
-            }
-            return;
-        }
+        if (!player.classList.contains('ad-showing')) return;
+        warnLayerOneMissed();
         for (var i = 0; i < SKIP_SELECTORS.length; i++) {
             var button = player.querySelector(SKIP_SELECTORS[i]);
             if (button && (button.offsetParent || button.offsetHeight > 0)) {
@@ -282,15 +305,23 @@
                 return;
             }
         }
-        // Unskippable: run the ad out instead of watching it. playbackRate first,
-        // because some builds ignore a currentTime jump on an ad stream.
+        // Unskippable: seek past it. The seek is INVISIBLE when it works and a
+        // no-op when the build refuses it.
+        //
+        // There used to be a forced playback rate of 16x here, and removing it
+        // is the point of this version. WebKit clamps that to about 2x, so the
+        // user still watched every ad, just faster and stranger — which is
+        // precisely what they reported ("I still see youtube ads! They are sped
+        // up to 2x automatically!") while the real cause was that layer 1 was
+        // dead. A fallback that visibly degrades playback AND disguises a
+        // broken primary path is worse than no fallback: it converts a legible
+        // failure into a mystery. The warning above replaces it.
+        var video = player.querySelector('video');
         if (video && isFinite(video.duration) && video.duration > 0) {
-            forcedRate = true;
-            video.playbackRate = 16;
             try {
                 video.currentTime = video.duration;
-            } catch (e) { /* seek refused: the rate still runs it out */ }
-            state.forwarded += 1;
+                state.forwarded += 1;
+            } catch (e) { /* seek refused: the ad plays, honestly */ }
         }
     }
 
