@@ -387,23 +387,32 @@ pub fn reconcile() -> Vec<AssetStatus> {
         let ruleset_landing = !dir.join(crate::adblock::RULESET_FILE).is_file()
             || crate::adblock::installed_ruleset_version(&dir.join(crate::adblock::RULESET_FILE))
                 .is_none_or(|installed| installed < crate::adblock::bundled_ruleset_version());
-        if ruleset_landing
-            && let Some(scripts) = userscript_dir()
-            && let Some(ext) = crate::extensions::find(crate::abp::COSMETIC_SCRIPT_STEM)
-        {
-            let path = scripts.join(format!("{}.js", ext.stem));
-            let disabled = scripts.join(format!("{}.js.disabled", ext.stem));
-            if !path.exists() && !disabled.exists() {
-                let error = write_with_backup(&path, ext.body)
-                    .err()
-                    .map(|e| e.to_string());
-                statuses.push(AssetStatus {
-                    id: ext.stem.to_string(),
-                    kind: AssetKind::Userscript,
-                    path,
-                    verdict: Verdict::Absent,
-                    error,
-                });
+        // BOTH generated scripts, for the same reason: one `abp::convert` makes
+        // the ruleset, the cosmetic script and the scriptlet script, and a host
+        // with one and not the others is missing filters nothing will say are
+        // missing.
+        for stem in [
+            crate::abp::COSMETIC_SCRIPT_STEM,
+            crate::abp::SCRIPTLET_SCRIPT_STEM,
+        ] {
+            if ruleset_landing
+                && let Some(scripts) = userscript_dir()
+                && let Some(ext) = crate::extensions::find(stem)
+            {
+                let path = scripts.join(format!("{}.js", ext.stem));
+                let disabled = scripts.join(format!("{}.js.disabled", ext.stem));
+                if !path.exists() && !disabled.exists() {
+                    let error = write_with_backup(&path, ext.body)
+                        .err()
+                        .map(|e| e.to_string());
+                    statuses.push(AssetStatus {
+                        id: ext.stem.to_string(),
+                        kind: AssetKind::Userscript,
+                        path,
+                        verdict: Verdict::Absent,
+                        error,
+                    });
+                }
             }
         }
         statuses.push(reconcile_one(
