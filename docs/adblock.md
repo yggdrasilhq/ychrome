@@ -197,6 +197,41 @@ before it for that load. The sections are therefore:
    silently switch off a page's element hiding, which is not what it says
 5. document exceptions (`$document`, `$elemhide`, `$generichide`) — last,
    because these ones **do** mean the page is exempt from all of it
+6. **the bot-check guard — OURS, after every upstream rule** (see below)
+
+### The bot-check guard: two rules that must always be last
+
+A bot check is the last thing on the web that may be blocked by accident,
+because the failure has no symptom a user can read: the login page comes back,
+and comes back, and comes back. A user hit exactly this shape on a login in July
+2026 and filed a ticket with Cloudflare rather than with us.
+
+`abp::bot_check_guard_rules` appends two `ignore-previous-rules` entries at the
+very end of every generated ruleset:
+
+| path | what it is |
+|---|---|
+| `/cdn-cgi/challenge-platform/` | the first-party orchestrator, JS detector and its XHRs, served from the challenged site's OWN origin |
+| `challenges.cloudflare.com` | Turnstile's script and its iframe document |
+
+Three properties, all locked by
+`a_bot_check_is_allowlisted_last_and_survives_the_ceiling`:
+
+- **present** — a list refresh cannot lose it;
+- **last** — `ignore-previous-rules` cancels only what precedes it, so a guard in
+  the middle protects nothing after it;
+- **ceiling-proof** — the trim runs against `WEBKIT_RULE_CEILING - guard.len()`,
+  so a ruleset that arrives at 150,000 can never be the one that drops it.
+
+Deliberately NOT `/cdn-cgi/` wholesale: `/cdn-cgi/rum`, `/cdn-cgi/beacon/` and
+`/cdn-cgi/zaraz/` are analytics on the same prefix and stay blocked.
+
+**Audit of the shipped ruleset, 2026-07-31 (146,817 rules):** nothing blocked a
+challenge then either. Of the 79 rules mentioning cloudflare or `cdn-cgi`, the
+four touching a challenge were already upstream's own `ignore-previous-rules`,
+and every blocking one was analytics on a different path. So the guard is a lock
+against the next list update, not a fix for a live break — and the committed
+`rules.json.gz` predates it, so it arrives at the next `ychrome adblock update`.
 
 ## 4. Cosmetic filtering's other half: `cosmetic-filters.js`
 

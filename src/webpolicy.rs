@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! yggterm --GET <control>/policy--> ychrome
-//!     {adblock_rules, userscripts, userscripts_v2, user_agent}
+//!     {adblock_rules, userscripts, userscripts_v2, user_agent, user_agent_sites}
 //! ```
 //!
 //! `userscripts` and `userscripts_v2` are the SAME scripts in two shapes, both
@@ -73,11 +73,20 @@ pub struct Policy {
     /// `userscripts` strings on the wire are DERIVED from this list in
     /// [`Policy::to_json`], never maintained beside it.
     pub userscripts: Vec<Userscript>,
-    /// The UA the surface identifies as; `None` leaves WebKitGTK's default,
-    /// which UA-allowlisting edges refuse. Owned by [`crate::useragent`] and
-    /// carried here because /policy is the one channel the GUI applies at
-    /// webview creation, which is the only moment a UA can be set.
+    /// The UA the surface identifies as at creation; `None` leaves WebKitGTK's
+    /// own, which is now the DEFAULT because it is the coherent one (see
+    /// [`crate::useragent`]). Owned by [`crate::useragent`] and carried here
+    /// because /policy is the channel the GUI reads before it builds a webview.
     pub user_agent: Option<String>,
+    /// Per-site identity overrides, host -> the UA STRING to send, `null` for
+    /// "the engine's own". Applied by the GUI on navigation, the same division
+    /// of labour as `/zoom`: ychrome owns the map, yggterm matches the live
+    /// page's host against it.
+    ///
+    /// Resolved to strings HERE so the GUI never learns what a preset is, and
+    /// carried as its own field so a GUI older than per-site identity keeps
+    /// working off [`Policy::user_agent`] alone.
+    pub user_agent_sites: Value,
 }
 
 impl Policy {
@@ -118,6 +127,7 @@ impl Policy {
             "userscripts": legacy,
             "userscripts_v2": rich,
             "user_agent": self.user_agent,
+            "user_agent_sites": self.user_agent_sites,
         })
     }
 }
@@ -206,6 +216,7 @@ pub fn policy(profile: &str) -> Policy {
         adblock_rules,
         userscripts,
         user_agent: crate::useragent::effective(),
+        user_agent_sites: crate::useragent::sites_json(),
     }
 }
 
@@ -233,7 +244,10 @@ fn promote_or_refuse(
     // strictly better than injecting it wrong; `crate::provision` owns the
     // decision and the wording.
     if let Some(refusal) = crate::provision::placement_refusal(source, &script) {
-        eprintln!("ychrome: REFUSING userscript {}: {refusal}", source.display());
+        eprintln!(
+            "ychrome: REFUSING userscript {}: {refusal}",
+            source.display()
+        );
         return None;
     }
     if script.untranslatable_includes.is_empty() {
@@ -615,6 +629,7 @@ mod tests {
                 "// ==UserScript==\n// @match https://*.youtube.com/*\n// @world main\n// ==/UserScript==\nx\n",
             )],
             user_agent: Some("UA/1".to_string()),
+            user_agent_sites: json!({ "portal.gov.in": "UA/2" }),
         }
     }
 
@@ -623,6 +638,9 @@ mod tests {
         let value = demo_policy().to_json();
         assert_eq!(value["adblock_rules"], "[]");
         assert_eq!(value["user_agent"], "UA/1");
+        // The per-site map rides beside the global, never instead of it: a GUI
+        // that has never heard of per-site identity still reads `user_agent`.
+        assert_eq!(value["user_agent_sites"]["portal.gov.in"], "UA/2");
     }
 
     // MIXED-VERSION FLEET. A GUI older than the scriptlet plane deserializes
@@ -683,7 +701,8 @@ mod tests {
              // ==/UserScript==\n\
              x();\n",
         );
-        let promoted = promote_or_refuse(Path::new("clean.js"), clean).expect("a clean script promotes");
+        let promoted =
+            promote_or_refuse(Path::new("clean.js"), clean).expect("a clean script promotes");
         assert_eq!(
             promoted.matches,
             vec!["https://m.example.test/*".to_string()]

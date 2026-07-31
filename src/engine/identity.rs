@@ -28,12 +28,20 @@ use anyhow::{Result, bail};
 use glib::translate::{IntoGlib, ToGlibPtr, from_glib_full};
 use serde_json::json;
 use webkit2gtk::{
-    NetworkProxyMode, NetworkProxySettings, UserContentInjectedFrames, UserContentManager,
-    UserContentManagerExt, UserScript, UserScriptInjectionTime, WebContext, WebsiteDataManager,
-    WebsiteDataManagerExt,
+    CookieManagerExt, CookiePersistentStorage, NetworkProxyMode, NetworkProxySettings,
+    UserContentInjectedFrames, UserContentManager, UserContentManagerExt, UserScript,
+    UserScriptInjectionTime, WebContext, WebsiteDataManager, WebsiteDataManagerExt,
 };
 
 use crate::userscript::ScriptWorld;
+
+/// The cookie jar's filename inside a profile directory.
+///
+/// It is `cookies` because that is what wry writes for the visible surface and
+/// the standalone window. The engine and the surface must be ONE browser to a
+/// website (this module's whole premise), and two files would make them two.
+/// If wry ever renames it, this is the line that has to move with it.
+pub const COOKIE_JAR_FILE: &str = "cookies";
 
 /// The name of the isolated world engine userscripts run in.
 ///
@@ -87,6 +95,36 @@ fn build(profile: &str) -> Result<ProfileIdentity> {
         .base_data_directory(dir.to_string_lossy().as_ref())
         .base_cache_directory(dir.join("cache").to_string_lossy().as_ref())
         .build();
+    // ⭐ COOKIES DO NOT PERSIST JUST BECAUSE THE JAR HAS A DIRECTORY.
+    //
+    // A `WebsiteDataManager` with base directories still gets a MEMORY-ONLY
+    // cookie store: WebKitGTK persists cookies only when someone calls
+    // `set_persistent_storage`. wry does that for the visible surface and the
+    // standalone window (`webkitgtk/web_context.rs`), so those wrote
+    // `<profile>/cookies`; the engine built its manager by hand and never did,
+    // so EVERY engine page started with an empty jar and wrote nothing back.
+    //
+    // Measured on dev, 2026-07-31: after a full page load under a fresh
+    // profile, that profile's directory held `cache/`, `storage/` and
+    // `mediakeys/` and NO `cookies` file, while a profile the visible browser
+    // had used held one. So the module's claim above — "a page logged in under
+    // profile X in the visible surface is logged in here" — was false, and
+    // `parity.rs`'s cookie test passed only because both its pages live in one
+    // process sharing one in-memory store.
+    //
+    // The failure this causes is worse than "logged out": a bot-check clearance
+    // cookie (`cf_clearance`) can never be kept, so a site that issues one
+    // re-challenges on every single navigation and the challenge LOOPS with
+    // nothing on screen to explain why.
+    //
+    // Same path and same format as wry, deliberately — `<profile>/cookies`,
+    // Netscape text — because the whole point is that this is not a second jar.
+    if let Some(cookies) = manager.cookie_manager() {
+        cookies.set_persistent_storage(
+            dir.join(COOKIE_JAR_FILE).to_string_lossy().as_ref(),
+            CookiePersistentStorage::Text,
+        );
+    }
     let context = WebContext::with_website_data_manager(&manager);
 
     // THE policy — one call, one owner. The engine does not decide whether ad
@@ -122,6 +160,10 @@ fn build(profile: &str) -> Result<ProfileIdentity> {
         applied: json!({
             "profile": profile,
             "jar": dir.display().to_string(),
+            // The cookie FILE, not just the directory. Reported because "the jar
+            // directory exists" was never evidence that cookies survive, and a
+            // reader of this journal line deserves the path they can stat.
+            "cookie_jar": dir.join(COOKIE_JAR_FILE).display().to_string(),
             "user_agent": policy.user_agent,
             "userscripts": scripts_attached,
             "userscript_detail": script_detail,
@@ -431,5 +473,39 @@ mod tests {
             !source.contains("web-profiles"),
             "the jar path belongs to crate::profile_dir, not to this module"
         );
+    }
+
+    /// ⭐ THE COOKIE JAR MUST BE ASKED TO PERSIST.
+    ///
+    /// A `WebsiteDataManager` with base directories still stores cookies in
+    /// MEMORY ONLY. For three months the engine built one that way and every
+    /// page it opened started logged out and threw its cookies away on exit —
+    /// invisibly, because the profile directory filled up with cache and
+    /// storage and looked alive. A clearance cookie from a bot check
+    /// (`cf_clearance`) could never be kept, so a challenged site re-challenged
+    /// forever.
+    ///
+    /// Source-level, like the test above, and for the same reason: the failure
+    /// is architectural and SILENT. There is no assertion about a live page
+    /// that would have caught it — `parity.rs` set a cookie and read it back in
+    /// the same process, and passed.
+    #[test]
+    fn the_profiles_cookie_jar_is_made_persistent_at_the_wrys_own_path() {
+        let source = include_str!("identity.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the module body precedes its tests");
+        assert!(
+            source.contains("set_persistent_storage("),
+            "without this call the engine's cookies are memory-only and every \
+             page starts logged out"
+        );
+        assert!(
+            source.contains("CookiePersistentStorage::Text"),
+            "the format has to match wry's, or the engine and the visible \
+             surface keep two jars that cannot read each other"
+        );
+        // wry writes `<profile>/cookies`. One browser, one file.
+        assert_eq!(super::COOKIE_JAR_FILE, "cookies");
     }
 }

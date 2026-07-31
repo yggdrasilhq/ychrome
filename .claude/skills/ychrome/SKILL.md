@@ -40,6 +40,10 @@ assets/web-scriptlets/runtime.js   the `##+js(...)` scriptlet library (OURS, not
 src/provision.rs                the BUNDLED-ASSET RECONCILER: one owner of "is this
                                 host's copy current?" (docs/adblock.md §6)
 src/webzoom.rs                  per-site zoom overrides (web-zoom.json)
+src/useragent.rs                the browser IDENTITY: the global preset + per-site
+                                overrides (ychrome/user-agent.json), `ychrome identity`
+src/sitehost.rs                 THE per-site host rule (normalize + longest-suffix),
+                                shared by webzoom and useragent — one owner, never re-derived
 src/extensions.rs               the bundled userscript catalog ("Add an extension")
 assets/web-userscripts/         bundled scripts embedded by extensions.rs
 crates/ychrome-vault/src/
@@ -447,6 +451,51 @@ GUI's webview, so we serve the *effective* policy and yggterm applies it:
   filter and its userscripts bind to the WEBVIEW at creation, so an in-page reload
   leaves them attached. Only destroy-and-recreate applies a new policy.
 
+## ⭐ Browser identity (`src/useragent.rs`) — the default is the ENGINE'S OWN UA
+
+**Changed 2026-07-31 after a user could not clear a Cloudflare challenge on a
+login.** An anti-bot edge scores CONSISTENCY across the JS environment, TLS and
+the UA; it does not blocklist engines (GNOME Web is this same WebKitGTK and
+passes daily). The old default was Safari-on-macOS, which produced this,
+measured on the engine plane:
+
+```
+navigator.userAgent -> "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) … Safari/605.1.15"
+navigator.platform  -> "Linux x86_64"
+```
+
+One line of page script catches that. **The default is now `Preset::Engine`,
+which resolves to `None` — "leave WebKitGTK's own UA alone".** The module
+deliberately does NOT hold the engine's string (a test enforces it): WebKitGTK
+owns its identity, so an engine upgrade moves the UA and ychrome ships no new
+constant. For the record, WebKitGTK 2.52.5 on this fleet sends
+`Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko)
+Version/60.5 Safari/605.1.15`.
+
+- **Overrides are PER SITE**, in the same file as the global preset
+  (`~/.yggterm/ychrome/user-agent.json`, `{preset, sites:{host:preset}}`) —
+  never a second store. Matching is `sitehost`'s longest-suffix walk, the same
+  one the zoom map uses.
+- **`ychrome identity [<host>] [--set safari|chrome|engine] [--reset] [--json]`**
+  reads and writes it. Every `--set` prints the warning, because a spoof that
+  breaks a fingerprint-gated login fails as a challenge that never clears.
+- The settings pane draws it TWICE, on purpose: a per-site row under "This site"
+  (with the warning) and the browser-wide picker under "Browser identity" (which
+  now says to prefer the per-site one).
+- **`/policy` carries `user_agent` (global, applied at webview creation) AND
+  `user_agent_sites` (host → resolved UA string, `null` = the engine's own).**
+  The engine already applies the per-site map on every navigation
+  (`Engine::apply_identity`, BEFORE `goto` — the UA is a request header).
+  ⚠ **yggterm does not consume `user_agent_sites` yet**, so on the visible
+  surface a per-site override still needs the GUI companion change: match the
+  live page's host the way it already does for `/zoom`, then
+  `WebKitSettings::set_user_agent`.
+- **claude.ai really does UA-gate, and it still reproduces** (in a real WebKit
+  surface, not curl): engine identity → `403 {"error":{"type":"forbidden"}}`;
+  the Safari preset → `200` at `/login`. That is what the per-site layer is FOR
+  — one entry for claude.ai, every other site coherent. Do not answer it by
+  making the global default lie again.
+
 ## Per-site zoom (`src/webzoom.rs`) — the settings pane's "This site" row
 
 yggterm has one global zoom; a per-site number is OURS, host-resident in
@@ -688,6 +737,44 @@ X in the visible surface is logged in here.
 Input is **real**: `GdkEvent`s through `gtk_main_do_event`, so `isTrusted` is
 true, `:hover` applies and default actions fire. A `dispatchEvent` cannot do any
 of that, and the difference is the whole point.
+
+### ⛔ The engine's cookie jar was MEMORY-ONLY until 2026-07-31
+
+A `WebsiteDataManager` with base directories still gets a non-persistent cookie
+store — WebKitGTK persists only when someone calls `set_persistent_storage`.
+wry does that for the visible surface and the standalone window; `identity.rs`
+built its manager by hand and never did. So **every engine page started with an
+empty jar and threw its cookies away on exit**, invisibly, while the profile
+directory filled with cache and storage and looked alive. The Phase C claim "a
+page logged in in the visible surface is logged in here" was false, and
+`parity.rs`'s cookie test passed only because both its pages share one process.
+
+Fixed: `<profile>/cookies`, Netscape text, wry's exact path and format, so the
+engine and the surface really are one jar. Locked by
+`the_profiles_cookie_jar_is_made_persistent_at_the_wrys_own_path` (source-level,
+because the failure is silent and no live assertion would have caught it).
+
+Proof recipe, and the differential that makes it airtight:
+
+```sh
+export HOME=/tmp/ycf          # SHALLOW — the socket path is bounded by SUN_LEN
+ychrome ctl open url=https://example.com/ profile=default
+ychrome ctl eval page_id=pg_000001 js='document.cookie="k=v; path=/; max-age=3600"'
+ls $HOME/.yggterm/web-profiles/default/cookies    # MUST exist. Old binary: absent.
+ychrome daemon restart
+ychrome ctl open url=https://example.com/ profile=default
+ychrome ctl eval page_id=pg_000001 js='document.cookie'   # MUST still be "k=v"
+```
+
+### Main-frame load tracing — `engine.load.open` / `engine.load.goto`
+
+Every main-frame load journals `{page_id, url, response:{status, headers,
+bot_check}}` to `~/.yggterm/ychrome/journal.jsonl`. It exists because a bot-check
+challenge loop, an asset the content filter ate, and a jar that does not persist
+all present identically ("the page came back and it is not the page"). Headers
+are a short allowlist — `cf-mitigated`, `cf-ray`, `server`, `content-type` — and
+never `set-cookie`, because a clearance cookie is a credential. `bot_check` is
+true when `cf-mitigated` is present, or on a 403/503 carrying a `cf-ray`.
 
 ### What a future agent must NOT assume
 
