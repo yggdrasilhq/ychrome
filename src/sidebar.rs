@@ -861,6 +861,23 @@ pub(crate) fn dispatch(
         // for the current page's host on navigation and falls back to its global
         // "Ychrome Global Zoom" — the GUI does the matching, ychrome owns the map.
         ("GET", "/zoom") => (200, crate::webzoom::to_json()),
+        // CAMERA AND MICROPHONE, per origin. yggterm owns the engine mechanics
+        // (the `permission-request` gate and the native prompt); this endpoint is
+        // the MEMORY, and it is the only one — see [`crate::webmedia`].
+        //
+        // With an `origin`, this answers one live `getUserMedia()` ask and the
+        // GUI acts on the verdict. Without one, it is the whole map, which is
+        // what the settings pane's review-and-revoke list renders.
+        //
+        // GUI-only (the default in `route_access`): a page must never be able to
+        // read — let alone write — what the human decided about its camera.
+        ("GET", "/media-permission") => (200, media_permission_query(query)),
+        ("POST", "/media-permission") => {
+            if req.body.is_null() {
+                return (400, json!({ "error": "bad request" }));
+            }
+            media_permission_write(&req.body)
+        }
         // The EFFECTIVE web-content policy for the profile this ychrome is
         // running: every enable/disable decision already made, PLUS the passkey
         // shim prepended (document-start, so `navigator.credentials` is patched
@@ -923,6 +940,72 @@ pub(crate) fn dispatch(
         }
         _ => (404, json!({})),
     }
+}
+
+/// `GET /media-permission` — either the verdict for ONE live ask, or the whole
+/// remembered map.
+///
+/// The verdict form always answers with a decision word; there is no error shape
+/// the GUI could misread as a grant. An origin nothing can be keyed to (a
+/// `file://` page, a blank tab) reports `ask`, so the human still decides and
+/// nothing is written down for it.
+fn media_permission_query(query: &str) -> Value {
+    let Some(origin) = query_value(query, "origin").filter(|origin| !origin.is_empty()) else {
+        return crate::webmedia::to_json();
+    };
+    let audio = query_value(query, "audio").as_deref() == Some("1");
+    let video = query_value(query, "video").as_deref() == Some("1");
+    let sites = crate::webmedia::sites();
+    let decisions = crate::webmedia::decisions_for(&sites, &origin);
+    json!({
+        "origin": crate::webmedia::normalize_origin(&origin),
+        "decision": crate::webmedia::verdict(&sites, &origin, audio, video).as_str(),
+        "camera": decisions.camera.as_str(),
+        "microphone": decisions.microphone.as_str(),
+    })
+}
+
+/// `POST /media-permission` — remember what the human said.
+///
+/// `{"origin": "https://…", "camera": "allow"|"deny"|"ask", "microphone": …}`.
+/// Either device key may be omitted; an omitted key is left alone, so "the user
+/// allowed the microphone" does not silently clear a camera block. `ask` forgets.
+///
+/// A page the GUI could not reduce to an origin is refused rather than stored
+/// under a key that would never match again.
+fn media_permission_write(body: &Value) -> (u16, Value) {
+    let Some(origin) = body["origin"].as_str().filter(|origin| !origin.is_empty()) else {
+        return (400, json!({ "error": "media permission write needs an origin" }));
+    };
+    if crate::webmedia::normalize_origin(origin).is_none() {
+        return (
+            400,
+            json!({ "error": format!("no origin to remember a decision for: {origin}") }),
+        );
+    }
+    for (key, device) in [
+        ("camera", crate::webmedia::Device::Camera),
+        ("microphone", crate::webmedia::Device::Microphone),
+    ] {
+        let Some(raw) = body[key].as_str() else {
+            continue;
+        };
+        let decision = crate::webmedia::Decision::from_str(raw);
+        if let Err(error) = crate::webmedia::set(origin, device, decision) {
+            return (500, json!({ "error": error.to_string() }));
+        }
+    }
+    let sites = crate::webmedia::sites();
+    let decisions = crate::webmedia::decisions_for(&sites, origin);
+    (
+        200,
+        json!({
+            "ok": true,
+            "origin": crate::webmedia::normalize_origin(origin),
+            "camera": decisions.camera.as_str(),
+            "microphone": decisions.microphone.as_str(),
+        }),
+    )
 }
 
 pub(crate) fn query_value(query: &str, key: &str) -> Option<String> {
@@ -1749,6 +1832,13 @@ const USER_AGENT_ACTION_PREFIX: &str = "user-agent:";
 const SITE_IDENTITY_ACTION_PREFIX: &str = "site-identity:";
 /// Drop this site's identity override; it falls back to the browser default.
 const SITE_IDENTITY_RESET_ACTION: &str = "site-identity-reset";
+/// Change ONE device's remembered decision for ONE origin. The tail is
+/// `<origin>:<device>:<decision>` and is parsed FROM THE RIGHT, because an
+/// origin legitimately contains colons (`https://example.com:8443`).
+const MEDIA_PERMISSION_ACTION_PREFIX: &str = "media-permission:";
+/// Forget everything remembered for one origin — the pane's Revoke. Checked
+/// BEFORE [`MEDIA_PERMISSION_ACTION_PREFIX`], which is a prefix of it.
+const MEDIA_PERMISSION_FORGET_PREFIX: &str = "media-permission-forget:";
 
 /// What the GUI reports about the live surface, on the schema GET (as query
 /// params) and on every action (as `values`). All non-secret, and none of it is
@@ -1888,6 +1978,101 @@ fn current_site_identity_widgets(
     ]
 }
 
+/// Read one `media-permission:<origin>:<device>:<decision>` action.
+///
+/// ⛔ Parsed FROM THE RIGHT. An origin carries colons of its own — the scheme's,
+/// and a non-default port's (`https://example.com:8443`) — so a left-to-right
+/// split would cut the origin in half and write the decision under a key that
+/// can never match the page again. That failure is silent: the pane would say
+/// "blocked" and the site would keep being allowed.
+///
+/// Pure, so the parse can be proven against a colon-bearing origin without a
+/// disk write. `None` for an unrecognised device; an unrecognised DECISION is
+/// [`crate::webmedia::Decision::Ask`], never a grant.
+fn parse_media_permission_action(
+    action: &str,
+) -> Option<(String, crate::webmedia::Device, crate::webmedia::Decision)> {
+    let tail = action.strip_prefix(MEDIA_PERMISSION_ACTION_PREFIX)?;
+    let mut parts = tail.rsplitn(3, ':');
+    let decision = parts.next().unwrap_or_default();
+    let device = parts.next().unwrap_or_default();
+    let origin = parts.next()?;
+    Some((
+        origin.to_string(),
+        crate::webmedia::Device::from_str(device)?,
+        crate::webmedia::Decision::from_str(decision),
+    ))
+}
+
+/// The camera/microphone section: every origin that has been answered once, and
+/// the way back out of each answer.
+///
+/// Review and revoke is the whole job here. Notice what is deliberately ABSENT:
+/// there is no way to GRANT a device from this pane. A capture grant is only
+/// ever created at the moment a page actually asked, in yggterm's prompt, with
+/// the site named — inventing a second door here would mean a grant could exist
+/// without anyone having seen which page it was for.
+///
+/// `Ask` is absence, so an origin with nothing remembered has no row at all;
+/// the list is exactly the set of decisions the user could want to take back.
+fn media_permission_widgets(
+    sites: &std::collections::BTreeMap<String, crate::webmedia::SiteDecisions>,
+) -> Vec<Value> {
+    use crate::webmedia::{Decision, Device};
+    let mut widgets = vec![json!({"kind": "section", "text": "Camera & microphone"})];
+    if sites.is_empty() {
+        widgets.push(json!({
+            "kind": "label",
+            "muted": true,
+            "text": "No site has been given the camera or the microphone. yggterm asks the \
+                     first time a page tries, and remembers only what you tell it to.",
+        }));
+        return widgets;
+    }
+    for (origin, decisions) in sites {
+        let word = |decision: Decision| match decision {
+            Decision::Allow => "allowed",
+            Decision::Deny => "blocked",
+            Decision::Ask => "asks",
+        };
+        // ⛔ ONE action, and it must stay one. The rail's `list-row` gives the
+        // actions all the width they ask for and lets the TITLE take what is
+        // left, under `overflow:hidden; white-space:nowrap`. Measured live in the
+        // rail (2026-08-01): with a "Block camera" + "Block microphone" +
+        // "Revoke" row, the title element came back **0 px wide** — the origin,
+        // the one fact this whole section exists to show, painted nothing at all,
+        // and the user was left with three buttons and no idea which site they
+        // acted on. On a security-review surface that is worse than no row.
+        //
+        // The tri-state is still fully reachable without more buttons here:
+        // ALLOW and DENY are both made at the prompt (where the site is named
+        // and the page actually asked), and Revoke is the way back to ASK.
+        let actions = vec![json!({
+            "action": format!("{MEDIA_PERMISSION_FORGET_PREFIX}{origin}"),
+            "label": "Revoke",
+            "title": format!("Forget every camera and microphone decision for {origin}"),
+        })];
+        widgets.push(json!({
+            "kind": "list-row",
+            "id": format!("media-permission-{origin}"),
+            "title": origin,
+            "subtitle": format!(
+                "Camera {} · mic {}",
+                word(decisions.camera),
+                word(decisions.microphone),
+            ),
+            "actions": actions,
+        }));
+    }
+    widgets.push(json!({
+        "kind": "label",
+        "muted": true,
+        "text": "Revoking takes effect on the next request: the page is asked to be asked \
+                 about again, and a stream it already holds is not retroactively cut.",
+    }));
+    widgets
+}
+
 /// The browser-wide identity. The default is the engine's OWN UA, which is the
 /// coherent one: a bot check that scores consistency (Cloudflare's managed
 /// challenge) passes a browser whose UA, JS environment and TLS all agree, and
@@ -1991,6 +2176,7 @@ fn settings_schema(profile: &str, page: &PageContext) -> Value {
         page,
         &crate::webzoom::sites(),
         &crate::webpolicy::state(profile),
+        &crate::webmedia::sites(),
     )
 }
 
@@ -1999,6 +2185,7 @@ fn settings_schema_from(
     page: &PageContext,
     zoom_sites: &std::collections::BTreeMap<String, f64>,
     state: &crate::webpolicy::PolicyState,
+    media_sites: &std::collections::BTreeMap<String, crate::webmedia::SiteDecisions>,
 ) -> Value {
     let (host, live_zoom, secure) = (page.host(), page.zoom, page.secure);
     let mut widgets = vec![json!({"kind": "section", "text": "This site"})];
@@ -2042,6 +2229,10 @@ fn settings_schema_from(
                      writable, or run `ychrome adblock update` on this host.",
         }));
     }
+
+    // Hardware capture, beside ad blocking: both are "what may a page do to me",
+    // and this is the one the user comes looking for when they want a grant back.
+    widgets.extend(media_permission_widgets(media_sites));
 
     // SponsorBlock is a userscript, but a flagship one, so it gets its own named
     // section with a friendly toggle — pulled out of the generic list below.
@@ -2342,6 +2533,37 @@ fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
             "schema": settings_schema(&profile, &next),
             "surface_prefs": patch,
         });
+    }
+
+    // Camera/microphone. Forget is checked FIRST: `media-permission-forget:` and
+    // `media-permission:` share a stem, and a prefix match on the shorter one
+    // would swallow the Revoke button whole.
+    if let Some(origin) = action.strip_prefix(MEDIA_PERMISSION_FORGET_PREFIX) {
+        return match crate::webmedia::forget(origin) {
+            Ok(()) => redraw(json!({
+                "toast": format!("{origin} will be asked about again."),
+            })),
+            Err(error) => json!({ "toast": error.to_string() }),
+        };
+    }
+    if action.starts_with(MEDIA_PERMISSION_ACTION_PREFIX) {
+        let Some((origin, device, decision)) = parse_media_permission_action(action) else {
+            return json!({ "toast": "Unknown device." });
+        };
+        return match crate::webmedia::set(&origin, device, decision) {
+            Ok(()) => redraw(json!({
+                "toast": format!(
+                    "{} on {origin}: {}.",
+                    device.label(),
+                    match decision {
+                        crate::webmedia::Decision::Allow => "allowed",
+                        crate::webmedia::Decision::Deny => "blocked",
+                        crate::webmedia::Decision::Ask => "will be asked about again",
+                    },
+                ),
+            })),
+            Err(error) => json!({ "toast": error.to_string() }),
+        };
     }
 
     // The per-site identity, checked BEFORE the browser-wide one so the narrower
@@ -2776,6 +2998,219 @@ mod tests {
         std::collections::BTreeMap::new()
     }
 
+    /// No origin has been answered about the camera or the microphone. The
+    /// DEFAULT state of a fresh profile, and the one every pre-existing settings
+    /// test means when it says nothing about capture.
+    fn no_media() -> std::collections::BTreeMap<String, crate::webmedia::SiteDecisions> {
+        std::collections::BTreeMap::new()
+    }
+
+    /// ⛔ THE parse lock for the capture pane. An origin with a NON-DEFAULT PORT
+    /// carries three colons of its own, so a left-to-right split writes the
+    /// decision under `https` and the user's Block silently does nothing while
+    /// the pane reports success. Proven here rather than in a live click,
+    /// because that failure looks like a working button.
+    #[test]
+    fn a_capture_action_is_read_from_the_right_so_a_ported_origin_survives() {
+        use crate::webmedia::{Decision, Device};
+        assert_eq!(
+            parse_media_permission_action("media-permission:http://127.0.0.1:8099:camera:deny"),
+            Some((
+                "http://127.0.0.1:8099".to_string(),
+                Device::Camera,
+                Decision::Deny
+            )),
+        );
+        assert_eq!(
+            parse_media_permission_action("media-permission:https://example.com:microphone:ask"),
+            Some((
+                "https://example.com".to_string(),
+                Device::Microphone,
+                Decision::Ask
+            )),
+        );
+        // Unknown device: refused, not guessed.
+        assert_eq!(
+            parse_media_permission_action("media-permission:https://a.test:speaker:allow"),
+            None,
+        );
+        // An unknown DECISION word degrades to Ask, never to a grant.
+        assert_eq!(
+            parse_media_permission_action("media-permission:https://a.test:camera:yes")
+                .map(|parsed| parsed.2),
+            Some(Decision::Ask),
+        );
+        // A different action is not this one.
+        assert_eq!(parse_media_permission_action("zoom-in"), None);
+    }
+
+    /// Revoke and set share a stem, and the shorter one is a prefix of the
+    /// longer. If the dispatcher ever checks `media-permission:` first, Revoke is
+    /// swallowed and parses as an origin of `forget` — so the ORDER is the lock.
+    #[test]
+    fn revoke_is_not_swallowed_by_the_set_action_prefix() {
+        assert!(MEDIA_PERMISSION_FORGET_PREFIX.starts_with(
+            MEDIA_PERMISSION_ACTION_PREFIX.trim_end_matches(':')
+        ));
+        let revoke = format!("{MEDIA_PERMISSION_FORGET_PREFIX}https://example.com");
+        assert!(revoke.strip_prefix(MEDIA_PERMISSION_FORGET_PREFIX).is_some());
+        let body = include_str!("sidebar.rs");
+        let forget_at = body
+            .find("if let Some(origin) = action.strip_prefix(MEDIA_PERMISSION_FORGET_PREFIX)")
+            .expect("the Revoke arm is gone from run_settings_action");
+        let set_at = body
+            .find("if action.starts_with(MEDIA_PERMISSION_ACTION_PREFIX)")
+            .expect("the set arm is gone from run_settings_action");
+        assert!(
+            forget_at < set_at,
+            "the set arm is checked before Revoke; `media-permission:` is a prefix \
+             of `media-permission-forget:`, so every Revoke click would be read as \
+             a set with a nonsense origin",
+        );
+    }
+
+    /// The pane REVIEWS and REVOKES, and — deliberately — offers no way to grant.
+    #[test]
+    fn the_settings_pane_lists_every_remembered_origin_with_a_way_out() {
+        use crate::webmedia::{Decision, SiteDecisions};
+        let media: std::collections::BTreeMap<String, SiteDecisions> = [
+            (
+                "https://meet.example.com".to_string(),
+                SiteDecisions {
+                    camera: Decision::Allow,
+                    microphone: Decision::Allow,
+                },
+            ),
+            (
+                "https://ads.example.net".to_string(),
+                SiteDecisions {
+                    camera: Decision::Deny,
+                    microphone: Decision::Ask,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let schema = settings_schema_from(
+            "work",
+            &PageContext::default(),
+            &no_zoom(),
+            &policy_state(true, &[]),
+            &media,
+        );
+        let widgets = schema["widgets"].as_array().expect("widgets");
+        let row = |id: &str| {
+            widgets
+                .iter()
+                .find(|widget| widget["id"] == id)
+                .unwrap_or_else(|| panic!("no {id} row in {schema}"))
+        };
+        let granted = row("media-permission-https://meet.example.com");
+        assert_eq!(granted["title"], "https://meet.example.com");
+        let subtitle = granted["subtitle"].as_str().expect("subtitle");
+        assert!(
+            subtitle.contains("Camera allowed") && subtitle.contains("mic allowed"),
+            "the row does not say what is remembered: {subtitle}",
+        );
+        let blocked = row("media-permission-https://ads.example.net");
+        let blocked_subtitle = blocked["subtitle"].as_str().expect("subtitle");
+        assert!(
+            blocked_subtitle.contains("Camera blocked") && blocked_subtitle.contains("mic asks"),
+            "a blocked camera and an untouched mic must read differently: \
+             {blocked_subtitle}",
+        );
+        // ⛔ EXACTLY ONE action per row, and it is Revoke. Measured live in the
+        // rail (2026-08-01): a three-action row squeezed the TITLE element to
+        // **0 px** under `overflow:hidden; white-space:nowrap`, so the origin —
+        // the one fact this section exists to show — painted nothing and the
+        // user could not tell which site the buttons belonged to. Every extra
+        // button here is width taken from the site name.
+        for (id, row_value) in [
+            ("https://meet.example.com", &granted),
+            ("https://ads.example.net", &blocked),
+        ] {
+            let actions = row_value["actions"].as_array().expect("actions");
+            assert_eq!(
+                actions.len(),
+                1,
+                "{id}: {} actions on a capture row — the rail gives the actions \
+                 their width first and the title takes what is left, so this \
+                 blanks the origin",
+                actions.len(),
+            );
+            assert_eq!(actions[0]["label"], "Revoke");
+        }
+        // ⛔ Nothing in this pane hands out a device.
+        let text = schema.to_string();
+        assert!(
+            !text.contains(":camera:allow") && !text.contains(":microphone:allow"),
+            "the settings pane offers a GRANT action; a capture grant may only be \
+             created at the moment a page asked, in yggterm's prompt",
+        );
+    }
+
+    #[test]
+    fn the_settings_pane_says_so_when_nothing_is_remembered() {
+        let schema = settings_schema_from(
+            "work",
+            &PageContext::default(),
+            &no_zoom(),
+            &policy_state(true, &[]),
+            &no_media(),
+        );
+        let text = schema.to_string();
+        assert!(
+            text.contains("Camera & microphone"),
+            "the capture section is missing entirely",
+        );
+        assert!(
+            text.contains("No site has been given the camera or the microphone"),
+            "the empty state does not tell the user what the default is",
+        );
+    }
+
+    /// `GET /media-permission` answers ONE live ask with a decision word, and
+    /// with no origin it is the whole map the pane renders.
+    #[test]
+    fn the_control_endpoint_answers_a_live_ask_and_serves_the_whole_map() {
+        // No origin: the map shape, whatever is on this host's disk.
+        let all = media_permission_query("");
+        assert!(all.get("sites").is_some(), "the map form lost its `sites` key");
+        // With an origin: always a decision word, never an error shape the GUI
+        // could misread. An origin nothing was remembered for asks.
+        let one = media_permission_query("origin=https%3A%2F%2Fnobody.invalid&audio=1&video=1");
+        assert_eq!(one["decision"], "ask");
+        assert_eq!(one["camera"], "ask");
+        assert_eq!(one["microphone"], "ask");
+        assert_eq!(one["origin"], "https://nobody.invalid");
+        // A page with no origin to key a decision to still asks.
+        let none = media_permission_query("origin=about%3Ablank&audio=1&video=0");
+        assert_eq!(none["decision"], "ask");
+        assert_eq!(none["origin"], Value::Null);
+        // A write with no usable origin is REFUSED rather than stored under a key
+        // that could never match again.
+        let (status, _) = media_permission_write(&json!({
+            "origin": "about:blank", "camera": "allow"
+        }));
+        assert_eq!(status, 400);
+        let (status, _) = media_permission_write(&json!({ "camera": "allow" }));
+        assert_eq!(status, 400);
+    }
+
+    /// ⛔ A page must never be able to read or write what the human decided about
+    /// its camera. The control port is page-reachable through yggterm's
+    /// `yggterm-appctl://` bridge, so this route living outside the token gate
+    /// would put the whole capture memory on the web.
+    #[test]
+    fn the_capture_memory_is_gui_only() {
+        assert!(requires_gui_token("GET", "/media-permission"));
+        assert!(requires_gui_token("POST", "/media-permission"));
+        assert!(matches!(
+            route_access("/media-permission"),
+            RouteAccess::GuiOnly
+        ));
+    }
+
     // The "This site" row shows the override number and a Reset when a site is
     // custom; on the global it shows the GUI's reported number and no Reset.
     #[test]
@@ -2836,6 +3271,7 @@ mod tests {
             &PageContext::default(),
             &no_zoom(),
             &policy_state(true, &[]),
+            &no_media(),
         );
         assert_eq!(schema["title"], "YChrome Settings");
         assert!(
@@ -2853,7 +3289,7 @@ mod tests {
             restore_tabs: false,
             ..PageContext::default()
         };
-        let schema = settings_schema_from("work", &page, &no_zoom(), &policy_state(true, &[]));
+        let schema = settings_schema_from("work", &page, &no_zoom(), &policy_state(true, &[]), &no_media());
         let widgets = schema["widgets"].as_array().expect("widgets");
         let toggle = |id: &str| {
             widgets
@@ -2905,6 +3341,7 @@ mod tests {
             &PageContext::default(),
             &no_zoom(),
             &policy_state(true, &[]),
+            &no_media(),
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
         for preset in crate::useragent::Preset::ALL {
@@ -2933,6 +3370,7 @@ mod tests {
             &PageContext::default(),
             &no_zoom(),
             &policy_state(false, &[]),
+            &no_media(),
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
         assert!(
@@ -2953,6 +3391,7 @@ mod tests {
             &PageContext::default(),
             &no_zoom(),
             &policy_state(true, &[("sponsorblock", true)]),
+            &no_media(),
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
         let live: std::collections::HashMap<&str, &str> = crate::sponsorblock::effective()
@@ -3031,6 +3470,7 @@ mod tests {
             &PageContext::default(),
             &no_zoom(),
             &policy_state(true, &[("sponsorblock", false)]),
+            &no_media(),
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
         assert!(
@@ -3052,6 +3492,7 @@ mod tests {
             &PageContext::default(),
             &no_zoom(),
             &policy_state(true, &[("sponsorblock", true), ("darkmode", false)]),
+            &no_media(),
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
         // SponsorBlock: its own toggle, friendly label, NOT in the generic list.
@@ -3095,7 +3536,7 @@ mod tests {
         let mut state = policy_state(true, &[("broken", true)]);
         state.userscripts[0].refusal =
             Some("Refused — not injected: @exclude https://*.youtube.com/embed/*".to_string());
-        let schema = settings_schema_from("work", &PageContext::default(), &no_zoom(), &state);
+        let schema = settings_schema_from("work", &PageContext::default(), &no_zoom(), &state, &no_media());
         let widgets = schema["widgets"].as_array().expect("widgets");
         let row = widgets
             .iter()
@@ -3134,6 +3575,7 @@ mod tests {
             &PageContext::default(),
             &no_zoom(),
             &policy_state(true, &[("sponsorblock", true)]),
+            &no_media(),
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
         assert!(
