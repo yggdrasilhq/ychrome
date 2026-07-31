@@ -1,5 +1,6 @@
 // ==UserScript==
 // @name        SponsorBlock
+// @version     1.0.0
 // @match       https://*.youtube.com/*
 // @match       https://youtube.com/*
 // @world       isolated

@@ -134,8 +134,13 @@ pub enum DropReason {
     /// WebKit's trigger has `if-domain` and `unless-domain` but honours only
     /// one of them, so neither half alone is the filter that was written.
     MixedDomainOption,
-    /// A `$domain=` / cosmetic domain entry with a wildcard or a regex in it.
-    WildcardDomain,
+    /// A `$domain=` / cosmetic domain entry this cannot hand WebKit, and
+    /// dropping it would WIDEN the filter (an `unless-domain` entry, or a
+    /// positive list that ends up empty). Wildcards (`tripadvisor.*`), regex
+    /// entries, and non-ASCII hosts all land here — the last measured, not
+    /// guessed: WebKit answers `"Domains must be lower case ASCII. Use
+    /// punycode to encode non-ASCII characters."` and fails the whole ruleset.
+    UntranslatableDomain,
     /// `$object`, `$webrtc`, `$strict3p`, `$header=`, `$method=`, `$to=`,
     /// `$denyallow=` and the rest of the modern option surface that has no
     /// declarative equivalent.
@@ -165,7 +170,7 @@ impl DropReason {
             DropReason::UnprovableSelector => "unprovable-selector",
             DropReason::UnsupportedRegex => "unsupported-regex",
             DropReason::MixedDomainOption => "mixed-domain-option",
-            DropReason::WildcardDomain => "wildcard-domain",
+            DropReason::UntranslatableDomain => "untranslatable-domain",
             DropReason::UnsupportedOption => "unsupported-option",
             DropReason::TooBroad => "too-broad",
             DropReason::BadFilter => "badfilter",
@@ -205,8 +210,13 @@ impl DropReason {
                 "WebKit honours if-domain or unless-domain, never both, so neither half is the \
                  filter that was written"
             }
-            DropReason::WildcardDomain => "if-domain takes a domain, not a pattern",
-            DropReason::UnsupportedOption => "no declarative equivalent in the content-blocker JSON",
+            DropReason::UntranslatableDomain => {
+                "if-domain takes a lower-case ASCII domain — not a pattern, a regex or an IDN — \
+                 and a bad one fails the ENTIRE ruleset compile"
+            }
+            DropReason::UnsupportedOption => {
+                "no declarative equivalent in the content-blocker JSON"
+            }
             DropReason::TooBroad => "would match every URL",
             DropReason::BadFilter => "disabled upstream by a $badfilter line",
             DropReason::OverCeiling => {
@@ -244,6 +254,11 @@ pub struct Report {
     pub emitted: usize,
     /// Identical rules collapsed. Overlapping lists produce a lot of these.
     pub deduplicated: usize,
+    /// Individual `$domain=` / cosmetic domain ENTRIES WebKit could not take,
+    /// on filters that were otherwise kept. Each one narrows its filter by one
+    /// site; none of them widens it. Counted separately from `dropped` because
+    /// no rule was lost.
+    pub domain_entries_dropped: usize,
     pub dropped: BTreeMap<&'static str, usize>,
     pub samples: BTreeMap<&'static str, Vec<String>>,
 }
@@ -287,6 +302,7 @@ impl Report {
             "comments": self.comments,
             "emitted": self.emitted,
             "deduplicated": self.deduplicated,
+            "domain_entries_dropped": self.domain_entries_dropped,
             "network_block": self.network_block,
             "network_exception": self.network_exception,
             "network_important": self.network_important,
@@ -316,7 +332,7 @@ impl DropReason {
         DropReason::UnprovableSelector,
         DropReason::UnsupportedRegex,
         DropReason::MixedDomainOption,
-        DropReason::WildcardDomain,
+        DropReason::UntranslatableDomain,
         DropReason::UnsupportedOption,
         DropReason::TooBroad,
         DropReason::BadFilter,
@@ -324,8 +340,91 @@ impl DropReason {
     ];
 }
 
+/// Translate one `$domain=` / cosmetic domain entry into the spelling WebKit's
+/// `if-domain` takes, or `None` when it cannot be one.
+///
+/// WebKit's `*` PREFIX means "this domain and its subdomains", which is what an
+/// ABP domain entry means — it is not a wildcard and must not be confused with
+/// one. A `*` anywhere else (`tripadvisor.*`, `*.foo`) is an ABP wildcard with
+/// no equivalent, and a non-ASCII host is refused by the engine outright:
+/// measured, `"Domains must be lower case ASCII. Use punycode to encode
+/// non-ASCII characters."`, which fails the whole ruleset rather than that one
+/// rule. Case is folded rather than refused, because a canonical host is
+/// lowercase and a list that shouted one still meant it.
+pub fn translate_domain(entry: &str) -> Option<String> {
+    let host = entry.trim().trim_start_matches('.').to_ascii_lowercase();
+    if host.is_empty() || !host.is_ascii() || host.starts_with('/') {
+        return None;
+    }
+    if host
+        .bytes()
+        .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-' || byte == b'_'))
+    {
+        return None;
+    }
+    Some(format!("*{host}"))
+}
+
+/// Split an ABP domain list into WebKit's two, dropping the entries WebKit
+/// cannot take.
+///
+/// The asymmetry is the point. An entry dropped from the POSITIVE list makes
+/// the filter apply to fewer sites — the conservative direction, and much
+/// better than losing all 250 domains of a list because one of them said
+/// `tripadvisor.*`. An entry dropped from the NEGATIVE list makes the filter
+/// apply to MORE sites, including one its author excluded, so a bad negative
+/// entry refuses the whole filter.
+fn split_domain_list<'a>(
+    entries: impl Iterator<Item = &'a str>,
+    dropped_entries: &mut usize,
+) -> Result<(Vec<String>, Vec<String>), DropReason> {
+    let mut positive = Vec::new();
+    let mut negative = Vec::new();
+    let mut saw_positive = false;
+    for entry in entries {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (negated, host) = match entry.strip_prefix('~') {
+            Some(rest) => (true, rest),
+            None => (false, entry),
+        };
+        match (translate_domain(host), negated) {
+            (Some(host), false) => {
+                saw_positive = true;
+                positive.push(host);
+            }
+            (Some(host), true) => negative.push(host),
+            (None, false) => {
+                saw_positive = true;
+                *dropped_entries += 1;
+            }
+            (None, true) => return Err(DropReason::UntranslatableDomain),
+        }
+    }
+    if saw_positive && positive.is_empty() {
+        // Every positive entry was untranslatable: emitting the filter with no
+        // if-domain would apply it EVERYWHERE, which is the opposite of what it
+        // said.
+        return Err(DropReason::UntranslatableDomain);
+    }
+    if !positive.is_empty() && !negative.is_empty() {
+        return Err(DropReason::MixedDomainOption);
+    }
+    positive.sort();
+    positive.dedup();
+    negative.sort();
+    negative.dedup();
+    Ok((positive, negative))
+}
+
 /// One source list.
 pub struct Source<'a> {
+    /// The list's id, as it appears in the generated ruleset's provenance
+    /// sidecar. Carried on the source so a future per-list statistic has one
+    /// place to hang off, and so a caller cannot pass an anonymous blob.
+    #[allow(dead_code)]
     pub name: &'a str,
     pub text: &'a str,
 }
@@ -473,16 +572,29 @@ pub fn translate_pattern(pattern: &str) -> Result<String, DropReason> {
         out.push('$');
     }
 
-    // A url-filter that matches everything blocks everything. `.*` is legal
-    // and useful for a COSMETIC trigger, never for a block.
-    let skeleton: String = out.replace(".*", "").replace('^', "").replace('$', "");
-    if skeleton.is_empty() {
-        return Err(DropReason::TooBroad);
+    // An EMPTY pattern is `$popup,domain=a.test`: no URL constraint at all,
+    // only options. WebKit rejects an empty url-filter, so it is spelled `.*`
+    // — which is honest, and which `matches_everything` then makes the caller
+    // justify with a domain or a resource type.
+    if out.is_empty() {
+        out.push_str(".*");
     }
     if !webkit_regex_ok(&out) {
         return Err(DropReason::UnsupportedRegex);
     }
     Ok(out)
+}
+
+/// Whether a translated url-filter matches every URL. Such a filter is fine
+/// when something ELSE narrows the rule (`$popup,domain=a.test` is a real,
+/// common filter), and blocks the web when nothing does.
+fn matches_everything(url_filter: &str) -> bool {
+    url_filter
+        .chars()
+        .zip(url_filter.chars().skip(1).chain(std::iter::once(' ')))
+        .all(|(ch, next)| {
+            matches!(ch, '^' | '$' | '*') || (ch == '.' && next == '*')
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +688,10 @@ fn resource_types_for(option: &str) -> Option<&'static [&'static str]> {
         "websocket" => &["websocket"],
         "other" => &["other"],
         "popup" | "popunder" => &["popup"],
+        // ABP's $object is plugin content, which this engine reports as
+        // `other`; there is no `object` resource-type (measured: the string is
+        // rejected and takes the whole ruleset with it).
+        "object" | "object-subrequest" => &["other"],
         _ => return None,
     })
 }
@@ -588,7 +704,10 @@ struct NetworkRule {
 }
 
 /// Parse one network filter line. `Err` names why it could not become a rule.
-fn parse_network(line: &str) -> Result<NetworkRule, DropReason> {
+/// `dropped_entries` counts individual `$domain=` entries WebKit could not take
+/// while the filter itself survived — a narrowing, which is reported as a
+/// number rather than pretended away.
+fn parse_network(line: &str, dropped_entries: &mut usize) -> Result<NetworkRule, DropReason> {
     let (body, exception) = match line.strip_prefix("@@") {
         Some(rest) => (rest, true),
         None => (line, false),
@@ -602,7 +721,11 @@ fn parse_network(line: &str) -> Result<NetworkRule, DropReason> {
     let mut document_scope = false;
     let mut negated_types: BTreeSet<&'static str> = BTreeSet::new();
 
-    for option in options.unwrap_or_default().split(',').filter(|o| !o.is_empty()) {
+    for option in options
+        .unwrap_or_default()
+        .split(',')
+        .filter(|o| !o.is_empty())
+    {
         let (negated, option) = match option.strip_prefix('~') {
             Some(rest) => (true, rest),
             None => (false, option),
@@ -644,10 +767,18 @@ fn parse_network(line: &str) -> Result<NetworkRule, DropReason> {
                 document_scope = true;
             }
             "third-party" | "3p" => {
-                trigger.load_type = Some(if negated { "first-party" } else { "third-party" });
+                trigger.load_type = Some(if negated {
+                    "first-party"
+                } else {
+                    "third-party"
+                });
             }
             "first-party" | "1p" => {
-                trigger.load_type = Some(if negated { "third-party" } else { "first-party" });
+                trigger.load_type = Some(if negated {
+                    "third-party"
+                } else {
+                    "first-party"
+                });
             }
             "match-case" => trigger.case_sensitive = !negated,
             "important" => important = true,
@@ -656,24 +787,7 @@ fn parse_network(line: &str) -> Result<NetworkRule, DropReason> {
             "all" => {}
             "domain" | "from" => {
                 let list = value.ok_or(DropReason::UnsupportedOption)?;
-                let mut positive = Vec::new();
-                let mut negative = Vec::new();
-                for entry in list.split('|').filter(|e| !e.is_empty()) {
-                    let (neg, host) = match entry.strip_prefix('~') {
-                        Some(rest) => (true, rest),
-                        None => (false, entry),
-                    };
-                    if host.contains('*') || host.starts_with('/') {
-                        return Err(DropReason::WildcardDomain);
-                    }
-                    // WebKit's `*` prefix means "this domain and its
-                    // subdomains", which is what an ABP $domain= entry means.
-                    let host = format!("*{}", host.trim_start_matches('.'));
-                    if neg { &mut negative } else { &mut positive }.push(host);
-                }
-                if !positive.is_empty() && !negative.is_empty() {
-                    return Err(DropReason::MixedDomainOption);
-                }
+                let (positive, negative) = split_domain_list(list.split('|'), dropped_entries)?;
                 trigger.if_domain = positive;
                 trigger.unless_domain = negative;
             }
@@ -694,6 +808,16 @@ fn parse_network(line: &str) -> Result<NetworkRule, DropReason> {
             .copied()
             .filter(|kind| !negated_types.contains(kind))
             .collect();
+    }
+
+    // A pattern that matches every URL is only safe when the options narrowed
+    // the rule to a domain or a resource type. `$popup,domain=a.test` with an
+    // empty pattern is exactly that, and there are hundreds of them.
+    if matches_everything(&trigger.url_filter)
+        && trigger.if_domain.is_empty()
+        && trigger.resource_types.is_empty()
+    {
+        return Err(DropReason::TooBroad);
     }
 
     let section = match (exception, document_scope, important) {
@@ -799,31 +923,12 @@ struct DomainScope {
     unless_domain: Vec<String>,
 }
 
-fn parse_domain_scope(list: &str) -> Result<DomainScope, DropReason> {
-    let mut scope = DomainScope::default();
-    for entry in list.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-        let (negated, host) = match entry.strip_prefix('~') {
-            Some(rest) => (true, rest),
-            None => (false, entry),
-        };
-        if host.contains('*') || host.starts_with('/') {
-            return Err(DropReason::WildcardDomain);
-        }
-        let host = format!("*{}", host.trim_start_matches('.'));
-        if negated {
-            scope.unless_domain.push(host);
-        } else {
-            scope.if_domain.push(host);
-        }
-    }
-    if !scope.if_domain.is_empty() && !scope.unless_domain.is_empty() {
-        return Err(DropReason::MixedDomainOption);
-    }
-    scope.if_domain.sort();
-    scope.if_domain.dedup();
-    scope.unless_domain.sort();
-    scope.unless_domain.dedup();
-    Ok(scope)
+fn parse_domain_scope(list: &str, dropped_entries: &mut usize) -> Result<DomainScope, DropReason> {
+    let (if_domain, unless_domain) = split_domain_list(list.split(','), dropped_entries)?;
+    Ok(DomainScope {
+        if_domain,
+        unless_domain,
+    })
 }
 
 /// How many selectors ride in one `css-display-none` rule. Measured: a single
@@ -918,10 +1023,13 @@ pub fn convert(sources: &[Source<'_>]) -> Conversion {
                                 if entry.is_empty() {
                                     continue;
                                 }
-                                domain_unhide
-                                    .entry(format!("*{}", entry.trim_start_matches(['~', '.'])))
-                                    .or_default()
-                                    .insert(body.to_string());
+                                if let Some(host) = translate_domain(entry.trim_start_matches('~'))
+                                {
+                                    domain_unhide
+                                        .entry(host)
+                                        .or_default()
+                                        .insert(body.to_string());
+                                }
                             }
                         }
                     }
@@ -935,9 +1043,12 @@ pub fn convert(sources: &[Source<'_>]) -> Conversion {
                         } else if domains.is_empty() {
                             generic_hide.insert(body.to_string());
                         } else {
-                            match parse_domain_scope(domains) {
+                            match parse_domain_scope(domains, &mut report.domain_entries_dropped) {
                                 Ok(scope) => {
-                                    domain_hide.entry(scope).or_default().insert(body.to_string());
+                                    domain_hide
+                                        .entry(scope)
+                                        .or_default()
+                                        .insert(body.to_string());
                                 }
                                 Err(reason) => report.drop(reason, line),
                             }
@@ -958,7 +1069,7 @@ pub fn convert(sources: &[Source<'_>]) -> Conversion {
                 report.comments += 1;
                 continue;
             }
-            match parse_network(line) {
+            match parse_network(line, &mut report.domain_entries_dropped) {
                 Ok(rule) => {
                     let action = if rule.exception {
                         json!({ "type": "ignore-previous-rules" })
@@ -1102,11 +1213,14 @@ pub fn convert(sources: &[Source<'_>]) -> Conversion {
 mod tests {
     use super::*;
 
+    /// `parse_network` with the entry counter the tests do not care about.
+    fn parse_network_for_test(line: &str) -> Result<NetworkRule, DropReason> {
+        let mut dropped = 0;
+        parse_network(line, &mut dropped)
+    }
+
     fn convert_one(text: &str) -> Conversion {
-        convert(&[Source {
-            name: "test",
-            text,
-        }])
+        convert(&[Source { name: "test", text }])
     }
 
     // THE GATE. Every construct here was measured against WebKitGTK 2.52.5 by
@@ -1159,10 +1273,7 @@ mod tests {
             translate_pattern("|http://ads.example.net/").unwrap(),
             "^http://ads\\.example\\.net/"
         );
-        assert_eq!(
-            translate_pattern("/banner.gif|").unwrap(),
-            "/banner\\.gif$"
-        );
+        assert_eq!(translate_pattern("/banner.gif|").unwrap(), "/banner\\.gif$");
         assert_eq!(
             translate_pattern("/ads/*/banner").unwrap(),
             "/ads/.*/banner"
@@ -1179,13 +1290,62 @@ mod tests {
         }
     }
 
-    // A pattern that reduces to "match everything" would block the web. It is
-    // valid for a cosmetic trigger and never for a block.
+    // A filter that reduces to "match everything" would block the web —
+    // UNLESS something else narrows it. `$popup,domain=a.test` with an empty
+    // pattern is a real and common filter (381 of them in the shipped corpus),
+    // and refusing those was throwing away work the lists had done.
     #[test]
-    fn a_pattern_that_matches_everything_is_refused() {
-        assert_eq!(translate_pattern("*"), Err(DropReason::TooBroad));
-        assert_eq!(translate_pattern("**"), Err(DropReason::TooBroad));
-        assert_eq!(translate_pattern("|*|"), Err(DropReason::TooBroad));
+    fn a_filter_that_matches_everything_is_refused_unless_something_narrows_it() {
+        for wide in ["*", "**", "|*|", "$third-party"] {
+            assert_eq!(
+                parse_network_for_test(wide).err(),
+                Some(DropReason::TooBroad),
+                "{wide} matches every URL with nothing to narrow it"
+            );
+        }
+        for narrowed in ["$popup,domain=a.test", "*$script,domain=a.test"] {
+            let rule = parse_network_for_test(narrowed)
+                .unwrap_or_else(|reason| panic!("{narrowed} refused as {reason:?}"));
+            assert!(matches_everything(&rule.trigger.url_filter));
+            assert!(!rule.trigger.if_domain.is_empty() || !rule.trigger.resource_types.is_empty());
+        }
+    }
+
+    // A domain list is not all-or-nothing. Dropping an entry WebKit cannot take
+    // narrows a positive filter (fine, and much better than losing the other
+    // 249 domains beside it) and WIDENS a negative one (never allowed).
+    // Non-ASCII is not a style question: measured, WebKit answers "Domains must
+    // be lower case ASCII" and fails the WHOLE ruleset.
+    #[test]
+    fn an_untranslatable_domain_entry_narrows_but_never_widens() {
+        let mut dropped = 0;
+        let rule = parse_network(
+            "||ads.test^$domain=good.test|tripadvisor.*|other.test",
+            &mut dropped,
+        )
+        .expect("the translatable entries survive");
+        assert_eq!(rule.trigger.if_domain, vec!["*good.test", "*other.test"]);
+        assert_eq!(dropped, 1, "the wildcard entry must be COUNTED, not hidden");
+
+        assert_eq!(
+            parse_network_for_test("||ads.test^$domain=~exempt.*").err(),
+            Some(DropReason::UntranslatableDomain),
+            "dropping a NEGATIVE entry would run the filter on a site its author excluded"
+        );
+        assert_eq!(
+            parse_network_for_test("||ads.test^$domain=only.*").err(),
+            Some(DropReason::UntranslatableDomain),
+            "an empty positive list would apply the filter everywhere"
+        );
+        assert_eq!(
+            translate_domain("Example.COM").as_deref(),
+            Some("*example.com")
+        );
+        assert_eq!(
+            translate_domain("bücher.test"),
+            None,
+            "a non-ASCII domain fails the entire ruleset compile — measured"
+        );
     }
 
     // A /regex/ filter passes through only if it is already in the dialect.
@@ -1206,7 +1366,7 @@ mod tests {
     // measured valid on 2.52.5.
     #[test]
     fn network_options_map_onto_the_trigger_keys() {
-        let rule = parse_network("||ads.example.net^$third-party,script,image").unwrap();
+        let rule = parse_network_for_test("||ads.example.net^$third-party,script,image").unwrap();
         assert_eq!(rule.trigger.load_type, Some("third-party"));
         assert_eq!(
             rule.trigger.resource_types.iter().collect::<Vec<_>>(),
@@ -1214,20 +1374,20 @@ mod tests {
         );
         assert_eq!(rule.section, Section::Block);
 
-        let first = parse_network("||ads.example.net^$~third-party").unwrap();
+        let first = parse_network_for_test("||ads.example.net^$~third-party").unwrap();
         assert_eq!(first.trigger.load_type, Some("first-party"));
 
-        let domained = parse_network("||ads.example.net^$domain=a.test|b.test").unwrap();
+        let domained = parse_network_for_test("||ads.example.net^$domain=a.test|b.test").unwrap();
         assert_eq!(domained.trigger.if_domain, vec!["*a.test", "*b.test"]);
         assert!(domained.trigger.unless_domain.is_empty());
 
-        let excluded = parse_network("||ads.example.net^$domain=~a.test").unwrap();
+        let excluded = parse_network_for_test("||ads.example.net^$domain=~a.test").unwrap();
         assert_eq!(excluded.trigger.unless_domain, vec!["*a.test"]);
 
-        let framed = parse_network("||ads.example.net^$subdocument").unwrap();
+        let framed = parse_network_for_test("||ads.example.net^$subdocument").unwrap();
         assert_eq!(framed.trigger.load_context, Some("child-frame"));
 
-        let cased = parse_network("||ads.example.net/A^$match-case").unwrap();
+        let cased = parse_network_for_test("||ads.example.net/A^$match-case").unwrap();
         assert!(cased.trigger.case_sensitive);
     }
 
@@ -1236,7 +1396,7 @@ mod tests {
     // "and also refuse to load the page", which is a broken browser.
     #[test]
     fn a_negated_type_never_widens_to_the_document_itself() {
-        let rule = parse_network("||ads.example.net^$~script").unwrap();
+        let rule = parse_network_for_test("||ads.example.net^$~script").unwrap();
         assert!(!rule.trigger.resource_types.contains("script"));
         assert!(rule.trigger.resource_types.contains("image"));
         assert!(
@@ -1253,23 +1413,31 @@ mod tests {
     #[test]
     fn impossible_options_are_refused_with_the_reason() {
         for (filter, reason) in [
-            (
-                "||a.test/ads.js$redirect=noopjs",
-                DropReason::Redirect,
-            ),
+            ("||a.test/ads.js$redirect=noopjs", DropReason::Redirect),
             ("||a.test^$redirect-rule=noopjs", DropReason::Redirect),
-            ("||a.test^$removeparam=utm_source", DropReason::RequestRewrite),
+            (
+                "||a.test^$removeparam=utm_source",
+                DropReason::RequestRewrite,
+            ),
             ("||a.test^$replace=/a/b/", DropReason::RequestRewrite),
-            ("||a.test^$csp=script-src 'none'", DropReason::HeaderInjection),
-            ("||a.test^$permissions=camera=()", DropReason::HeaderInjection),
-            ("||a.test^$domain=a.test|~b.test", DropReason::MixedDomainOption),
-            ("||a.test^$domain=*.test", DropReason::WildcardDomain),
+            (
+                "||a.test^$csp=script-src 'none'",
+                DropReason::HeaderInjection,
+            ),
+            (
+                "||a.test^$permissions=camera=()",
+                DropReason::HeaderInjection,
+            ),
+            (
+                "||a.test^$domain=a.test|~b.test",
+                DropReason::MixedDomainOption,
+            ),
+            ("||a.test^$domain=*.test", DropReason::UntranslatableDomain),
             ("||a.test^$webrtc", DropReason::UnsupportedOption),
-            ("||a.test^$object", DropReason::UnsupportedOption),
             ("||a.test^$header=x:y", DropReason::UnsupportedOption),
         ] {
             assert_eq!(
-                parse_network(filter).err(),
+                parse_network_for_test(filter).err(),
                 Some(reason),
                 "{filter} must be refused as {reason:?}"
             );
@@ -1426,7 +1594,8 @@ mod tests {
     // ships a filter its own maintainers withdrew.
     #[test]
     fn a_badfilter_disables_the_rule_it_names() {
-        let conversion = convert_one("||ads.test^$third-party\n||ads.test^$third-party,badfilter\n");
+        let conversion =
+            convert_one("||ads.test^$third-party\n||ads.test^$third-party,badfilter\n");
         assert_eq!(conversion.report.network_block, 0);
         assert_eq!(conversion.report.dropped.get("badfilter"), Some(&1));
     }
@@ -1458,7 +1627,10 @@ mod tests {
             let filter = rule["trigger"]["url-filter"]
                 .as_str()
                 .expect("every trigger has a url-filter");
-            assert!(webkit_regex_ok(filter), "emitted an invalid regex: {filter}");
+            assert!(
+                webkit_regex_ok(filter),
+                "emitted an invalid regex: {filter}"
+            );
             if let Some(types) = rule["trigger"]["resource-type"].as_array() {
                 for kind in types {
                     let kind = kind.as_str().unwrap();

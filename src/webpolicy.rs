@@ -198,7 +198,7 @@ pub fn policy(profile: &str) -> Policy {
         .flat_map(|dir| enabled_scripts(dir))
         .filter_map(|path| {
             let body = std::fs::read_to_string(&path).ok()?;
-            promote_or_refuse(&path.display().to_string(), crate::userscript::parse(&body))
+            promote_or_refuse(&path, crate::userscript::parse(&body))
         })
         .collect();
 
@@ -222,15 +222,29 @@ pub fn policy(profile: &str) -> Policy {
 /// the raw body on every page in the page's world, which is even further from
 /// what the script declared than the half-scoped version.
 fn promote_or_refuse(
-    source: &str,
+    source: &Path,
     script: crate::userscript::Userscript,
 ) -> Option<crate::userscript::Userscript> {
+    // The SECOND reason, and the one the YouTube 2x report came down to: a
+    // body carrying one of ychrome's own stems but declaring no metadata block
+    // would be injected with the DEFAULT placement instead of the one it needs,
+    // which for `youtube-adblock` means the isolated world, where its network
+    // prune is invisible and only the fast-forward fallback runs. Refusing is
+    // strictly better than injecting it wrong; `crate::provision` owns the
+    // decision and the wording.
+    if let Some(refusal) = crate::provision::placement_refusal(source, &script) {
+        eprintln!("ychrome: REFUSING userscript {}: {refusal}", source.display());
+        return None;
+    }
     if script.untranslatable_includes.is_empty() {
         return Some(script);
     }
     eprint!(
         "{}",
-        crate::userscript::refusal_report(source, &script.untranslatable_includes)
+        crate::userscript::refusal_report(
+            &source.display().to_string(),
+            &script.untranslatable_includes
+        )
     );
     None
 }
@@ -330,6 +344,13 @@ pub struct UserscriptStatus {
     /// owner of the decision). `None` for a script that promotes — and for a
     /// disabled one, where nothing is claiming to run in the first place.
     pub refusal: Option<String>,
+    /// `Some(note)` when this host's copy of a BUNDLED script diverges from the
+    /// one ychrome ships and the reconciler deliberately left it alone: the
+    /// user edited it, or it is newer than the bundle. Read off
+    /// [`crate::provision`], the one owner of that judgement, so the pane
+    /// cannot disagree with what the launch actually did. Strictly less serious
+    /// than `refusal` — a noted script is running, a refused one is not.
+    pub note: Option<String>,
 }
 
 /// The pane's half of the promotion gate's verdict for one on-disk script:
@@ -347,6 +368,15 @@ fn userscript_refusal(path: &Path) -> Option<String> {
             &script.untranslatable_includes,
         ))
     }
+}
+
+/// The pane's half of the reconciler's verdict for one on-disk script: the
+/// note `crate::provision` would show for it, or `None`. Read through the same
+/// owner the launch-time reconcile used — the pane never re-derives "is this
+/// current".
+fn userscript_note(stem: &str, path: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(path).ok()?;
+    crate::provision::userscript_note(stem, &body)
 }
 
 pub fn state(profile: &str) -> PolicyState {
@@ -373,12 +403,14 @@ pub fn state(profile: &str) -> PolicyState {
                     // checked against the gate's verdict here — the pane must
                     // never present a refused script as merely "Enabled".
                     refusal: userscript_refusal(&entry.path()),
+                    note: userscript_note(stem, &entry.path()),
                 });
             } else if let Some(stem) = name.strip_suffix(".js.disabled") {
                 userscripts.push(UserscriptStatus {
                     stem: stem.to_string(),
                     enabled: false,
                     refusal: None,
+                    note: userscript_note(stem, &entry.path()),
                 });
             }
         }
@@ -641,7 +673,7 @@ mod tests {
              x();\n",
         );
         assert!(
-            promote_or_refuse("poisoned.js", poisoned).is_none(),
+            promote_or_refuse(Path::new("poisoned.js"), poisoned).is_none(),
             "one untranslatable @include must refuse the WHOLE script"
         );
 
@@ -651,7 +683,7 @@ mod tests {
              // ==/UserScript==\n\
              x();\n",
         );
-        let promoted = promote_or_refuse("clean.js", clean).expect("a clean script promotes");
+        let promoted = promote_or_refuse(Path::new("clean.js"), clean).expect("a clean script promotes");
         assert_eq!(
             promoted.matches,
             vec!["https://m.example.test/*".to_string()]
@@ -759,6 +791,17 @@ mod tests {
              poisoned_body();\n",
         )
         .expect("poisoned.js");
+        // THE SECOND REFUSAL REASON, as it actually reached a user: a body
+        // carrying one of ychrome's OWN stems with its metadata block gone.
+        // Injected, it would land in the isolated world where
+        // youtube-adblock's network prune is invisible and only its
+        // fast-forward fallback runs — every ad still on screen, at 2x. It
+        // must not reach either wire shape.
+        std::fs::write(
+            scripts.join("youtube-adblock.js"),
+            "(function () { headerless_bundled_body(); })();\n",
+        )
+        .expect("youtube-adblock.js");
 
         let exe = std::env::current_exe().expect("test binary path");
         let output = std::process::Command::new(exe)
@@ -817,6 +860,28 @@ mod tests {
                     .is_some_and(|body| body.contains("poisoned_body"))
             }),
             "a refused script shipped half-scoped on the v2 wire"
+        );
+
+        // The header-less copy of a BUNDLED script is in neither shape either,
+        // and the pane says why.
+        assert!(
+            !legacy
+                .iter()
+                .any(|body| body.contains("headerless_bundled_body")),
+            "a bundled script with no metadata block shipped anyway — it would run in the \
+             isolated world, which is the YouTube-ads-at-2x bug"
+        );
+        assert!(
+            !rich.iter().any(|entry| {
+                entry["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("headerless_bundled_body"))
+            }),
+            "a bundled script with no metadata block shipped on the v2 wire"
+        );
+        assert!(
+            stderr.contains("declares no metadata block"),
+            "the header-less bundled script was dropped without saying why:\n{stderr}"
         );
 
         // THE LOUD HALF: the child's stderr carries the refusal, naming the
