@@ -245,6 +245,33 @@ mod tests {
         );
     }
 
+    // SponsorBlock's PRIVACY property, locked in the running body. Asking
+    // `/api/skipSegments?videoID=<id>` tells sponsor.ajay.app exactly what the
+    // user is watching, every single video. The hash-prefix endpoint tells it
+    // four hex characters, which name thousands of videos and identify none —
+    // and there must be no fallback to the by-id form, because a privacy
+    // property that silently degrades is not one.
+    #[test]
+    fn sponsorblock_never_asks_by_video_id() {
+        let ext = find(SPONSORBLOCK_STEM).expect("sponsorblock in catalog");
+        let body = running_body(ext);
+        assert!(
+            !body.contains("videoID="),
+            "sponsorblock builds a by-id query — that leaks the exact video to a third party \
+             on every watch"
+        );
+        require(ext, "crypto.subtle");
+        require(ext, "'SHA-256'");
+        require(ext, "api/skipSegments/");
+        require(ext, "HASH_PREFIX_LENGTH");
+        // The match happens in the browser, over the prefix answer.
+        require(ext, "row.videoID === videoId");
+        // And the two filters that stop it skipping things the community did
+        // not mean: a non-`skip` actionType, and a downvoted segment.
+        require(ext, "seg.actionType !== 'skip'");
+        require(ext, "seg.votes < -1");
+    }
+
     // The cookie script must never consent on the user's behalf. `REJECT_TEXT`
     // is the ONLY list it clicks from, so that array is exactly where a wrong
     // phrase would have to be added — check it rather than the whole file, which
