@@ -301,6 +301,26 @@ impl HeadlessDisplay {
         // exists and therefore before any other thread reads the environment.
         unsafe {
             std::env::set_var("DISPLAY", &self.name);
+            std::env::set_var("GDK_BACKEND", "x11");
+            std::env::remove_var("WAYLAND_DISPLAY");
+            // ⛔⛔ SETTING `DISPLAY` IS NOT ENOUGH, AND THE FAILURE IS ON THE
+            // OPERATOR'S SCREEN. GTK prefers the Wayland backend, and **GDK's
+            // Wayland backend defaults to `wayland-0` when `WAYLAND_DISPLAY` is
+            // UNSET** — while `XDG_RUNTIME_DIR` still points at the operator's
+            // runtime dir. So an absent variable does not mean "no display": it
+            // means *their compositor*. GTK connected to wayland-0, ignored the
+            // Xvfb we had just started for it, and put real `ychrome` toplevels
+            // on the human's desktop — including, live on 2026-07-31, a
+            // filled-in brokerage login over the video he was watching.
+            //
+            // Unsetting a variable is never isolation. The engine must name its
+            // world POSITIVELY: force the X11 backend so `DISPLAY` is the only
+            // thing that can be honoured, and remove the Wayland fallback so
+            // nothing can find its way back to wayland-0.
+            //
+            // Same family as the x11vnc refusal and the frozen-daemon-env
+            // poisoning already recorded in this fleet's memory: an inherited
+            // — or absent — variable that describes a different world.
             std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
         }
     }
@@ -345,6 +365,44 @@ mod tests {
     // The seam's contract: a probe REPORTS, it never panics and never guesses.
     // Both probes must answer on any host, including one with neither
     // substrate installed, because `select`'s error message is built from them.
+
+    /// ⛔ THE ENGINE MUST NAME ITS DISPLAY POSITIVELY.
+    ///
+    /// Setting DISPLAY is not enough: GTK prefers Wayland, and GDK's Wayland
+    /// backend falls back to `wayland-0` when WAYLAND_DISPLAY is UNSET while
+    /// XDG_RUNTIME_DIR still points at the operator's runtime dir. That put
+    /// real ychrome windows — one carrying a filled-in brokerage login — on the
+    /// operator's desktop while the engine believed it was headless.
+    ///
+    /// An absent variable is not isolation. If this test is failing, someone
+    /// removed the only two lines that stop the engine finding its way back to
+    /// a human's compositor.
+    #[test]
+    fn install_env_pins_the_engine_to_its_own_x_display() {
+        let source = include_str!("substrate.rs");
+        let body = source
+            .split("pub fn install_env(&self)")
+            .nth(1)
+            .expect("install_env is present")
+            .split("\n    }")
+            .next()
+            .expect("its body closes");
+        assert!(
+            body.contains(r#"set_var("DISPLAY""#),
+            "install_env must set DISPLAY to the engine's own Xvfb"
+        );
+        assert!(
+            body.contains(r#"set_var("GDK_BACKEND", "x11")"#),
+            "install_env MUST force the X11 backend — otherwise GTK picks Wayland \
+             and DISPLAY is ignored entirely"
+        );
+        assert!(
+            body.contains(r#"remove_var("WAYLAND_DISPLAY")"#),
+            "install_env MUST remove WAYLAND_DISPLAY — an UNSET one resolves to \
+             wayland-0, i.e. the operator's own compositor"
+        );
+    }
+
     #[test]
     fn probes_answer_without_panicking_and_carry_their_evidence() {
         for probe in probe_all() {
