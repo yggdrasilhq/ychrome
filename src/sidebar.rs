@@ -1695,7 +1695,9 @@ fn settings_schema_from(
         widgets.push(json!({
             "kind": "label",
             "muted": true,
-            "text": "No ruleset installed (~/.yggterm/web-adblock/rules.json missing on this host).",
+            "text": "No ruleset installed. ychrome installs the bundled one at launch, so \
+                     this means the write failed — check that ~/.yggterm/web-adblock/ is \
+                     writable, or run `ychrome adblock update` on this host.",
         }));
     }
 
@@ -1723,7 +1725,9 @@ fn settings_schema_from(
         widgets.push(userscript_row(
             &script.stem,
             script.enabled,
-            script.refusal.as_deref(),
+            // A refusal outranks a note: a refused script is not running at
+            // all, which is the more urgent of the two things to say.
+            script.refusal.as_deref().or(script.note.as_deref()),
         ));
     }
 
@@ -1840,10 +1844,10 @@ fn sponsorblock_widgets(state: &crate::webpolicy::PolicyState) -> Vec<Value> {
 /// verbatim) instead of the lie "Enabled". The actions stay: refusal is a
 /// verdict on the header, not a lock-out, and Disable/Delete are exactly what
 /// a user may want to do with a script that runs nowhere.
-fn userscript_row(stem: &str, enabled: bool, refusal: Option<&str>) -> Value {
+fn userscript_row(stem: &str, enabled: bool, notice: Option<&str>) -> Value {
     let toggle_label = if enabled { "Disable" } else { "Enable" };
-    let subtitle = match refusal {
-        Some(refusal) => refusal.to_string(),
+    let subtitle = match notice {
+        Some(notice) => notice.to_string(),
         None if enabled => "Enabled".to_string(),
         None => "Disabled".to_string(),
     };
@@ -2280,6 +2284,7 @@ mod tests {
                     stem: stem.to_string(),
                     enabled: *on,
                     refusal: None,
+                    note: None,
                 })
                 .collect(),
         }

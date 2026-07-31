@@ -1,0 +1,188 @@
+{
+  "generator": "ychrome abp converter",
+  "report": {
+    "comments": 13823,
+    "cosmetic_domain_rules": 20792,
+    "cosmetic_domain_selectors": 27588,
+    "cosmetic_generic_rules": 18,
+    "cosmetic_generic_selectors": 35535,
+    "cosmetic_unhide_applied": 545,
+    "deduplicated": 191,
+    "document_exception": 597,
+    "domain_entries_dropped": 873,
+    "dropped": {
+      "badfilter": {
+        "count": 2,
+        "samples": [
+          "||namethatporn.com/assets/imgs/1x1.gif",
+          "@@||natureetdecouvertes.com^*/pixel.png$~third-party"
+        ],
+        "why": "disabled upstream by a $badfilter line"
+      },
+      "header-injection": {
+        "count": 38,
+        "samples": [
+          "$csp=script-src 'self' data: 'unsafe-inline' 'unsafe-hashes' 'unsafe-eval',domain=thumbs.pro",
+          "||thegay.com^$csp=default-src 'self' *.ahcdn.com fonts.gstatic.com fonts.googleapis.com https://thegay.com https://tn.thegay.com 'unsafe-inline' 'unsafe-eval' data: blob:",
+          "@@||google.com/recaptcha/$csp,subdocument",
+          "$csp=child-src 'none'; frame-src 'self' *; worker-src 'none',domain=fileone.tv|theappguruz.com",
+          "$csp=child-src 'none'; frame-src *; worker-src 'none',domain=thepiratebay.org|vidoza.net"
+        ],
+        "why": "there is no action that injects a response header"
+      },
+      "html-filtering": {
+        "count": 50,
+        "samples": [
+          "abema.tv##^script:has-text(NREUM)",
+          "wetteronline.*##^script:has-text(runCount)",
+          "skidrowreloaded.com##^script:has-text(adserverDomain)",
+          "gamestorrents.*,gogoanimes.*,limetorrents.*,piratebayz.*##^script:has-text(AaDetector)",
+          "animepahe.*,kwik.*##^script:has-text('shift')"
+        ],
+        "why": "editing the response body is not a blocker action"
+      },
+      "procedural-selector": {
+        "count": 652,
+        "samples": [
+          "deliveroo.*#?#a[role=\"button\"]:has(p:has-text(Sponsored))",
+          "deliveroo.*#?#div[class^=\"HomeFeedScrollTracker-\"]:has(span[class^=\"HomeFeedUILines-\"]:has-text(Sponsored))",
+          "advocate.com,out.com,pride.com#?#.component.module-headline:has-text(FROM OUR SPONSORS)",
+          "character.ai#?#.space-y-4 > .w-full:has-text(Advertisement)",
+          "cjleo.com#?#.alt-widget-title:has-text(advertisement)"
+        ],
+        "why": "not a CSS selector; WebKit drops it silently, so it is counted rather than shipped"
+      },
+      "redirect": {
+        "count": 322,
+        "samples": [
+          "||2mdn.net/videoplayback/$rewrite=abp-resource:blank-mp4,domain=laurelberninteriors.com|safeframe.googlesyndication.com",
+          "||googlevideo.com/videoplayback?$rewrite=abp-resource:blank-mp4,domain=laurelberninteriors.com|safeframe.googlesyndication.com",
+          "||innovid.com/media/encoded/*.mp4$rewrite=abp-resource:blank-mp4,domain=ktla.com",
+          "||aucdn.net/library/*.mp4$rewrite=abp-resource:blank-mp4,domain=txnhh.com|xnxx.com|xvideos.com|xvv1deos.com",
+          "||cdn.miohentai.com/partners/$rewrite=abp-resource:blank-mp4,domain=miohentai.com"
+        ],
+        "why": "WebKit's content blocker has no redirect action; a rule can only allow or deny"
+      },
+      "request-rewrite": {
+        "count": 438,
+        "samples": [
+          "||www.youtube.com/playlist?list=$xhr,1p,replace=/\"adPlacements\"/\"no_ads\"/",
+          "||www.youtube.com/playlist?list=$xhr,1p,replace=/\"adSlots\"/\"no_ads\"/",
+          "||www.youtube.com/watch?$xhr,1p,replace=/\"adPlacements\"/\"no_ads\"/",
+          "||www.youtube.com/watch?$xhr,1p,replace=/\"adSlots\"/\"no_ads\"/",
+          "||www.youtube.com/youtubei/v1/player?$xhr,1p,replace=/\"adPlacements\"/\"no_ads\"/"
+        ],
+        "why": "a declarative blocker cannot edit a request URL, only allow or deny it"
+      },
+      "scriptlet": {
+        "count": 5059,
+        "samples": [
+          "accuweather.com,acmemarkets.com,aiskillsnavigator.microsoft.com,boston.com,capezio.com,chime.com,costco.com,crunchyroll.com,deezer.com,delta.com,dnb.co.uk,dnb.com,dollargeneral.com,engadget.com,espn.com,eventbrite.com,filson.com,flyfrontier.com,formula1.com,geizhals.de,gladiatorgarageworks.com,harborfreight.com,hopwtr.com,jdsports.com,kkrt.com,lenscrafters.com,livewithkellyandmark.com,madewell.com,mail.yahoo.com,mazdausa.com,michaels.com,milesplit.live,monsterenergy.com,newyorker.com,norton.com,pandora.com,payment.nba.com,porsche.com,qobuz.com,rivals.com,soundcloud.com,spotify.com,subway.com,techcrunch.com,ticketmaster.*,tidal.com,tirerack.com,twitter.com,uber.com,ubereats.com,usaa.com,vimeo.com,visible.com,weather.com,wunderground.com,www.yahoo.com,x.com##+js(set, Navigator.prototype.globalPrivacyControl, false)",
+          "accuweather.com,acmemarkets.com,aiskillsnavigator.microsoft.com,boston.com,capezio.com,chime.com,costco.com,crunchyroll.com,deezer.com,delta.com,dnb.co.uk,dnb.com,dollargeneral.com,engadget.com,espn.com,eventbrite.com,filson.com,flyfrontier.com,formula1.com,geizhals.de,gladiatorgarageworks.com,harborfreight.com,hopwtr.com,jdsports.com,kkrt.com,lenscrafters.com,livewithkellyandmark.com,madewell.com,mail.yahoo.com,mazdausa.com,michaels.com,milesplit.live,monsterenergy.com,newyorker.com,norton.com,pandora.com,payment.nba.com,porsche.com,qobuz.com,rivals.com,soundcloud.com,spotify.com,subway.com,techcrunch.com,ticketmaster.*,tidal.com,tirerack.com,twitter.com,uber.com,ubereats.com,usaa.com,vimeo.com,visible.com,weather.com,wunderground.com,www.yahoo.com,x.com##+js(set, navigator.globalPrivacyControl, false)",
+          "madewell.com##+js(cookie-remover, dns_cookie)",
+          "visible.com##+js(set-local-storage-item, browser-ids, $remove$)",
+          "usaa.com##+js(set-cookie, GPC, 1, , reload, 1)"
+        ],
+        "why": "uBO scriptlet injection needs a surrogate library and per-domain JS injection"
+      },
+      "style-or-snippet": {
+        "count": 1,
+        "samples": [
+          "podleze-piekielko.pl#$#abort-on-property-read cookieman"
+        ],
+        "why": "css-display-none can only hide an element; it cannot set an arbitrary property"
+      },
+      "unprovable-selector": {
+        "count": 37,
+        "samples": [
+          "cyberchef.org###workspace-wrapper > [id][style*=\"height\"] {height: 100% !important}",
+          "justjared.com##.banner-spacer-top {max-height: 50px !important;}",
+          "justjared.com##[role=\"banner\"] {top:0 !important}",
+          "6abc.com,abc11.com,abc13.com,abc30.com,abc7.com,abc7chicago.com,abc7news.com,abc7ny.com,abcotvs.net##.nav.sticky {top:0px;}",
+          "abcnews.com,abcnews.go.com##.navigation--has-subnav {top:0;}"
+        ],
+        "why": "could not be proven to be valid CSS, and an invalid selector is dropped silently"
+      },
+      "unsupported-option": {
+        "count": 248,
+        "samples": [
+          "||void.nicopr.fr/rec$method=POST",
+          "*$script,3p,denyallow=googleapis.com,domain=skidrowcodexgames.com",
+          "*$script,3p,denyallow=google.com|gstatic.com,domain=dailyuploads.net",
+          "*$script,3p,denyallow=cloudflare.com|cloudflare.net|fontawesome.com|gstatic.com|hwcdn.net|jquery.com|jsdelivr.net,domain=mp4upload.com",
+          "*$script,3p,denyallow=google.com|gstatic.com|recaptcha.net,domain=clik.pw"
+        ],
+        "why": "no declarative equivalent in the content-blocker JSON"
+      },
+      "unsupported-regex": {
+        "count": 218,
+        "samples": [
+          "/(https?:\\/\\/)\\w{30,}\\.me\\/\\w{30,}\\./$script,third-party",
+          "/(https?:\\/\\/)104\\.154\\..{100,}/",
+          "/(https?:\\/\\/)104\\.197\\..{100,}/",
+          "/(https?:\\/\\/)104\\.198\\..{100,}/",
+          "/(https?:\\/\\/)130\\.211\\..{100,}/"
+        ],
+        "why": "uses regex WebKit's dialect lacks (no alternation, no {n,m}, no lookahead, no \\w); emitting it would fail the entire ruleset compile"
+      },
+      "untranslatable-domain": {
+        "count": 641,
+        "samples": [
+          "read.amazon.*##.kw-ads-ftue-container",
+          "radiome.*##.min-h-\\[250px\\].mx-auto.w-full.hidden.my-1.lg\\:flex.center-children",
+          "crazygames.*##[class*=\"MpuContainer_\"]",
+          "crazygames.*##[class*=\"_leaderboardContainer_\"]",
+          "opentable.*##div[data-promoted=\"true\"]"
+        ],
+        "why": "if-domain takes a lower-case ASCII domain — not a pattern, a regex or an IDN — and a bad one fails the ENTIRE ruleset compile"
+      }
+    },
+    "dropped_total": 7706,
+    "emitted": 146748,
+    "network_block": 122547,
+    "network_exception": 2211,
+    "network_important": 52,
+    "source_lines": 218312
+  },
+  "rules_fnv1a": "ea08425e4d64d386",
+  "ruleset_version": "1.20260731",
+  "sources": [
+    {
+      "lines": 84946,
+      "name": "easylist"
+    },
+    {
+      "lines": 56423,
+      "name": "easyprivacy"
+    },
+    {
+      "lines": 10937,
+      "name": "ubo-filters"
+    },
+    {
+      "lines": 3224,
+      "name": "ubo-privacy"
+    },
+    {
+      "lines": 6373,
+      "name": "ubo-badware"
+    },
+    {
+      "lines": 525,
+      "name": "ubo-quick-fixes"
+    },
+    {
+      "lines": 25838,
+      "name": "easylist-cookie"
+    },
+    {
+      "lines": 5707,
+      "name": "ubo-annoyances-cookies"
+    },
+    {
+      "lines": 24339,
+      "name": "idcac"
+    }
+  ],
+  "webkit_rule_ceiling": 150000
+}
