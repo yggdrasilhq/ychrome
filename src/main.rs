@@ -131,7 +131,7 @@ fn open_tunnel(via: &str) -> Result<Tunnel> {
 /// INVOKING host — the same location the yggterm GUI uses for a session's
 /// surface, so a profile means the same identity whether ychrome renders it
 /// itself (standalone) or hands it to the yggterm viewport (thin-client).
-fn profile_dir(profile: &str) -> Result<PathBuf> {
+pub(crate) fn profile_dir(profile: &str) -> Result<PathBuf> {
     if profile.contains('/') || profile.contains("..") || profile.is_empty() {
         bail!("profile name must be a plain name, not a path: {profile:?}");
     }
