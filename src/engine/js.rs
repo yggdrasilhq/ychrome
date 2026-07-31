@@ -5,6 +5,128 @@
 //! via `/eval`'s path, which means a page CAN see them — none of them carries
 //! a secret, and the DOM extractor deliberately refuses to read one back out.
 
+/// The page-side globals the three click scripts hand each other.
+///
+/// They appear as literals inside the scripts — a `const` cannot be
+/// interpolated into another `const` string — so this is where the shared
+/// spelling is written down once, and `the_click_scripts_share_one_page_side_vocabulary`
+/// is what holds all three to it. Two spellings of one key is the same class of
+/// silent divergence as two spellings of a refusal.
+#[cfg(test)]
+pub const CLICK_POOL_KEY: &str = "__ychromeClickPool";
+#[cfg(test)]
+pub const CLICK_PIN_KEY: &str = "__ychromeClickPin";
+
+/// Phase A of a selector-addressed click: classify EVERY match, keep the live
+/// ones, and pin that pool for the phases that follow.
+///
+/// ⛔ **`document.querySelector` returning the first match is the bug this
+/// exists to end.** Real pages carry hidden duplicates — IBKR's login page has
+/// six-plus `button[type=submit]`, five of them dead, the live one third in
+/// document order — so "the first match" and "the thing a human would click"
+/// are routinely different elements, and dispatching at the first one is a
+/// click into the void reported as `{"dispatched":3,"ok":true}`.
+///
+/// Liveness is the same predicate the visible surface plane's matcher uses
+/// (`__yggLive` in yggterm's `shell.rs`): an `aria-hidden` ancestor, a zero-area
+/// rect, `display:none` or `visibility:hidden` all mean "not a thing anyone can
+/// click". One vocabulary across both planes, deliberately — two planes with
+/// different words for the same refusal is exactly the divergence this codebase
+/// forbids.
+///
+/// The rect test comes BEFORE the style test on purpose: `display:none` measures
+/// `0x0`, so it is reported as `zero_size_element`, which is the token the bug
+/// report asks for and the phrase the surface plane already uses.
+///
+/// `opacity: 0` is deliberately NOT hidden here. A fully transparent element is
+/// still hit-testable, a real click on it really fires, and `elementFromPoint`
+/// in phase B is the honest arbiter of whether the point lands. Filtering it
+/// out would refuse a click that would have worked.
+pub const CLICK_POOL: &str = r#"(selector) => {
+  let all;
+  try { all = Array.prototype.slice.call(document.querySelectorAll(selector)); }
+  catch (e) { return { bad_selector: String((e && e.message) || e) }; }
+  const live = [];
+  let hidden = 0, zero_size = 0;
+  for (const el of all) {
+    let ariaHidden = false;
+    let p = el, guard = 0;
+    while (p && guard < 24) {
+      if (p.getAttribute && p.getAttribute('aria-hidden') === 'true') { ariaHidden = true; break; }
+      p = p.parentElement; guard++;
+    }
+    if (ariaHidden) { hidden++; continue; }
+    const r = el.getBoundingClientRect();
+    if (!(r.width > 0 && r.height > 0)) { zero_size++; continue; }
+    let style = null;
+    try { style = window.getComputedStyle(el); } catch (err) { style = null; }
+    if (style && (style.visibility === 'hidden' || style.display === 'none')) { hidden++; continue; }
+    live.push(el);
+  }
+  window.__ychromeClickPool = live;
+  return { matches: all.length, hittable: live.length, hidden: hidden, zero_size: zero_size };
+}"#;
+
+/// Phase A2: pin one candidate out of the pool and scroll it into view.
+///
+/// It reports NO geometry, and that is the whole point of the split. A rect read
+/// in the same tick as the `scrollIntoView` that moved the node is the
+/// pre-scroll rect — the measured cause, on the surface plane, of a click that
+/// came back `accepted` + `delivered` + `is_trusted` with nothing selected,
+/// because the event landed where the element used to be.
+pub const CLICK_PIN: &str = r#"(index) => {
+  const pool = window.__ychromeClickPool || [];
+  const el = pool[index] || null;
+  window.__ychromeClickPin = el;
+  if (!el) return { found: false };
+  const connected = (el.isConnected !== undefined)
+    ? !!el.isConnected
+    : !!(document.contains && document.contains(el));
+  try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); }
+  catch (e) { try { el.scrollIntoView(true); } catch (e2) { /* nothing to scroll */ } }
+  return { found: true, isConnected: connected };
+}"#;
+
+/// Phase B: re-measure the PINNED node once the scroll has settled, and report
+/// everything the DOM knows about it at that instant.
+///
+/// It must not scroll (a second scroll would invalidate its own measurement) and
+/// must not re-run the selector (that is how you end up measuring a twin).
+/// `phase: 'post_scroll'` is a contract token: the Rust side REFUSES a payload
+/// without it, so collapsing the two phases back into one cannot pass silently.
+///
+/// ⛔ **`hit.contains(el)` IS NOT HITTABILITY, AND BELIEVING IT WAS IS THE BUG.**
+/// `elementFromPoint` over a `visibility:hidden` element returns whatever paints
+/// there — on a plain page, `<body>` — and `<body>` contains every element on it.
+/// So a test of `hit === el || el.contains(hit) || hit.contains(el)` accepts the
+/// FIRST match unconditionally on any normal page, which made the whole
+/// walk-every-match loop a no-op. Measured on the fixture: the decoy's centre
+/// hit `BODY`, `hitContainsE` was `true`, and the click went to (87.875, 21.5)
+/// where nothing listens. A click reaches an element only when the point lands
+/// ON it or on a DESCENDANT of it, because only then does the event path run
+/// through it. An ancestor hit means the ancestor was clicked, not this node.
+pub const CLICK_MEASURE: &str = r#"(() => {
+  const el = window.__ychromeClickPin;
+  if (!el) return { found: false, phase: 'post_scroll', handle: 'lost' };
+  const connected = (el.isConnected !== undefined)
+    ? !!el.isConnected
+    : !!(document.contains && document.contains(el));
+  const r = el.getBoundingClientRect();
+  const x = r.left + r.width / 2, y = r.top + r.height / 2;
+  const inViewport = x >= 0 && y >= 0 && x <= window.innerWidth && y <= window.innerHeight;
+  const hit = inViewport ? document.elementFromPoint(x, y) : null;
+  const onTarget = !!(hit && (hit === el || (el.contains && el.contains(hit))));
+  const name = (n) => n ? (String(n.tagName || '').toLowerCase()
+    + (n.id ? '#' + n.id : '')) : null;
+  return {
+    found: true, phase: 'post_scroll', isConnected: connected,
+    x: x, y: y, w: r.width, h: r.height,
+    visible: r.width > 0 && r.height > 0,
+    in_viewport: inViewport, onTarget: onTarget,
+    hit: name(hit), tag: String(el.tagName || '').toLowerCase()
+  };
+})()"#;
+
 /// The structured interactable read behind `/engine/dom {mode:"snapshot"}`.
 ///
 /// This is the verb an agent leans on hardest — it is how a script answers

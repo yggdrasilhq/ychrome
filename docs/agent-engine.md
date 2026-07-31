@@ -3,7 +3,8 @@
 Status: **BUILT — phases A through E are all implemented and proven**
 (approved 2026-07-13, delivered 2026-07-31). Run the proofs yourself:
 `ychrome engine gate` (A, green on dev **and** the GUI host), `engine flow` (B),
-`engine parity` (C), `engine govern 300` (D), `assets/engine-recipes/run-all.sh`
+`engine hit` (B, selector-click hittability), `engine parity` (C),
+`engine govern 300` (D), `assets/engine-recipes/run-all.sh`
 (E, green on dev/the GUI host/oc). **Phase F (promote-to-visible) remains a separate
 campaign and is untouched.** Read §10 HONEST GAPS before believing any claim
 this document makes about what is covered.
@@ -231,13 +232,16 @@ POST /eval {page_id, js, await_promise: bool, timeout_ms}
 
 ```
 POST /input {page_id, events: [
-  {"type":"click",  "selector":"css"}            # engine resolves center, scrolls into view
+  {"type":"click",  "selector":"css", "nth"?: k, "require_unique"?: bool}
 | {"type":"click",  "x":…, "y":…, "button":"left"|"right"|"middle", "count":1|2}
 | {"type":"move",   "x":…, "y":…}                # real hover — menus, tooltips work
 | {"type":"type",   "text":"…"}                  # keyevents to the focused element
 | {"type":"key",    "key":"Enter", "mods":["ctrl"]}
 | {"type":"scroll", "dx":0, "dy":…, "x"?, "y"?}
-]} → {dispatched: n}
+]} → 200 {ok, dispatched: n, resolved: [{selector, matches, hittable, hidden,
+                                         zero_size, nth, ambiguous, x, y, tag}…]}
+  | 400 {ok:false, error}                         # the BATCH is malformed
+  | 409 {ok:false, error, dispatched, failed_at, resolved}   # the PAGE refused
 POST /fill  {page_id, selector?, entry?}          # vault autofill, reuses /fill machinery
 ```
 
@@ -248,9 +252,65 @@ exactly like seat input: focus moves, `:hover` applies, default actions fire,
 Enter under-delivers" instrument-lying class documented in the picker
 investigation.
 
-Selector-addressed clicks are sugar: the engine evals
-`getBoundingClientRect` on the selector, scrolls it into view, then
-dispatches real coordinates. One resolver, shared by `/input` and `/dom`.
+### Selector-addressed clicks: hittability, and the semantics decided 2026-07-31
+
+⛔ **This section used to read "the engine evals `getBoundingClientRect` on the
+selector, scrolls it into view, then dispatches real coordinates", and that
+description was the bug.** `document.querySelector` returns the FIRST match and
+real pages carry hidden duplicates — IBKR's login page has six-plus
+`button[type=submit]`, five of them dead and the live one third in document
+order. The engine resolved the first, dispatched at its centre, and answered
+`{"dispatched":3,"ok":true}` for a click that reached nothing. That reported
+success cost a reporting agent three wrong conclusions in one session, one of
+which blamed the operator's vault for a 2FA rejection that had never been
+submitted.
+
+**The rule now: the pool is the HITTABLE matches, in document order, and the
+default is the first of them.** Hidden duplicates are noise, not ambiguity — a
+page with five dead submit buttons and one live one poses a question with exactly
+one answer, and refusing it would be refusing to answer. This is also what the
+visible surface plane's matcher already does, and two planes answering the same
+question differently is the divergence AGENTS.md forbids.
+
+Both alternatives are reachable **on the request**, before the click rather than
+after it: `"nth": k` takes the k-th hittable match, and `"require_unique": true`
+refuses `ambiguous_selector` when more than one match is hittable. Every
+selector click echoes its `resolved` report, so a caller that took the default
+still learns it was one of nine.
+
+Resolution is **two-phase**, the same shape the surface plane arrived at:
+classify every match and pin the live pool; pin one candidate and
+`scrollIntoView`; **let the scroll settle (120 ms)**; then RE-measure the pinned
+node. A rect read in the same tick as the scroll is the pre-scroll rect, which is
+how a click lands where an element used to be. Phase B stamps `post_scroll` as a
+contract token, and a payload without it is refused rather than trusted.
+
+Hittability is the browser's own answer: `document.elementFromPoint` at the
+centre must return the element **or a descendant of it**. ⛔ Not an ancestor — a
+click on an ancestor reaches the ancestor, and since `<body>` contains every
+element on the page, accepting an ancestor hit accepts every candidate
+unconditionally. That single clause is what made the walk a no-op.
+
+Refusals use the surface plane's vocabulary, not a second one: `no element
+matches`, `no_hittable_match` (with the `zero_size_element` / `hidden` counts),
+`detached_node`, `target_moved`, `handle_lost`, `rect_not_reresolved`, plus
+`ambiguous_selector` for the opt-in above.
+
+**A batch resolves each event against the page as it is when that event is
+dispatched.** Resolving up front measured event 2 before event 1 had moved
+anything, so `[{click "#open"},{click "#item"}]` could not work and a click that
+merely MOVED its target landed where the target used to be. Shape-checking is
+still done for the whole batch up front, so a malformed batch dispatches nothing;
+a mid-batch refusal is a fact about the page and is answered with the count
+actually dispatched and the index that stopped it.
+
+Proven by **`ychrome engine hit`** — 15 steps against a fixture carrying a
+hidden duplicate ahead of the real control, a covered button, a
+`pointer-events:none` button, an unreachable one, real twins, and a node that
+detaches itself mid-resolve. Mutation-proven: restoring `hit.contains(el)` turns
+the ancestor-hit step red, removing the liveness filter turns two steps red, and
+both together (the historical resolver) turn the reported case red with
+`dispatched:3` and an unchanged `document.title`.
 
 ### Fleet + governance
 
