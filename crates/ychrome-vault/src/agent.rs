@@ -845,6 +845,23 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             state.touch();
             Ok(json!({ "name": item.name, "passkeys": passkeys }))
         }
+        // Which hosts this vault holds a passkey for — nothing else.
+        //
+        // ⛔ SECRET-FREE BY CONSTRUCTION, and it must stay that way. The browser
+        // calls this to decide WHERE to install its WebAuthn shim, so the answer
+        // travels to a process that then hands match patterns to a webview. An
+        // rpId is a public hostname; a credentialId is not, and does not belong
+        // in this reply however convenient it would be for a future caller.
+        //
+        // A LOCKED vault errors here, and that is CORRECT rather than a
+        // regression: the browser then installs no shim at all, which is the
+        // honest state — a passkey ceremony needs an unlocked agent anyway.
+        "passkey-hosts" => {
+            let vault = unlocked(&state)?;
+            let rp_ids = vault.passkey_rp_ids();
+            state.touch();
+            Ok(json!({ "rp_ids": rp_ids }))
+        }
         // The strict host rule: what an auto-fill is allowed to use. Returns
         // the credential outright, because every caller wants it next.
         "match" => {

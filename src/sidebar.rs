@@ -77,6 +77,111 @@ fn vault_status() -> Result<Value> {
     ychrome_vault_proto::status(&vault_dir()?)
 }
 
+/// Said ONCE per process, not once per `/policy` fetch — the GUI refetches
+/// whenever the policy stamp moves, and a line that repeats forever is a line
+/// nobody reads (the same reasoning as the daemon's staleness notice).
+fn announce_vault_agent_predates_passkey_scoping() {
+    static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ANNOUNCED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    eprintln!(
+        "ychrome: the running vault agent predates the `passkey-hosts` op, so the \
+         WebAuthn shim is installed on NO site and passkey logins will not work."
+    );
+    eprintln!("ychrome: hand the agent over to the current binary:  ychrome-vault handover");
+}
+
+/// A WebKit match pattern covering an rpId and its subdomains.
+///
+/// WebAuthn scopes a credential to the rpId and any subdomain of it (a passkey
+/// for `example.com` is usable on `login.example.com`), so the pattern has to
+/// admit both. Two patterns rather than one because `*://*.example.com/*` does
+/// NOT match the bare `example.com` in WebKit's grammar.
+pub(crate) fn rp_id_match_patterns(rp_id: &str) -> Vec<String> {
+    let host = rp_id.trim().trim_matches('.').to_ascii_lowercase();
+    // A pattern built from a host containing a separator would silently widen
+    // the scope — `*://*./*` matches everything. Refuse rather than over-admit.
+    if host.is_empty() || host.contains(['/', ':', '*', ' ', '?', '#']) {
+        return Vec::new();
+    }
+    vec![format!("*://{host}/*"), format!("*://*.{host}/*")]
+}
+
+/// The passkey shim, installed ONLY for the hosts this vault holds a passkey
+/// for. Empty means install nothing, and empty is the common, correct answer.
+///
+/// ⛔ A LOCKED OR UNREACHABLE VAULT INSTALLS NOTHING, AND THAT IS NOT A
+/// REGRESSION. A ceremony needs an unlocked agent regardless, so a shim
+/// installed over a locked vault could only ever fail the ceremony it advertised
+/// — while still telling every page it touches that this browser has a platform
+/// authenticator. Silence is both honest and strictly safer.
+///
+/// ⛔ THIS DOES NOT TOUCH THE USER-PRESENCE INVARIANT. Scoping decides WHERE
+/// `navigator.credentials` is patched, nothing more. Every ceremony still goes
+/// through `/fido2/*`, still needs the per-page bearer token, and still blocks
+/// on an explicit GUI grant. An agent cannot approve its own ceremony, before
+/// this change or after it.
+///
+/// ⛔ TIGHTLY BOUNDED, BECAUSE `/policy` IS ON A PATH THAT ALREADY FAILS BADLY.
+/// A surface whose policy fetch fails is created UNBLOCKED and runs without
+/// adblock or userscripts for its whole life (`yggterm/docs/web-surfaces.md`),
+/// so making this route wait on another process is how a slow vault agent turns
+/// into an unprotected browser. Measured while adding it: the default read
+/// budget pushed `tests/daemon_staleness.rs` from 8.5 s to 23-30 s and made its
+/// control-endpoint reads time out. The agent is host-local and answers in
+/// microseconds when it is there at all, so anything slower is a failure, and a
+/// failure means no shim.
+fn passkey_shim_scripts(state: &ControlState) -> Vec<crate::userscript::Userscript> {
+    const RP_ID_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+    let Ok(dir) = vault_dir() else {
+        return Vec::new();
+    };
+    let reply = match ychrome_vault_proto::request_with_timeout(
+        &dir,
+        &json!({ "op": "passkey-hosts" }),
+        RP_ID_PROBE_BUDGET,
+    ) {
+        Ok(reply) => reply,
+        Err(error) => {
+            // ⛔ ONE FAILURE HERE IS NOT LIKE THE OTHERS, AND IT MUST NOT BE
+            // SILENT. A locked or absent vault installing no shim is correct —
+            // a ceremony needs an unlocked agent anyway. But an agent that
+            // simply PREDATES this op is unlocked and working, and answering it
+            // with silence would turn passkeys off everywhere while looking
+            // exactly like the healthy case. That is the deploy-ordering hazard
+            // of this change: the agent must be handed over before, or with, the
+            // browser. Say so, once, rather than let the operator discover it at
+            // a login prompt.
+            if error.to_string().contains("predates this binary") {
+                announce_vault_agent_predates_passkey_scoping();
+            }
+            return Vec::new();
+        }
+    };
+    let patterns: Vec<String> = reply["rp_ids"]
+        .as_array()
+        .map(|hosts| {
+            hosts
+                .iter()
+                .filter_map(Value::as_str)
+                .flat_map(rp_id_match_patterns)
+                .collect()
+        })
+        .unwrap_or_default();
+    if patterns.is_empty() {
+        return Vec::new();
+    }
+    // MAIN world, not the isolated default every user script gets: the shim
+    // exists to be called BY THE PAGE (`navigator.credentials`), and a patch
+    // installed in an isolated world is invisible from the page that needs it.
+    let mut script =
+        crate::userscript::Userscript::new(state.signer.shim_userscript()).in_main_world();
+    script.matches = patterns;
+    vec![script]
+}
+
 /// Re-word the one failure the user can act on. The agent replies "the vault is
 /// locked"; point them at the fix, exactly as the old CLI shell-out did.
 fn with_readable_error(result: Result<Value>) -> Result<Value> {
@@ -763,13 +868,28 @@ pub(crate) fn dispatch(
         ("GET", "/policy") => {
             let profile = state.pane.lock().unwrap().profile.clone();
             let mut policy = crate::webpolicy::policy(&profile);
-            // MAIN world, not the isolated default every user script gets: the
-            // shim exists to be called BY THE PAGE (`navigator.credentials`),
-            // and a patch installed in an isolated world is invisible from the
-            // page that needs it.
-            policy.prepend(
-                crate::userscript::Userscript::new(state.signer.shim_userscript()).in_main_world(),
-            );
+            // ⛔ THE SHIM IS SCOPED TO THE HOSTS A PASSKEY ACTUALLY EXISTS FOR.
+            //
+            // It used to be installed on EVERY page, unconditionally. On a page
+            // it touches, `window.PublicKeyCredential` becomes DEFINED and
+            // `isUserVerifyingPlatformAuthenticatorAvailable()` answers true —
+            // on an engine (WebKitGTK 2.52.5) that has no WebAuthn at all, where
+            // both read `undefined` untouched. Claiming a platform authenticator
+            // this browser cannot have is an anomaly no real GNOME Web shows,
+            // and a bot check reads it. `all_frames: false` did not save it: an
+            // interstitial managed challenge is served as the TOP-FRAME document
+            // at the site's own URL, so it runs in exactly the patched world.
+            //
+            // Making the shim "look native" cannot work — the engine genuinely
+            // lacks WebAuthn, so ANY presence of these APIs is the anomaly. Only
+            // absence is native, and per-origin installation is how you get it.
+            //
+            // ⚠ This is an agent-socket round trip, so it must never move onto
+            // the `policy_version` path — that stamp is recomputed on the ~4 s
+            // heartbeat and must stay free of socket IO.
+            for script in passkey_shim_scripts(state) {
+                policy.prepend(script);
+            }
             (200, policy.to_json())
         }
         ("POST", "/action") => {
@@ -2524,7 +2644,21 @@ mod tests {
              array only",
         );
         assert!(
-            arm.contains(".in_main_world()"),
+            arm.contains("passkey_shim_scripts(state)"),
+            "the /policy route must source the shim from its one owner, which is \
+             also where the per-origin scoping lives",
+        );
+        // The main-world requirement did not go away when the shim moved into
+        // `passkey_shim_scripts` for scoping — it moved with it. Anchored on
+        // that function for the same reason this test was anchored on the route
+        // arm: an `.in_main_world()` anywhere else must not satisfy it.
+        let builder = source
+            .split("fn passkey_shim_scripts(state: &ControlState) -> Vec<crate::userscript::Userscript> {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n}").next())
+            .expect("passkey_shim_scripts is present");
+        assert!(
+            builder.contains(".in_main_world()"),
             "the passkey shim was left on the isolated default, where its patch \
              to `navigator.credentials` is invisible to every page that calls it",
         );
@@ -4037,5 +4171,121 @@ mod tests {
             !raw.contains("Access-Control-Allow-Origin"),
             "an /engine/* reply must not advertise CORS: {raw:?}"
         );
+    }
+
+    // ── THE PASSKEY SHIM'S SCOPE ────────────────────────────────────────────
+    // Installed on every page, the shim DEFINES window.PublicKeyCredential and
+    // answers isUserVerifyingPlatformAuthenticatorAvailable() true — on an
+    // engine that has no WebAuthn at all, where both read undefined. A bot
+    // check reads that mismatch, and an interstitial managed challenge is
+    // served as the TOP-FRAME document at the site's own URL, so all_frames:
+    // false never protected it.
+
+    // WebAuthn scopes a credential to the rpId AND its subdomains, so both must
+    // match. They are two patterns because WebKit's `*://*.example.com/*` does
+    // NOT admit the bare `example.com`.
+    #[test]
+    fn an_rp_id_matches_itself_and_its_subdomains() {
+        let patterns = rp_id_match_patterns("example.com");
+        assert!(
+            patterns.contains(&"*://example.com/*".to_string()),
+            "the bare rpId must match: {patterns:?}"
+        );
+        assert!(
+            patterns.contains(&"*://*.example.com/*".to_string()),
+            "a passkey for example.com is usable on login.example.com: {patterns:?}"
+        );
+    }
+
+    // ⛔ A PATTERN IS A SCOPE. Anything that could widen one to every site must
+    // produce NO pattern rather than a permissive one — `*://*./*` is every page
+    // on the web, which is the exact state this whole change exists to end.
+    #[test]
+    fn a_malformed_rp_id_yields_no_pattern_rather_than_a_wide_one() {
+        for bad in ["", "   ", "*", "evil.com/*", "https://evil.com", "a b", "x?y", "h#f", "host:443"] {
+            assert!(
+                rp_id_match_patterns(bad).is_empty(),
+                "{bad:?} must produce no pattern at all, never a widened one"
+            );
+        }
+        // …and a well-formed one still works after all that refusing.
+        assert_eq!(rp_id_match_patterns("github.com").len(), 2);
+    }
+
+    // The shim must never be installed unscoped. An empty `matches` means EVERY
+    // URL (see `Userscript::matches`), so a shim with no patterns is precisely
+    // the old bug wearing the new code's clothes.
+    #[test]
+    fn the_shim_is_never_installed_with_an_empty_match_list() {
+        let source = include_str!("sidebar.rs");
+        let body = source
+            .split("fn passkey_shim_scripts(state: &ControlState) -> Vec<crate::userscript::Userscript> {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n}").next())
+            .expect("passkey_shim_scripts body present");
+        assert!(
+            body.contains("if patterns.is_empty()") && body.contains("return Vec::new()"),
+            "no rpIds must mean NO shim: an empty matches list means every URL, \
+             which is the unscoped shim this change removes"
+        );
+        assert!(
+            body.contains("script.matches = patterns"),
+            "the shim must carry its match patterns"
+        );
+    }
+
+    // ⛔⛔ THE USER-PRESENCE INVARIANT IS NOT A SCOPING QUESTION. Scoping decides
+    // WHERE navigator.credentials is patched. Every ceremony still goes through
+    // the token-gated /fido2/* routes and still blocks on an explicit GUI grant.
+    // An agent must never be able to approve its own ceremony.
+    #[test]
+    fn scoping_the_shim_does_not_touch_the_presence_gate() {
+        let source = include_str!("sidebar.rs");
+        assert!(
+            source.contains(r#"if page_route && !state.signer.authorized(req.fido2_token.as_deref())"#),
+            "the page-facing /fido2 routes must still be bearer-token gated"
+        );
+        for route in ["/fido2/get", "/fido2/create", "/fido2/grant", "/fido2/deny"] {
+            assert!(source.contains(route), "{route} must still exist");
+        }
+    }
+
+    // The probe is a unix-socket round trip. On the ~4s heartbeat path that
+    // would be a per-beat socket call, which the bug entry rules out explicitly.
+    #[test]
+    fn the_rp_id_probe_stays_off_the_heartbeat_path() {
+        // PRODUCTION CODE ONLY, and the needle is assembled at runtime, or this
+        // test's own prose would satisfy the search it is performing.
+        let production = include_str!("sidebar.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source before the test module");
+        let probe = format!("\"op\": \"passkey-{}\"", "hosts");
+        assert_eq!(
+            production.matches(probe.as_str()).count(),
+            1,
+            "the rpId probe is a unix-socket round trip and must have exactly \
+             ONE call site (`passkey_shim_scripts`); a second one is how it \
+             reaches a hot path"
+        );
+        // The ~4s heartbeat is `emit_declare`/`declare_payload`; the `/policy`
+        // route is refetched only when the stamp MOVES. Neither declare function
+        // may reach the probe, directly or through the shim builder.
+        for name in [
+            "pub fn emit_declare(",
+            "fn declare_payload(",
+        ] {
+            let body = production
+                .split(name)
+                .nth(1)
+                .and_then(|suffix| suffix.split("\n}").next())
+                .unwrap_or_else(|| panic!("{name} is present"));
+            assert!(
+                !body.contains(probe.as_str()) && !body.contains("passkey_shim_scripts"),
+                "{name} runs on the ~4s heartbeat and must stay free of socket \
+                 IO — the rpId probe belongs on the /policy route, which is \
+                 fetched only when the policy stamp moves"
+            );
+        }
     }
 }

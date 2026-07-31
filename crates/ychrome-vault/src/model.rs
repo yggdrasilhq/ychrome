@@ -582,6 +582,46 @@ impl Vault {
         )?)
     }
 
+    /// Every distinct rpId this vault holds a passkey for — sorted, deduplicated.
+    ///
+    /// ⛔ METADATA ONLY, AND DELIBERATELY THE LEAST THAT ANSWERS THE QUESTION.
+    /// No credentialIds, no user names, no keys, no item names — an rpId is a
+    /// public hostname the site itself announces to any visitor. The caller is
+    /// the browser deciding WHERE to install the WebAuthn shim, and "does this
+    /// vault hold a passkey for this host" is the whole of what that needs.
+    ///
+    /// Why the browser asks at all: the shim used to be installed on EVERY page,
+    /// which told every site that a platform authenticator exists — on an engine
+    /// (WebKitGTK) that has no WebAuthn whatsoever. That mismatch is readable by
+    /// any bot check. Scoping the shim to the rpIds a passkey actually exists
+    /// for means a site you have no passkey for sees a pristine `navigator`.
+    pub fn passkey_rp_ids(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = Vec::new();
+        for cipher in &self.ciphers {
+            if cipher.fido2.is_empty() {
+                continue;
+            }
+            let Ok(key) = self.cipher_key(cipher) else {
+                continue;
+            };
+            for credential in &cipher.fido2 {
+                let Some(rp_id) = credential
+                    .rp_id
+                    .as_ref()
+                    .and_then(|enc| key.decrypt_to_string(enc).ok())
+                else {
+                    continue;
+                };
+                let rp_id = rp_id.trim().to_ascii_lowercase();
+                if !rp_id.is_empty() && !hosts.contains(&rp_id) {
+                    hosts.push(rp_id);
+                }
+            }
+        }
+        hosts.sort();
+        hosts
+    }
+
     /// Resolve a `navigator.credentials.get()` request to the stored passkeys
     /// that can answer it. The page names an `rp_id` and, for a non-discoverable
     /// login, an `allow_credential_ids` allow-list (base64url credentialIds from
