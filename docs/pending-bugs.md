@@ -41,6 +41,49 @@ adblock and no userscripts** while the ruleset sits correctly installed and
 served. The failure is silent after the single toast, and it survives for the
 life of the surface.
 
+### PROVEN IN A SHADOW SESSION, 2026-07-31 — and the consequence is worse than "no rules"
+
+Probed with `server app web eval` against a real YouTube page in a backgrounded
+probe session (the user's viewport never moved). The page contained **every one
+of yggterm's own shims** — `__yggtermClipboardImagePasteShim`,
+`__yggtermCloseShim`, `__yggtermScrollNavShim`, `__yggtermThemeColorShim` — and
+**not one ychrome userscript**: `window.__ytAdDefense` `undefined`,
+`window.__ysb` `undefined`, `window.fetch` still native. The surface reported
+`policy_gate: "absent"`.
+
+So the userscript plane is not merely late, it is **absent for the life of that
+surface**, which is exactly what `yggterm/docs/web-surfaces.md:341-346` already
+says happens:
+
+> *"A surface opened before its contribution exists is created unblocked and
+> runs without userscripts for its whole life. After
+> `MAX_POLICY_FETCH_ATTEMPTS` failed fetches the gate opens anyway — a page with
+> no adblock beats no page — and the user is notified."*
+
+**That is the whole chain**: binary swap → daemon handover → GUI holds a stale
+control port → policy fetch fails → gate opens unblocked → **no userscripts,
+permanently** → YouTube pre-rolls play (they are served from googlevideo.com,
+the same host as the video, so no network rule can touch them — the main-world
+`adPlacements` strip is the only defence) and SponsorBlock never runs.
+
+**Two fixes are owed, not one:**
+1. Re-resolve the control port (above). Necessary, not sufficient.
+2. ⭐ **"For its whole life" is too harsh a punishment for a transient fetch
+   failure.** A surface that opened unblocked must be REPAIRED when the policy
+   later becomes reachable — recreate it, or re-run the userscript attach —
+   rather than staying degraded until the user happens to close the tab.
+   Reloading the page does NOT fix it: `init_script` is bound at webview
+   creation, so the surface must be rebuilt.
+
+⚠ Interim remedy for a user in this state: **close and reopen the ychrome tab**
+(not reload) once the policy endpoint answers. Verify with
+`curl 127.0.0.1:<registered-port>/policy`.
+
+⚠ Honest limit: a follow-up attempt to prove the cure by recreating the surface
+was INCONCLUSIVE — the second `ychrome` invocation did not mint a new surface
+(the href never changed), so "a fresh surface gets its scripts" is expected but
+**not yet demonstrated**. Demonstrate it before closing this entry.
+
 ### The fix
 
 On a policy-fetch connection failure the GUI must **re-resolve the endpoint**
