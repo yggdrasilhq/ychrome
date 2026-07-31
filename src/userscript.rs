@@ -59,6 +59,11 @@
 //! - **`@run-at`** — recorded verbatim and carried on the wire, but see
 //!   [`Userscript::run_at`]: today every script is injected at document-start
 //!   regardless.
+//! - **`@version`** — the LINEAGE stamp, and the only thing that lets ychrome
+//!   tell "the copy on this host is an old release of ours" from "the user
+//!   edited it". See [`ScriptVersion`] and `crate::provision`, which is the one
+//!   owner of that decision. Absent means "older than every released version",
+//!   because every version ychrome has ever shipped declares one.
 
 /// Which JavaScript world a script's globals live in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +91,86 @@ impl ScriptWorld {
 
 /// The only `@run-at` any surface honours today.
 pub const RUN_AT_DOCUMENT_START: &str = "document-start";
+
+/// A userscript's `@version`, as a dotted numeric sequence (`3`, `1.4`,
+/// `2026.7.31`).
+///
+/// This is the LINEAGE stamp, and it exists for exactly one decision: is the
+/// copy on this host an older release of a script ychrome ships, or is it the
+/// user's own edit? Content hashes cannot tell those apart; a declared version
+/// can. `crate::provision` is the sole reader.
+///
+/// Comparison is component-wise numeric with missing components read as zero,
+/// so `1.4` and `1.4.0` are the same version and `1.10` is newer than `1.9`
+/// (which a string compare gets backwards). A component's LEADING digits are
+/// what count: `2.0-beta` reads as `2.0`, because a userscript author's suffix
+/// convention is not something this can adjudicate, and reading the numbers is
+/// closer to their intent than refusing the whole stamp.
+#[derive(Debug, Clone)]
+pub struct ScriptVersion(Vec<u64>);
+
+impl ScriptVersion {
+    /// Parse a `@version` value. `None` when it carries no digits at all —
+    /// which is NOT the same as absent, and both mean "unversioned" to the
+    /// caller.
+    pub fn parse(value: &str) -> Option<Self> {
+        let parts: Vec<u64> = value
+            .trim()
+            .split('.')
+            .map(|part| {
+                let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse::<u64>().unwrap_or(0)
+            })
+            .collect();
+        if parts.is_empty() || !value.chars().any(|ch| ch.is_ascii_digit()) {
+            return None;
+        }
+        Some(ScriptVersion(parts))
+    }
+
+    /// The canonical spelling, for a report line.
+    pub fn to_string_dotted(&self) -> String {
+        self.0
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+}
+
+impl Ord for ScriptVersion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let len = self.0.len().max(other.0.len());
+        for index in 0..len {
+            let mine = self.0.get(index).copied().unwrap_or(0);
+            let theirs = other.0.get(index).copied().unwrap_or(0);
+            match mine.cmp(&theirs) {
+                std::cmp::Ordering::Equal => {}
+                other => return other,
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+}
+
+impl PartialOrd for ScriptVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+// DERIVED equality would be structural — `1.4` and `1.4.0` would compare
+// unequal while `cmp` calls them equal, and `Ord` is documented to be
+// consistent with `Eq`. A version pair that is "neither older nor newer but
+// also not the same" is exactly the state `provision::verdict` reasons about,
+// so the two must not disagree.
+impl PartialEq for ScriptVersion {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for ScriptVersion {}
 
 /// One `@include` or `@exclude` whose glob could not be PROVEN equivalent to a
 /// WebKit match pattern: which directive carried it, the glob verbatim (the
@@ -128,6 +213,14 @@ pub struct Userscript {
     /// injection, the declaration is already on the wire and no script has to be
     /// re-authored.
     pub run_at: String,
+    /// `@version`, the lineage stamp. `None` = the body declared none (or
+    /// declared one with no digits in it), which `crate::provision` reads as
+    /// "older than every release", because every bundled body declares one.
+    ///
+    /// Deliberately NOT on the wire: yggterm applies placement, and a version
+    /// is not placement. It is read on this host, by the one component that
+    /// decides whether an installed copy is current.
+    pub version: Option<ScriptVersion>,
     /// Every `@include`/`@exclude` whose glob failed [`translate_include`],
     /// verbatim.
     ///
@@ -150,6 +243,7 @@ impl Userscript {
             all_frames: false,
             world: ScriptWorld::Isolated,
             run_at: RUN_AT_DOCUMENT_START.to_string(),
+            version: None,
             untranslatable_includes: Vec::new(),
         }
     }
@@ -294,6 +388,11 @@ pub fn parse(body: &str) -> Userscript {
                 }
             }
             "@run-at" if !value.is_empty() => script.run_at = value.to_string(),
+            // The lineage stamp. A malformed value leaves `None` — the
+            // conservative reading, because `None` means "older than every
+            // release", so a typo'd version gets the script REPLACED by the
+            // bundled copy rather than silently pinned forever.
+            "@version" if !value.is_empty() => script.version = ScriptVersion::parse(value),
             _ => {}
         }
     }
@@ -849,6 +948,49 @@ mod tests {
                 include.glob
             );
         }
+    }
+
+    // The lineage stamp. Component-wise NUMERIC comparison is the whole point:
+    // a string compare puts 1.10 before 1.9 and would refuse to heal a host
+    // that is nine releases behind.
+    #[test]
+    fn versions_compare_component_wise_and_numerically() {
+        let v = |s: &str| ScriptVersion::parse(s).expect("parses");
+        assert!(v("1.10") > v("1.9"), "a string compare gets this backwards");
+        assert!(v("2") > v("1.99.99"));
+        assert_eq!(v("1.4"), v("1.4.0"), "missing components read as zero");
+        assert_eq!(v("2.0-beta"), v("2.0"), "leading digits are what count");
+        assert!(v("3") > v("2.9"));
+        // No digits at all is not a version, which the caller reads as "older
+        // than every release" — never as "newer".
+        assert!(ScriptVersion::parse("").is_none());
+        assert!(ScriptVersion::parse("beta").is_none());
+        assert_eq!(v("2026.7.31").to_string_dotted(), "2026.7.31");
+    }
+
+    // @version rides the same metadata block as everything else, and a
+    // malformed one must land on None (= replaceable), never on a value that
+    // could read as newer than the bundle.
+    #[test]
+    fn the_version_is_read_off_the_metadata_block() {
+        let script = parse("// ==UserScript==\n// @version 4.2\n// ==/UserScript==\nx();\n");
+        assert_eq!(script.version, ScriptVersion::parse("4.2"));
+        assert!(
+            parse("// ==UserScript==\n// @version\n// ==/UserScript==\n")
+                .version
+                .is_none(),
+            "an empty @version must not pin the script"
+        );
+        assert!(
+            parse("// ==UserScript==\n// @version nightly\n// ==/UserScript==\n")
+                .version
+                .is_none(),
+            "a digitless @version must not pin the script"
+        );
+        assert!(
+            parse("console.log(1);\n").version.is_none(),
+            "a header-less body is unversioned"
+        );
     }
 
     // The wire spelling is what yggterm matches on; a rename here silently
