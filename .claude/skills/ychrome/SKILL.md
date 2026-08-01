@@ -219,12 +219,9 @@ ychrome-vault sync | lock | stop-agent | ping | status | diagnose | check
 
 ## Fleet, build, deploy
 
-A small x86_64 Debian fleet. Only the ROLES matter here, and there are three:
-the **GUI host** (the live desktop — yggterm GUI + daemon), one or more
-**headless hosts** (build/agent work, no GUI client registered), and the
-**hypervisor host** that carries the guests. ⚠ One ssh alias on this fleet loops
-back to the very machine you are on, so "deploy to both" can silently be one
-host — check `machine-id` rather than trusting two names to mean two boxes.
+Five hosts: **dev(=pi), jojo, oc, practice, jyas-webapp** — all x86_64 Debian.
+**`pi` and `dev` are the SAME MACHINE** (machine-id `03d282108f6f`; `ssh dev`
+loops back). jojo is the live desktop (yggterm GUI + daemon).
 
 **There is no deploy script.** `scripts/deploy-fleet.sh` does not exist and never
 did (a memory note claims otherwise — it is wrong). The fleet-binary-sync hook
@@ -297,7 +294,7 @@ ps -o pid,lstart -p $PID; readlink /proc/$PID/exe   # SAME pid, SAME start time,
                                                     # DIFFERENT exe, no " (deleted)"
 ychrome-vault status | jq '{agent_stale,state,item_count}'
 # state must still be "unlocked" and item_count intact — and no master password
-# was typed. Run it on a host with NO agent first (free), then dev, then the GUI host.
+# was typed. Run it on a host with NO agent first (free), then dev, then jojo.
 ```
 
 **Opening a contributed pane in the live GUI.** `server app right-panel
@@ -576,7 +573,7 @@ ones are `@match`-scoped instead, so WebKit does the matching in the engine.
 
 - **The 2x-ads bug, so it is never rediagnosed from scratch.** The user
   reported "I still see youtube ads! They are sped up to 2x automatically!" The
-  copy of `youtube-adblock.js` on the GUI host predated the script's metadata block, so
+  copy of `youtube-adblock.js` on jojo predated the script's metadata block, so
   it parsed to the DEFAULTS, so it ran in the ISOLATED world, where its
   `window.fetch` patch is invisible to the page. The prune never ran; only the
   DOM fallback did, and it forced `playbackRate = 16`, which WebKit clamps to
@@ -676,7 +673,7 @@ ychrome ctl open url=https://example.com/ [profile=work]   # -> {page_id, ...}
 ychrome ctl goto  page_id=pg_000001 url=…
 ychrome ctl eval  page_id=pg_000001 js=document.title
 ychrome ctl dom   page_id=pg_000001 mode=snapshot           # the structured read
-ychrome ctl shot  page_id=pg_000001 --out shot.png          # image/png bytes
+ychrome ctl shot  page_id=pg_000001 --out shot.png          # image/png bytes (see below)
 ychrome ctl input page_id=pg_000001 events='[{"type":"click","selector":"#go"}]'
 ychrome ctl wait  page_id=pg_000001 until='{"js":"…"}' timeout_ms=8000
 ychrome ctl batch open='[{"url":"…"},…]' concurrency=8      # streams NDJSON
@@ -749,8 +746,64 @@ fix it. **`wait` is the fix.** The same rule covers navigation, lazy content and
 anything a framework renders asynchronously. An unmet wait returns
 `{"met": false, "reason": …}` — a fact to branch on, never an exception.
 
-Worked examples: `assets/engine-recipes/{crawl-and-extract,form-fill,watch-page-until}.sh`.
-`run-all.sh` runs all three; green on dev, the GUI host and a headless host.
+Worked examples:
+`assets/engine-recipes/{crawl-and-extract,form-fill,watch-page-until,capture-page}.sh`.
+`run-all.sh` runs all four; green on dev, jojo and oc.
+
+### Screenshots — four regions, one snapshot primitive
+
+```sh
+p=$(ychrome ctl open url=https://example.com/ | jq -r .page_id)
+
+ychrome ctl shot page_id=$p                                   --out shot.png   # viewport
+ychrome ctl shot page_id=$p region=full                       --out page.png   # WHOLE document
+ychrome ctl shot page_id=$p region=full prescroll=true        --out page.png   # + lazy content
+ychrome ctl shot page_id=$p region=element selector='#main' padding=8 --out el.png
+ychrome ctl shot page_id=$p region=rect \
+    rect='{"x":0,"y":1100,"w":700,"h":400}'                   --out area.png   # selection area
+```
+
+`--out` writes the PNG and prints ONE json object — the capture's own account
+(`region`, `width`, `height`, the measured `scale`, the document geometry,
+`crop.css`/`crop.device`, the `selector` counts, the `prescroll` report) plus
+`out` and `bytes`. Over the socket that account is the `X-Ychrome-Shot`
+response header; the body stays pure PNG. A refusal exits non-zero and writes
+**no** file.
+
+- **Full page is NATIVE.** `SnapshotRegion::FullDocument` renders the whole
+  laid-out document in one call. There is no scroll-and-stitch and there must
+  not be one: a stitch seams at every step, repeats every `position: fixed`
+  header once per tile, and leaves the page scrolled where the caller did not
+  put it. Proven on a 1280x2910 fixture: one header, no seam.
+- **`element` and `rect` are that same snapshot, cropped from pixels already in
+  hand** — never a second snapshot, so an element capture and the full page it
+  claims to be part of cannot show different content.
+- **The CSS→device scale is MEASURED** (snapshot width ÷ reported document
+  width), never assumed from `devicePixelRatio`. `dpr` is reported alongside so
+  a disagreement is visible.
+- ⛔ **`rect` is in DOCUMENT coordinates.** A `getBoundingClientRect().top` is
+  viewport-relative — add `window.scrollY` first. A crop that misses is
+  refused BY NAME rather than answered with a blank PNG, because a blank PNG
+  gets debugged as a rendering bug.
+- **`region=element` resolves through the SAME hittable pool `/engine/input`
+  clicks through** (same filter, same `nth` default, same
+  `{matches, hittable, hidden, zero_size}` account). "Screenshot the button I
+  am about to click" therefore cannot pick a different element than the click.
+
+### ⚠ `region=full` does NOT load what was never near the viewport
+
+A full-document snapshot renders what is **laid out**. A lazily-loaded page has
+never run its `IntersectionObserver` callbacks below the fold, so it captures as
+a full-height document of empty boxes — and the snapshot is not lying, the
+images really are not there yet.
+
+`prescroll=true` walks the document one viewport at a time with a 120 ms settle
+between steps, then puts the scroll back. It **cannot** be one `eval`: a
+synchronous scroll loop never yields the event-loop turns the observers and
+fetches need, so the loop lives in Rust with the settle between steps. Measured
+side by side on a five-band fixture: without it three bands stayed unloaded;
+with it, all five. The walk is capped at 60 steps and says `capped: true`
+rather than pretending it reached the bottom of an infinite feed.
 
 ### What the engine gives you that a lab browser cannot
 
