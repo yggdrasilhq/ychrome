@@ -213,9 +213,12 @@ ychrome-vault sync | lock | stop-agent | ping | status | diagnose | check
 
 ## Fleet, build, deploy
 
-Five hosts: **dev(=pi), the GUI host, oc, practice, jyas-webapp** — all x86_64 Debian.
-**`pi` and `dev` are the SAME MACHINE** (machine-id `<machine-id>`; `ssh dev`
-loops back). the GUI host is the live desktop (yggterm GUI + daemon).
+A small x86_64 Debian fleet. Only the ROLES matter here, and there are three:
+the **GUI host** (the live desktop — yggterm GUI + daemon), one or more
+**headless hosts** (build/agent work, no GUI client registered), and the
+**hypervisor host** that carries the guests. ⚠ One ssh alias on this fleet loops
+back to the very machine you are on, so "deploy to both" can silently be one
+host — check `machine-id` rather than trusting two names to mean two boxes.
 
 **There is no deploy script.** `scripts/deploy-fleet.sh` does not exist and never
 did (a memory note claims otherwise — it is wrong). The fleet-binary-sync hook
