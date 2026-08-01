@@ -80,6 +80,14 @@ fn vault_status() -> Result<Value> {
 /// Said ONCE per process, not once per `/policy` fetch — the GUI refetches
 /// whenever the policy stamp moves, and a line that repeats forever is a line
 /// nobody reads (the same reasoning as the daemon's staleness notice).
+///
+/// ⚠ THIS LINE IS NOT THE USER-FACING SURFACE, AND ON 2026-08-01 IT REACHED
+/// NOBODY. ychrome's stderr is the PTY it was launched in; it is not in
+/// `~/.yggterm`, not in the GUI's `app-launch-logs`, and not anywhere an
+/// operator greps. The user met the failure at a Forgejo 2FA prompt as "Your
+/// browser does not currently support WebAuthn" while this line existed and had
+/// nowhere to land. [`passkey_shim_widgets`] is the surface that answers that;
+/// this stays for the log-reading case and is deliberately secondary.
 fn announce_vault_agent_predates_passkey_scoping() {
     static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if ANNOUNCED.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -90,6 +98,123 @@ fn announce_vault_agent_predates_passkey_scoping() {
          WebAuthn shim is installed on NO site and passkey logins will not work."
     );
     eprintln!("ychrome: hand the agent over to the current binary:  ychrome-vault handover");
+}
+
+/// Whether the WebAuthn shim is installable, and when it is not, WHY.
+///
+/// ONE owner for a fact two surfaces need: `/policy` turns it into match
+/// patterns, and the vault pane turns it into something the user can read. They
+/// must never derive it separately — a browser that silently disables passkeys
+/// while the pane reports a healthy vault is exactly the 2026-08-01 failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PasskeyShimState {
+    /// Installable, scoped to these rpIds (never empty).
+    ScopedTo(Vec<String>),
+    /// The vault is readable and holds no passkey at all. Correct and common:
+    /// every page keeps a pristine `navigator`.
+    NoStoredPasskeys,
+    /// Locked, or no agent. A ceremony needs an unlocked agent anyway, so no
+    /// shim is the honest state — but the user must be told, because the PAGE
+    /// will blame their browser.
+    VaultUnavailable(String),
+    /// ⛔ THE ONE THAT LOOKS HEALTHY AND IS NOT. The agent is running and
+    /// unlocked and simply does not know the op this browser needs, so passkeys
+    /// are off on EVERY site while `status` reports a perfectly good vault.
+    ///
+    /// Measured on guihost 2026-08-01: `status` answered `state: unlocked`,
+    /// `agent_stale: false`, 1116 items — and the same socket answered
+    /// `unknown op "passkey-hosts"`. `agent_stale` compares the agent against
+    /// the INSTALLED `ychrome-vault`, and both were the same six-day-old
+    /// binary, so it is structurally incapable of catching this. Only asking
+    /// for the op finds it.
+    AgentPredatesBrowser,
+}
+
+/// Ask the vault where the shim may be installed. THE ONE call site of the
+/// `passkey-hosts` probe (a lock in this file's tests pins that).
+fn passkey_shim_state() -> PasskeyShimState {
+    const RP_ID_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+    let Ok(dir) = vault_dir() else {
+        return PasskeyShimState::VaultUnavailable("no vault directory on this host".into());
+    };
+    let reply = match ychrome_vault_proto::request_with_timeout(
+        &dir,
+        &json!({ "op": "passkey-hosts" }),
+        RP_ID_PROBE_BUDGET,
+    ) {
+        Ok(reply) => reply,
+        Err(error) => {
+            // The proto crate rewrites `unknown op` into a sentence naming the
+            // cause; that rewrite is the only way to tell "too old" from
+            // "locked", and the two need opposite remedies.
+            if error.to_string().contains("predates this binary") {
+                announce_vault_agent_predates_passkey_scoping();
+                return PasskeyShimState::AgentPredatesBrowser;
+            }
+            return PasskeyShimState::VaultUnavailable(error.to_string());
+        }
+    };
+    let rp_ids: Vec<String> = reply["rp_ids"]
+        .as_array()
+        .map(|hosts| {
+            hosts
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if rp_ids.is_empty() {
+        return PasskeyShimState::NoStoredPasskeys;
+    }
+    PasskeyShimState::ScopedTo(rp_ids)
+}
+
+/// What the vault pane says about the shim. Empty when there is nothing the
+/// user needs to act on.
+///
+/// ⛔ THE PAGE CANNOT TELL THEM. A site whose ceremony finds no
+/// `navigator.credentials` reports "your browser does not support WebAuthn",
+/// which is true of the engine and useless as a remedy. This pane is already on
+/// screen when that happens, and it is the only surface that knows why.
+///
+/// Secret-free: a count of hosts, never the host list. Which sites you hold
+/// passkeys for is the user's business and does not belong in a schema that
+/// crosses the OSC channel.
+fn passkey_shim_widgets(state: &PasskeyShimState) -> Vec<Value> {
+    match state {
+        // Working, and silence is right: a banner on every render for a healthy
+        // subsystem is a banner nobody reads when it finally matters.
+        PasskeyShimState::ScopedTo(_) | PasskeyShimState::NoStoredPasskeys => Vec::new(),
+        PasskeyShimState::AgentPredatesBrowser => vec![
+            json!({"kind": "section", "text": "Passkeys are off"}),
+            json!({
+                "kind": "label", "muted": true,
+                "text": "This host's vault agent is older than this browser and does not \
+                         answer the request that decides where passkeys work, so passkey \
+                         sign-in is disabled on every site. A site will tell you your \
+                         browser does not support WebAuthn; this is the real reason. \
+                         Install the current ychrome-vault on this host, then hand the \
+                         agent over — it keeps the vault unlocked.",
+            }),
+            json!({
+                "kind": "button", "id": "hand_over_agent", "action": "hand_over_agent",
+                "primary": true, "label": "Hand the agent over (keeps the unlock)",
+            }),
+        ],
+        PasskeyShimState::VaultUnavailable(reason) => vec![
+            json!({"kind": "section", "text": "Passkeys are off"}),
+            json!({
+                "kind": "label", "muted": true,
+                "text": format!(
+                    "Passkey sign-in needs a reachable, unlocked vault on this host, and \
+                     the shim is decided when a web surface OPENS. {reason}. Unlock the \
+                     vault, then open the page in a new web surface.",
+                ),
+            }),
+        ],
+    }
 }
 
 /// A WebKit match pattern covering an rpId and its subdomains.
@@ -133,43 +258,23 @@ pub(crate) fn rp_id_match_patterns(rp_id: &str) -> Vec<String> {
 /// microseconds when it is there at all, so anything slower is a failure, and a
 /// failure means no shim.
 fn passkey_shim_scripts(state: &ControlState) -> Vec<crate::userscript::Userscript> {
-    const RP_ID_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
-
-    let Ok(dir) = vault_dir() else {
-        return Vec::new();
+    // ⛔ ONE FAILURE HERE IS NOT LIKE THE OTHERS, AND IT MUST NOT BE SILENT. A
+    // locked or absent vault installing no shim is correct — a ceremony needs an
+    // unlocked agent anyway. But an agent that simply PREDATES this op is
+    // unlocked and working, and answering it with silence turns passkeys off
+    // everywhere while looking exactly like the healthy case. That is the
+    // deploy-ordering hazard of this change, it reached the user on 2026-08-01,
+    // and the remedy is [`passkey_shim_widgets`] in the pane — a stderr line
+    // reached nobody.
+    let patterns: Vec<String> = match passkey_shim_state() {
+        PasskeyShimState::ScopedTo(rp_ids) => rp_ids
+            .iter()
+            .flat_map(|rp_id| rp_id_match_patterns(rp_id))
+            .collect(),
+        PasskeyShimState::NoStoredPasskeys
+        | PasskeyShimState::VaultUnavailable(_)
+        | PasskeyShimState::AgentPredatesBrowser => Vec::new(),
     };
-    let reply = match ychrome_vault_proto::request_with_timeout(
-        &dir,
-        &json!({ "op": "passkey-hosts" }),
-        RP_ID_PROBE_BUDGET,
-    ) {
-        Ok(reply) => reply,
-        Err(error) => {
-            // ⛔ ONE FAILURE HERE IS NOT LIKE THE OTHERS, AND IT MUST NOT BE
-            // SILENT. A locked or absent vault installing no shim is correct —
-            // a ceremony needs an unlocked agent anyway. But an agent that
-            // simply PREDATES this op is unlocked and working, and answering it
-            // with silence would turn passkeys off everywhere while looking
-            // exactly like the healthy case. That is the deploy-ordering hazard
-            // of this change: the agent must be handed over before, or with, the
-            // browser. Say so, once, rather than let the operator discover it at
-            // a login prompt.
-            if error.to_string().contains("predates this binary") {
-                announce_vault_agent_predates_passkey_scoping();
-            }
-            return Vec::new();
-        }
-    };
-    let patterns: Vec<String> = reply["rp_ids"]
-        .as_array()
-        .map(|hosts| {
-            hosts
-                .iter()
-                .filter_map(Value::as_str)
-                .flat_map(rp_id_match_patterns)
-                .collect()
-        })
-        .unwrap_or_default();
     if patterns.is_empty() {
         return Vec::new();
     }
@@ -975,7 +1080,10 @@ fn media_permission_query(query: &str) -> Value {
 /// under a key that would never match again.
 fn media_permission_write(body: &Value) -> (u16, Value) {
     let Some(origin) = body["origin"].as_str().filter(|origin| !origin.is_empty()) else {
-        return (400, json!({ "error": "media permission write needs an origin" }));
+        return (
+            400,
+            json!({ "error": "media permission write needs an origin" }),
+        );
     };
     if crate::webmedia::normalize_origin(origin).is_none() {
         return (
@@ -1359,6 +1467,12 @@ fn unlocked_schema(state: &PaneState, host: Option<&str>, status: &Value) -> Val
         ],
     })];
 
+    // ⛔ ABOVE THE TABS, ON EVERY TAB, BECAUSE IT IS NOT A TAB'S PROBLEM. A
+    // browser whose passkeys are off is off for every site, and the user
+    // arrives at this pane from a login page that just blamed their browser.
+    // Silent when the shim is fine, which is nearly always.
+    widgets.extend(passkey_shim_widgets(&passkey_shim_state()));
+
     match state.tab.as_str() {
         "add" => {
             widgets.push(json!({"kind": "section", "text": "Add a login"}));
@@ -1652,6 +1766,31 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                     reschema(state, host.as_deref()),
                     json!({ "toast": error.to_string() }),
                 ),
+            }
+        }
+        // The CHEAP remedy for an agent older than this browser: exec the
+        // installed binary in place, same pid, same socket, vault still
+        // unlocked. `restart_agent` below is the fallback that costs a master
+        // password, and it is deliberately the second offer.
+        //
+        // ⚠ It execs the INSTALLED `ychrome-vault`, which the agent chooses —
+        // never this process. If that binary is itself old, the handover is
+        // refused ("it is the binary already running") rather than looping, and
+        // the operator has to install the new one first. Verification lives in
+        // `ychrome_vault_proto::handover`, one owner shared with the CLI.
+        "hand_over_agent" => {
+            match vault_dir().and_then(|dir| ychrome_vault_proto::handover(&dir)) {
+                Ok(reply) if reply["handed_over"].as_bool().unwrap_or(false) => merge(
+                    reschema(state, host.as_deref()),
+                    json!({ "toast": "Agent handed over — passkeys are on again, in web surfaces opened from now on." }),
+                ),
+                // Accepted but unproven is a FAILURE here, not a partial success:
+                // the second round trip found the old binary still answering.
+                Ok(_) => json!({
+                    "toast": "The agent is still running its old binary. Install the current \
+                              ychrome-vault on this host, then try again.",
+                }),
+                Err(error) => json!({ "toast": error.to_string() }),
             }
         }
         "restart_agent" => match vault_dir().and_then(|dir| ychrome_vault_proto::stop(&dir)) {
@@ -3063,11 +3202,16 @@ mod tests {
     /// swallowed and parses as an origin of `forget` — so the ORDER is the lock.
     #[test]
     fn revoke_is_not_swallowed_by_the_set_action_prefix() {
-        assert!(MEDIA_PERMISSION_FORGET_PREFIX.starts_with(
-            MEDIA_PERMISSION_ACTION_PREFIX.trim_end_matches(':')
-        ));
+        assert!(
+            MEDIA_PERMISSION_FORGET_PREFIX
+                .starts_with(MEDIA_PERMISSION_ACTION_PREFIX.trim_end_matches(':'))
+        );
         let revoke = format!("{MEDIA_PERMISSION_FORGET_PREFIX}https://example.com");
-        assert!(revoke.strip_prefix(MEDIA_PERMISSION_FORGET_PREFIX).is_some());
+        assert!(
+            revoke
+                .strip_prefix(MEDIA_PERMISSION_FORGET_PREFIX)
+                .is_some()
+        );
         let body = include_str!("sidebar.rs");
         let forget_at = body
             .find("if let Some(origin) = action.strip_prefix(MEDIA_PERMISSION_FORGET_PREFIX)")
@@ -3189,7 +3333,10 @@ mod tests {
     fn the_control_endpoint_answers_a_live_ask_and_serves_the_whole_map() {
         // No origin: the map shape, whatever is on this host's disk.
         let all = media_permission_query("");
-        assert!(all.get("sites").is_some(), "the map form lost its `sites` key");
+        assert!(
+            all.get("sites").is_some(),
+            "the map form lost its `sites` key"
+        );
         // With an origin: always a decision word, never an error shape the GUI
         // could misread. An origin nothing was remembered for asks.
         let one = media_permission_query("origin=https%3A%2F%2Fnobody.invalid&audio=1&video=1");
@@ -3303,7 +3450,13 @@ mod tests {
             restore_tabs: false,
             ..PageContext::default()
         };
-        let schema = settings_schema_from("work", &page, &no_zoom(), &policy_state(true, &[]), &no_media());
+        let schema = settings_schema_from(
+            "work",
+            &page,
+            &no_zoom(),
+            &policy_state(true, &[]),
+            &no_media(),
+        );
         let widgets = schema["widgets"].as_array().expect("widgets");
         let toggle = |id: &str| {
             widgets
@@ -3550,7 +3703,13 @@ mod tests {
         let mut state = policy_state(true, &[("broken", true)]);
         state.userscripts[0].refusal =
             Some("Refused — not injected: @exclude https://*.youtube.com/embed/*".to_string());
-        let schema = settings_schema_from("work", &PageContext::default(), &no_zoom(), &state, &no_media());
+        let schema = settings_schema_from(
+            "work",
+            &PageContext::default(),
+            &no_zoom(),
+            &state,
+            &no_media(),
+        );
         let widgets = schema["widgets"].as_array().expect("widgets");
         let row = widgets
             .iter()
@@ -4658,7 +4817,17 @@ mod tests {
     // on the web, which is the exact state this whole change exists to end.
     #[test]
     fn a_malformed_rp_id_yields_no_pattern_rather_than_a_wide_one() {
-        for bad in ["", "   ", "*", "evil.com/*", "https://evil.com", "a b", "x?y", "h#f", "host:443"] {
+        for bad in [
+            "",
+            "   ",
+            "*",
+            "evil.com/*",
+            "https://evil.com",
+            "a b",
+            "x?y",
+            "h#f",
+            "host:443",
+        ] {
             assert!(
                 rp_id_match_patterns(bad).is_empty(),
                 "{bad:?} must produce no pattern at all, never a widened one"
@@ -4698,12 +4867,154 @@ mod tests {
     fn scoping_the_shim_does_not_touch_the_presence_gate() {
         let source = include_str!("sidebar.rs");
         assert!(
-            source.contains(r#"if page_route && !state.signer.authorized(req.fido2_token.as_deref())"#),
+            source.contains(
+                r#"if page_route && !state.signer.authorized(req.fido2_token.as_deref())"#
+            ),
             "the page-facing /fido2 routes must still be bearer-token gated"
         );
         for route in ["/fido2/get", "/fido2/create", "/fido2/grant", "/fido2/deny"] {
             assert!(source.contains(route), "{route} must still exist");
         }
+    }
+
+    // ⛔ THE FAILURE THAT REACHED THE USER ON 2026-08-01. A vault agent older
+    // than this browser answers `status` perfectly — unlocked, 1116 items,
+    // `agent_stale: false`, because the agent and the INSTALLED ychrome-vault
+    // were the same binary — while answering `unknown op "passkey-hosts"` on the
+    // same socket. Passkeys were off on every site, the pane said nothing, and
+    // the page said "your browser does not support WebAuthn".
+    #[test]
+    fn an_agent_older_than_this_browser_is_reported_in_the_pane() {
+        let widgets = passkey_shim_widgets(&PasskeyShimState::AgentPredatesBrowser);
+        assert!(
+            !widgets.is_empty(),
+            "this state must never be silent in the pane"
+        );
+        let text = serde_json::to_string(&widgets).unwrap();
+        assert!(
+            text.contains("WebAuthn"),
+            "the pane must connect itself to the words the PAGE showed the user: {text}"
+        );
+        assert!(
+            widgets
+                .iter()
+                .any(|widget| widget["action"] == "hand_over_agent"),
+            "the remedy that keeps the unlock must be one click: {text}"
+        );
+    }
+
+    // A working shim is SILENT. A banner rendered on every schema for a healthy
+    // subsystem is a banner nobody reads when it finally matters.
+    #[test]
+    fn a_healthy_shim_says_nothing() {
+        for state in [
+            PasskeyShimState::ScopedTo(vec!["example.com".into()]),
+            PasskeyShimState::NoStoredPasskeys,
+        ] {
+            assert!(
+                passkey_shim_widgets(&state).is_empty(),
+                "{state:?} must be silent"
+            );
+        }
+    }
+
+    // ⛔ THE PANE MUST NOT LEAK WHICH SITES YOU HOLD PASSKEYS FOR. The schema
+    // crosses the OSC channel to the GUI; an rpId list is the user's business.
+    #[test]
+    fn the_pane_never_names_the_hosts_a_passkey_exists_for() {
+        let state = PasskeyShimState::ScopedTo(vec!["bank.example".into()]);
+        let text = serde_json::to_string(&passkey_shim_widgets(&state)).unwrap();
+        assert!(
+            !text.contains("bank.example"),
+            "an rpId reached the schema: {text}"
+        );
+    }
+
+    // A locked or unreachable vault is a DIFFERENT story from an agent that is
+    // too old, and the two need opposite remedies: unlock versus hand over.
+    #[test]
+    fn an_unavailable_vault_tells_the_user_to_unlock_and_reopen() {
+        let widgets = passkey_shim_widgets(&PasskeyShimState::VaultUnavailable(
+            "the vault is locked".into(),
+        ));
+        let text = serde_json::to_string(&widgets).unwrap();
+        assert!(text.contains("Unlock"), "{text}");
+        // The shim is chosen when a surface OPENS, so unlocking alone is not
+        // enough and saying only "unlock" would be a stale answer.
+        assert!(text.contains("new web surface"), "{text}");
+        assert!(
+            !widgets
+                .iter()
+                .any(|widget| widget["action"] == "hand_over_agent"),
+            "handing the agent over does not unlock a vault: {text}"
+        );
+    }
+
+    // ⛔ ONE OWNER FOR THE DECISION. `/policy` decides where to install the shim
+    // and the pane explains why it did not; if they probed separately, a browser
+    // could disable passkeys while the pane reported everything fine — which is
+    // exactly what happened before this existed.
+    #[test]
+    fn the_shim_decision_and_the_pane_read_the_same_owner() {
+        let production = include_str!("sidebar.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source before the test module");
+        assert_eq!(
+            production.matches("fn passkey_shim_state()").count(),
+            1,
+            "there must be exactly one owner of the shim decision"
+        );
+        for caller in ["fn passkey_shim_scripts(", "fn unlocked_schema("] {
+            let body = production
+                .split(caller)
+                .nth(1)
+                .and_then(|suffix| suffix.split("\n}").next())
+                .unwrap_or_else(|| panic!("{caller} is present"));
+            assert!(
+                body.contains("passkey_shim_state()"),
+                "{caller} must read the shared owner rather than probing on its own"
+            );
+        }
+    }
+
+    // ⛔ THE POLICY STAMP WAS BLIND TO THE SHIM, WHICH MADE THE FAILURE
+    // PERMANENT. Measured on guihost: `sidebar_contribution/policy` recorded
+    // `userscripts: 6` then `userscripts: 5` under ONE unchanged
+    // `policy_version` (`ebc219f7d40ddc53`), and the GUI refetches only when
+    // that stamp moves — so no surface could ever recover the shim.
+    #[test]
+    fn the_policy_stamp_moves_when_the_vault_agent_is_replaced() {
+        let production = include_str!("webpolicy.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source before the test module");
+        let body = production
+            .split("pub fn policy_version(profile: &str) -> String {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n}").next())
+            .expect("policy_version is present");
+        assert!(
+            body.contains("passkey_shim_stamp()"),
+            "the stamp must cover the vault facts that decide the shim's scope, \
+             or a handed-over agent never reaches an open surface"
+        );
+        let stamp = production
+            .split("fn passkey_shim_stamp() -> String {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n}").next())
+            .expect("passkey_shim_stamp is present");
+        // STAT-ONLY: this runs on the ~4s re-declare, where a socket round trip
+        // was already measured to wreck the surface tests.
+        assert!(
+            !stamp.contains("request") && !stamp.contains("passkey-hosts"),
+            "the stamp runs on the heartbeat and must never do socket IO"
+        );
+        assert!(
+            stamp.contains("pid_path") && stamp.contains("installed_vault_exe_stamp"),
+            "a handover rewrites agent.pid and an install moves the binary's mtime; \
+             those two stats are what make a recovered agent reach a surface"
+        );
     }
 
     // The probe is a unix-socket round trip. On the ~4s heartbeat path that
@@ -4727,10 +5038,7 @@ mod tests {
         // The ~4s heartbeat is `emit_declare`/`declare_payload`; the `/policy`
         // route is refetched only when the stamp MOVES. Neither declare function
         // may reach the probe, directly or through the shim builder.
-        for name in [
-            "pub fn emit_declare(",
-            "fn declare_payload(",
-        ] {
+        for name in ["pub fn emit_declare(", "fn declare_payload("] {
             let body = production
                 .split(name)
                 .nth(1)

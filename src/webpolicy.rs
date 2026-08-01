@@ -306,6 +306,7 @@ pub fn policy_version(profile: &str) -> String {
     // so a category the user just switched to auto-skip would not reach the
     // page until something else in the policy happened to change.
     manifest.push_str(&crate::sponsorblock::stamp());
+    manifest.push_str(&passkey_shim_stamp());
     if let Ok(rules) = rules_path() {
         stamp(&mut manifest, &rules);
     }
@@ -315,6 +316,50 @@ pub fn policy_version(profile: &str) -> String {
         }
     }
     format!("{:016x}", fnv1a(manifest.as_bytes()))
+}
+
+/// The vault facts that change WHICH sites the passkey shim is installed on,
+/// as cheaply as a stat.
+///
+/// ⛔ THE STAMP WAS BLIND TO THE SHIM, AND THAT MADE THE FAILURE PERMANENT.
+/// `/policy` prepends a shim whose scope comes from the vault agent, while this
+/// stamp covered only adblock, the UA, SponsorBlock and userscript FILES. Two
+/// fetches under one stamp could therefore return different policies, and the
+/// GUI refetches only when the stamp MOVES — so a surface kept whatever shim
+/// decision happened to be true when it opened, forever.
+///
+/// Measured on guihost, 2026-08-01, one unchanged `policy_version`
+/// (`ebc219f7d40ddc53`): `sidebar_contribution/policy` recorded
+/// `userscripts: 6` at 14:53 and `userscripts: 5` from 16:07 on, across the
+/// ychrome deploy that landed per-origin scoping. The missing script was the
+/// shim, nothing refetched, and the user met it as "your browser does not
+/// support WebAuthn" on a 2FA page.
+///
+/// ⚠ STAT-ONLY, DELIBERATELY. This runs on the ~4 s re-declare, where a unix
+/// socket round trip was already measured to wreck the surface tests, so the
+/// probe itself may never come here. These two files answer the case that
+/// actually bit:
+///
+/// * `agent.pid` — rewritten by `serve_on` every time an agent starts OR is
+///   handed over (an `execve` keeps the pid, and the write still moves the
+///   mtime), so "the agent's code changed" is a stat.
+/// * the installed `ychrome-vault` — so installing a new one moves the stamp
+///   even before the handover.
+///
+/// ⚠ WHAT THIS STILL DOES NOT SEE: a plain lock → unlock, which touches no
+/// file. A surface opened over a locked vault therefore still needs to be
+/// reopened; `sidebar::passkey_shim_widgets` says so in words rather than
+/// leaving the user to guess. See `docs/pending-bugs.md`.
+fn passkey_shim_stamp() -> String {
+    let mut manifest = String::new();
+    if let Ok(dir) = ychrome_vault_proto::default_dir() {
+        stamp(&mut manifest, &ychrome_vault_proto::pid_path(&dir));
+    }
+    manifest.push_str(&format!(
+        "vault_exe:{}\n",
+        ychrome_vault_proto::installed_vault_exe_stamp()
+    ));
+    manifest
 }
 
 /// Append one file's identity to the manifest: path, length, mtime. A missing
