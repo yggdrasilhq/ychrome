@@ -5,7 +5,7 @@ Status: **BUILT — phases A through E are all implemented and proven**
 `ychrome engine gate` (A, green on dev **and** the GUI host), `engine flow` (B),
 `engine hit` (B, selector-click hittability), `engine parity` (C),
 `engine govern 300` (D), `assets/engine-recipes/run-all.sh`
-(E, green on dev/the GUI host/oc). **Phase F (promote-to-visible) remains a separate
+(E, green on dev/the GUI host/a headless host). **Phase F (promote-to-visible) remains a separate
 campaign and is untouched.** Read §10 HONEST GAPS before believing any claim
 this document makes about what is covered.
 
@@ -548,9 +548,9 @@ E owns it. A JSON array is honest, a half-stream would not be.
 **Phase E — agent ergonomics.** `ychrome ctl` polish, SKILL.md section with
 recipes (crawl-and-extract, form-fill, watch-page-until), /dom snapshot
 extractor hardening, NDJSON streaming.
-*AC: the three recipe scripts run green on the GUI host/dev/oc; skill documented.*
+*AC: the three recipe scripts run green on the GUI host/dev/a headless host; skill documented.*
 
-✅ **DONE 2026-07-31. All three recipes GREEN on dev, the GUI host AND oc.**
+✅ **DONE 2026-07-31. All three recipes GREEN on dev, the GUI host AND a headless host.**
 `assets/engine-recipes/{crawl-and-extract,form-fill,watch-page-until}.sh` plus
 `run-all.sh`; the SKILL doc gained an agent-engine section.
 
@@ -592,8 +592,8 @@ momentum). Deliberately out of scope here; the engine's existence de-risks it.
 |---|---|---|
 | ~~Rust bindings for wpe-webkit-2.0 missing/stale~~ **RESOLVED, differently than expected** | Phase A | Moot: there is no WPEPlatform to bind. We use the gir crates wry already links. No shim, no C helper, no build.rs — §9.1 |
 | ~~WPEPlatform headless API gaps at 2.52~~ **FIRED — the whole API is absent, not just gaps** | Phase A | Fallback substrate taken. Xvfb, not `cage`/`weston`: same class of thing, already installed, and GTK3 is X11-native so it needs no new package — §9.1 |
-| Debian packages absent on a fleet host | `apt list` on dev/oc before Phase B | `sudo apt install libwpewebkit-2.0-1 libwpe-1.0-1` is a documented one-time prereq (oc precedent: libwebkit2gtk) |
-| GPU-less hosts (oc) render slowly | bench in Phase D | swrast is fine for agent work; record numbers, don't guess |
+| Debian packages absent on a fleet host | `apt list` on dev/a headless host before Phase B | `sudo apt install libwpewebkit-2.0-1 libwpe-1.0-1` is a documented one-time prereq (a headless host precedent: libwebkit2gtk) |
+| GPU-less hosts (a headless host) render slowly | bench in Phase D | swrast is fine for agent work; record numbers, don't guess |
 | Form-state park/restore lossy | Phase D | documented best-effort; tags let scripts re-derive; never claim more than captured |
 | Shared jar: engine + visible surface open same profile concurrently | Phase C | WebKit handles multi-process jar access via the network process per session; verify with a live differential, journal a warning if two writers detected |
 | Anti-bot flags headless views | Phase C | we present the SAME UA/identity as the visible browser and real input events; do not add evasion beyond that — honesty rule |

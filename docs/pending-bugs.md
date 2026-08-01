@@ -111,17 +111,17 @@ half-delivered: **headless means off-screen, not off-host.** `Xvfb :90` and ever
 WebKitWebProcess run on **the GUI host — the operator's machine** — so the CPU, RAM and
 thermal cost are still his; only the pixels are hidden.
 
-**HALF-CLOSED 2026-07-31 (oc).** `fleet-binary-sync` pulled the engine binary to
-**oc**, where `ychrome ctl pool --json` now answers for real and the whole IBKR
+**HALF-CLOSED 2026-07-31 (a headless host).** `fleet-binary-sync` pulled the engine binary to
+**a headless host**, where `ychrome ctl pool --json` now answers for real and the whole IBKR
 login flow was driven off the operator's laptop. **`dev` is still uncovered, and
 worse than before: `ychrome` is `command not found` there** — not an old binary,
 no binary. dev is a container on mains power and is the documented preference for
 anything that renders (`data-fabric`: *"Prefer dev over the GUI host… the GUI host is the laptop
 the user is working on"*), so it is the one host that most needs it.
 
-⚠ **oc can run the engine but CANNOT mint a TOTP** — see the clock-skew entry
+⚠ **a headless host can run the engine but CANNOT mint a TOTP** — see the clock-skew entry
 below. Any flow that needs a second factor has to source the code from the GUI host even
-when the browsing itself happens on oc.
+when the browsing itself happens on a headless host.
 
 **This is a bug, not a deployment chore**, because the feature's stated benefit
 does not exist until it lands: an engine that can only run on the operator's
@@ -131,12 +131,12 @@ laptop has moved the problem, not solved it. It also blocks the fleet framing in
 agent browsing.
 
 **Wants:** ychrome deployed fleet-wide (it "deploys as a fleet" per standing
-practice), and the engine verified reachable from dev/oc, so `ctl` runs where
+practice), and the engine verified reachable from dev/a headless host, so `ctl` runs where
 nobody is sitting.
 
-## ★★★ the hypervisor host's CLOCK IS 72 s SLOW, SO `ychrome-vault totp` CANNOT WORK ON dev OR oc
+## ★★★ the hypervisor host's CLOCK IS 72 s SLOW, SO `ychrome-vault totp` CANNOT WORK ON dev OR a headless host
 
-**Measured 2026-07-31 on oc.** Three independent servers agree, and so does the
+**Measured 2026-07-31 on a headless host.** Three independent servers agree, and so does the
 host's own chrony:
 
 ```
@@ -145,14 +145,14 @@ chronyc tracking → System time : 71.908782959 seconds slow of NTP time
 timedatectl      → System clock synchronized: no   (NTP service: active)
 ```
 
-Epoch compared across the fleet: **the GUI host `…997` (correct); dev `…925`; oc `…925`.**
-dev and oc are LXCs on **the hypervisor host** and share its `CLOCK_REALTIME`, so this is one
+Epoch compared across the fleet: **the GUI host `…997` (correct); dev `…925`; a headless host `…925`.**
+dev and a headless host are LXCs on **the hypervisor host** and share its `CLOCK_REALTIME`, so this is one
 clock, wrong, serving two of the three hosts. the GUI host is a separate machine and is
 fine.
 
 **Why it is a ychrome bug and not just infra trivia:** a TOTP window is 30 s, so
 72 s is **2.4 windows stale** and servers accept at most ±1. `ychrome-vault totp`
-on dev/oc therefore emits a code that is *always* wrong, while looking perfectly
+on dev/a headless host therefore emits a code that is *always* wrong, while looking perfectly
 well-formed — six digits, stable within its window, no error. It is a
 lie-of-success in the same family as the click-into-the-void: the instrument
 reports a confident answer that cannot be right. **Waiting does not help** — the
@@ -170,7 +170,7 @@ shows the truth.**
 memory inside a 72 s window resolve by the wrong winner — a file genuinely newer
 on the GUI host can lose to a stale the hypervisor host copy.
 
-**Wants:** the hypervisor host's clock stepped and kept in sync (oc *does* hold `cap_sys_time`
+**Wants:** the hypervisor host's clock stepped and kept in sync (a headless host *does* hold `cap_sys_time`
 and sudo, but the clock is the shared host's — stepping it from inside a
 container hits the hypervisor host and dev's running agents, so it is the operator's call);
 and `ychrome-vault totp` should **refuse, not guess**, when the host clock is
@@ -189,7 +189,7 @@ sessions:
   operator's screen; it is the subject of `dream-detached-agent-surfaces.md` and
   of the detached-by-default rule in `yggterm/docs/agent-surface-attachment.md`.
 - **§1 Unlock request** and **§6 Autofill-from-vault.** The vault is the standing
-  friction: it is LOCKED on oc and dev (as root it answers `not_configured`) and
+  friction: it is LOCKED on a headless host and dev (as root it answers `not_configured`) and
   resolves only on the GUI host, and `fill-vault` needs a mapped surface so it is
   unavailable on exactly the detached surfaces agents are told to prefer. Every
   run pays this toll by hand.
@@ -272,7 +272,7 @@ headless host until this closes.
 
 ## ★★ A MISTYPED OR NOT-YET-BUILT SUBCOMMAND IS SILENTLY SWALLOWED AS A URL
 
-**Found on oc, 2026-07-31, while checking whether the engine had been deployed.
+**Found on a headless host, 2026-07-31, while checking whether the engine had been deployed.
 It produced a false deployment report.**
 
 `ychrome` takes a positional `[URL]`, so **any bare word in argv position 1 is
@@ -337,6 +337,6 @@ injection question — see `dream-detached-agent-surfaces.md` §5.
 
 **Deploy state at time of writing:** the GUI host has the new binary with a **stale
 daemon** (pid 3857563, up 54,310 s, answering `{"error":"unknown op","stale":
-true}`); dev and oc still have the old binary. `ychrome status` diagnoses this
+true}`); dev and a headless host still have the old binary. `ychrome status` diagnoses this
 correctly and refuses to retire under the operator's 3 live surfaces —
 `ychrome daemon restart` is the handover and is the operator's call.

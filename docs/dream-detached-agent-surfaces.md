@@ -1,6 +1,6 @@
 # Dream: an agent surface the operator never sees
 
-**Field report from oc, 2026-07-31.** Written for the agent finishing the ychrome
+**Field report from a headless host, 2026-07-31.** Written for the agent finishing the ychrome
 work on dev. It is deliberately organised as *established / unresolved / how to
 settle it*, because this investigation produced two confident wrong answers
 before it produced a useful one, and the wrongness is the most transferable part.
