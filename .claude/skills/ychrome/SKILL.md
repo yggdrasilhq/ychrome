@@ -170,7 +170,12 @@ ychrome-vault configure --server https://vault.example.com --email you@example.c
 read -rs PW; echo "$PW" | ychrome-vault unlock
 ychrome-vault list                     # name<TAB>user<TAB>folder   (--json for exact bytes)
 ychrome-vault get NAME [USER]          # --field password|username|totp|totp-secret|notes
-ychrome-vault totp NAME [USER]         # 6-digit code
+ychrome-vault totp NAME [USER]         # 6-digit code; REFUSES on an
+                                       # undisciplined host clock
+                                       # (--ignore-clock waives)
+ychrome-vault clock                    # the kernel's own NTP state, as JSON.
+                                       # ⚠ chrony's Last/RMS offset lines report
+                                       # perfect tracking on a host 72 s out
 ychrome-vault card NAME [USER]         # brand<TAB>holder<TAB>expM<TAB>expY<TAB>last4
 ychrome-vault match HOST               # strict: the ONE entry an auto-fill may use
 ychrome-vault suggest HOST             # loose: rows the sidebar floats up (secret-free)

@@ -90,8 +90,28 @@ enum Command {
         field: GetField,
     },
     /// Print an item's current TOTP code — `rbw code` parity.
+    ///
+    /// Refuses on a host whose kernel says its clock is not disciplined: a
+    /// 30 s window tolerates one window of skew, and manin was 72 s out while
+    /// minting confident, always-wrong codes. `--ignore-clock` waives that
+    /// after you have read what is wrong; `ychrome-vault clock` shows it.
     #[command(alias = "code")]
-    Totp { name: String, user: Option<String> },
+    Totp {
+        name: String,
+        user: Option<String>,
+        /// Mint anyway on an undisciplined clock. The code will very probably
+        /// be rejected; this exists for a host you have verified by other means.
+        #[arg(long)]
+        ignore_clock: bool,
+    },
+    /// Print what the KERNEL says about this host's clock, as JSON.
+    ///
+    /// Needs no unlock. ⚠ Do NOT diagnose from `chronyc tracking`'s
+    /// `Last offset`/`RMS offset` — they reported perfect tracking on a host
+    /// that was 72 s out. `timedatectl`'s `System clock synchronized:` and
+    /// `chronyc tracking`'s `System time :` are the lines that tell the truth,
+    /// and this verb reads the same kernel state they do.
+    Clock,
     /// List an item's stored passkeys as `rpId<TAB>user<TAB>credentialId<TAB>created`.
     ///
     /// Metadata only — the passkey private key is never printed, and a listing
@@ -463,10 +483,22 @@ fn main() -> Result<()> {
             println!("{}", required_field(&reply, key, &name)?);
             Ok(())
         }
-        Command::Totp { name, user } => {
-            let response =
-                agent::request(&dir, &json!({"op": "totp", "name": name, "user": user}))?;
+        Command::Totp {
+            name,
+            user,
+            ignore_clock,
+        } => {
+            let response = agent::request(
+                &dir,
+                &json!({"op": "totp", "name": name, "user": user,
+                        "ignore_clock": ignore_clock}),
+            )?;
             println!("{}", required_field(&response, "code", &name)?);
+            Ok(())
+        }
+        Command::Clock => {
+            let response = agent::request(&dir, &json!({"op": "clock"}))?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
             Ok(())
         }
         Command::Passkeys { name, user } => {
