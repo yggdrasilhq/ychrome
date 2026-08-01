@@ -127,6 +127,21 @@ pub struct VaultManager {
     /// WITHOUT the master password, which is what makes "unlocked until
     /// locked" true for writes as well as reads.
     refresh_token: Option<Zeroizing<String>>,
+    /// When the in-memory ciphers were last pulled from the server.
+    ///
+    /// ⛔ THE FAILURE THIS EXISTS TO END. A vault that has not synced since the
+    /// morning serves the value it holds with exactly the confidence of a fresh
+    /// one, and nothing says otherwise: on 2026-08-01 a password corrected in
+    /// the official Bitwarden extension was filled from OUR stale copy into a
+    /// sign-in form, and the surface that filled it had no way to say "this is
+    /// from N hours ago". Age is not a diagnostic here, it is the single fact
+    /// that separates a credential from a wrong one.
+    ///
+    /// Set in ONE place — [`VaultManager::mark_synced`] — reached by every path
+    /// that replaces the cipher set (`unlock`, `resync`, and therefore every
+    /// write, which resyncs). Cleared by `lock`, because a locked vault holds no
+    /// ciphers and "synced 3 minutes ago" about nothing is a lie.
+    last_sync: Option<std::time::SystemTime>,
 }
 
 impl VaultManager {
@@ -143,6 +158,7 @@ impl VaultManager {
             vault: None,
             access_token: None,
             refresh_token: None,
+            last_sync: None,
         }
     }
 
@@ -274,7 +290,23 @@ impl VaultManager {
         self.vault = Some(vault);
         self.access_token = Some(Zeroizing::new(token.access_token));
         self.refresh_token = token.refresh_token.map(Zeroizing::new);
+        self.mark_synced();
         Ok(count)
+    }
+
+    /// The ONE writer of [`VaultManager::last_sync`]. Every path that replaces
+    /// the in-memory ciphers ends here, so no caller can refresh the vault
+    /// without refreshing the fact that says how fresh it is.
+    fn mark_synced(&mut self) {
+        self.last_sync = Some(std::time::SystemTime::now());
+    }
+
+    /// When the ciphers were last pulled, as seconds since the unix epoch.
+    /// `None` when the vault is locked or has never synced.
+    pub fn last_sync_unix(&self) -> Option<u64> {
+        self.last_sync
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|since| since.as_secs())
     }
 
     /// Test-only: install an already-decrypted vault, so the agent's op layer
@@ -282,6 +314,10 @@ impl VaultManager {
     #[cfg(test)]
     pub(crate) fn install_vault_for_test(&mut self, vault: Vault) {
         self.vault = Some(vault);
+        // A test vault is "as fresh as it will ever be": the agent tests read
+        // `status`, and a `None` here would make them assert against a state no
+        // unlocked vault can actually be in.
+        self.mark_synced();
     }
 
     /// Everything a successor process needs to keep THIS unlock alive: the user
@@ -333,6 +369,10 @@ impl VaultManager {
         self.vault = None;
         self.access_token = None;
         self.refresh_token = None;
+        // A locked vault holds no ciphers, so it has no freshness to report.
+        // Leaving the old stamp would let the pane say "synced 3 minutes ago"
+        // about nothing.
+        self.last_sync = None;
     }
 
     /// Run an authenticated server call, renewing the bearer ONCE if the server
@@ -493,7 +533,9 @@ impl VaultManager {
         let organization_keys = unwrap_organization_keys(&user_key, &sync)?;
         let vault = self.vault.as_mut().expect("checked");
         vault.replace_contents(organization_keys, sync.ciphers, sync.trashed, sync.folders);
-        Ok(vault.items().len())
+        let count = vault.items().len();
+        self.mark_synced();
+        Ok(count)
     }
 
     fn persist(&self, config: &VaultConfig) -> Result<(), VaultError> {
