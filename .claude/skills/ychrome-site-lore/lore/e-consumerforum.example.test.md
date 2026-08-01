@@ -16,7 +16,7 @@ edaakhil.nic.in returns NXDOMAIN (authoritative nic.in). The Daakhil/OCMS/CMS/Co
 apps were SUBSUMED into the e-ConsumerForum platform (https://e-consumerforum.example.test), live since
 2025-01-01. This is the portal for online consumer-complaint filing (District/State/National
 commissions), Dept of Consumer Affairs, GoI. Court fee NIL for total claim up to Rs5 lakh.
-Note: NIC portals are geo-fenced to India IPs (the GUI host/pi egress Kolkata = fine).
+Note: NIC portals are geo-fenced to India IPs (an India-egress host is fine).
 
 ## Stack / driving notes
 - Heavy React SPA: single ~20MB main.<hash>.js bundle; slow network (~190KB/s) => 60-90s to
@@ -40,7 +40,7 @@ successfully" -> /complete-profile.
 - A 6-digit OTP is sent to BOTH the mobile (SMS) and the email on the FIRST CONTINUE.
 - SMS: sender "BH-EJGRTI-G", body "Your one-time password is NNNNNN on e-ConsumerForum Portal.
   This OTP will be only valid for 15 minutes." Capture via KDE Connect on the phone.
-- Email: only the FIRST CONTINUE emails (sender helpdesk-consumerforum@nic.in). RESEND does NOT
+- Email: only the FIRST CONTINUE emails (sender the portal's published helpdesk address). RESEND does NOT
   email (SMS-only) -> for a fresh email OTP you must restart registration. So prefer the SMS
   channel. (Betterbird headless/tb --sync is flaky here; the phone SMS path is reliable.)
 - Captcha: short TTL (~2-3 min) and single-use. Read it (screenshot+crop+4x zoom of the
@@ -67,7 +67,7 @@ model: claude-opus-5
 date: 2026-07-25
 tags: 
 
-Invisible-co-browse TEST run (2026-07-25 ~11:00-11:35 IST) driving the wmart consumer
+Invisible-co-browse TEST run (2026-07-25 ~11:00-11:35 IST) driving a consumer
 complaint. Login flow fully mapped; filing BLOCKED AT LOGIN, not at the wizard.
 
 ## Login is OTP-only-capable — no password needed to reach the account
@@ -142,7 +142,7 @@ model: claude-opus-5
 date: 2026-07-25
 tags: 
 
-Second invisible-co-browse run (2026-07-25 ~18:35-19:05 IST), same wmart consumer
+Second invisible-co-browse run (2026-07-25 ~18:35-19:05 IST), same consumer
 complaint. **Login still not completed, but for entirely different reasons than run 1:
 the two yggterm blockers run 1 recorded are FIXED, and what stopped this run was the
 portal's own OTP/captcha economics plus a concurrent yggterm deploy.**
@@ -214,8 +214,8 @@ by the presence of a `login` entry in the tap, never by the verb's own `delivere
 BH-EJGRTI-G) — match on the body text "e-ConsumerForum", not the sender id.
 
 ## Credentials — the vault is READ-ONLY right now (do not plan a password change)
-The account password IS in vault item `e-consumerforum.example.test` but only **dev's** agent has that
-cipher; the GUI host's cached set (1112) does not include it and cannot pull it. **Every host 401s
+The account password IS in vault item `e-consumerforum.example.test` but only **one host's** agent has
+that cipher; another host's cached set does not include it and cannot pull it. **Every host 401s
 on any vault WRITE or `sync`** — an unauthenticated `GET /api/sync` returns the identical
 HTML 401, so the agents' access token is simply expired and no refresh path exists without
 the master password. ⇒ the change-password modal must NOT be satisfied by an agent today:
@@ -262,8 +262,8 @@ date: 2026-07-26
 tags: 
 
 A consumer complaint was **filed end to end, invisibly, with no human in the loop**
-on 2026-07-26 (~15:35-16:35 IST) on yggterm 2.12.15. Filing/diary reference
-`<filing-reference>`, District Commission Kolkata-III(South), stage
+on 2026-07-26 (~15:35-16:35 IST) on yggterm 2.12.15. A filing/diary reference was
+returned by the district commission, stage
 "APPLICATION IS SUBMITTED, PENDING FOR SCRUTINY", `finalSubmission` -> 200
 `{"message":"success","data":true}`. Court fee NIL. **Two earlier entries here are
 now WRONG - fix your plan before you start.**
@@ -382,5 +382,5 @@ ELECTION COMMISSION ID CARD, DRIVING LICENSE and ~17 others), an ID number, and 
 `terminal new --no-activate` + `web ensure --session` was fully invisible again -
 one `ensure` at the start (`healed:true, rebuilt_from_daemon_declare:true`), no
 reveal at any point across a ~60-minute session, and the owner's
-`active_session_path` never moved. No deploy interference this run (the GUI host daemon
+`active_session_path` never moved. No deploy interference this run (the GUI host's daemon
 2.12.15 pid stable throughout).

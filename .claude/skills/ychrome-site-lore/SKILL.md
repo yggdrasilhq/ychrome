@@ -18,6 +18,37 @@ cybercrime, PG-portal, Amazon, Flipkart, Meta) is the bottleneck for the
 atlasStore triage runs and for automated trademark filing. Every solved flow
 logged here is one less hurdle next time.
 
+## ⛔ THE LORE IS PUBLIC. Write the METHOD, never the IDENTITY.
+
+This repository is on public GitHub, so every word you log here is published.
+That is the point — a solved flow is worth sharing — but it means **the entry
+must be about the SITE, not about who drove it.**
+
+The split costs nothing, because the private half was never the useful half.
+A reader needs "the OTP arrives from a 6-char alphanumeric sender id, match on
+the body text"; they do not need whose phone it landed on.
+
+| ✅ belongs in lore | ⛔ never in lore |
+|---|---|
+| selectors, routes, DOM traps, timings | e-mail addresses, usernames, account ids |
+| which verb worked and which silently no-opped | phone numbers, OTP codes, case/filing references |
+| the shape of a login or OTP flow | fleet hostnames — say *the GUI host* / *a headless host* |
+| the NAME of a vault entry (`e-consumerforum.example.test`) | the account inside it, or any secret |
+| "an India-egress host is required" | LAN/tailnet addresses, `/home/<user>` paths |
+
+**`lore.py log` refuses an entry carrying these shapes** and names each one it
+found. That gate is at WRITE time on purpose: a check that runs at review time
+runs after the leak is already pushed. `--allow-private` exists and you should
+have to think before typing it.
+
+⚠ **A file you hand-edit bypasses the gate entirely** — the gate only sees what
+goes through `log`. Run **`python3 lore.py scan`** before any push; it exits
+non-zero and names every hit, so it is the check to wire into CI.
+
+If a run genuinely needs the private detail to be recoverable, put it where
+private things live — the vault, or the graph the task belongs to — and have the
+lore entry POINT at it by name.
+
 ## The store (and why it is shaped this way)
 
 - **Source of truth: one Markdown file per domain, `lore/<domain>.md`, committed

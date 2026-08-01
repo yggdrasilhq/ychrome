@@ -152,6 +152,55 @@ def cmd_get(args: argparse.Namespace) -> int:
     return 0
 
 
+#: Shapes that must never reach a lore file, because this repo is PUBLIC.
+#:
+#: Lore is meant to be shareable knowledge — how a site behaves, which selector
+#: works, which trap eats an hour. None of that needs to know WHOSE account ran
+#: it. The private half (who logged in, from which machine, with which case
+#: number) is exactly the half that is worthless to a reader and harmful to
+#: publish, so the split costs nothing and is enforced here rather than left to
+#: whoever reviews the diff.
+#:
+#: Enforced at WRITE time on purpose: a check that runs at review time is a
+#: check that runs after the leak is already committed and pushed.
+#: `(pattern, why, flags)`. Flags are per-pattern because case matters for
+#: exactly one of them: a Unix home is `/home/<user>` in lower case, while
+#: `/Home/Preview` is a ROUTE on a website and belongs in lore. Folding case
+#: for everything turned a legitimate site path into a false positive, and a
+#: checker that cries wolf is one people learn to skip.
+PRIVATE_SHAPES = (
+    (r"\b(?:the GUI host|the hypervisor host)\b", "a fleet hostname — say 'the GUI host' / 'a headless host'", re.I),
+    (r"[A-Za-z0-9._%+-]+@(?!example\.(?:com|org)\b)[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+     "an e-mail address — name the VAULT ENTRY, or 'the site's published helpdesk'", re.I),
+    (r"\b(?:\+?91[-\s]?)?[6-9]\d{9}\b", "a phone number — write 'the registered number'", 0),
+    (r"\b(?:1[0-9]|[1-9])\d{11,}\b", "a case/reference number — say 'the filing reference'", 0),
+    (r"\b(?:19|20)\d{2}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b", "something card-shaped", 0),
+    (r"/home/(?!cart\b)[a-z][a-z0-9_-]*", "a real home directory path", 0),
+    (r"\b(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b",
+     "a private LAN address", 0),
+    (r"\b100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b", "a tailnet address", 0),
+)
+
+
+def scrub_violations(text: str) -> list[str]:
+    """Private shapes found in `text`, each named so the fix is obvious.
+
+    Public and harmless by construction, so deliberately NOT flagged: loopback
+    and public resolvers, `example.com` addresses, and a site's own published
+    support address is still caught — quote it as `<site>'s published helpdesk`
+    if you need it, because a checker that guesses intent is a checker people
+    learn to bypass.
+    """
+    out = []
+    for pattern, why, flags in PRIVATE_SHAPES:
+        for m in re.finditer(pattern, text, flags):
+            hit = m.group(0)
+            if hit in ("127.0.0.1", "1.1.1.1", "8.8.8.8", "0.0.0.0"):
+                continue
+            out.append(f"{hit!r} — {why}")
+    return sorted(set(out))
+
+
 def cmd_log(args: argparse.Namespace) -> int:
     status = args.status.upper()
     if status not in STATUSES:
@@ -162,6 +211,21 @@ def cmd_log(args: argparse.Namespace) -> int:
         body = Path(args.body_file).read_text(encoding="utf-8")
     if body is None:
         body = sys.stdin.read() if not sys.stdin.isatty() else ""
+    # ⛔ THE GATE. This repo is public; lore is the part of it most likely to
+    # carry an identity, because it is written straight out of a live run.
+    bad = scrub_violations(
+        "\n".join(filter(None, [body, args.task, args.slug, args.tags]))
+    )
+    if bad and not args.allow_private:
+        print(
+            "refusing to log: this entry carries private data and the lore is PUBLIC.\n"
+            + "\n".join(f"  - {b}" for b in bad)
+            + "\n\nRewrite it so the METHOD survives and the IDENTITY does not — that is"
+            "\nall a reader needs. `--allow-private` overrides, and you should have to"
+            "\nthink before typing it.",
+            file=sys.stderr,
+        )
+        return 2
     dom = _normalize_domain(args.domain)
     path = _site_path(dom)
     entry = Entry(
@@ -186,6 +250,29 @@ def cmd_log(args: argparse.Namespace) -> int:
     with path.open("a", encoding="utf-8") as fh:
         fh.write("\n" + entry.to_markdown())
     print(f"logged {dom} · {entry.slug} ({status}) -> {path}")
+    return 0
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
+    """Audit every committed lore file. Exit 1 on any hit, so CI can gate on it.
+
+    The write-time gate in `log` only sees entries written THROUGH it; a file
+    hand-edited in an editor bypasses it entirely. This is the sweep that
+    catches that, and it is the one to run before a push.
+    """
+    total = 0
+    for path in _all_sites():
+        bad = scrub_violations(path.read_text(encoding="utf-8"))
+        if bad:
+            total += len(bad)
+            print(f"{path.name}:")
+            for b in bad:
+                print(f"  - {b}")
+    if total:
+        print(f"\n{total} private-data hit(s). The lore repo is PUBLIC — rewrite, "
+              f"do not publish.", file=sys.stderr)
+        return 1
+    print(f"clean — {len(_all_sites())} site file(s), no private data")
     return 0
 
 
@@ -283,6 +370,17 @@ def main(argv: list[str] | None = None) -> int:
     lg.add_argument("--tags", default="", help="comma,separated")
     lg.add_argument("--body", default=None, help="method body; omit to read stdin")
     lg.add_argument("--body-file", default=None, help="read body from a file")
+    lg.add_argument(
+        "--allow-private",
+        action="store_true",
+        help="write an entry the private-data gate rejected. The lore is PUBLIC; "
+        "prefer rewriting so the method survives and the identity does not.",
+    )
+
+    sc = sub.add_parser(
+        "scan", help="check every lore file for private data (the CI-shaped check)"
+    )
+    sc.set_defaults(fn=cmd_scan)
     lg.set_defaults(fn=cmd_log)
 
     s = sub.add_parser("search", help="grep entries across every site")

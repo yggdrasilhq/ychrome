@@ -51,7 +51,7 @@ no ychrome surface. Login succeeded on the FIRST attempt, 2026-07-26; 46 grievan
 | account identity (confirm which login you are on) | `/EditProfile` — shows Username, Name, mobile, e-mail unmasked |
 | login history | `/AuditTrail` — **empty in practice**, do not rely on it |
 
-The status page masks mobile/e-mail (`84xxxxxxx39`, `fixxxx…u@gmail.com`); `/EditProfile` does not.
+The status page masks mobile/e-mail (`NN xxxxxxx NN`, `fixxxx…@example.com`); `/EditProfile` does not.
 
 ### Public tracker as an EXISTENCE PROBE (no login needed)
 
@@ -84,6 +84,6 @@ detail) also render this way once `<script>` tags are stripped — images 404 bu
   `/NewGrievance`, `/ChangePassword`, `/AccountDeletion`. Reads are free; anything that lodges,
   reminds, rates or appeals is a state change on a government portal and needs the operator.
 - `ychrome-vault get "<name>" <user>` CANNOT disambiguate two vault items sharing a username
-  ("matches 2 accounts — name one: avikalpa, avikalpa") and `get` does not accept an item id.
+  ("matches 2 accounts — name one: <user>, <user>") and `get` does not accept an item id.
   `ychrome-vault match <host>` resolves one item and was the way out. Worth teaching `get` to
   take an id.
