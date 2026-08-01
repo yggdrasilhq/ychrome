@@ -103,7 +103,28 @@ record) and `Vault::edit_body` patches **that**:
 - `revisionDate` is echoed as `lastKnownRevisionDate`, so a stale client is
   **refused** instead of clobbering a concurrent edit.
 - Replacing a password prepends the old ciphertext to `passwordHistory`.
-- Clearing a field is rejected rather than encrypting `""`.
+- Setting a field to `""` is rejected rather than encrypting an empty string.
+  Removing a value is a SEPARATE request, `--clear <notes|totp|username|uri|folder>`
+  — one owner, `model::ClearField`. There is no `--clear password` on purpose.
+- **Custom fields are editable too** (`--set-field NAME=VALUE`,
+  `--set-hidden-field NAME` reading the value from stdin, `--remove-field NAME`).
+  The field ENTRY is mutated, never rebuilt — it carries `linkedId` and future
+  keys. `--set-field` on an already-hidden field KEEPS it hidden: updating a
+  secret must never expose it. A linked field, a duplicated name, and removing a
+  field that is not there are all refused rather than guessed.
+- **`--uri` is a repeatable list**, and a uri the item already stores is carried
+  over as its stored OBJECT — a uri is not a string, it carries `match` and
+  `uriChecksum`.
+- ⛔ **Every edit is RE-READ before it is reported.** A 200 from `PUT` says the
+  server took a body, not that the field landed. `edit_item` re-syncs, runs
+  `Vault::verify_edit`, and fails the whole edit if a change is not visible. The
+  reply's `verified` list carries field LABELS (`password`, `field:API Key`,
+  `clear:notes`), never values — and its ABSENCE is how the CLI detects an agent
+  too old to have checked, which would otherwise have ignored every new argument
+  in silence.
+- ⚠ **Absent is not empty on the write side either.** The agent's decoder used to
+  drop an empty value, so `--notes ""` arrived as "no fields named". `edit_value`
+  preserves it so `edit_body` refuses it. Found by the live round trip.
 
 ### Two unlocked agents WILL go stale against each other
 
@@ -181,6 +202,12 @@ ychrome-vault match HOST               # strict: the ONE entry an auto-fill may 
 ychrome-vault suggest HOST             # loose: rows the sidebar floats up (secret-free)
 ychrome-vault add NAME [USER] --generate --uri https://...
 ychrome-vault edit NAME [USER] --generate            # rotate; everything else preserved
+ychrome-vault edit NAME --rename TITLE --set-user U --notes N --folder F
+ychrome-vault edit NAME --uri URL --uri URL2         # replaces the whole list
+ychrome-vault edit NAME --set-field "API Key=v"      # custom fields, at last
+ychrome-vault edit NAME --set-hidden-field NAME      # value from STDIN, like a password
+ychrome-vault edit NAME --remove-field NAME
+ychrome-vault edit NAME --clear notes --clear totp   # remove, not blank
 ychrome-vault rm NAME [USER]           # -> TRASH.  --permanent destroys it.
 ychrome-vault generate 24              # local dice, no vault touched
 ychrome-vault sync | lock | stop-agent | ping | status | diagnose | check
@@ -272,6 +299,14 @@ what you touched. `cargo clippy` has 3 pre-existing warnings and one pre-existin
 ```sh
 # Crypto end-to-end, in-process, leaving any running agent alone:
 read -rs PW; echo "$PW" | ychrome-vault check
+
+# The WHOLE edit surface, end to end, against a scratch server you own — never
+# the operator's vault (it registers its own account and creates its own items):
+docker run -d --name ychrome-vault-scratch -e SIGNUPS_ALLOWED=true \
+  -e ROCKET_PORT=8080 -e I_REALLY_WANT_VOLATILE_STORAGE=true \
+  -p 127.0.0.1:8087:8080 vaultwarden/server:latest
+YCHROME_VAULT_TEST_SERVER=http://127.0.0.1:8087 \
+  cargo test -p ychrome-vault --test live_edit -- --ignored --nocapture
 
 # Prove an edit preserved an UNMODELLED field (the whole point of raw retention):
 ychrome-vault edit ITEM --notes "stamp"
@@ -665,6 +700,40 @@ Shape: **agent drives, operator approves once at the GUI.** A page can only
 trigger a ceremony, never answer one. Do not propose an auto-consent path.
 
 ⚠ Still owed: full crypto E2E against a real relying party.
+
+### ⛔ THE SHIM IS PER-ORIGIN NOW, AND THAT HAS TWO SHARP EDGES
+
+Since `e3aaa9d` the `navigator.credentials` shim is installed ONLY on the rpIds
+the vault holds a passkey for (an unconditional shim advertised a platform
+authenticator WebKitGTK does not have, and bot checks read it). Both edges bit
+on 2026-08-01 — see `docs/pending-bugs.md`.
+
+1. **The browser needs the agent's `passkey-hosts` op, and an agent outlives its
+   binary.** An agent that predates it turns passkeys off on EVERY site while
+   `status` reads perfectly healthy. **`agent_stale` cannot see this** — it
+   compares the agent against the INSTALLED binary, and both are the old one.
+   Ask the socket directly:
+
+   ```sh
+   printf '{"op":"passkey-hosts"}\n' | nc -U ~/.yggterm/vault/agent.sock
+   # unknown op  =>  passkeys are OFF everywhere on this host
+   ```
+
+   Remedy, **in this order**: install the current `ychrome-vault`, THEN
+   `ychrome-vault handover` (it execs the *installed* binary, so a stale
+   installed binary makes the handover a no-op). The vault pane now shows this
+   state with a one-click button; a stderr line reached nobody.
+
+2. **The shim is chosen when a SURFACE OPENS.** yggterm applies userscripts at
+   surface creation and refetches `/policy` only when `policy_version` moves, so
+   a vault that becomes usable later does not reach an open surface. The stamp
+   now covers `agent.pid` and the installed vault binary (stat-only — never put
+   a socket call on that path), but a plain lock -> unlock still needs the
+   surface REOPENED.
+
+3. ⚠ **You cannot ENROL a passkey on a site you have none for** — no passkey
+   means no shim means no `create()`. Every credential in this vault came from
+   another browser. Do not "fix" this by widening the scope back.
 
 
 ## The agent engine (`src/engine/`) — headless browsing, `ychrome ctl`
