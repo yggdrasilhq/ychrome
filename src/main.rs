@@ -1504,7 +1504,7 @@ mod second_invocation_tests {
             "localhost:3000",
             "about:blank",
             "198.51.100.1",
-            "oi.gour.top/c/abc",
+            "oi.example.com/c/abc",
         ] {
             assert!(
                 !looks_like_a_bare_subcommand(url),

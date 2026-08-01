@@ -649,7 +649,7 @@ anything a framework renders asynchronously. An unmet wait returns
 `{"met": false, "reason": …}` — a fact to branch on, never an exception.
 
 Worked examples: `assets/engine-recipes/{crawl-and-extract,form-fill,watch-page-until}.sh`.
-`run-all.sh` runs all three; green on dev, the GUI host and oc.
+`run-all.sh` runs all three; green on dev, the GUI host and a headless host.
 
 ### What the engine gives you that a lab browser cannot
 
