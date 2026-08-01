@@ -99,27 +99,124 @@ const SERVER_MANAGED_KEYS: &[&str] = &[
 /// How many past passwords Bitwarden's clients keep on an item.
 const PASSWORD_HISTORY_LIMIT: usize = 5;
 
-/// A change to an existing cipher. Only the `Some` fields are touched; every
+/// A field an edit REMOVES rather than replaces.
+///
+/// Setting and clearing are genuinely different operations and the "no empty
+/// value" rule cannot express the second: `--notes ""` would encrypt an empty
+/// string, which is a stored value, not an absent one. So clearing is asked for
+/// by name — and by ONE name, this enum, rather than a `clear_x` flag per field
+/// that the CLI, the wire and the patcher could each spell differently.
+///
+/// There is deliberately no `Password`. Removing a password destroys a secret
+/// with nothing to recover it from: `passwordHistory` records a REPLACEMENT, and
+/// an item with no password at all is what `rm` is for (which trashes, and is
+/// restorable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ClearField {
+    Notes,
+    Totp,
+    Username,
+    /// The whole uri list.
+    Uri,
+    /// Move the item out of every folder (back to "no folder").
+    Folder,
+}
+
+impl ClearField {
+    /// The name the user typed and the error messages quote. One owner, so the
+    /// CLI's accepted values, the wire and the refusals cannot drift.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ClearField::Notes => "notes",
+            ClearField::Totp => "totp",
+            ClearField::Username => "username",
+            ClearField::Uri => "uri",
+            ClearField::Folder => "folder",
+        }
+    }
+
+    /// Parse the same spelling back off the wire. `None` for anything else —
+    /// a client naming a field this build does not know must be refused, never
+    /// silently ignored.
+    pub fn parse(name: &str) -> Option<Self> {
+        [
+            ClearField::Notes,
+            ClearField::Totp,
+            ClearField::Username,
+            ClearField::Uri,
+            ClearField::Folder,
+        ]
+        .into_iter()
+        .find(|candidate| candidate.as_str() == name)
+    }
+
+    /// Only meaningful on a login cipher.
+    fn is_login_only(self) -> bool {
+        matches!(
+            self,
+            ClearField::Totp | ClearField::Username | ClearField::Uri
+        )
+    }
+}
+
+/// Which custom-field type a [`FieldEdit::Set`] writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    /// Create a plain-text field. On a field that ALREADY exists the stored type
+    /// wins, so setting a value on a hidden field cannot silently downgrade a
+    /// secret into one every client renders in the clear.
+    Text,
+    /// Create the field hidden, or convert an existing one to hidden.
+    Hidden,
+}
+
+/// One change to an item's custom fields. Names match case-insensitively, the
+/// same way `fields --field-name` reads them back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldEdit {
+    /// Replace the named field's value, appending the field if it is absent.
+    Set {
+        name: String,
+        value: String,
+        kind: FieldKind,
+    },
+    /// Drop the named field entirely. An absent name is an ERROR, not a no-op:
+    /// "there was nothing to remove" and "removed it" are different facts, and
+    /// reporting the second for the first is the lie-of-success this crate
+    /// treats as worse than a failure.
+    Remove { name: String },
+}
+
+impl FieldEdit {
+    pub fn name(&self) -> &str {
+        match self {
+            FieldEdit::Set { name, .. } | FieldEdit::Remove { name } => name,
+        }
+    }
+}
+
+/// A change to an existing cipher. Only the named parts are touched; every
 /// other field of the item survives verbatim.
 ///
-/// There is deliberately no way to CLEAR a field: `Some("")` is rejected rather
-/// than quietly encrypting an empty string. Clearing needs its own verb with
-/// its own confirmation, and guessing would be the kind of silent data loss
-/// this whole struct exists to prevent.
+/// Setting a field to `Some("")` is rejected rather than quietly encrypting an
+/// empty string — that is what [`ClearField`] is for, and guessing between the
+/// two would be the kind of silent data loss this whole struct exists to
+/// prevent.
 #[derive(Debug, Clone, Default)]
 pub struct CipherEdit {
     pub name: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
     pub totp: Option<String>,
-    /// Replaces the item's ENTIRE uri list with this single uri.
-    pub uri: Option<String>,
+    /// Replaces the item's ENTIRE uri list with these, in order. Empty means
+    /// "leave the uris alone"; use [`ClearField::Uri`] to remove them all.
+    pub uris: Vec<String>,
     pub notes: Option<String>,
     pub folder_id: Option<String>,
-    /// Clear the item's authenticator secret (set `login.totp` to null). Unlike
-    /// the value fields, this REMOVES rather than replaces — the one thing the
-    /// "no empty value" rule cannot express. Mutually exclusive with `totp`.
-    pub clear_totp: bool,
+    /// Custom-field changes, applied in order.
+    pub fields: Vec<FieldEdit>,
+    /// Fields to REMOVE. Ordered so an edit's shape is deterministic.
+    pub clear: std::collections::BTreeSet<ClearField>,
 }
 
 impl CipherEdit {
@@ -128,10 +225,11 @@ impl CipherEdit {
             && self.username.is_none()
             && self.password.is_none()
             && self.totp.is_none()
-            && self.uri.is_none()
+            && self.uris.is_empty()
             && self.notes.is_none()
             && self.folder_id.is_none()
-            && !self.clear_totp
+            && self.fields.is_empty()
+            && self.clear.is_empty()
     }
 
     /// Whether the edit touches a field that only exists on a login cipher.
@@ -139,8 +237,38 @@ impl CipherEdit {
         self.username.is_some()
             || self.password.is_some()
             || self.totp.is_some()
-            || self.clear_totp
-            || self.uri.is_some()
+            || !self.uris.is_empty()
+            || self.clear.iter().any(|field| field.is_login_only())
+    }
+
+    /// The set-side twin of a clear, so "set and clear in one edit" can be
+    /// refused for every field from one place instead of one `if` per field.
+    fn also_set(&self, field: ClearField) -> bool {
+        match field {
+            ClearField::Notes => self.notes.is_some(),
+            ClearField::Totp => self.totp.is_some(),
+            ClearField::Username => self.username.is_some(),
+            ClearField::Uri => !self.uris.is_empty(),
+            ClearField::Folder => self.folder_id.is_some(),
+        }
+    }
+}
+
+/// What a re-read found after an edit was written. Field LABELS only — a
+/// verification that echoed values would put a password in every caller's
+/// `--json` output, which is the one thing this crate never does.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct EditVerification {
+    /// Changes confirmed present on the freshly synced item.
+    pub landed: Vec<String>,
+    /// Changes the re-read could NOT confirm. Non-empty means the write must be
+    /// reported as a failure however cleanly the `PUT` returned.
+    pub missing: Vec<String>,
+}
+
+impl EditVerification {
+    pub fn is_complete(&self) -> bool {
+        self.missing.is_empty()
     }
 }
 
@@ -152,10 +280,27 @@ pub enum EditError {
     NoRawRecord(String),
     #[error("{0} is not a login item, so it has no username, password, totp or uri")]
     NotALogin(String),
-    #[error("refusing to set a field to the empty string; clearing a field is not supported")]
+    #[error(
+        "refusing to set a field to the empty string; to remove a value use \
+         `--clear <field>` or `--remove-field <name>`"
+    )]
     EmptyValue,
-    #[error("cannot set and clear the totp in one edit; pass either --totp or --clear-totp")]
-    ClearAndSetTotp,
+    #[error("cannot set and clear {0} in one edit; ask for one or the other")]
+    ClearAndSet(&'static str),
+    #[error("this edit names the custom field {0:?} more than once")]
+    RepeatedField(String),
+    #[error(
+        "the item carries {1} custom fields named {0:?}; this vault will not guess \
+         which one to change"
+    )]
+    AmbiguousField(String, usize),
+    #[error("the item has no custom field named {0:?}")]
+    NoSuchField(String),
+    #[error(
+        "custom field {0:?} is a LINKED field: it points at the item's own username \
+         or password and stores no value of its own"
+    )]
+    LinkedField(String),
     #[error(transparent)]
     Crypto(#[from] CryptoError),
 }
@@ -825,19 +970,42 @@ impl Vault {
         if edit.touches_login() && cipher.item_type != CIPHER_TYPE_LOGIN {
             return Err(EditError::NotALogin(id.to_string()));
         }
-        if edit.clear_totp && edit.totp.is_some() {
-            return Err(EditError::ClearAndSetTotp);
+        for cleared in &edit.clear {
+            if edit.also_set(*cleared) {
+                return Err(EditError::ClearAndSet(cleared.as_str()));
+            }
         }
         for value in [
             &edit.name,
             &edit.username,
             &edit.password,
             &edit.totp,
-            &edit.uri,
             &edit.notes,
         ] {
             if value.as_deref().is_some_and(str::is_empty) {
                 return Err(EditError::EmptyValue);
+            }
+        }
+        if edit.uris.iter().any(String::is_empty) {
+            return Err(EditError::EmptyValue);
+        }
+        // A custom field named twice in one edit has no defined outcome — the
+        // second write would silently win, or the remove would, depending on
+        // order. Refuse instead of picking.
+        for (index, change) in edit.fields.iter().enumerate() {
+            if change.name().is_empty() {
+                return Err(EditError::EmptyValue);
+            }
+            if let FieldEdit::Set { value, .. } = change
+                && value.is_empty()
+            {
+                return Err(EditError::EmptyValue);
+            }
+            if edit.fields[..index]
+                .iter()
+                .any(|earlier| earlier.name().eq_ignore_ascii_case(change.name()))
+            {
+                return Err(EditError::RepeatedField(change.name().to_string()));
             }
         }
         let raw = cipher
@@ -886,18 +1054,60 @@ impl Vault {
         if let Some(totp) = &edit.totp {
             set_ci(&mut login, "totp", encrypt(totp)?);
         }
-        if edit.clear_totp {
-            // The server does `login.totp = data.login.totp`, so an explicit
-            // null wipes the authenticator secret; omitting the key would leave
-            // it untouched, hence we set null rather than remove.
-            set_ci(&mut login, "totp", Value::Null);
+        if !edit.uris.is_empty() {
+            // ⛔ REUSE THE STORED ENTRY FOR A URI THAT IS NOT CHANGING. A uri is
+            // an OBJECT, not a string: beside `uri` it carries `match` (the per-
+            // uri match type the user chose in another client) and, on newer
+            // servers, `uriChecksum` — plus whatever Bitwarden adds next. Minting
+            // a fresh `{uri, match: null}` for a uri the item already has would
+            // silently discard all of that, which is the same data loss that
+            // raw-patching exists to prevent, one level down.
+            let stored = get_ci(&login, "uris")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let existing = |wanted: &str| -> Option<Value> {
+                stored
+                    .iter()
+                    .find(|entry| {
+                        entry
+                            .as_object()
+                            .and_then(|entry| get_ci(entry, "uri"))
+                            .and_then(Value::as_str)
+                            .and_then(|text| EncString::parse(text).ok())
+                            .and_then(|enc| key.decrypt_to_string(&enc).ok())
+                            .is_some_and(|text| text == wanted)
+                    })
+                    .cloned()
+            };
+            let mut uris = Vec::with_capacity(edit.uris.len());
+            for uri in &edit.uris {
+                match existing(uri) {
+                    Some(entry) => uris.push(entry),
+                    None => uris.push(json!({ "uri": encrypt(uri)?, "match": Value::Null })),
+                }
+            }
+            set_ci(&mut login, "uris", Value::Array(uris));
         }
-        if let Some(uri) = &edit.uri {
-            set_ci(
-                &mut login,
-                "uris",
-                json!([{ "uri": encrypt(uri)?, "match": Value::Null }]),
-            );
+        for change in &edit.fields {
+            apply_field_edit(&mut body, change, &key)?;
+        }
+        // Clears run LAST so that, whatever order the caller built the edit in,
+        // a set and a clear of the same field can never both apply — the refusal
+        // above is the only outcome, and this cannot quietly become a
+        // last-writer-wins.
+        for cleared in &edit.clear {
+            // The server assigns unconditionally (`cipher.notes = data.notes`),
+            // so an explicit null WIPES the field; omitting the key would leave
+            // whatever we copied out of the raw record in place. Null, never
+            // remove.
+            match cleared {
+                ClearField::Notes => set_ci(&mut body, "notes", Value::Null),
+                ClearField::Folder => set_ci(&mut body, "folderId", Value::Null),
+                ClearField::Totp => set_ci(&mut login, "totp", Value::Null),
+                ClearField::Username => set_ci(&mut login, "username", Value::Null),
+                ClearField::Uri => set_ci(&mut login, "uris", Value::Null),
+            }
         }
         if let Some(history) = history {
             set_ci(&mut body, "passwordHistory", history);
@@ -909,6 +1119,104 @@ impl Vault {
             set_ci(&mut body, "lastKnownRevisionDate", revision);
         }
         Ok(Value::Object(body))
+    }
+
+    /// Which of an edit's named changes are actually on the item NOW.
+    ///
+    /// ⛔ A WRITE THAT REPORTS SUCCESS WITHOUT LOOKING IS THE LIE-OF-SUCCESS
+    /// SHAPE THIS CRATE TREATS AS WORSE THAN A FAILURE. `PUT` returning 200 and
+    /// a resync completing say the server accepted a body; neither says the
+    /// field the user asked for is what they asked it to be. Run this AFTER the
+    /// resync and refuse to report an edit that did not land.
+    ///
+    /// Labels only, never values: a custom field's NAME travels (the card audit
+    /// line already sets that precedent), its value never does.
+    pub fn verify_edit(&self, id: &str, edit: &CipherEdit) -> EditVerification {
+        let mut verification = EditVerification::default();
+        let Some(cipher) = self.find(id) else {
+            verification.missing.push("item".into());
+            return verification;
+        };
+        let decrypted = |enc: Option<&EncString>| -> Option<String> {
+            let key = self.cipher_key(cipher).ok()?;
+            key.decrypt_to_string(enc?).ok()
+        };
+        let mut check = |label: &str, ok: bool| {
+            if ok {
+                verification.landed.push(label.to_string());
+            } else {
+                verification.missing.push(label.to_string());
+            }
+        };
+
+        if let Some(name) = &edit.name {
+            check(
+                "name",
+                decrypted(cipher.name.as_ref()).as_ref() == Some(name),
+            );
+        }
+        if let Some(username) = &edit.username {
+            check(
+                "username",
+                decrypted(cipher.username.as_ref()).as_ref() == Some(username),
+            );
+        }
+        if let Some(password) = &edit.password {
+            check(
+                "password",
+                decrypted(cipher.password.as_ref()).as_ref() == Some(password),
+            );
+        }
+        if let Some(totp) = &edit.totp {
+            check("totp", self.totp_secret(id).as_ref() == Some(totp));
+        }
+        if !edit.uris.is_empty() {
+            check("uri", self.uris_of(cipher) == edit.uris);
+        }
+        if let Some(notes) = &edit.notes {
+            check("notes", self.notes(id).as_ref() == Some(notes));
+        }
+        if let Some(folder_id) = &edit.folder_id {
+            check("folder", cipher.folder_id.as_ref() == Some(folder_id));
+        }
+        for change in &edit.fields {
+            let stored = self
+                .fields(id)
+                .into_iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(change.name()));
+            let label = format!("field:{}", change.name());
+            let ok = match change {
+                FieldEdit::Set { value, .. } => {
+                    stored.map(|(_, held)| held) == Some(FieldValue::Value(value.clone()))
+                }
+                FieldEdit::Remove { .. } => stored.is_none(),
+            };
+            check(&label, ok);
+        }
+        for cleared in &edit.clear {
+            let gone = match cleared {
+                ClearField::Notes => self.notes(id).is_none(),
+                ClearField::Totp => cipher.totp.is_none(),
+                ClearField::Username => cipher.username.is_none(),
+                ClearField::Uri => self.uris_of(cipher).is_empty(),
+                ClearField::Folder => cipher.folder_id.is_none(),
+            };
+            check(&format!("clear:{}", cleared.as_str()), gone);
+        }
+        verification
+    }
+
+    /// One cipher's decrypted uris, in stored order. Undecryptable entries are
+    /// dropped, exactly as `items()` does.
+    fn uris_of(&self, cipher: &RawCipher) -> Vec<String> {
+        let Ok(key) = self.cipher_key(cipher) else {
+            return Vec::new();
+        };
+        cipher
+            .uris
+            .iter()
+            .filter_map(|enc| key.decrypt_to_string(enc).ok())
+            .collect()
     }
 
     /// The user key, so a resync can re-unwrap organization keys without the
@@ -1187,6 +1495,105 @@ fn decrypt_or_plain(key: &SymmetricKey, value: &serde_json::Value) -> Option<Str
 fn last_four(number: &str) -> Option<String> {
     let digits: String = number.chars().filter(char::is_ascii_digit).collect();
     (digits.len() >= 4).then(|| digits[digits.len() - 4..].to_string())
+}
+
+/// Bitwarden's custom-field `type` discriminants. A LINKED field is the one
+/// that matters here: it stores no value of its own, so writing one would be
+/// meaningless rather than merely wrong.
+const FIELD_TYPE_TEXT: u64 = 0;
+const FIELD_TYPE_HIDDEN: u64 = 1;
+const FIELD_TYPE_LINKED: u64 = 3;
+
+/// Apply one custom-field change to the cipher body, in place.
+///
+/// Custom fields live on the RAW record and `sync` never parses them into
+/// [`RawCipher`] — the same reason [`Vault::notes`] reads raw. Editing them
+/// therefore means patching this array, and every property of the field the
+/// caller did NOT name (its type, its `linkedId`, anything Bitwarden adds
+/// later) has to survive: the entry object is mutated, never rebuilt.
+fn apply_field_edit(
+    body: &mut JsonMap,
+    change: &FieldEdit,
+    key: &SymmetricKey,
+) -> Result<(), EditError> {
+    let mut fields: Vec<serde_json::Value> = get_ci(body, "fields")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    // Match on the DECRYPTED name, case-insensitively — the same rule
+    // `fields --field-name` reads by, so what the user can see is what they can
+    // change. An undecryptable name simply does not match; it is not this
+    // edit's business and it stays put.
+    let matched: Vec<usize> = fields
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| {
+            field
+                .as_object()
+                .and_then(|field| get_ci(field, "name"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|text| EncString::parse(text).ok())
+                .and_then(|enc| key.decrypt_to_string(&enc).ok())
+                .is_some_and(|name| name.eq_ignore_ascii_case(change.name()))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    // Bitwarden permits duplicate field names, so this is a real shape and not a
+    // hypothetical. Guessing which one the user meant could overwrite the wrong
+    // secret, and there is no undo for that.
+    if matched.len() > 1 {
+        return Err(EditError::AmbiguousField(
+            change.name().to_string(),
+            matched.len(),
+        ));
+    }
+    let at = matched.first().copied();
+
+    match change {
+        FieldEdit::Remove { name } => {
+            let Some(at) = at else {
+                return Err(EditError::NoSuchField(name.clone()));
+            };
+            fields.remove(at);
+        }
+        FieldEdit::Set { name, value, kind } => {
+            let encrypted = serde_json::json!(key.encrypt_string(value)?.to_string());
+            match at {
+                Some(at) => {
+                    let field = fields[at]
+                        .as_object_mut()
+                        .ok_or_else(|| EditError::NoSuchField(name.clone()))?;
+                    let stored_type = get_ci(field, "type")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(FIELD_TYPE_TEXT);
+                    if stored_type == FIELD_TYPE_LINKED {
+                        return Err(EditError::LinkedField(name.clone()));
+                    }
+                    // ⛔ `Text` means "do not change the visibility", not "make
+                    // it text". Setting a new value on a HIDDEN field must not
+                    // downgrade it to one every Bitwarden client renders in the
+                    // clear — that would expose a secret as a side effect of
+                    // updating it. Only an explicit `Hidden` changes the type.
+                    if *kind == FieldKind::Hidden {
+                        set_ci(field, "type", serde_json::json!(FIELD_TYPE_HIDDEN));
+                    }
+                    set_ci(field, "value", encrypted);
+                }
+                None => fields.push(serde_json::json!({
+                    "name": key.encrypt_string(name)?.to_string(),
+                    "value": encrypted,
+                    "type": match kind {
+                        FieldKind::Text => FIELD_TYPE_TEXT,
+                        FieldKind::Hidden => FIELD_TYPE_HIDDEN,
+                    },
+                    "linkedId": serde_json::Value::Null,
+                })),
+            }
+        }
+    }
+    set_ci(body, "fields", serde_json::Value::Array(fields));
+    Ok(())
 }
 
 fn get_ci<'a>(object: &'a JsonMap, key: &str) -> Option<&'a serde_json::Value> {
@@ -1941,7 +2348,7 @@ mod tests {
             .edit_body(
                 "c1",
                 &CipherEdit {
-                    clear_totp: true,
+                    clear: [ClearField::Totp].into_iter().collect(),
                     ..Default::default()
                 },
             )
@@ -1960,17 +2367,74 @@ mod tests {
             "c1",
             &CipherEdit {
                 totp: Some("JBSWY3DPEHPK3PXP".into()),
-                clear_totp: true,
+                clear: [ClearField::Totp].into_iter().collect(),
                 ..Default::default()
             },
         );
-        assert!(matches!(error, Err(EditError::ClearAndSetTotp)));
+        assert!(matches!(error, Err(EditError::ClearAndSet("totp"))));
+    }
+
+    // The same refusal for EVERY clearable field, from the one owner. A per-
+    // field `if` is how `--notes X --clear notes` would have quietly become
+    // last-writer-wins on the four fields nobody wrote an `if` for.
+    #[test]
+    fn setting_and_clearing_is_refused_for_every_field() {
+        let vault = login_vault(&[0x5au8; 64]);
+        let cases: [(ClearField, CipherEdit); 5] = [
+            (
+                ClearField::Notes,
+                CipherEdit {
+                    notes: Some("n".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                ClearField::Totp,
+                CipherEdit {
+                    totp: Some("JBSWY3DPEHPK3PXP".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                ClearField::Username,
+                CipherEdit {
+                    username: Some("u".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                ClearField::Uri,
+                CipherEdit {
+                    uris: vec!["https://example.com".into()],
+                    ..Default::default()
+                },
+            ),
+            (
+                ClearField::Folder,
+                CipherEdit {
+                    folder_id: Some("f".into()),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (field, base) in cases {
+            let edit = CipherEdit {
+                clear: [field].into_iter().collect(),
+                ..base
+            };
+            let error = vault.edit_body("c1", &edit);
+            assert!(
+                matches!(&error, Err(EditError::ClearAndSet(named)) if *named == field.as_str()),
+                "setting and clearing {} in one edit must be refused, by name",
+                field.as_str()
+            );
+        }
     }
 
     #[test]
-    fn clear_totp_alone_is_not_an_empty_edit() {
+    fn a_clear_alone_is_not_an_empty_edit() {
         let edit = CipherEdit {
-            clear_totp: true,
+            clear: [ClearField::Totp].into_iter().collect(),
             ..Default::default()
         };
         assert!(!edit.is_empty());
@@ -2543,6 +3007,531 @@ mod tests {
         );
     }
 
+    /// A login whose custom fields are REAL: names and values sealed with the
+    /// vault key, one text, one hidden, one linked (no value at all), plus a
+    /// key inside a field entry that this client has never heard of.
+    ///
+    /// The fixture in `raw_login_record` cannot serve here — its field name is
+    /// the literal `"2.enc-field"`, which does not decrypt, so nothing would
+    /// ever match by name.
+    fn field_vault(key_bytes: &[u8; 64]) -> Vault {
+        let seal_str = |text: &str| seal(key_bytes, text).to_string();
+        let mut raw = raw_login_record();
+        raw["fields"] = serde_json::json!([
+            {
+                "name": seal_str("API Key"),
+                "value": seal_str("old-token"),
+                "type": FIELD_TYPE_TEXT,
+                "linkedId": serde_json::Value::Null,
+                "somethingBitwardenAddsIn2027": {"per": "field"},
+            },
+            {
+                "name": seal_str("Recovery Code"),
+                "value": seal_str("old-recovery"),
+                "type": FIELD_TYPE_HIDDEN,
+                "linkedId": serde_json::Value::Null,
+            },
+            {
+                "name": seal_str("Linked User"),
+                "value": serde_json::Value::Null,
+                "type": FIELD_TYPE_LINKED,
+                "linkedId": 100,
+            },
+        ]);
+        let user_key = SymmetricKey::from_bytes(key_bytes).unwrap();
+        Vault::new(
+            user_key,
+            HashMap::new(),
+            vec![RawCipher {
+                raw,
+                id: "c1".into(),
+                item_type: 1,
+                name: Some(seal(key_bytes, "GitHub")),
+                username: Some(seal(key_bytes, "octocat")),
+                password: Some(seal(key_bytes, "old-password")),
+                uris: vec![seal(key_bytes, "https://github.com")],
+                ..Default::default()
+            }],
+            vec![],
+            HashMap::new(),
+        )
+    }
+
+    /// Decrypt one custom field's value straight out of a built body.
+    fn field_in(body: &serde_json::Value, key_bytes: &[u8; 64], wanted: &str) -> Option<String> {
+        let key = SymmetricKey::from_bytes(key_bytes).unwrap();
+        let read = |entry: &serde_json::Value, name: &str| -> Option<String> {
+            let text = entry.get(name)?.as_str()?;
+            key.decrypt_to_string(&EncString::parse(text).ok()?).ok()
+        };
+        body["fields"].as_array()?.iter().find_map(|entry| {
+            (read(entry, "name")?.eq_ignore_ascii_case(wanted)).then(|| read(entry, "value"))?
+        })
+    }
+
+    // Custom fields were readable and NOT writable, which is the gap the user
+    // reported as "our vault cannot edit entries".
+    #[test]
+    fn edit_body_sets_an_existing_custom_field_and_appends_a_new_one() {
+        let key_bytes = [0x5au8; 64];
+        let vault = field_vault(&key_bytes);
+        let body = vault
+            .edit_body(
+                "c1",
+                &CipherEdit {
+                    fields: vec![
+                        FieldEdit::Set {
+                            name: "api key".into(), // case-insensitive, as `fields` reads
+                            value: "new-token".into(),
+                            kind: FieldKind::Text,
+                        },
+                        FieldEdit::Set {
+                            name: "Deploy Key".into(),
+                            value: "fresh".into(),
+                            kind: FieldKind::Hidden,
+                        },
+                    ],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            field_in(&body, &key_bytes, "API Key").as_deref(),
+            Some("new-token")
+        );
+        assert_eq!(
+            field_in(&body, &key_bytes, "Deploy Key").as_deref(),
+            Some("fresh")
+        );
+        // The other two ride along untouched, and the appended one is hidden.
+        let fields = body["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 4, "one field appended, none dropped");
+        assert_eq!(fields[3]["type"], FIELD_TYPE_HIDDEN);
+        assert_eq!(
+            field_in(&body, &key_bytes, "Recovery Code").as_deref(),
+            Some("old-recovery")
+        );
+    }
+
+    // ⛔ THE REGRESSION THIS EXISTS TO CATCH. A field entry carries more than
+    // name/value/type, and rebuilding the entry from what this client models
+    // would drop the rest — the same data loss as rebuilding a cipher, one
+    // level down. Setting a value MUTATES the entry.
+    #[test]
+    fn setting_a_custom_field_preserves_the_rest_of_that_entry() {
+        let key_bytes = [0x5au8; 64];
+        let body = field_vault(&key_bytes)
+            .edit_body(
+                "c1",
+                &CipherEdit {
+                    fields: vec![FieldEdit::Set {
+                        name: "API Key".into(),
+                        value: "new-token".into(),
+                        kind: FieldKind::Text,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let entry = &body["fields"][0];
+        assert_eq!(
+            entry["somethingBitwardenAddsIn2027"],
+            serde_json::json!({"per": "field"}),
+            "an unknown key inside a field entry must survive the write"
+        );
+        assert!(entry.get("linkedId").is_some(), "linkedId must survive");
+    }
+
+    // ⛔ UPDATING A SECRET MUST NOT EXPOSE IT. `FieldKind::Text` means "do not
+    // change the visibility"; a hidden field that silently became a text field
+    // on its next edit would be rendered in the clear by every Bitwarden client.
+    #[test]
+    fn setting_a_hidden_field_by_value_does_not_downgrade_it_to_text() {
+        let key_bytes = [0x5au8; 64];
+        let body = field_vault(&key_bytes)
+            .edit_body(
+                "c1",
+                &CipherEdit {
+                    fields: vec![FieldEdit::Set {
+                        name: "Recovery Code".into(),
+                        value: "new-recovery".into(),
+                        kind: FieldKind::Text,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(body["fields"][1]["type"], FIELD_TYPE_HIDDEN);
+        assert_eq!(
+            field_in(&body, &key_bytes, "Recovery Code").as_deref(),
+            Some("new-recovery")
+        );
+    }
+
+    // …and the opposite direction IS allowed, because it is the user asking to
+    // hide something, not a side effect.
+    #[test]
+    fn set_hidden_converts_a_text_field() {
+        let key_bytes = [0x5au8; 64];
+        let body = field_vault(&key_bytes)
+            .edit_body(
+                "c1",
+                &CipherEdit {
+                    fields: vec![FieldEdit::Set {
+                        name: "API Key".into(),
+                        value: "now-secret".into(),
+                        kind: FieldKind::Hidden,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(body["fields"][0]["type"], FIELD_TYPE_HIDDEN);
+    }
+
+    #[test]
+    fn removing_a_custom_field_drops_only_that_one() {
+        let key_bytes = [0x5au8; 64];
+        let body = field_vault(&key_bytes)
+            .edit_body(
+                "c1",
+                &CipherEdit {
+                    fields: vec![FieldEdit::Remove {
+                        name: "API Key".into(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(body["fields"].as_array().unwrap().len(), 2);
+        assert!(field_in(&body, &key_bytes, "API Key").is_none());
+        assert_eq!(
+            field_in(&body, &key_bytes, "Recovery Code").as_deref(),
+            Some("old-recovery")
+        );
+    }
+
+    // Absent is not empty, here too: "there was nothing to remove" and "removed
+    // it" are different facts and the second must not be reported for the first.
+    #[test]
+    fn removing_an_absent_custom_field_is_an_error_not_a_no_op() {
+        let vault = field_vault(&[0x5au8; 64]);
+        let error = vault.edit_body(
+            "c1",
+            &CipherEdit {
+                fields: vec![FieldEdit::Remove {
+                    name: "Nope".into(),
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(matches!(error, Err(EditError::NoSuchField(name)) if name == "Nope"));
+    }
+
+    // A LINKED field points at the item's own username or password and stores
+    // no value. Writing one would be meaningless, and quietly turning it into a
+    // value field would break what it links to.
+    #[test]
+    fn setting_a_linked_custom_field_is_refused() {
+        let vault = field_vault(&[0x5au8; 64]);
+        let error = vault.edit_body(
+            "c1",
+            &CipherEdit {
+                fields: vec![FieldEdit::Set {
+                    name: "Linked User".into(),
+                    value: "x".into(),
+                    kind: FieldKind::Text,
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(matches!(error, Err(EditError::LinkedField(name)) if name == "Linked User"));
+    }
+
+    // Bitwarden permits duplicate field names. Picking one could overwrite the
+    // wrong secret, and there is no undo for that.
+    #[test]
+    fn a_duplicated_custom_field_name_is_refused_rather_than_guessed() {
+        let key_bytes = [0x5au8; 64];
+        let mut raw = raw_login_record();
+        let seal_str = |text: &str| seal(&key_bytes, text).to_string();
+        raw["fields"] = serde_json::json!([
+            {"name": seal_str("Token"), "value": seal_str("a"), "type": FIELD_TYPE_TEXT},
+            {"name": seal_str("token"), "value": seal_str("b"), "type": FIELD_TYPE_TEXT},
+        ]);
+        let vault = Vault::new(
+            SymmetricKey::from_bytes(&key_bytes).unwrap(),
+            HashMap::new(),
+            vec![RawCipher {
+                raw,
+                id: "c1".into(),
+                item_type: 1,
+                name: Some(seal(&key_bytes, "GitHub")),
+                ..Default::default()
+            }],
+            vec![],
+            HashMap::new(),
+        );
+        let error = vault.edit_body(
+            "c1",
+            &CipherEdit {
+                fields: vec![FieldEdit::Set {
+                    name: "Token".into(),
+                    value: "c".into(),
+                    kind: FieldKind::Text,
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(matches!(error, Err(EditError::AmbiguousField(name, 2)) if name == "Token"));
+    }
+
+    // Naming one field twice has no defined outcome — order would decide it.
+    #[test]
+    fn naming_one_custom_field_twice_in_an_edit_is_refused() {
+        let vault = field_vault(&[0x5au8; 64]);
+        let error = vault.edit_body(
+            "c1",
+            &CipherEdit {
+                fields: vec![
+                    FieldEdit::Set {
+                        name: "API Key".into(),
+                        value: "a".into(),
+                        kind: FieldKind::Text,
+                    },
+                    FieldEdit::Remove {
+                        name: "api key".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        assert!(matches!(error, Err(EditError::RepeatedField(name)) if name == "api key"));
+    }
+
+    // Every clearable field nulls, rather than omits: the server assigns
+    // unconditionally, so an omitted key would leave the OLD value in place and
+    // the clear would silently do nothing.
+    #[test]
+    fn every_clear_nulls_its_field_rather_than_omitting_it() {
+        let vault = login_vault(&[0x5au8; 64]);
+        let body = vault
+            .edit_body(
+                "c1",
+                &CipherEdit {
+                    clear: [
+                        ClearField::Notes,
+                        ClearField::Totp,
+                        ClearField::Username,
+                        ClearField::Uri,
+                        ClearField::Folder,
+                    ]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(body["notes"].is_null(), "notes");
+        assert!(body["folderId"].is_null(), "folderId");
+        assert!(body["login"]["totp"].is_null(), "totp");
+        assert!(body["login"]["username"].is_null(), "username");
+        assert!(body["login"]["uris"].is_null(), "uris");
+        // The password is deliberately NOT clearable, and it must ride through
+        // a clear-everything edit untouched.
+        assert_eq!(body["login"]["password"], "2.enc-pass");
+        // And the unknown future key still survives all of that.
+        assert_eq!(
+            body["somethingBitwardenAddsIn2027"],
+            serde_json::json!({"keep": "me"})
+        );
+    }
+
+    // ⛔ A URI IS AN OBJECT, NOT A STRING. Re-minting an entry for a uri the
+    // item already stores would discard its `match` type (and `uriChecksum`, and
+    // whatever comes next) — the same loss raw-patching exists to prevent.
+    #[test]
+    fn an_unchanged_uri_keeps_its_match_type_and_unknown_keys() {
+        let key_bytes = [0x5au8; 64];
+        let mut raw = raw_login_record();
+        raw["login"]["uris"] = serde_json::json!([{
+            "uri": seal(&key_bytes, "https://github.com").to_string(),
+            "match": 3,
+            "uriChecksum": "chk",
+        }]);
+        let vault = Vault::new(
+            SymmetricKey::from_bytes(&key_bytes).unwrap(),
+            HashMap::new(),
+            vec![RawCipher {
+                raw,
+                id: "c1".into(),
+                item_type: 1,
+                name: Some(seal(&key_bytes, "GitHub")),
+                uris: vec![seal(&key_bytes, "https://github.com")],
+                ..Default::default()
+            }],
+            vec![],
+            HashMap::new(),
+        );
+        let body = vault
+            .edit_body(
+                "c1",
+                &CipherEdit {
+                    uris: vec![
+                        "https://github.com".into(),
+                        "https://gist.github.com".into(),
+                    ],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let uris = body["login"]["uris"].as_array().unwrap();
+        assert_eq!(uris.len(), 2, "the list is replaced, in the order given");
+        assert_eq!(uris[0]["match"], 3, "an unchanged uri keeps its match type");
+        assert_eq!(uris[0]["uriChecksum"], "chk", "and its unknown keys");
+        // The new one is freshly sealed, with no match type invented for it.
+        assert!(uris[1]["match"].is_null());
+        let key = SymmetricKey::from_bytes(&key_bytes).unwrap();
+        let written = EncString::parse(uris[1]["uri"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            key.decrypt_to_string(&written).unwrap(),
+            "https://gist.github.com"
+        );
+    }
+
+    // An empty value is refused everywhere a value can be set, so "" can never
+    // reach the server as an encrypted empty string that looks like a value.
+    #[test]
+    fn an_empty_value_is_refused_for_a_uri_and_a_custom_field() {
+        let vault = field_vault(&[0x5au8; 64]);
+        for edit in [
+            CipherEdit {
+                uris: vec![String::new()],
+                ..Default::default()
+            },
+            CipherEdit {
+                fields: vec![FieldEdit::Set {
+                    name: "API Key".into(),
+                    value: String::new(),
+                    kind: FieldKind::Text,
+                }],
+                ..Default::default()
+            },
+            CipherEdit {
+                fields: vec![FieldEdit::Set {
+                    name: String::new(),
+                    value: "x".into(),
+                    kind: FieldKind::Text,
+                }],
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                vault.edit_body("c1", &edit),
+                Err(EditError::EmptyValue)
+            ));
+        }
+    }
+
+    // ⛔ THE WRITE-VERIFICATION IS THE POINT OF THE WHOLE EDIT PATH. A 200 from
+    // PUT says the server took a body; only a re-read says the field is what
+    // the user asked for. This runs the built body back through a vault, as the
+    // resync does, and checks both directions.
+    #[test]
+    fn verify_edit_finds_what_landed_and_names_what_did_not() {
+        let key_bytes = [0x5au8; 64];
+        let edit = CipherEdit {
+            name: Some("GitHub (work)".into()),
+            username: Some("octocat-work".into()),
+            uris: vec!["https://github.com".into()],
+            fields: vec![FieldEdit::Set {
+                name: "API Key".into(),
+                value: "new-token".into(),
+                kind: FieldKind::Text,
+            }],
+            clear: [ClearField::Notes].into_iter().collect(),
+            ..Default::default()
+        };
+        let body = field_vault(&key_bytes).edit_body("c1", &edit).unwrap();
+
+        // What the server would send back on the next sync, parsed as `sync`
+        // parses it. This is the re-read `edit_item` performs.
+        let mut raw = body.clone();
+        raw["id"] = serde_json::json!("c1");
+        let written = |path: &str| EncString::parse(body[path].as_str().unwrap()).unwrap();
+        let after = Vault::new(
+            SymmetricKey::from_bytes(&key_bytes).unwrap(),
+            HashMap::new(),
+            vec![RawCipher {
+                raw,
+                id: "c1".into(),
+                item_type: 1,
+                name: Some(written("name")),
+                username: Some(
+                    EncString::parse(body["login"]["username"].as_str().unwrap()).unwrap(),
+                ),
+                uris: vec![
+                    EncString::parse(body["login"]["uris"][0]["uri"].as_str().unwrap()).unwrap(),
+                ],
+                ..Default::default()
+            }],
+            vec![],
+            HashMap::new(),
+        );
+        let verification = after.verify_edit("c1", &edit);
+        assert!(
+            verification.is_complete(),
+            "every change should be visible on a re-read, missing: {:?}",
+            verification.missing
+        );
+        for label in ["name", "username", "uri", "field:API Key", "clear:notes"] {
+            assert!(
+                verification.landed.iter().any(|got| got == label),
+                "{label} should be reported as landed: {:?}",
+                verification.landed
+            );
+        }
+
+        // …and a change the item does NOT carry is named, not glossed over.
+        let unlanded = after.verify_edit(
+            "c1",
+            &CipherEdit {
+                password: Some("never-written".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(unlanded.missing, vec!["password".to_string()]);
+        assert!(!unlanded.is_complete());
+    }
+
+    // ⛔ A VERIFICATION MUST NOT BECOME A LEAK. It travels to every caller's
+    // --json output, so it may name a field and must never carry its value.
+    #[test]
+    fn a_verification_carries_names_and_never_values() {
+        let key_bytes = [0x5au8; 64];
+        let edit = CipherEdit {
+            password: Some("hunter2-in-the-clear".into()),
+            fields: vec![FieldEdit::Set {
+                name: "API Key".into(),
+                value: "sk-live-topsecret".into(),
+                kind: FieldKind::Hidden,
+            }],
+            ..Default::default()
+        };
+        let verification = field_vault(&key_bytes).verify_edit("c1", &edit);
+        let wire = serde_json::to_string(&verification).unwrap();
+        for secret in ["hunter2-in-the-clear", "sk-live-topsecret"] {
+            assert!(
+                !wire.contains(secret),
+                "{secret} leaked into the verification"
+            );
+        }
+        assert!(
+            wire.contains("field:API Key"),
+            "the field NAME is the receipt"
+        );
+    }
+
     #[test]
     fn edit_body_replaces_the_whole_uri_list() {
         let key_bytes = [0x5au8; 64];
@@ -2551,7 +3540,7 @@ mod tests {
             .edit_body(
                 "c1",
                 &CipherEdit {
-                    uri: Some("https://example.com".into()),
+                    uris: vec!["https://example.com".into()],
                     ..Default::default()
                 },
             )
