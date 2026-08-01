@@ -305,7 +305,7 @@ campaign inherits a home instead of building one.
 
 1. yggterm GUI-only deploy on the GUI host (ping widening + `?session=`/ack +
    command drain + tests). No version bump, no daemon touch.
-2. ychrome fleet deploy (dev + the GUI host + oc, `./scripts/deploy-fleet.sh`,
+2. ychrome fleet deploy (dev + the GUI host + a headless host, `./scripts/deploy-fleet.sh`,
    same artifact everywhere). First invocation per host spawns the daemon.
 3. Vault agent untouched: **no re-unlock anywhere**.
 4. Live proofs (acceptance):
