@@ -27,6 +27,14 @@ pub enum VaultError {
     Crypto(#[from] crate::crypto::CryptoError),
     #[error(transparent)]
     Edit(#[from] crate::model::EditError),
+    /// The server took the write and a re-read could not find it. Names the
+    /// FIELDS, never their values.
+    #[error(
+        "the server accepted the write but a re-read does not show it: {0}. \
+         The item may have been changed by another client — run `ychrome-vault sync` \
+         and check before retrying."
+    )]
+    EditNotVerified(String),
     #[error("config storage: {0}")]
     Io(String),
 }
@@ -412,18 +420,34 @@ impl VaultManager {
     /// client's change. Run `sync` and retry.
     ///
     /// [`Vault::edit_body`]: crate::model::Vault::edit_body
+    /// Returns what the RE-READ confirmed, and refuses an edit it cannot see.
+    ///
+    /// ⛔ A 200 FROM `PUT` IS NOT PROOF THE FIELD LANDED. It says the server
+    /// accepted a body. Whether the item now holds what the user asked for is a
+    /// different question, and the only honest way to answer it is to look:
+    /// `resync` re-pulls the cipher and [`Vault::verify_edit`] decrypts it back.
+    /// Reporting success without that is the lie-of-success shape, and it is the
+    /// one this crate treats as worse than an outright failure.
     pub fn edit_item(
         &mut self,
         id: &str,
         edit: &crate::model::CipherEdit,
-    ) -> Result<(), VaultError> {
+    ) -> Result<crate::model::EditVerification, VaultError> {
         let body = {
             let vault = self.vault.as_ref().ok_or(VaultError::Locked)?;
             vault.edit_body(id, edit)?
         };
         self.authenticated(|client, token| client.update_cipher(token, id, &body))?;
         self.resync()?;
-        Ok(())
+        let verification = self
+            .vault
+            .as_ref()
+            .ok_or(VaultError::Locked)?
+            .verify_edit(id, edit);
+        if !verification.is_complete() {
+            return Err(VaultError::EditNotVerified(verification.missing.join(", ")));
+        }
+        Ok(verification)
     }
 
     /// Delete an item and re-sync.
