@@ -5,6 +5,14 @@ ychrome — an agent-first browser and co-browse surface.
 Source code is licensed under GPL-3.0-or-later. Markdown documentation and
 skills are licensed separately under CC BY-SA 4.0. See the LICENSE files.
 
+Exception: crates/ychrome-vault and crates/ychrome-vault-proto are licensed
+under Apache-2.0 — reusable infrastructure carved out of the GPL browser
+around them. Each carries its own LICENSE file.
+
+The committed adblock ruleset is a derivative work of upstream filter lists,
+and this repository uses third-party work under licences that require
+attribution. See THIRD-PARTY-NOTICES.md.
+
 Site lore under .claude/skills/ychrome-site-lore/lore/ describes how public
 websites behave. It carries no account identities by contract; `lore.py scan`
 enforces that.
