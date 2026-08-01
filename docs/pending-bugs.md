@@ -94,25 +94,49 @@ item and there is no way to enumerate rpIds. The work is:
 
 ---
 
-## ★★ (yggterm) A PROFILE WHOSE WRITE-LOCK IS HELD ELSEWHERE OPENS EPHEMERAL, SILENTLY
+## ★★ (yggterm) A PROFILE WHOSE WRITE-LOCK IS HELD ELSEWHERE OPENS WITH NO JAR
 
 **Not in this repo — filed here because it is the other half of the cookie-jar
-failure ychrome just fixed on its own engine plane, and an ychrome user meets it
-as "the login will not stick".**
+failure ychrome fixed on its own engine plane, and an ychrome user meets it as
+"the login will not stick".**
 
-`yggterm-shell/src/shell.rs` (~:10672) comments that a surface whose profile
-write-lock is held elsewhere "opens READ-ONLY (ephemeral, no jar)". Ephemeral is
-not read-only: an ephemeral `WebContext` reads NOTHING from the jar and writes
+`yggterm-shell/src/shell.rs` commented that a surface whose profile write-lock
+is held elsewhere "opens READ-ONLY (ephemeral, no jar)". Ephemeral is not
+read-only: an ephemeral `WebContext` reads NOTHING from the jar and writes
 nothing back. A second surface on a profile another surface already holds
 therefore starts logged out and cannot keep a cookie — including a bot-check
-clearance cookie, which is why a challenged login can loop forever with nothing
-on screen explaining it.
+clearance cookie, which is why a challenged login can loop forever.
 
-Two things are owed there: make the degradation match its comment (a genuinely
-read-only jar), and **stop degrading silently** — the surface has to say which
-mode it opened in.
+Two things were owed. **One is done** (yggterm `lane/dev/ychrome-bugs-docs`):
+the silence. `WebSurfaceJarMode` now owns the decision, the spelling and the
+words — `persistent` / `ephemeral_by_request` / `no_jar_lock_held_elsewhere` —
+the mode is on the `profile_write_lock` trace line, and a degraded profile
+raises ONE notice (per profile, not per tab) that talks about being logged out
+and about the bot-check cookie rather than about write locks. The misleading
+"READ-ONLY" comment is gone. A `debug_assert` pins the mode to the jar it
+describes.
 
----
+⚠ **The other half is a design call, not a mechanical fix, and that is why it
+is still here.** WebKitGTK has no read-only jar mode, so "genuinely read-only"
+means giving the loser a private COPY of the profile's cookies (a Netscape text
+file — mechanically easy) and its local storage. Editorially it is not easy:
+**every shadow surface an agent opens on a profile the user holds would then
+duplicate that profile's live session cookies to a second place on disk.** In a
+browser that carries the operator's brokerage sessions, spreading cookie jars is
+his decision to make. Options, so the next reader does not start from scratch:
+
+1. copy-on-open into a scratch dir, wiped at teardown, with a startup sweep for
+   crash leftovers — full fidelity, maximum secret spread;
+2. copy the `cookies` file ONLY, which fixes the reported symptom (the login
+   sticks for the surface's life) at a fraction of the exposure;
+3. decline, and keep the notice as the whole answer.
+
+⚠ **Not live-proven.** The notice needs two live clients contending for one
+profile on guihost, which needs a yggterm GUI + daemon deploy — and
+`yggterm/docs/pending-bugs.md` still carries "REMOTE ROWS WEDGE IN
+`RemoteBootstrap` AFTER A DAEMON VERSION HANDOVER", which wedged 15 rows on the
+last bump. The rule and the words are unit-locked and mutation-proven; the
+pixel is owed.
 
 ## ★★★ A DAEMON HANDOVER STRANDS THE GUI ON A DEAD CONTROL PORT, AND SURFACES SILENTLY LOSE ADBLOCK
 
