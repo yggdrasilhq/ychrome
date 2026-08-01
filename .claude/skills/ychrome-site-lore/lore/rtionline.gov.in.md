@@ -152,7 +152,7 @@ registration number.
 
 No West Bengal online RTI portal exists: `rtiwb.gov.in` / `wbrti.gov.in` /
 `rti.wb.gov.in` do not resolve; `wbic.gov.in` and `wb.gov.in` time out from both
-dev and the GUI host. WBERC's own RTI menu links only to the central Act text. So WB
+two separate hosts. WBERC's own RTI menu links only to the central Act text. So WB
 applications (WBERC / WBSEDCL / WBUHS) are **postal, Rs 10 by IPO or court-fee
 stamp, to the SPIO** — print-ready is the only automatable output.
 
@@ -333,7 +333,7 @@ and must itself be re-canaried.
 
 When the reader is in doubt, use the second channel: rtionline sends its OTP to
 **e-mail as well as SMS**, and a human watching the handset can relay. (Mail is
-read with `ssh dev 'tb ...'` - dev is the mail host; never run a mail client on
+read with `ssh <mail-host> 'tb ...'` - one host is designated the mail host; never run a mail client on
 the desktop host, it opens a window in the user's face.)
 
 **Card (`paySubmitForCard('CreditCard')`) -> CONFIRM -> button `#Go` ->
@@ -748,7 +748,7 @@ registration numbers, reconciled.** Recipe held end to end. New traps:
    traffic ever. The true handset is the Pixel 8 (SIM NNNNNNNNNN).
    Discriminator: the round-3 debit SMSes (26-07 21:43:32/22:05:16/22:13:49)
    exist only on the true phone. Tailnet-dead != sshd-dead: it answered on the
-   home LAN (192.168.N.NNN:8022, and link-local via a the GUI host ProxyJump) all along.
+   home LAN (192.168.N.NNN:8022, and link-local via a ProxyJump) all along.
 2. **Card-limit exhaustion mode:** 3DS OTP arrives, ACS accepts, THEN SBIePay says
    FAILURE; the tell is the bank SMS "exceeds your available limit". Zero debit.
 3. **After a failed gateway txn, payment.php -> confirmpayment.php auto-verify ->

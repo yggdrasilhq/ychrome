@@ -32,7 +32,7 @@ Also present: 'WEB_HOME_COLLECTION', 'NammaLab_MW' (middleware), 'ordersms'.
 
 ⛔ THE WALL: every WebCall returns bare 'ERROR_IN_SESSION' without an established session, and NO Set-Cookie is issued by /appointments/, /city.html or any entry path (checked with -I). So the session is server-side and keyed to something the JS establishes that a cold curl does not — solve THAT and the entire catalogue is one WebCall away, no browser needed. Next agent: capture the phone+pincode submit from a live surface, diff the request, and write the recipe here.
 
-HOST NOTE: dev has the yggterm headless daemon but NO live GUI client ('no live Yggterm GUI client is registered for app control'), so the web/app-control plane exists ONLY on the GUI host — the human's laptop. Materialising a surface there needs the session ACTIVATED (a --no-activate session answers no_declare to 'web ensure'), which moves the user's view. ASK FIRST.
+HOST NOTE: a headless host can have the yggterm daemon but NO live GUI client ('no live Yggterm GUI client is registered for app control'), so the web/app-control plane exists ONLY on the GUI host — the human's machine. Materialising a surface there needs the session ACTIVATED (a --no-activate session answers no_declare to 'web ensure'), which moves the user's view. ASK FIRST.
 
 ## full-catalogue-via-city-phone-pincode · WORKS
 task: read Aarthi's full test catalogue + prices, no booking

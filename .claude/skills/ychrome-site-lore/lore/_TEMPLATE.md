@@ -4,6 +4,13 @@ Copy this shape when hand-writing a site file (the `lore.py log` command writes 
 for you). Files named with a leading `_` are ignored by the CLI. Newest entries at
 the bottom, append-only.
 
+⛔ **This directory is PUBLIC. Write the METHOD, never the IDENTITY.** No e-mail
+addresses, usernames, phone numbers, case references, LAN/tailnet addresses,
+`/home/<user>` paths, or fleet hostnames (say *the GUI host* / *a headless
+host*). Name a vault ENTRY, never the account inside it. `lore.py log` refuses
+these; a file you hand-edit bypasses that, so run `python3 lore.py scan` before
+pushing. Full rule: `../SKILL.md`.
+
 ## login-via-vault · WORKS
 task: log in with saved credentials
 model: claude-fable-5

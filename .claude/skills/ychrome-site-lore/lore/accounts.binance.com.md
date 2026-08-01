@@ -22,7 +22,7 @@ login page was fully there. Wait before concluding anything.
 
 LOGIN SHAPE (accounts.binance.com/en/login): a single "Email/Phone number" field
 then a "Log In" button; password is a SECOND page; Google/Apple/Telegram SSO
-alternatives. Vault entry `accounts.binance.com` (user the account named in the vault entry) HAS a
+alternatives. Vault entry `accounts.binance.com` HAS a
 TOTP, so the second factor is completable without the phone.
 
 ⭐ THE USEFUL PART — this page is a FREE CONTROL for the "does injected input
