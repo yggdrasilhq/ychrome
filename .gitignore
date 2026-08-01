@@ -1,1 +1,5 @@
 /target
+
+# Python bytecode (lore.py and friends)
+__pycache__/
+*.pyc
