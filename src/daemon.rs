@@ -735,9 +735,13 @@ fn serve_engine_http(mut reader: BufReader<UnixStream>, stream: UnixStream) {
         crate::engine::api::Reply::Json(status, body) => {
             sidebar::respond_json(stream, status, &body, &request.path)
         }
-        crate::engine::api::Reply::Png(png) => {
-            sidebar::respond_bytes(stream, 200, "image/png", &png)
-        }
+        crate::engine::api::Reply::Png { png, meta } => sidebar::respond_bytes(
+            stream,
+            200,
+            "image/png",
+            &crate::engine::api::shot_meta_header(&meta),
+            &png,
+        ),
         crate::engine::api::Reply::Ndjson(write_body) => {
             let mut stream = stream;
             sidebar::respond_ndjson_head(&mut stream);
