@@ -46,6 +46,68 @@ shape is **per-origin installation**: build the shim's `Userscript::matches`
 from the set of rpIds the vault actually holds passkeys for, so a page for a
 site you have no passkey for sees a pristine `navigator`.
 
+### IT REACHED THE USER, 2026-08-01 — measured, and the cause is NOT what it looked like
+
+**Report:** a Forgejo 2FA page answered *"Could not read your security key. Your
+browser does not currently support WebAuthn."* — *"How am I supposed to use the
+passkey?"*
+
+**Two independent faults, both measured on guihost. Neither was the documented
+"the vault holds no passkey for this host" case:** `ychrome-vault passkeys
+<host>` returns a real credential for it.
+
+1. **The running agent does not know `passkey-hosts`.** Asked directly on
+   `~/.yggterm/vault/agent.sock` it answers `unknown op "passkey-hosts"`, in
+   0.2 ms, five times out of five. That is the documented deploy-ordering
+   hazard below, and it happened: the browser shipped ahead of its agent.
+
+   ⚠ **The stderr announce was not evidence either way, and reasoning from its
+   absence sent a first diagnosis in the wrong direction.** ychrome's stderr is
+   the PTY it was launched in — it is not in `~/.yggterm`, not in the GUI's
+   `app-launch-logs`, and not anywhere anyone greps. **FIXED:** the vault pane
+   now renders the state (`sidebar::passkey_shim_widgets`) with a one-click
+   `handover`, so the browser says it where the user already is when a passkey
+   login fails.
+
+   ⚠ **`agent_stale` is structurally incapable of catching this**, which is why
+   the pane was silent: it compares the agent against the INSTALLED
+   `ychrome-vault`, and both were the same six-day-old binary. `status` read
+   `unlocked`, `agent_stale: false`, 1116 items — a perfectly healthy vault —
+   on the same socket that refused the op. Only ASKING for the op finds it.
+   The remedy is also ordered: `handover` execs the *installed* binary, so a
+   stale installed binary must be replaced FIRST or the handover is a no-op.
+
+2. **The policy stamp was blind to the shim, which made it permanent.**
+   `webpolicy::policy_version` stamped adblock, the UA, SponsorBlock and
+   userscript FILES — nothing about the vault — while `/policy` prepends a shim
+   whose scope comes from the vault. The GUI refetches only when that stamp
+   moves, and yggterm applies userscripts at surface CREATION. So a surface kept
+   whatever shim decision was true when it opened, for life.
+
+   Measured, one unchanged `policy_version` (`ebc219f7d40ddc53`):
+   `sidebar_contribution/policy` recorded `userscripts: 6` at 14:53 and
+   `userscripts: 5` from 16:07 onward, across the deploy. **FIXED:**
+   `passkey_shim_stamp()` folds `agent.pid` (rewritten by `serve_on` on every
+   start AND every handover, since an `execve` keeps the pid) and the installed
+   binary's stamp into `policy_version`, stat-only so it stays off the socket.
+
+   ⚠ **Still open:** a plain lock → unlock touches no file, so a surface opened
+   over a locked vault still needs REOPENING. The pane says so in words. A
+   vault-published scope stamp would close it properly.
+
+### ⚠ ENROLMENT IS IMPOSSIBLE ON A SITE WITH NO PASSKEY YET
+
+Found while measuring the above. The shim's match patterns come only from rpIds
+the vault ALREADY holds credentials for, so a site you have no passkey for sees
+a pristine `navigator` — which is exactly right for the fingerprinting fix, and
+also means `navigator.credentials.create()` can never be called there. The
+`/fido2/create` path is fully built and unreachable on any new site; every
+passkey in this vault was enrolled in some other browser.
+
+⛔ The fix is NOT to widen the scope back. It is an explicit per-site opt-in —
+the user asking, in the vault pane, to enrol on the site they are looking at —
+so the anomaly exists only on a page a human deliberately armed.
+
 ### IMPLEMENTED 2026-08-01, NOT YET PROVEN ON A REAL PAGE
 
 All four steps are done and unit-locked: the `passkey-hosts` agent op (metadata
