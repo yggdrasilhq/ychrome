@@ -35,6 +35,10 @@ const SCRATCH_PASSWORD: &str = "scratch-vault-master-password";
 
 struct Scratch {
     dir: PathBuf,
+    /// Leave the unlocked agent and its directory in place on drop. Set only by
+    /// the provisioning helper below, whose whole purpose is to hand a working
+    /// scratch vault to something outside this test binary.
+    keep: bool,
     server: String,
     email: String,
     http: reqwest::blocking::Client,
@@ -96,6 +100,7 @@ impl Scratch {
 
         let mut scratch = Scratch {
             dir,
+            keep: false,
             server,
             email,
             http,
@@ -181,6 +186,21 @@ impl Scratch {
             .to_string()
     }
 
+    /// One raw agent request, the way the SIDEBAR speaks to it (the pane talks
+    /// to this socket directly through `ychrome-vault-proto`, not through the
+    /// CLI). Returns the reply verbatim, errors included, so a test can assert
+    /// on `ok` and on what the reply does NOT contain.
+    fn agent(&self, request: &Value) -> Value {
+        use std::io::{BufRead, BufReader, Write};
+        let mut stream = std::os::unix::net::UnixStream::connect(self.dir.join("agent.sock"))
+            .expect("the scratch agent is listening");
+        writeln!(stream, "{request}").unwrap();
+        stream.flush().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        serde_json::from_str(&line).expect("the agent replies with json")
+    }
+
     /// The cipher exactly as the server holds it.
     fn raw_cipher(&self, id: &str) -> Value {
         self.http
@@ -217,6 +237,9 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
+        if self.keep {
+            return;
+        }
         // The agent holds this scratch account's keys; leaving one running would
         // outlive the test and keep answering on a temp directory.
         Command::new(env!("CARGO_BIN_EXE_ychrome-vault"))
@@ -561,4 +584,169 @@ fn an_edit_reports_what_a_re_read_confirmed_and_refuses_what_it_cannot() {
         );
     }
     eprintln!("edit receipt + refusals: OK");
+}
+
+/// The exact wire the SIDEBAR PANE speaks, against a real server.
+///
+/// The pane cannot be unit-tested against a vault (it must never touch a real
+/// one) and its request builder lives in the other crate, so this pins the
+/// contract from the agent's side: the shape `sidebar::build_edit_request`
+/// emits has to be one this agent accepts, verify, and answer without ever
+/// putting a value in its reply. `sidebar::typed_secrets_reach_the_request_...`
+/// pins the other half — that the pane really emits this shape.
+#[test]
+#[ignore = "needs a scratch vaultwarden; set YCHROME_VAULT_TEST_SERVER"]
+fn the_pane_wire_path_edits_a_login_and_reports_freshness() {
+    let Some(vault) = Scratch::provision("pane") else {
+        eprintln!("YCHROME_VAULT_TEST_SERVER is not set — skipping");
+        return;
+    };
+    vault.cli_json(
+        &[
+            "add",
+            "pane.example",
+            "old@example.com",
+            "--uri",
+            "https://pane.example",
+            "--notes",
+            "notes that should go away",
+            "--generate",
+        ],
+        None,
+    );
+
+    // The pane reads freshness off `status`, so the agent must report it.
+    let status = vault.cli_json(&["status"], None);
+    let synced_at = status["last_sync_unix"]
+        .as_u64()
+        .expect("status must carry last_sync_unix, or the pane cannot show an age");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        now.saturating_sub(synced_at) < 300,
+        "a vault that just added an item must read as freshly synced"
+    );
+
+    // ⛔ THE USER'S ACTUAL EDIT, in the pane's own request shape: a password
+    // corrected elsewhere, a username fixed, a second uri, a hidden custom
+    // field, and the notes removed — all in ONE save.
+    let reply = vault.agent(&json!({
+        "op": "edit", "name": "pane.example", "user": "old@example.com",
+        "set_user": "fixed@example.com",
+        "password": "corrected-in-another-client",
+        "uris": ["https://pane.example", "https://login.pane.example"],
+        "fields": [{"name": "API Key", "action": "set-hidden", "value": "sk-live-x"}],
+        "clear": ["notes"],
+    }));
+    assert_eq!(
+        reply["ok"],
+        json!(true),
+        "the pane's request shape: {reply}"
+    );
+    let verified: Vec<&str> = reply["verified"]
+        .as_array()
+        .expect("the pane refuses a save with no receipt")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for label in [
+        "username",
+        "password",
+        "uri",
+        "field:API Key",
+        "clear:notes",
+    ] {
+        assert!(verified.contains(&label), "receipt: {verified:?}");
+    }
+    // ⛔ The reply is rendered into a toast. It may name fields; it may not
+    // carry one single value.
+    let wire = reply.to_string();
+    for secret in ["corrected-in-another-client", "sk-live-x"] {
+        assert!(!wire.contains(secret), "a value reached the pane's reply");
+    }
+
+    // And the re-reads the pane's own Fill tab would do.
+    assert_eq!(
+        vault.cli(&["get", "pane.example"], None).trim(),
+        "corrected-in-another-client"
+    );
+    assert_eq!(
+        vault
+            .cli(&["fields", "pane.example", "--field-name", "API Key"], None)
+            .trim(),
+        "sk-live-x"
+    );
+    let listed = vault.cli_json(&["list", "pane.example", "--json"], None);
+    assert_eq!(
+        listed[0]["uris"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>(),
+        vec!["https://pane.example", "https://login.pane.example"],
+    );
+    assert_eq!(listed[0]["username"], "fixed@example.com");
+    eprintln!("pane wire path: OK");
+}
+
+/// Stand up a throwaway vault OUTSIDE this test binary, for a proof that needs a
+/// running agent — a screenshot of the sidebar pane, say, which needs an
+/// unlocked vault and must never use the operator's.
+///
+/// Writes the vault into `$YCHROME_VAULT_SCRATCH_DIR` and leaves the agent
+/// unlocked and running. Not a test of anything; it is a fixture with a
+/// `#[test]` on it so it can reuse the registration path the real tests prove.
+#[test]
+#[ignore = "fixture: set YCHROME_VAULT_TEST_SERVER and YCHROME_VAULT_SCRATCH_DIR"]
+fn provision_a_scratch_vault_for_a_live_proof() {
+    let Ok(target) = std::env::var("YCHROME_VAULT_SCRATCH_DIR") else {
+        eprintln!("YCHROME_VAULT_SCRATCH_DIR is not set — skipping");
+        return;
+    };
+    let Some(mut vault) = Scratch::provision("fixture") else {
+        eprintln!("YCHROME_VAULT_TEST_SERVER is not set — skipping");
+        return;
+    };
+    // Items shaped like the ones a person actually has, so a screenshot of the
+    // pane shows a realistic list rather than one row called "test".
+    for (name, user, uri) in [
+        ("git.example.org", "avik", "https://git.example.org"),
+        (
+            "mail.example.net",
+            "avik@example.net",
+            "https://mail.example.net",
+        ),
+        ("bank.example", "10029384", "https://bank.example"),
+    ] {
+        vault.cli_json(&["add", name, user, "--uri", uri, "--generate"], None);
+    }
+    vault.cli_json(
+        &[
+            "edit",
+            "git.example.org",
+            "--notes",
+            "the personal forge",
+            "--set-field",
+            "Deploy Token=t-0001",
+            "--totp",
+            "JBSWY3DPEHPK3PXP",
+        ],
+        None,
+    );
+    // Hand the whole directory over to the caller, agent still unlocked.
+    std::fs::create_dir_all(&target).unwrap();
+    for entry in std::fs::read_dir(&vault.dir).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(
+            entry.path(),
+            std::path::Path::new(&target).join(entry.file_name()),
+        )
+        .ok();
+    }
+    vault.keep = true;
+    eprintln!("scratch vault dir: {}", vault.dir.display());
+    eprintln!("copied config to: {target}");
 }

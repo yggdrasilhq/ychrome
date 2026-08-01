@@ -551,6 +551,109 @@ overlap, and `restore` resolves its name **against the trash only** — it can
 never bring back or touch a live entry that happens to share a name. A
 `--permanent` removal leaves nothing in the trash and cannot be restored.
 
+## Parity: what the official clients do, what Keyguard does, what we do
+
+The user asked for "100% parity with the official Bitwarden client or Keyguard".
+That is a direction, not a unit of work, so here is the actual gap list. Read
+the verdicts first: **most of what is missing is missing on purpose.**
+
+⚠ **ychrome-vault is a client against one person's own Vaultwarden, on hosts he
+owns.** It is not a reimplementation of the Bitwarden product. Anything whose
+value is account administration, team sharing, or moving a vault between vendors
+is out of scope by design, and saying so is more useful than a permanent red
+cell. Verdicts: ✅ have · ⚠ partial · ✗ gap · ⛔ deliberately not.
+
+### Items and editing
+
+| Capability | Bitwarden | Keyguard | ychrome-vault | Verdict |
+| --- | --- | --- | --- | --- |
+| Login items | full | full | full | ✅ |
+| Card items | full | full | read + fill; edit name/notes/folder/fields | ⚠ no card-field editor |
+| Identity items | full | full | not modelled | ✗ |
+| Secure notes | full | full | readable as notes | ⚠ |
+| SSH keys | yes | yes | no | ⛔ the ssh-agent is not this tool's job |
+| Create item | yes | yes | `add`, logins only | ⚠ |
+| Edit item | yes | yes | full for logins, from CLI **and** the pane | ✅ |
+| Trash / restore | yes | yes | `rm` (soft by default) / `restore` / `list --trashed` | ✅ |
+| Clone an item | yes | yes | no | ✗ cheap, and genuinely useful |
+| Password history | view | view | preserved on write, not readable | ⚠ |
+| Attachments | yes | yes | no | ✗ needs its own key handling |
+| Move to organization | yes | yes | no | ⛔ single-account vault |
+
+### Fields
+
+| Capability | Bitwarden | Keyguard | ychrome-vault | Verdict |
+| --- | --- | --- | --- | --- |
+| Custom fields: text / hidden | yes | yes | read + write + remove | ✅ |
+| Custom fields: boolean / linked | yes | yes | read; refuses to WRITE a linked one | ⚠ deliberate: a linked field has no value |
+| Reorder custom fields | yes | yes | no | ✗ low value |
+| Multiple URIs | yes | yes | yes (repeatable `--uri`, one per line in the pane) | ✅ |
+| Per-URI match type | 6 modes | 6 modes | **preserved** on edit, not chosen | ⚠ see below |
+| Favorite flag | yes | yes | preserved, not settable | ✗ trivial to add |
+| TOTP secret | yes | yes | store / generate / read raw / clear | ✅ |
+| TOTP: otpauth URIs, custom digits/period/algorithm | yes | yes | yes | ✅ |
+| TOTP: Steam | yes | yes | prefix accepted, **not** Steam's alphabet | ⚠ mis-mints for Steam |
+| Passkeys | yes | yes | read, assert, create — but only where one already exists | ⚠ see `pending-bugs.md` |
+
+### Sync, search, and reports
+
+| Capability | Bitwarden | Keyguard | ychrome-vault | Verdict |
+| --- | --- | --- | --- | --- |
+| Manual sync | yes | yes | `sync`, and a button on the Fill tab | ✅ |
+| **Last-sync time on screen** | extension only (**not** desktop, **not** web) | yes | yes, with a stale warning | ✅ **ahead of the desktop client** |
+| Automatic sync | yes | yes | on pane open once the copy is >30 min old | ✅ |
+| Offline writes with merge | ✗ (writes just fail) | ✅ three-way field-level merge | ✗ (writes fail) | ⛔ we hold nothing locally on purpose |
+| Search name / username | yes | yes | yes | ✅ |
+| Search notes, uris, custom fields | yes (indexed, boosted) | yes + qualifiers | **no** | ✗ **highest-value search gap** |
+| Filter by type / folder / favorite | yes | yes + tags | no | ✗ |
+| Filter by has-TOTP | **no** | **no** | no | — nobody has it |
+| Reused / weak passwords | web app only | 13 checks, free, in-app | `watchtower`: reused + weak | ⚠ ahead of the extension, behind Keyguard |
+| Breached-password check (HIBP) | premium, web app | free | no | ✗ k-anonymity, self-contained, worth doing |
+| Duplicate detection + merge | no | yes | no | ✗ |
+| Tags | no | yes | no | ⛔ folders already cover this here |
+
+### Generation, movement, and account
+
+| Capability | Bitwarden | Keyguard | ychrome-vault | Verdict |
+| --- | --- | --- | --- | --- |
+| Password generator | yes | yes | length + symbols | ⚠ |
+| Passphrase generator | yes | yes | **no** | ✗ cheap and frequently wanted |
+| Username / email-alias generator | yes | yes | no | ⛔ |
+| Folders: use an existing one | yes | yes | yes (`--folder`, `--clear folder`) | ✅ |
+| Folders: create / rename / delete | yes | yes | **no** | ✗ small and annoying |
+| Import (71 formats) | yes | ✗ none | no | ⛔ this vault is already the source of truth |
+| Export | yes | yes | no | ⛔ `rm`-grade blast radius, no demand |
+| Sends / secure sharing | yes | yes | no | ⛔ |
+| Emergency access | yes | no | no | ⛔ |
+| Change master password / KDF | web app (both clients redirect) | web app | no | ⛔ the web vault owns this |
+| 2FA management | web app | web app | no | ⛔ |
+| Browser autofill | ✅ its strongest suit | ✗ no browser extension at all | login / TOTP / card, per-origin | ✅ |
+| Biometric unlock | needs the desktop app running | native, plus YubiKey HMAC | no | ⛔ the unlock is the boundary here |
+
+### The ranked remainder, for picking from
+
+Ordered by value per unit of work, honestly:
+
+1. **Search that covers notes, uris and custom-field names.** The one gap a user
+   meets every day; `list`'s filter reads name and username only, while every
+   other client indexes far more. Self-contained, no new crypto.
+2. **A passphrase generator.** Cheap, and the thing people actually want when
+   the site rejects symbols.
+3. **Folder create / rename / delete**, so `--folder` stops being "pick from
+   what already exists".
+4. **Favorite as a settable flag** plus a favourites filter. The flag already
+   survives every write; only the toggle is missing.
+5. **Clone an item.** Falls straight out of `add` + a read.
+6. **A breached-password check.** HIBP's k-anonymity range API sends five hash
+   characters and no account identifier, so it fits this codebase's rules; it is
+   the one Keyguard feature with real safety value that we could match.
+7. **Identity items**, if he uses them — otherwise skip.
+8. **Steam TOTP's alphabet.** Currently a silently WRONG code rather than a
+   refusal, which is the worse failure. Small.
+9. **Password-history reader.** The data is already preserved on every edit.
+10. **Attachments.** Real work (per-attachment keys, file handling), and nothing
+    is asking for it.
+
 ## What is proven, and what is not
 
 - **The TOTP clock gate** — the kernel read is proven live on **dev**:

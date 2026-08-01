@@ -1401,6 +1401,37 @@ impl Vault {
             .collect()
     }
 
+    /// Does this item match a search term in the places a LISTING cannot see?
+    ///
+    /// `needle` must already be lowercased. Covers the item's **notes** and its
+    /// **custom-field names**; the caller checks name, username and uris first,
+    /// because those are already decrypted in [`VaultItem`] and cost nothing.
+    ///
+    /// ⛔ CUSTOM-FIELD VALUES ARE DELIBERATELY NOT SEARCHED. A hidden field's
+    /// value is a secret, and a search that matched on it would turn the search
+    /// box into an oracle: type a guess, and the result list tells you whether
+    /// the guess was right. Field NAMES travel here for the same reason they
+    /// travel in the card audit line and the edit receipt — they identify, they
+    /// do not reveal. Notes ARE searched, because notes are where people put the
+    /// context they later search for, and every other client indexes them.
+    ///
+    /// Nothing about the match leaves this function but a boolean; the caller
+    /// returns the same secret-free metadata it always did.
+    pub fn deep_search_match(&self, id: &str, needle: &str) -> bool {
+        if needle.is_empty() {
+            return false;
+        }
+        if self
+            .notes(id)
+            .is_some_and(|notes| notes.to_lowercase().contains(needle))
+        {
+            return true;
+        }
+        self.fields(id)
+            .iter()
+            .any(|(name, _)| name.to_lowercase().contains(needle))
+    }
+
     /// How many custom-field entries the RAW cipher carries, decrypted or not.
     /// A diagnostic companion to [`Vault::fields`]: when `fields` comes back
     /// empty, this says whether the item truly has no custom fields (`Some(0)`
