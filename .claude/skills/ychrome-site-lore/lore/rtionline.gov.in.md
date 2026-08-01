@@ -743,7 +743,7 @@ UGCOM/R/E/26/NNNNN, DARPG/R/E/26/NNNNN, NITDP/R/E/26/NNNNN. Four debits, four
 registration numbers, reconciled.** Recipe held end to end. New traps:
 
 1. **HANDSET IDENTITY: a canary that ANSWERS is not a canary on the RIGHT STORE.**
-   The Pixel 7a (tailnet "lynx") receives IDFC debit-card/savings families and
+   One of the family handsets receives IDFC debit-card/savings families and
    passes every liveness canary, but has NO RTISMS, NO EJGRTI, NO WOW-card-NNNN
    traffic ever. The true handset is the Pixel 8 (SIM NNNNNNNNNN).
    Discriminator: the round-3 debit SMSes (26-07 21:43:32/22:05:16/22:13:49)
