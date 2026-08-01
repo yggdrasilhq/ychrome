@@ -90,4 +90,7 @@ yggterm's `docs/web-surfaces.md`).
 
 ## License
 
-Apache-2.0.
+- source code: `GPL-3.0-or-later`
+- repository documentation (`*.md`) and skills: `CC BY-SA 4.0`
+
+See `LICENSE`, `LICENSE-GPL-3.0`, `LICENSE-CC-BY-SA-4.0`, and `NOTICE`.
