@@ -168,8 +168,17 @@ def cmd_get(args: argparse.Namespace) -> int:
 #: `/Home/Preview` is a ROUTE on a website and belongs in lore. Folding case
 #: for everything turned a legitimate site path into a false positive, and a
 #: checker that cries wolf is one people learn to skip.
+#: ⚠ THE HOSTNAMES ARE SPLIT ACROSS STRING CONCATENATION ON PURPOSE, and it is
+#: not decoration. A repo-wide redaction pass (`sed 's/\bhostname\b/the GUI
+#: host/g'`) rewrote this very tuple the first time it ran, so the checker
+#: started hunting for its own replacement text and would have passed a file
+#: full of the real names. A word-boundary substitution cannot match across the
+#: seam, so the guard survives the next scrub. Same lesson as a leak-scanner
+#: that must skip its own source: the detector is inside the search space.
+_HOSTS = "|".join(("jo" "jo", "man" "in"))
+
 PRIVATE_SHAPES = (
-    (r"\b(?:the GUI host|the hypervisor host)\b", "a fleet hostname — say 'the GUI host' / 'a headless host'", re.I),
+    (rf"\b(?:{_HOSTS})\b", "a fleet hostname — say 'the GUI host' / 'a headless host'", re.I),
     (r"[A-Za-z0-9._%+-]+@(?!example\.(?:com|org)\b)[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
      "an e-mail address — name the VAULT ENTRY, or 'the site's published helpdesk'", re.I),
     (r"\b(?:\+?91[-\s]?)?[6-9]\d{9}\b", "a phone number — write 'the registered number'", 0),
