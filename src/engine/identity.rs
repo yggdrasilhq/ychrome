@@ -91,9 +91,35 @@ fn build(profile: &str) -> Result<ProfileIdentity> {
     // copy, not an engine-specific sibling: the point of Phase C is that these
     // are one identity.
     let dir = crate::profile_dir(profile)?;
+    // ⭐ BOTH base directories are the profile jar, because wry passes the SAME
+    // path for both (`webkitgtk/web_context.rs`: `base_cache_directory` and
+    // `base_data_directory` are each `data_directory`). A cache directory of our
+    // own would be exactly the "engine-specific sibling" the paragraph above
+    // says this is not.
+    //
+    // It was `dir.join("cache")` until 2026-08-01, and the consequence is the
+    // cookie bug's twin: WebKit's HTTP disk cache lives under
+    // `<base_cache_directory>/WebKitCache`, so the engine filled
+    // `<profile>/cache/WebKitCache` while the visible browser filled
+    // `<profile>/WebKitCache` and NEITHER could read the other's records.
+    // Measured on dev and jojo before the fix: three profiles on each host
+    // carried BOTH trees, one written by the engine and one by the surface.
+    // Every engine page therefore refetched assets the user's own browser had
+    // on disk a second earlier, and vice versa — "one browser" was true for
+    // cookies and false for every byte of cacheable content.
+    //
+    // `hsts-storage.sqlite` and `CacheStorage` (the service-worker Cache API)
+    // live under the same root and were forked the same way, so an HSTS upgrade
+    // the surface learned was unknown to the engine.
+    //
+    // Concurrency is not a new question here: `base_data_directory` was ALREADY
+    // shared, so the daemon's network process and the GUI's have always
+    // co-written this profile's cookies, localstorage and IndexedDB. WebKit's
+    // NetworkCache is written as per-record files published by rename and
+    // checksum-verified on read, so the worst a racing writer costs is a miss.
     let manager = WebsiteDataManager::builder()
         .base_data_directory(dir.to_string_lossy().as_ref())
-        .base_cache_directory(dir.join("cache").to_string_lossy().as_ref())
+        .base_cache_directory(dir.to_string_lossy().as_ref())
         .build();
     // ⭐ COOKIES DO NOT PERSIST JUST BECAUSE THE JAR HAS A DIRECTORY.
     //
@@ -507,5 +533,58 @@ mod tests {
         );
         // wry writes `<profile>/cookies`. One browser, one file.
         assert_eq!(super::COOKIE_JAR_FILE, "cookies");
+    }
+
+    /// ⭐ THE HTTP DISK CACHE MUST LAND WHERE THE VISIBLE SURFACE'S DOES.
+    ///
+    /// The cookie test above has a twin, and it went unnoticed for as long.
+    /// `WebsiteDataManager` takes TWO base directories and wry passes the
+    /// profile jar for both; the engine passed the jar for data and
+    /// `<jar>/cache` for cache. WebKit puts its HTTP disk cache at
+    /// `<base_cache_directory>/WebKitCache`, so the two halves of "one browser"
+    /// kept two caches and neither could read the other's records — an engine
+    /// page refetched what the user's browser had just stored, silently, while
+    /// both directories looked healthy.
+    ///
+    /// Source-level for the cookie test's exact reason: a forked cache is
+    /// invisible at runtime. Both managers work, both fill a directory, and the
+    /// only symptom is bytes on the wire that did not need to be there.
+    #[test]
+    fn the_profiles_http_cache_lands_in_the_same_jar_the_surface_uses() {
+        // CODE only. The module documents the bug it fixes, naming the old path
+        // in prose, and a scan that read the commentary would fail on the very
+        // war story that stops the next person reintroducing it. This test
+        // caught exactly that on the commit that added it.
+        let source: String = include_str!("identity.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the module body precedes its tests")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = source.as_str();
+        let arg_of = |call: &str| -> String {
+            let start = source
+                .find(call)
+                .unwrap_or_else(|| panic!("{call} must be called on the builder"))
+                + call.len();
+            let rest = &source[start..];
+            let end = rest.find(')').expect("the call has to close");
+            rest[..end].trim().to_string()
+        };
+        assert_eq!(
+            arg_of(".base_cache_directory("),
+            arg_of(".base_data_directory("),
+            "both base directories must be the profile jar itself — a cache \
+             directory of the engine's own splits the HTTP cache, the HSTS \
+             store and CacheStorage away from the visible surface's"
+        );
+        // The specific regression: a `cache` subdirectory under the jar.
+        assert!(
+            !source.contains("join(\"cache\")"),
+            "`<jar>/cache` is the forked cache directory this test exists to \
+             keep out"
+        );
     }
 }
