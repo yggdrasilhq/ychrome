@@ -160,6 +160,16 @@ Traps that must be handled, because each one silently corrupts a date or a run:
   collection with its folder tree preserved; history imports as *visits*, into
   `history.jsonl`, not as a giant collection nobody can read.
 
+## ⚠ Correction to this spec, 2026-08-01: where the code lives
+
+The verbs below were written as `ychrome collection …`. **The implementation
+lives in `yggterm`, not ychrome** — `ychrome` does not depend on `yggterm-core`,
+and the store sits under `~/.yggterm/web-profiles/<profile>/`, which is
+yggterm's, alongside the `history.jsonl` these collections are built from. The
+parser is `yggterm-core::web_collection`. Read the verb names below as
+`yggterm server app web collection …`; ychrome reaches them the same way it
+reaches every other yggterm verb rather than growing a second store.
+
 ## Verbs (agent plane)
 
 Every one of these is how an agent shapes a collection, which the user asked for
@@ -188,9 +198,13 @@ truth.
 
 ## Build plan
 
-- **I1 — the format.** Parse and rewrite a collection `.md` losslessly:
-  frontmatter, notes, folders, items, unknown keys preserved. Pure, property
-  tested (parse→write→parse is identity).
+- **I1 — the format.** ✅ **DONE** — `yggterm-core::web_collection`, 13 tests.
+  Round-trip is byte-identical **by construction**: every block keeps its source
+  line and renders that back unless something deliberately changed it, rather
+  than being carefully re-serialised (which works until someone adds a field).
+  Unknown frontmatter keys survive, and a line that looks like an item but does
+  not parse is kept as prose — losing a link is the one unrecoverable failure
+  this format could have.
 - **I2 — the store.** Per-profile directory, atomic writes, id allocation, the
   snapshot dedupe and prune rules. Pure decisions, `now_ms` injected.
 - **I3 — the verbs**, one parser, both binaries, as `automation` does.
