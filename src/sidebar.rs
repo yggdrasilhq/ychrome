@@ -1064,10 +1064,24 @@ pub(crate) fn respond_ndjson_head(stream: &mut impl Write) {
 /// `image/png` per docs/agent-engine.md §4: a screenshot is bytes the HTTP
 /// layer can carry natively, and base64 inside JSON would be a second encoding
 /// of it.
-pub(crate) fn respond_bytes(mut stream: impl Write, status: u16, content_type: &str, body: &[u8]) {
+///
+/// `extra_headers` is already-formatted `Name: value\r\n` lines, or empty. It
+/// exists for `/engine/shot`, whose body must stay pure PNG bytes (`--out`
+/// writes it straight to a file) while the capture still has to be able to say
+/// WHAT it captured. Each line is written verbatim, so a caller building one
+/// owes it a value with no CR or LF in it — `engine::api::shot_meta_header` is
+/// the only builder and it enforces that by serialising compact JSON.
+pub(crate) fn respond_bytes(
+    mut stream: impl Write,
+    status: u16,
+    content_type: &str,
+    extra_headers: &str,
+    body: &[u8],
+) {
     let head = format!(
         "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\n\
-         Content-Length: {len}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+         Content-Length: {len}\r\nCache-Control: no-store\r\n{extra_headers}\
+         Connection: close\r\n\r\n",
         len = body.len(),
     );
     let _ = stream.write_all(head.as_bytes());

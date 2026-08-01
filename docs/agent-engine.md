@@ -216,8 +216,15 @@ POST /wait {page_id, until, timeout_ms=15000}
 ### Reading
 
 ```
-POST /shot {page_id, mode: "viewport"|"full", format: "png", scale?}
+POST /shot {page_id,
+            region: "viewport" | "full" | "element" | "rect",   # default viewport
+            selector: "css", nth?: k, require_unique?: bool, padding?: px,  # element
+            rect: {x, y, w, h},                  # rect — DOCUMENT-space CSS px
+            prescroll?: bool}                    # walk the page first (lazy loads)
   → PNG bytes (Content-Type: image/png)         # engine snapshot, ALWAYS faithful
+  + X-Ychrome-Shot: {region, mode, width, height, scale, document:{…},
+                     crop?:{css,device}, selector?:{matches,hittable,nth,…},
+                     prescroll?:{steps,capped,…}}
 POST /dom  {page_id, mode: "html"|"text"|"snapshot"}
   → snapshot = the structured interactable tree: [{role,text,selector,rect,value?}…]
     built by an injected extractor script (v1: buttons, links, inputs, selects,
@@ -227,6 +234,60 @@ POST /eval {page_id, js, await_promise: bool, timeout_ms}
     await_promise=true wraps in the callback shim (store to a token global,
     poll) — the engine does the polling so scripts never hand-roll it again
 ```
+
+#### `/shot`'s four regions, and the two traps in full-page capture
+
+**Full-page capture is native, and that settles the design.** WebKitGTK's
+`webkit_web_view_snapshot` takes `WEBKIT_SNAPSHOT_REGION_FULL_DOCUMENT`, which
+renders the whole laid-out document in ONE call. The obvious fallback —
+scroll, capture a viewport, scroll, capture again, stitch — is strictly worse
+and is not used: it seams at every step, it repeats every `position: fixed`
+header once per tile, and it leaves the page scrolled somewhere the caller did
+not put it. Measured on a 1280x2910 fixture: one snapshot, one fixed header at
+the top, no seam.
+
+`element` and `rect` are that same full-document snapshot **cropped from the
+pixels already in hand**, never a second snapshot. Two snapshots taken a scroll
+or an animation frame apart would let "the element" and "the full page it is
+part of" show different content.
+
+⚠ **Trap 1 — the crop scale is MEASURED, never assumed.** A caller speaks CSS
+pixels; the snapshot is device pixels. The engine divides the snapshot's real
+width by the document width the page reported, and crops with that. Nothing
+depends on `devicePixelRatio` (it is reported alongside so a disagreement is
+visible). Rounding is outward, so a 1 px border is never shaved.
+
+⚠ **Trap 2 — `full` does not load what was never near the viewport.** A
+full-document snapshot renders what is LAID OUT. A lazily-loaded page has never
+run its `IntersectionObserver` callbacks below the fold, so it captures as a
+full-height document of empty boxes — and the snapshot is not lying, the images
+really are not there. `prescroll: true` walks the document a viewport at a time
+with a 120 ms settle between steps and puts the scroll back. It cannot be one
+`eval`: a synchronous scroll loop never yields the event-loop turns the
+observers and fetches need, so the loop lives in Rust with the settle between
+steps. Proven side by side on a fixture: without it three of five bands stayed
+unloaded; with it, all five.
+
+A `rect` is in **DOCUMENT** coordinates, not viewport ones. That is the one
+mistake a caller makes here, so a crop that misses the capture is refused by
+name and says so rather than answering 200 with a blank PNG.
+
+From the CLI (`--out` catches the bytes and prints the account as one JSON
+object):
+
+```sh
+ychrome ctl shot page_id=pg_000001                        --out shot.png
+ychrome ctl shot page_id=pg_000001 region=full            --out page.png
+ychrome ctl shot page_id=pg_000001 region=full prescroll=true --out page.png
+ychrome ctl shot page_id=pg_000001 region=element selector='#main' padding=8 --out el.png
+ychrome ctl shot page_id=pg_000001 region=rect \
+    rect='{"x":0,"y":1100,"w":700,"h":400}'               --out area.png
+```
+
+`region=element` resolves its selector through the **same hittable pool**
+`/engine/input` clicks through — same filter, same `nth` default, same
+`{matches, hittable, hidden, zero_size}` account — so "screenshot the button I
+am about to click" cannot pick a different element than the click will.
 
 ### Acting (trusted input — the whole point)
 
