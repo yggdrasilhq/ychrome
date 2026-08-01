@@ -119,8 +119,41 @@ impl Totp {
         format!("{:0width$}", bin % modulo, width = self.digits as usize)
     }
 
-    /// The code for the current wall-clock time, and the seconds until it rolls.
-    pub fn now(&self) -> (String, u64) {
+    /// The code for the current wall-clock time, and the seconds until it rolls
+    /// — **or a refusal, when this host's clock cannot be trusted to mint one.**
+    ///
+    /// The gate lives here rather than at each caller because this is the ONE
+    /// function that turns a wall clock into a credential; anything else would
+    /// be a second place that could forget. [`Self::code_at`] stays pure and
+    /// ungated, which is what lets the RFC 6238 vectors be tested at their fixed
+    /// timestamps on any host.
+    ///
+    /// See [`crate::clock`] for the 72-second incident this refuses.
+    pub fn now(&self) -> Result<(String, u64), crate::clock::ClockUntrusted> {
+        self.now_against(crate::clock::state())
+    }
+
+    /// The same mint, judged against a clock state the caller supplies.
+    ///
+    /// This is what makes the gate falsifiable on a host whose clock is FINE.
+    /// Every host in this fleet now is, so a rule that could only be exercised
+    /// by breaking the operator's clock would never be exercised at all — and
+    /// this rule exists because exactly that kind of silence cost two live 2FA
+    /// attempts.
+    pub fn now_against(
+        &self,
+        clock: crate::clock::ClockState,
+    ) -> Result<(String, u64), crate::clock::ClockUntrusted> {
+        crate::clock::judge(clock, self.period)?;
+        Ok(self.now_unchecked())
+    }
+
+    /// The code for the current wall-clock time, with NO clock check.
+    ///
+    /// Reserved for a caller that has already been told the clock is bad and
+    /// has said to mint anyway (`--ignore-clock`). It is deliberately spelled
+    /// so that reading the call site tells you the guarantee was waived.
+    pub fn now_unchecked(&self) -> (String, u64) {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -195,5 +228,64 @@ mod tests {
 
         assert!(matches!(Totp::parse(""), Err(TotpError::Empty)));
         assert!(Totp::parse("not base32 @@@").is_err());
+    }
+
+    // THE 72-SECOND LOCK. A wall-clock mint on an undisciplined clock must
+    // refuse; the RFC vectors must stay mintable regardless, because `code_at`
+    // is a pure function of a timestamp the caller supplies and has nothing to
+    // do with this host's clock.
+    #[test]
+    fn a_wall_clock_mint_refuses_on_an_undisciplined_clock() {
+        use crate::clock::{Sync, tests::state_that_is};
+        let totp = Totp::parse("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ").unwrap();
+
+        let refused = totp
+            .now_against(state_that_is(Sync::Unsynchronized))
+            .expect_err("a kernel that says its clock is undisciplined must stop the mint");
+        assert!(
+            refused.to_string().starts_with("clock_unsynchronized"),
+            "{refused}"
+        );
+
+        for sync in [Sync::Synchronized, Sync::Unknown] {
+            let (code, remaining) = totp
+                .now_against(state_that_is(sync))
+                .unwrap_or_else(|e| panic!("{sync:?} must still mint: {e}"));
+            assert_eq!(code.len(), 6);
+            assert!(remaining >= 1 && remaining <= 30);
+        }
+
+        // The waiver reaches the same secret and skips only the question.
+        let (waived, _) = totp.now_unchecked();
+        assert_eq!(waived.len(), 6);
+
+        // …and the pure vectors are untouched by any of it.
+        assert_eq!(totp.code_at(59), "287082");
+    }
+
+    // The lock that catches a call site quietly dropping the gate. On a healthy
+    // host a gated mint and an ungated one print the same six digits, so no
+    // assertion on the OUTPUT can tell them apart — count the question instead.
+    #[test]
+    fn a_wall_clock_mint_always_asks_the_clock() {
+        let totp = Totp::parse("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ").unwrap();
+
+        let before = crate::clock::judgements();
+        let _ = totp.now();
+        assert_eq!(
+            crate::clock::judgements(),
+            before + 1,
+            "`now()` minted without asking the clock"
+        );
+
+        // And the waiver really waives: it must SKIP the question, not ask it
+        // and throw the answer away.
+        let before = crate::clock::judgements();
+        let _ = totp.now_unchecked();
+        assert_eq!(
+            crate::clock::judgements(),
+            before,
+            "`now_unchecked` is the name of a promise: no clock question happens here"
+        );
     }
 }
