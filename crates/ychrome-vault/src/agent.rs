@@ -821,17 +821,44 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
                 "exp_year": card.exp_year,
             }))
         }
+        // What the KERNEL says about this host's clock. Read-only, needs no
+        // unlock: an operator asking "can this host mint a code at all" must be
+        // able to find out before paying for an unlock.
+        "clock" => Ok(crate::clock::state().to_json()),
         "totp" => {
             let name = string("name").ok_or_else(|| anyhow!("totp needs a name"))?;
+            // The waiver travels in the REQUEST, not in an environment
+            // variable: the mint happens inside this long-lived agent, whose
+            // environment was frozen at launch and is not the caller's.
+            let ignore_clock = request
+                .get("ignore_clock")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let vault = unlocked(&state)?;
             let items = vault.items();
             let item = resolve(&items, &name, string("user").as_deref())?;
-            let (code, remaining) = vault
-                .totp_code(&item.id)
-                .ok_or_else(|| anyhow!("{} has no authenticator secret", item.name))?;
+            let no_secret = || anyhow!("{} has no authenticator secret", item.name);
+            let (code, remaining) = if ignore_clock {
+                vault
+                    .totp_code_ignoring_clock(&item.id)
+                    .ok_or_else(no_secret)?
+            } else {
+                vault
+                    .totp_code(&item.id)
+                    .ok_or_else(no_secret)?
+                    .map_err(|untrusted| anyhow!("{untrusted}"))?
+            };
             let name = item.name.clone();
             state.touch();
-            Ok(json!({ "code": code, "remaining_secs": remaining, "name": name }))
+            Ok(json!({
+                "code": code,
+                "remaining_secs": remaining,
+                "name": name,
+                // Reported on SUCCESS too, so a caller can see what the code was
+                // minted against rather than only hearing about it on refusal.
+                "clock": crate::clock::state().to_json(),
+                "clock_ignored": ignore_clock,
+            }))
         }
         // The item's stored passkeys, metadata only. No private key crosses this
         // socket — that is reserved for a future ceremony op with explicit
@@ -1834,9 +1861,43 @@ mod tests {
         assert_eq!(got["entry"]["password"], "s3cret!");
         assert_eq!(got["entry"]["username"], "octocat");
 
+        // The mint goes through the clock gate, and says what it minted
+        // against. Counting the question is the only way to see it: on a
+        // healthy host the digits are identical either way.
+        let asked = crate::clock::judgements();
         let totp = dispatch(&json!({"op": "totp", "name": "GitHub"}), &state).unwrap();
         assert_eq!(totp["code"].as_str().unwrap().len(), 6);
+        assert_eq!(
+            crate::clock::judgements(),
+            asked + 1,
+            "the totp op minted without asking whether this host's clock is fit"
+        );
+        assert_eq!(totp["clock"]["source"], "adjtimex");
+        assert_eq!(totp["clock_ignored"], false);
+
+        // `--ignore-clock` really skips the question and SAYS it did — a waiver
+        // that looked like the ordinary answer would be its own lie.
+        let asked = crate::clock::judgements();
+        let waived = dispatch(
+            &json!({"op": "totp", "name": "GitHub", "ignore_clock": true}),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(waived["code"].as_str().unwrap().len(), 6);
+        assert_eq!(
+            crate::clock::judgements(),
+            asked,
+            "the waiver must skip the gate, not ask and discard the answer"
+        );
+        assert_eq!(waived["clock_ignored"], true);
+
         assert!(dispatch(&json!({"op": "totp", "name": "ygg.example"}), &state).is_err());
+
+        // The clock op answers without an unlock and from the same owner as the
+        // field the mint reports.
+        let clock = dispatch(&json!({"op": "clock"}), &state).unwrap();
+        assert_eq!(clock["source"], totp["clock"]["source"]);
+        assert!(clock["sync"].is_string());
 
         // Strict rule: the github URI auto-matches its own host...
         let matched = dispatch(&json!({"op": "match", "host": "github.com"}), &state).unwrap();

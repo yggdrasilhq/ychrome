@@ -1105,13 +1105,35 @@ impl Vault {
     }
 
     /// The current TOTP code for a specific item, with the seconds until it
-    /// rolls. `None` if the item is unknown or carries no authenticator secret.
-    pub fn totp_code(&self, id: &str) -> Option<(String, u64)> {
+    /// rolls.
+    ///
+    /// Three answers, kept apart on purpose: `None` — the item is unknown or
+    /// carries no authenticator secret; `Some(Err(..))` — it HAS one and this
+    /// host's clock is not fit to mint from it (see [`crate::clock`]);
+    /// `Some(Ok(..))` — the code. Folding the refusal into `None` would tell a
+    /// caller "no authenticator here", which is a different and wrong story.
+    pub fn totp_code(
+        &self,
+        id: &str,
+    ) -> Option<Result<(String, u64), crate::clock::ClockUntrusted>> {
+        Some(self.totp_for(id)?.now())
+    }
+
+    /// The same code, minted with the clock check WAIVED. Only reachable from a
+    /// caller that passed `--ignore-clock` after being told what is wrong.
+    pub fn totp_code_ignoring_clock(&self, id: &str) -> Option<(String, u64)> {
+        Some(self.totp_for(id)?.now_unchecked())
+    }
+
+    /// The parsed authenticator for an item, if it has one that parses. The ONE
+    /// decrypt-and-parse path, so the checked and waived mints can never differ
+    /// about which secret they used.
+    fn totp_for(&self, id: &str) -> Option<Totp> {
         let cipher = self.find(id)?;
         let enc = cipher.totp.as_ref()?;
         let key = self.cipher_key(cipher).ok()?;
         let secret = key.decrypt_to_string(enc).ok()?;
-        Totp::parse(&secret).ok().map(|totp| totp.now())
+        Totp::parse(&secret).ok()
     }
 
     /// The RAW authenticator-secret string stored in the item's TOTP slot,
@@ -1336,9 +1358,30 @@ mod tests {
 
         // Secrets are NOT in the metadata; they decrypt on demand.
         assert_eq!(vault.password("c1").as_deref(), Some("s3cret!"));
-        let (code, remaining) = vault.totp_code("c1").unwrap();
+        // On a host whose clock the kernel calls disciplined this mints; on one
+        // it does not, it REFUSES rather than emitting a confident wrong code.
+        // Both are correct answers, and the test says which it observed instead
+        // of quietly accepting either.
+        match vault.totp_code("c1").expect("c1 carries an authenticator") {
+            Ok((code, remaining)) => {
+                assert_eq!(code.len(), 6);
+                assert!(remaining >= 1 && remaining <= 30);
+            }
+            Err(untrusted) => assert!(
+                untrusted.to_string().starts_with("clock_unsynchronized"),
+                "the only reason to withhold a code is a measured bad clock: {untrusted}"
+            ),
+        }
+        // The waiver reaches the same secret; it only skips the clock question.
+        let (code, remaining) = vault
+            .totp_code_ignoring_clock("c1")
+            .expect("c1 carries an authenticator");
         assert_eq!(code.len(), 6);
         assert!(remaining >= 1 && remaining <= 30);
+
+        // An item with no authenticator is `None` — never a clock refusal, and
+        // never the other way round.
+        assert!(vault.totp_code("nope").is_none());
         assert!(vault.password("nope").is_none());
     }
 

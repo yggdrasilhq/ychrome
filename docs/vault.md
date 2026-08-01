@@ -16,7 +16,8 @@ State: `~/.yggterm/vault/` — `config.json` (secret-free), `agent.sock`, and
 | `crypto` | KDF → master key → stretched key → user key; EncString type-2 (AES-256-CBC + HMAC-SHA256), MAC checked in constant time before decrypt; type-3/4 (RSA-OAEP) for organization keys |
 | `api` | `prelogin`, the identity token endpoint, `sync`. Responses navigated case-insensitively (Vaultwarden drifts PascalCase↔camelCase) |
 | `model` | The unlocked `Vault`: user key + still-encrypted ciphers. Metadata is secret-free; passwords and TOTP secrets decrypt on demand |
-| `totp` | RFC 6238, `otpauth://` URIs |
+| `totp` | RFC 6238, `otpauth://` URIs. A wall-clock mint goes through `clock` first |
+| `clock` | Is this host's clock fit to mint a one-time code? Reads the KERNEL's NTP state (`adjtimex`), never a time daemon's opinion of itself |
 | `matching` | Page-host → item rules (below) |
 | `generator` | Local password generation (no server, no `rbw generate` subprocess) |
 | `watchtower` | Reused + weak password analysis. Groups by SHA-256 digest, so no plaintext password ever sits in a collection; only entry labels leave the module |
@@ -215,7 +216,8 @@ taking the first — deterministic.
 ychrome-vault configure --server https://vault.example.com --email you@example.com
 read -rs PW; echo "$PW" | ychrome-vault unlock   # once
 ychrome-vault get github.com                     # password on stdout
-ychrome-vault totp github.com                    # 6-digit code
+ychrome-vault totp github.com                    # 6-digit code (refuses on a bad clock)
+ychrome-vault clock                              # what the kernel says about this host's clock
 ychrome-vault passkeys github.com                # rpId<TAB>user<TAB>credId<TAB>created
 ychrome-vault card "HDFC Regalia"                # brand<TAB>holder<TAB>month<TAB>year<TAB>last4
 ychrome-vault list                               # name<TAB>user<TAB>folder
@@ -269,7 +271,8 @@ but undocumented.
 | --- | --- |
 | `rbw list --fields name,user,folder` | `ychrome-vault list` (same TSV) |
 | `rbw get NAME [USER]` | `ychrome-vault get NAME [USER]` |
-| `rbw code NAME [USER]` | `ychrome-vault totp NAME [USER]` |
+| `rbw code NAME [USER]` | `ychrome-vault totp NAME [USER]` (refuses on an undisciplined clock; `--ignore-clock` waives) |
+| _(none — rbw guesses)_ | `ychrome-vault clock` |
 | `rbw unlock` | `read -rs PW; echo "$PW" \| ychrome-vault unlock` |
 | `rbw lock` | `ychrome-vault lock` |
 | `rbw add NAME [USER]` | `ychrome-vault add NAME [USER]` |
@@ -479,6 +482,18 @@ never bring back or touch a live entry that happens to share a name. A
 `--permanent` removal leaves nothing in the trash and cannot be restored.
 
 ## What is proven, and what is not
+
+- **The TOTP clock gate** — the kernel read is proven live on **dev**:
+  `ychrome-vault clock` answers `{"sync":"synchronized","source":"adjtimex",
+  "max_error_secs":0.03}` and agrees with `timedatectl`'s
+  `System clock synchronized: yes`, which is the only line that told the truth
+  during the 72-second incident. The **refusal** branch is proven by unit test
+  and by mutation (seven production call sites, each made RED and restored) and
+  is **NOT live-reproducible**: every host in this fleet now has a disciplined
+  clock, and breaking one to watch the refusal fire would break the operator's.
+  ⚠ A full mint-through-the-gate against the REAL vault has not been run either:
+  it needs the operator's unlocked agent handed over to this binary, and an
+  unlock is his to type.
 
 - **Read path** — proven end to end against the real vault at `vault.example.com`
   (1107 ciphers, 35 with TOTP, 936 with URIs), and in `cargo test` against a
