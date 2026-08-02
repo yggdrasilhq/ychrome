@@ -2,15 +2,6 @@
 
 Entries are removed in the same commit as their verified fix. Newest first.
 
-> **Compressed 2026-08-01.** Most of what stood here has shipped. Closed since
-> the last pass: the daemon socket singleton, Xvfb reaping on retire, `ctl`
-> naming the daemon generation, the mis-clicked hidden duplicate, `ychrome-vault
-> totp` minting on a skewed clock, the two separate HTTP caches, second-invocation
-> tab routing, and the engine's reachability off the GUI host. **Eight entries remain,
-> and three of them are ⚠ minor or a known-flaky test.**
-
----
-
 > **This file is the ONE answer to "what is open" for ychrome.** Open items
 > only; an entry is deleted in the same commit as its verified fix and git
 > remembers it. The law, the owner table for every other question, and how to
