@@ -91,18 +91,27 @@ passkey?"*
    over a locked vault still needs REOPENING. The pane says so in words. A
    vault-published scope stamp would close it properly.
 
-### ⚠ ENROLMENT IS IMPOSSIBLE ON A SITE WITH NO PASSKEY YET
+### ⚠ ENROLMENT ON A SITE WITH NO PASSKEY — THE ARM IS BUILT, THE PROOF IS OWED
 
-Found while measuring the above. The shim's match patterns come only from rpIds
-the vault ALREADY holds credentials for, so a site you have no passkey for sees
-a pristine `navigator` — which is exactly right for the fingerprinting fix, and
-also means `navigator.credentials.create()` can never be called there. The
-`/fido2/create` path is fully built and unreachable on any new site; every
-passkey in this vault was enrolled in some other browser.
+The shim's match patterns come only from rpIds the vault ALREADY holds
+credentials for, so a site you have no passkey for sees a pristine `navigator`
+— exactly right for the fingerprinting fix, and it also meant
+`navigator.credentials.create()` could never be called there. Every passkey in
+this vault was enrolled in some other browser. The user hit this on a Google
+sign-in: *"I cannot enter the passkey when anyone requests me … there is no
+clicking to give passkey or save a passkey."*
 
-⛔ The fix is NOT to widen the scope back. It is an explicit per-site opt-in —
-the user asking, in the vault pane, to enrol on the site they are looking at —
-so the anomaly exists only on a page a human deliberately armed.
+⛔ The fix is NOT to widen the scope back, and it was not: **the user arms one
+host from the vault pane** ("Enrol a passkey here"), the anomaly exists only on
+a page a human deliberately armed, and arming is per-process so a browser
+restart forgets it. Built 2026-08-02, unit-locked and mutation-proven (an armed
+host must reach the shim's real match patterns; a wildcard or empty host is
+refused at the door).
+
+**Owed:** the end-to-end proof on a real page — arm a site, reopen the tab,
+and watch `navigator.credentials.create()` succeed. ⚠ The pane says the tab must
+be REOPENED, because the shim is installed when a surface is built; if that
+turns out to be wrong on this path, the notice is what needs correcting.
 
 ### IMPLEMENTED 2026-08-01, NOT YET PROVEN ON A REAL PAGE
 
