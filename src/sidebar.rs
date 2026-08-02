@@ -214,7 +214,7 @@ fn passkey_enrol_widgets(host: Option<&str>, shim: &PasskeyShimState) -> Vec<Val
     }
     if passkey_enrol_armed().contains(&host) {
         return vec![
-            json!({"kind": "section", "text": "Passkey enrolment armed"}),
+            json!({"kind": "section", "text": "Passkey enrolment armed", "card": true}),
             json!({
                 "kind": "label", "muted": true,
                 "text": format!(
@@ -231,7 +231,7 @@ fn passkey_enrol_widgets(host: Option<&str>, shim: &PasskeyShimState) -> Vec<Val
         ];
     }
     vec![
-        json!({"kind": "section", "text": "Passkeys"}),
+        json!({"kind": "section", "text": "Passkeys", "card": true}),
         json!({
             "kind": "label", "muted": true,
             "text": format!(
@@ -255,7 +255,7 @@ fn passkey_shim_widgets(state: &PasskeyShimState) -> Vec<Value> {
         // subsystem is a banner nobody reads when it finally matters.
         PasskeyShimState::ScopedTo(_) | PasskeyShimState::NoStoredPasskeys => Vec::new(),
         PasskeyShimState::AgentPredatesBrowser => vec![
-            json!({"kind": "section", "text": "Passkeys are off"}),
+            json!({"kind": "section", "text": "Passkeys are off", "card": true}),
             json!({
                 "kind": "label", "muted": true,
                 "text": "This host's vault agent is older than this browser and does not \
@@ -271,7 +271,7 @@ fn passkey_shim_widgets(state: &PasskeyShimState) -> Vec<Value> {
             }),
         ],
         PasskeyShimState::VaultUnavailable(reason) => vec![
-            json!({"kind": "section", "text": "Passkeys are off"}),
+            json!({"kind": "section", "text": "Passkeys are off", "card": true}),
             json!({
                 "kind": "label", "muted": true,
                 "text": format!(
@@ -1837,7 +1837,7 @@ fn locked_schema(status: &Value) -> Value {
     let mut widgets = vec![];
     match state {
         "locked" => {
-            widgets.push(json!({"kind": "section", "text": "Unlock the vault"}));
+            widgets.push(json!({"kind": "section", "text": "Unlock the vault", "card": true}));
             if let Some(email) = status["email"].as_str().filter(|email| !email.is_empty()) {
                 widgets.push(json!({"kind": "label", "muted": true, "text": email}));
             }
@@ -1859,14 +1859,14 @@ fn locked_schema(status: &Value) -> Value {
             widgets.extend(stale_agent_widgets(status));
         }
         "not_configured" => {
-            widgets.push(json!({"kind": "section", "text": "Vault not set up"}));
+            widgets.push(json!({"kind": "section", "text": "Vault not set up", "card": true}));
             widgets.push(json!({
                 "kind": "label", "muted": true,
                 "text": "No vault is configured on this host. Run `ychrome-vault configure --server <url> --email <you>` here, then unlock.",
             }));
         }
         other => {
-            widgets.push(json!({"kind": "section", "text": "Vault"}));
+            widgets.push(json!({"kind": "section", "text": "Vault", "card": true}));
             widgets.push(
                 json!({"kind": "label", "muted": true, "text": format!("Vault state: {other}.")}),
             );
@@ -2083,7 +2083,7 @@ fn vault_schema_revealing(
         Err(error) => json!({
             "title": "Vault",
             "widgets": [
-                {"kind": "section", "text": "Vault"},
+                {"kind": "section", "text": "Vault", "card": true},
                 {"kind": "label", "muted": true, "text": error.to_string()},
             ],
         }),
@@ -2111,6 +2111,9 @@ fn unlocked_schema(
             {"id": "tools", "label": "Tools"},
         ],
     })];
+    // The pane's pinned action bar. Empty for every tab but Edit, whose form is
+    // taller than the rail.
+    let mut footer: Vec<Value> = Vec::new();
 
     // ⛔ ABOVE THE TABS, ON EVERY TAB, BECAUSE IT IS NOT A TAB'S PROBLEM. A
     // browser whose passkeys are off is off for every site, and the user
@@ -2121,7 +2124,7 @@ fn unlocked_schema(
 
     match state.tab.as_str() {
         "add" => {
-            widgets.push(json!({"kind": "section", "text": "Add a login"}));
+            widgets.push(json!({"kind": "section", "text": "Add a login", "card": true}));
             widgets.push(json!({"kind": "text-input", "id": "add_name", "label": "Name", "placeholder": "example.com", "value": state.add.name}));
             widgets.push(json!({"kind": "text-input", "id": "add_user", "label": "Username", "placeholder": "you@example.com", "value": state.add.user}));
             widgets.push(json!({"kind": "text-input", "id": "add_uri", "label": "URI", "placeholder": "https://example.com", "value": state.add.uri}));
@@ -2135,7 +2138,7 @@ fn unlocked_schema(
                 "kind": "text-input", "id": "add_password", "label": "Password",
                 "placeholder": "Leave empty to generate one", "secret": true, "value": "",
             }));
-            widgets.push(json!({"kind": "section", "text": "Generator"}));
+            widgets.push(json!({"kind": "section", "text": "Generator", "card": true}));
             widgets.push(json!({
                 "kind": "number-input", "id": "generate_length", "label": "Length",
                 "value": state.generate_length,
@@ -2154,9 +2157,12 @@ fn unlocked_schema(
                 "label": "Save to vault",
             }));
         }
-        "edit" => widgets.extend(edit_tab_widgets(&state.edit, reveal)),
+        "edit" => {
+            widgets.extend(edit_tab_widgets(&state.edit, reveal));
+            footer = edit_footer_widgets(&state.edit);
+        }
         "tools" => {
-            widgets.push(json!({"kind": "section", "text": "Vault"}));
+            widgets.push(json!({"kind": "section", "text": "Vault", "card": true}));
             let state_label = status["state"].as_str().unwrap_or("unknown");
             let items = status["item_count"].as_u64().unwrap_or(0);
             widgets.push(json!({
@@ -2180,7 +2186,7 @@ fn unlocked_schema(
             }));
             widgets.push(json!({"kind": "button", "id": "lock", "action": "lock", "label": "Lock the vault"}));
 
-            widgets.push(json!({"kind": "section", "text": "Watchtower"}));
+            widgets.push(json!({"kind": "section", "text": "Watchtower", "card": true}));
             widgets.push(json!({
                 "kind": "label", "muted": true,
                 "text": "Finds logins that share a password, and passwords that are short or single-class. The scan runs inside the vault agent; only entry names come back.",
@@ -2260,39 +2266,119 @@ fn unlocked_schema(
         }
     }
 
-    json!({ "title": "Vault", "widgets": widgets })
+    json!({ "title": "Vault", "widgets": widgets, "footer": footer })
 }
 
-/// One stored value, as a row with an eye and a copy button — plus the value
-/// itself when THIS is the row the user just pressed the eye on.
+/// A field verb, with its target ENCODED IN THE ACTION.
 ///
-/// The reveal is rendered directly under the row it belongs to, so a pane
-/// holding several revealable values can never show one under another's title.
+/// ONE encoding of "which field", shared by the eye, the copy and the remove,
+/// on a row and on an inline form field alike — the `copy-row:` grammar, which
+/// exists for the same reason. An inline field's press carries the WIDGET's id
+/// as its value (yggterm has no idea what a "field spec" is), so the target has
+/// to travel in the action or the two surfaces would need two spellings.
+fn field_action(verb: &str, field: &StoredField, label: &str, title: String) -> Value {
+    json!({
+        "action": format!("{verb}:{}", field.spec()),
+        "label": label,
+        "title": title,
+    })
+}
+
+pub(crate) const EDIT_REVEAL_VERB: &str = "edit-reveal";
+pub(crate) const EDIT_COPY_VERB: &str = "edit-copy";
+pub(crate) const EDIT_REMOVE_FIELD_VERB: &str = "edit-remove-field";
+
+/// A form box for a value the entry may already hold — Bitwarden's shape.
+///
+/// ⛔ THE BOX IS NEVER PRE-FILLED WITH THE STORED VALUE. What it shows at rest
+/// is `stored`: decorative mask dots yggterm draws as a PLACEHOLDER, which
+/// cannot be submitted, cannot be read back, and vanish on the first keystroke.
+/// The stored value arrives only when the eye is pressed, for exactly one
+/// render, and yggterm keeps a `stored` field's declared value out of the form
+/// draft — so a reveal is displayed and never re-sent.
+///
+/// `present` is the boolean a SECRET-FREE listing already carries. False means
+/// the entry holds none of this: an ordinary empty box that ADDS one, with no
+/// eye offered for a value that is not there.
+fn secret_field(
+    id: &str,
+    label: &str,
+    field: StoredField,
+    present: bool,
+    reveal: Option<&Reveal>,
+    placeholder: &str,
+    rows: u32,
+    lead_actions: Vec<Value>,
+) -> Value {
+    let revealed = reveal.filter(|reveal| reveal.field == field);
+    let mut actions = lead_actions;
+    if present {
+        actions.push(field_action(
+            EDIT_REVEAL_VERB,
+            &field,
+            "👁",
+            format!("Show the stored {} here, once", field.label()),
+        ));
+        actions.push(field_action(
+            EDIT_COPY_VERB,
+            &field,
+            "⧉",
+            format!("Copy the stored {} to the clipboard", field.label()),
+        ));
+    }
+    let mut widget = json!({
+        "kind": "text-input",
+        "id": id,
+        "label": label,
+        // EMPTY unless this is the field the eye was just pressed on.
+        "value": revealed.map(|reveal| reveal.value.clone()).unwrap_or_default(),
+        // A revealed value must be READABLE — showing it behind ● would defeat
+        // the press that fetched it. Masked every other time.
+        "secret": revealed.is_none() && rows == 0,
+        "stored": present,
+        "placeholder": placeholder,
+        "actions": actions,
+    });
+    if rows > 0 {
+        widget["multiline"] = json!(true);
+        widget["rows"] = json!(rows);
+    }
+    widget
+}
+
+/// One CUSTOM field, as a row with an eye, a copy and a remove.
+///
+/// Custom fields stay rows rather than boxes because their VALUES are not
+/// editable in place: a field is set through the name/value pair below, which
+/// is the one write path `build_edit_request` knows. A typeable box that does
+/// nothing on save would be a lie about the affordance.
 fn stored_value_row(field: &StoredField, reveal: Option<&Reveal>, removable: bool) -> Vec<Value> {
     let mut actions = vec![
-        json!({
-            "action": "edit-reveal",
-            "label": "👁",
-            "title": format!("Show the stored {} here, once", field.label()),
-        }),
-        json!({
-            "action": "edit-copy",
-            "label": "⧉",
-            "title": format!("Copy the stored {} to the clipboard", field.label()),
-        }),
+        field_action(
+            EDIT_REVEAL_VERB,
+            field,
+            "👁",
+            format!("Show the stored {} here, once", field.label()),
+        ),
+        field_action(
+            EDIT_COPY_VERB,
+            field,
+            "⧉",
+            format!("Copy the stored {} to the clipboard", field.label()),
+        ),
     ];
     if removable {
-        actions.push(json!({
-            "action": "edit-remove-field",
-            "label": "🗑",
-            "title": "Remove this custom field",
-        }));
+        actions.push(field_action(
+            EDIT_REMOVE_FIELD_VERB,
+            field,
+            "🗑",
+            "Remove this custom field".to_string(),
+        ));
     }
     let mut widgets = vec![json!({
         "kind": "list-row",
-        // The row id IS the field spec, which is what the two actions above
-        // read: one encoding of "which field", shared by the reveal, the copy
-        // and the remove.
+        // The row id is the field spec too, so a row and its verbs agree even
+        // though the verbs no longer need to read it.
         "id": field.spec(),
         "title": field.row_title(),
         "actions": actions,
@@ -2301,16 +2387,17 @@ fn stored_value_row(field: &StoredField, reveal: Option<&Reveal>, removable: boo
         widgets.push(json!({ "kind": "label", "text": reveal.value }));
         widgets.push(json!({
             "kind": "label", "muted": true,
-            "text": "Shown once. The pane keeps nothing — press 👁 again to read it again.",
+            "text": "Shown once. Press 👁 again to read it again.",
         }));
     }
     widgets
 }
 
-/// The Edit form.
+/// The Edit form — Bitwarden's Edit Login, in our rail.
 ///
 /// ⛔ EVERY SECRET BOX IS STILL EMPTY AND STILL MEANS "LEAVE THIS ALONE". What
-/// changed on 2026-08-02 is that emptiness is no longer the whole story.
+/// changed on 2026-08-02 is that emptiness stopped being the whole story, and
+/// then stopped being how the box LOOKS.
 ///
 /// The rule a schema obeys is that it carries names, usernames and booleans and
 /// never a value — because a schema is re-fetched whenever the pane opens and
@@ -2318,15 +2405,16 @@ fn stored_value_row(field: &StoredField, reveal: Option<&Reveal>, removable: boo
 /// it stays there. A form PRE-FILLED with the stored password would break that
 /// on every render, which is why it is not, and why it must never become one.
 ///
-/// But the user's complaint was not about the form's boxes: *"I cannot edit the
-/// existing fields or see them to manually copy paste."* Every other client can
-/// show you what is stored, and that is the fallback when autofill misses. So
-/// the form now says WHAT the entry holds (booleans, which a listing may carry)
-/// and offers, per field, an eye that fetches that ONE value for ONE render and
-/// a copy that puts it on the clipboard without it ever entering a schema.
+/// But the user's complaint was about the FORM, twice. First: *"I cannot edit
+/// the existing fields or see them to manually copy paste."* Then, when the
+/// answer to that was a separate "Stored values" list with its own eyes:
+/// *"I cannot see passwords in edit mode"* — because a list of rows beneath a
+/// column of blank boxes is not what "edit mode" looks like anywhere else. Every
+/// other client puts the mask, the eye and the copy ON the field.
 ///
-/// The invariant is unchanged in substance and sharper in words: a secret is
-/// never in a schema AT REST and never in a LISTING.
+/// So they are on the field now, and the invariant is held by CONSTRUCTION
+/// rather than by care: the dots are a placeholder (never a value), and a
+/// revealed value is display-only in yggterm's draft (never re-sent).
 ///
 /// Removal stays its own request (`--clear`, the "Remove a value" toggles),
 /// because leaving a box blank and asking for a value to be deleted are
@@ -2335,91 +2423,131 @@ fn stored_value_row(field: &StoredField, reveal: Option<&Reveal>, removable: boo
 fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
     if draft.target_name.is_empty() {
         return vec![
-            json!({"kind": "section", "text": "Edit an entry"}),
+            json!({"kind": "section", "text": "Edit an entry", "card": true}),
             json!({
                 "kind": "label", "muted": true,
                 "text": "Pick an entry on the Fill tab and press ✎ to edit it.",
             }),
         ];
     }
+
+    // ITEM DETAILS — what the entry IS. Bitwarden's first group.
     let mut widgets = vec![
-        json!({"kind": "section", "text": format!("Editing {}", draft.target_name)}),
+        json!({"kind": "section", "text": "Item details", "card": true}),
         json!({
-            "kind": "text-input", "id": "edit_name", "label": "Name",
+            "kind": "text-input", "id": "edit_name", "label": "Item name",
             "value": draft.current.name,
-        }),
-        json!({
-            "kind": "text-input", "id": "edit_user", "label": "Username",
-            "value": draft.current.user,
-        }),
-        json!({
-            "kind": "text-input", "id": "edit_uris", "label": "URIs (one per line)",
-            "value": draft.current.uris, "multiline": true, "rows": 3,
-            "placeholder": "https://example.com",
         }),
         json!({
             "kind": "text-input", "id": "edit_folder", "label": "Folder",
             "value": draft.current.folder,
-            "placeholder": "Leave empty to keep it where it is",
+            "placeholder": "No folder",
         }),
     ];
 
-    // WHAT THIS ENTRY HOLDS, and a way to read each of it. Only the booleans
-    // travel in the schema; the values arrive one at a time, on a press.
-    widgets.push(json!({"kind": "section", "text": "Stored values"}));
-    let stored: Vec<StoredField> = [
-        (draft.has_password, StoredField::Password),
-        (draft.has_totp, StoredField::TotpCode),
-        (draft.has_totp, StoredField::TotpSecret),
-        (draft.has_notes, StoredField::Notes),
-    ]
-    .into_iter()
-    .filter(|(present, _)| *present)
-    .map(|(_, field)| field)
-    .collect();
-    if stored.is_empty() {
+    // LOGIN CREDENTIALS — the three boxes the user came for.
+    widgets.push(json!({"kind": "section", "text": "Login credentials", "card": true}));
+    widgets.push(json!({
+        "kind": "text-input", "id": "edit_user", "label": "Username",
+        "value": draft.current.user,
+        "actions": if draft.current.user.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![field_action(
+                EDIT_COPY_VERB,
+                &StoredField::Username,
+                "⧉",
+                "Copy the username to the clipboard".to_string(),
+            )]
+        },
+    }));
+    widgets.push(secret_field(
+        "edit_password",
+        "Password",
+        StoredField::Password,
+        draft.has_password,
+        reveal,
+        // Empty ⇒ yggterm draws the mask. An entry with no password says so.
+        if draft.has_password {
+            ""
+        } else {
+            "No password stored"
+        },
+        0,
+        vec![json!({
+            "action": "edit-generate",
+            "label": if draft.generate_password { "⟲" } else { "⟳" },
+            "title": if draft.generate_password {
+                "Cancel the roll — keep the stored password"
+            } else {
+                "Roll a new password on save"
+            },
+        })],
+    ));
+    if draft.generate_password {
         widgets.push(json!({
             "kind": "label", "muted": true,
-            "text": "This entry stores no password, authenticator secret or notes.",
+            "text": "A new password will be rolled on this host when you save. Press ⟲ to cancel.",
         }));
-    } else {
-        widgets.push(json!({
-            "kind": "label", "muted": true,
-            "text": "👁 fetches one value and shows it here for this one render; ⧉ puts it on                      the clipboard. Neither is kept, and neither rides the schema that draws                      this pane.",
-        }));
-        for field in &stored {
-            widgets.extend(stored_value_row(field, reveal, false));
-        }
     }
+    widgets.push(secret_field(
+        "edit_totp",
+        "Authenticator key",
+        StoredField::TotpSecret,
+        draft.has_totp,
+        reveal,
+        if draft.has_totp {
+            ""
+        } else {
+            "base32 or an otpauth:// URI"
+        },
+        0,
+        // The six digits are a different value from the key, so the code's copy
+        // is its own verb rather than a second meaning for the key's.
+        if draft.has_totp {
+            vec![field_action(
+                EDIT_COPY_VERB,
+                &StoredField::TotpCode,
+                "⏱",
+                "Copy the current verification code".to_string(),
+            )]
+        } else {
+            Vec::new()
+        },
+    ));
+    widgets.push(json!({
+        "kind": "label", "muted": true,
+        "text": "A box left empty keeps what is stored. Type to replace it.",
+    }));
 
-    widgets.extend([
-        json!({"kind": "section", "text": "Replace a secret"}),
-        json!({
-            "kind": "label", "muted": true,
-            "text": "These boxes are empty because an empty box means “leave this alone”.                      Use 👁 above to read what is stored; type here only to REPLACE it.",
-        }),
-        json!({
-            "kind": "text-input", "id": "edit_password", "label": "New password",
-            "secret": true, "value": "",
-            "placeholder": "Leave empty to keep the current one",
-        }),
-        json!({
-            "kind": "toggle", "id": "edit_generate", "label": "Roll a new password instead",
-            "value": draft.generate_password,
-        }),
-        json!({
-            "kind": "text-input", "id": "edit_totp", "label": "New authenticator secret",
-            "secret": true, "value": "",
-            "placeholder": "base32 or an otpauth:// URI",
-        }),
-        json!({
-            "kind": "text-input", "id": "edit_notes", "label": "Replace notes",
-            "multiline": true, "rows": 6, "value": "",
-            "placeholder": "Leave empty to keep the current notes",
-        }),
-    ]);
+    // AUTOFILL OPTIONS — where this entry matches.
+    widgets.push(json!({"kind": "section", "text": "Autofill options", "card": true}));
+    widgets.push(json!({
+        "kind": "text-input", "id": "edit_uris", "label": "Website (one URI per line)",
+        "value": draft.current.uris, "multiline": true, "rows": 3,
+        "placeholder": "https://example.com",
+    }));
 
-    widgets.push(json!({"kind": "section", "text": "Custom fields"}));
+    // ADDITIONAL OPTIONS — notes, custom fields, removals.
+    widgets.push(json!({"kind": "section", "text": "Additional options", "card": true}));
+    widgets.push(secret_field(
+        "edit_notes",
+        "Notes",
+        StoredField::Notes,
+        draft.has_notes,
+        reveal,
+        // Notes are prose, not a secret: mask dots over a six-row box would be
+        // theatre, so this one names its own placeholder and gets no mask.
+        if draft.has_notes {
+            "Stored — press 👁 to read, or type to replace"
+        } else {
+            "Anything to remember"
+        },
+        5,
+        Vec::new(),
+    ));
+
+    widgets.push(json!({"kind": "section", "text": "Custom fields", "card": true}));
     if draft.field_names.is_empty() {
         widgets.push(json!({
             "kind": "label", "muted": true, "text": "This entry carries none.",
@@ -2439,11 +2567,11 @@ fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
         }
     }
     widgets.push(json!({
-        "kind": "text-input", "id": "edit_field_name", "label": "Field name",
+        "kind": "text-input", "id": "edit_field_name", "label": "New field name",
         "value": draft.field_name, "placeholder": "API Key",
     }));
     widgets.push(json!({
-        "kind": "text-input", "id": "edit_field_value", "label": "Field value",
+        "kind": "text-input", "id": "edit_field_value", "label": "New field value",
         "secret": true, "value": "",
         "placeholder": "Set or replace this field",
     }));
@@ -2452,10 +2580,10 @@ fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
         "value": draft.field_hidden,
     }));
 
-    widgets.push(json!({"kind": "section", "text": "Remove a value"}));
+    widgets.push(json!({"kind": "section", "text": "Remove a value", "card": true}));
     widgets.push(json!({
         "kind": "label", "muted": true,
-        "text": "Emptying a box above keeps the old value. Removing one is this,                  deliberately separate.",
+        "text": "Emptying a box above keeps the old value. Removing one is this, deliberately separate.",
     }));
     widgets.push(json!({
         "kind": "toggle", "id": "edit_clear_notes", "label": "Delete the notes",
@@ -2465,16 +2593,25 @@ fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
         "kind": "toggle", "id": "edit_clear_totp", "label": "Delete the authenticator secret",
         "value": draft.clear_totp,
     }));
-
-    widgets.push(json!({
-        "kind": "button", "id": "edit-save", "action": "edit-save", "primary": true,
-        "label": "Save changes",
-    }));
-    widgets.push(json!({
-        "kind": "button", "id": "edit-cancel", "action": "edit-cancel",
-        "label": "Cancel",
-    }));
     widgets
+}
+
+/// Save and Cancel, PINNED under the form.
+///
+/// A rail form is taller than the rail, so a Save that scrolls away is a Save
+/// the user has to go looking for — which is exactly where every other client
+/// puts it and why Bitwarden's sits in a bar of its own.
+fn edit_footer_widgets(draft: &EditDraft) -> Vec<Value> {
+    if draft.target_name.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        json!({
+            "kind": "button", "id": "edit-save", "action": "edit-save", "primary": true,
+            "label": "Save changes",
+        }),
+        json!({"kind": "button", "id": "edit-cancel", "action": "edit-cancel", "label": "Cancel"}),
+    ]
 }
 
 /// Render a watchtower report. The report carries labels only, so this cannot
@@ -2592,11 +2729,12 @@ fn absorb_draft(state: &mut PaneState, values: &Value) {
     if let Some(field) = text("edit_field_name") {
         state.edit.field_name = field;
     }
+    // `edit_generate` is deliberately absent: the roll is armed by the ⟳ on the
+    // password field, and that action arm is its only writer.
     for (key, slot) in [
         ("edit_field_hidden", &mut state.edit.field_hidden),
         ("edit_clear_notes", &mut state.edit.clear_notes),
         ("edit_clear_totp", &mut state.edit.clear_totp),
-        ("edit_generate", &mut state.edit.generate_password),
     ] {
         if let Some(raw) = values[key].as_str() {
             *slot = raw == "true";
@@ -2880,6 +3018,31 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
             }
             reschema(state, host.as_deref())
         }
+        // ⟳ ON THE PASSWORD FIELD, which is where Bitwarden puts it. It arms a
+        // roll for the next save rather than generating anything now: a password
+        // that existed before the user pressed Save is a password they cannot
+        // decline, and nothing about this pane writes to the vault except Save.
+        //
+        // ONE owner for the boolean — this arm. It used to be a toggle row, and
+        // the toggle's value rode `absorb_draft`; two writers for one flag is
+        // how a form ends up disagreeing with itself.
+        "edit-generate" => {
+            let armed = {
+                let mut state = state.lock().unwrap();
+                state.edit.generate_password = !state.edit.generate_password;
+                state.edit.generate_password
+            };
+            merge(
+                reschema(state, host.as_deref()),
+                json!({
+                    "toast": if armed {
+                        "A new password will be rolled when you save."
+                    } else {
+                        "The stored password will be kept."
+                    },
+                }),
+            )
+        }
         // Show ONE stored value, for ONE render.
         //
         // ⛔ THE VALUE IS NEVER STORED. It is read here, threaded into the schema
@@ -2891,7 +3054,15 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
         //
         // The target is the LOADED DRAFT, not a row id: you are on the Edit tab,
         // editing one entry, and the field to read is the row's own id.
-        "edit-reveal" | "edit-copy" => {
+        //
+        // The FIELD is the action's suffix, not `values.value`: an inline form
+        // field's press carries the WIDGET's id (yggterm knows nothing about
+        // field specs), so the target rides the action exactly as `copy-row:`
+        // does — one encoding, two surfaces.
+        _ if action.starts_with(&format!("{EDIT_REVEAL_VERB}:"))
+            || action.starts_with(&format!("{EDIT_COPY_VERB}:")) =>
+        {
+            let (verb, spec) = action.split_once(':').expect("the guard matched a prefix");
             let (target_name, target_user) = {
                 let state = state.lock().unwrap();
                 (
@@ -2902,12 +3073,12 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
             if target_name.is_empty() {
                 return json!({ "toast": "Open an entry on the Fill tab first." });
             }
-            let Some(field) = StoredField::parse(&value) else {
-                return json!({ "toast": format!("{value:?} is not a field this pane can read.") });
+            let Some(field) = StoredField::parse(spec) else {
+                return json!({ "toast": format!("{spec:?} is not a field this pane can read.") });
             };
             match read_stored(&target_name, &target_user, &field) {
                 Ok(secret) => {
-                    if action == "edit-copy" {
+                    if verb == EDIT_COPY_VERB {
                         copy_reply(&target_name, &field, &secret)
                     } else {
                         reschema_revealing(
@@ -2924,7 +3095,11 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
             }
         }
         // Removing a custom field is its own request, not a blank box.
-        "edit-remove-field" => {
+        _ if action.starts_with(&format!("{EDIT_REMOVE_FIELD_VERB}:")) => {
+            let spec = action
+                .split_once(':')
+                .expect("the guard matched a prefix")
+                .1;
             let (target_name, target_user) = {
                 let state = state.lock().unwrap();
                 (
@@ -2932,11 +3107,11 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                     state.edit.target_user.clone(),
                 )
             };
-            // The row id is the FIELD SPEC — the same one the eye and the copy
-            // button read, so the three verbs on a custom-field row cannot
-            // disagree about which field they act on.
-            let Some(StoredField::Custom(value)) = StoredField::parse(&value) else {
-                return json!({ "toast": format!("{value:?} is not a custom field.") });
+            // The FIELD SPEC is the same one the eye and the copy read, so the
+            // three verbs on a custom-field row cannot disagree about which
+            // field they act on.
+            let Some(StoredField::Custom(value)) = StoredField::parse(spec) else {
+                return json!({ "toast": format!("{spec:?} is not a custom field.") });
             };
             let request = json!({
                 "op": "edit", "name": target_name, "user": opt_field(&target_user),
@@ -3495,7 +3670,7 @@ fn media_permission_widgets(
     sites: &std::collections::BTreeMap<String, crate::webmedia::SiteDecisions>,
 ) -> Vec<Value> {
     use crate::webmedia::{Decision, Device};
-    let mut widgets = vec![json!({"kind": "section", "text": "Camera & microphone"})];
+    let mut widgets = vec![json!({"kind": "section", "text": "Camera & microphone", "card": true})];
     if sites.is_empty() {
         widgets.push(json!({
             "kind": "label",
@@ -3557,7 +3732,7 @@ fn media_permission_widgets(
 /// hand-typed UA is a site quietly serving you the wrong code.
 fn user_agent_widgets() -> Vec<Value> {
     let current = crate::useragent::preset();
-    let mut widgets = vec![json!({"kind": "section", "text": "Browser identity"})];
+    let mut widgets = vec![json!({"kind": "section", "text": "Browser identity", "card": true})];
     widgets.push(json!({
         "kind": "label",
         "muted": true,
@@ -3664,7 +3839,7 @@ fn settings_schema_from(
     media_sites: &std::collections::BTreeMap<String, crate::webmedia::SiteDecisions>,
 ) -> Value {
     let (host, live_zoom, secure) = (page.host(), page.zoom, page.secure);
-    let mut widgets = vec![json!({"kind": "section", "text": "This site"})];
+    let mut widgets = vec![json!({"kind": "section", "text": "This site", "card": true})];
     widgets.extend(current_site_zoom_widgets(host, live_zoom, zoom_sites));
     widgets.extend(current_site_security_widgets(host, secure));
     // The per-site identity override, beside the per-site zoom: both are "this
@@ -3680,7 +3855,7 @@ fn settings_schema_from(
     // the window looks like.
     widgets.extend(browsing_widgets(page));
 
-    widgets.push(json!({"kind": "section", "text": "Ad blocking"}));
+    widgets.push(json!({"kind": "section", "text": "Ad blocking", "card": true}));
     if state.adblock_rules_present {
         widgets.push(json!({
             "kind": "toggle",
@@ -3716,7 +3891,7 @@ fn settings_schema_from(
 
     // Everything EXCEPT sponsorblock: one list-row each, with Enable/Disable and
     // a Delete (the "toggle + trash icon" the design calls for).
-    widgets.push(json!({"kind": "section", "text": "Userscripts"}));
+    widgets.push(json!({"kind": "section", "text": "Userscripts", "card": true}));
     let managed: Vec<&crate::webpolicy::UserscriptStatus> = state
         .userscripts
         .iter()
@@ -5654,60 +5829,174 @@ mod tests {
             .collect()
     }
 
-    // ⛔ THE 2026-08-02 REPORT, FIRST HALF: *"I cannot edit the existing fields
-    // or see them to manually copy paste."* The form used to be a REPLACE form —
-    // empty boxes and a sentence explaining that emptiness — so a user could not
-    // check what was stored, which is the fallback every other client gives when
-    // autofill misses.
-    //
-    // The answer is not a pre-filled form (that would put a secret in every
-    // render); it is the form SAYING what is there, from booleans a listing may
-    // carry, with a per-field eye and copy.
-    #[test]
-    fn the_edit_form_says_what_is_stored_and_offers_a_way_to_read_each_one() {
-        let widgets = edit_tab_widgets(&stored_everything_draft(), None);
-        let ids = row_ids(&widgets);
-        for expected in ["password", "totp", "totp-secret", "notes", "field:API Key"] {
-            assert!(
-                ids.contains(&expected.to_string()),
-                "no row for {expected}: {ids:?}"
-            );
-        }
-        // Every one of them offers BOTH verbs, and a custom field also offers
-        // the removal it always had.
-        for id in ids {
-            let row = widgets
-                .iter()
-                .find(|widget| widget["id"] == id)
-                .expect("the row we just listed");
-            let actions: Vec<&str> = row["actions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|action| action["action"].as_str().unwrap())
-                .collect();
-            assert!(actions.contains(&"edit-reveal"), "{id} has no eye");
-            assert!(actions.contains(&"edit-copy"), "{id} cannot be copied");
-            assert_eq!(
-                actions.contains(&"edit-remove-field"),
-                id.starts_with(CUSTOM_FIELD_PREFIX),
-                "only a custom field may be removed: {id}",
-            );
-        }
+    /// Every widget carrying an `actions` array, as `{id: [action, ...]}` —
+    /// a form field and a list row alike, because the two now offer the same
+    /// verbs and the point is that they agree.
+    fn widget_verbs(widgets: &[Value]) -> std::collections::BTreeMap<String, Vec<String>> {
+        widgets
+            .iter()
+            .filter_map(|widget| {
+                let id = widget["id"].as_str()?.to_string();
+                let actions = widget["actions"].as_array()?;
+                Some((
+                    id,
+                    actions
+                        .iter()
+                        .filter_map(|action| action["action"].as_str())
+                        .map(str::to_string)
+                        .collect(),
+                ))
+            })
+            .collect()
+    }
 
-        // An entry that stores none of them says so rather than offering eyes
-        // for values that are not there.
+    /// The widget with this id, or a panic naming what was missing.
+    fn one_widget<'a>(widgets: &'a [Value], id: &str) -> &'a Value {
+        widgets
+            .iter()
+            .find(|candidate| candidate["id"] == id)
+            .unwrap_or_else(|| panic!("no widget {id}"))
+    }
+
+    // ⛔ THE 2026-08-02 REPORT, BOTH HALVES. First: *"I cannot edit the existing
+    // fields or see them to manually copy paste."* Then, once that was answered
+    // with a separate "Stored values" list: *"I cannot see passwords in edit
+    // mode"* — because a list of rows under a column of blank boxes is not what
+    // edit mode looks like in any other client.
+    //
+    // So the mask, the eye and the copy are ON THE FIELD now. This test pins the
+    // SHAPE: which box exists, which verbs it offers, and that an entry storing
+    // nothing is never offered an eye for a value that is not there.
+    #[test]
+    fn the_edit_form_puts_the_mask_the_eye_and_the_copy_on_the_field() {
+        let widgets = edit_tab_widgets(&stored_everything_draft(), None);
+        let verbs = widget_verbs(&widgets);
+
+        // Bitwarden's groups, in Bitwarden's order.
+        let sections: Vec<&str> = widgets
+            .iter()
+            .filter(|widget| widget["kind"] == "section")
+            .filter_map(|widget| widget["text"].as_str())
+            .collect();
+        assert_eq!(
+            sections,
+            [
+                "Item details",
+                "Login credentials",
+                "Autofill options",
+                "Additional options",
+                "Custom fields",
+                "Remove a value",
+            ],
+        );
+        // …and a form group is a CARD, which is what stops the pane reading as
+        // one undifferentiated grey column.
+        assert!(
+            widgets
+                .iter()
+                .filter(|widget| widget["kind"] == "section")
+                .all(|widget| widget["card"] == true),
+            "a form section that is not a card",
+        );
+
+        for (id, field, extra) in [
+            ("edit_password", "password", "edit-generate"),
+            ("edit_totp", "totp-secret", "edit-copy:totp"),
+        ] {
+            let offered = verbs.get(id).unwrap_or_else(|| panic!("no {id} field"));
+            assert!(
+                offered.contains(&format!("edit-reveal:{field}")),
+                "{id} has no eye: {offered:?}",
+            );
+            assert!(
+                offered.contains(&format!("edit-copy:{field}")),
+                "{id} cannot be copied: {offered:?}",
+            );
+            assert!(
+                offered.contains(&extra.to_string()),
+                "{id} lost {extra}: {offered:?}",
+            );
+            // THE MASK IS A PLACEHOLDER, NOT A VALUE — the property that makes
+            // "the form is never pre-filled with a secret" true by construction.
+            let box_ = one_widget(&widgets, id);
+            assert_eq!(box_["value"], "", "{id} carries a value");
+            assert_eq!(box_["stored"], true, "{id} does not say it holds anything");
+            assert_eq!(box_["placeholder"], "", "{id} declined yggterm's mask");
+        }
+        // Notes are prose, so they name their own placeholder and get no dots —
+        // and they are still display-only, so a reveal cannot be re-sent.
+        let notes = one_widget(&widgets, "edit_notes");
+        assert_eq!(notes["stored"], true);
+        assert_eq!(notes["value"], "");
+        assert!(
+            notes["placeholder"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("👁")),
+            "the notes box says nothing about what is in it",
+        );
+        // The username is not a secret and never was: no eye, but the copy every
+        // other client offers.
+        assert_eq!(
+            verbs.get("edit_user").map(Vec::as_slice),
+            Some(["edit-copy:username".to_string()].as_slice()),
+        );
+        // A custom field keeps its row (its value has no in-place write path)
+        // and keeps all three verbs, through the SAME encoding as the fields.
+        assert_eq!(
+            verbs.get("field:API Key").map(Vec::as_slice),
+            Some(
+                [
+                    "edit-reveal:field:API Key".to_string(),
+                    "edit-copy:field:API Key".to_string(),
+                    "edit-remove-field:field:API Key".to_string(),
+                ]
+                .as_slice()
+            ),
+        );
+
+        // An entry that stores none of them is offered no eye for a value that
+        // is not there — the boxes are ordinary empty boxes that ADD one.
         let bare = EditDraft {
             target_name: "a note".into(),
             ..EditDraft::default()
         };
         let widgets = edit_tab_widgets(&bare, None);
-        assert!(row_ids(&widgets).is_empty(), "offered a reveal for nothing");
+        let verbs = widget_verbs(&widgets);
+        for id in ["edit_password", "edit_totp", "edit_notes"] {
+            let box_ = one_widget(&widgets, id);
+            assert_eq!(box_["stored"], false, "{id} claims to hold something");
+            assert!(
+                !verbs.get(id).is_some_and(|offered| offered
+                    .iter()
+                    .any(|action| action.starts_with(EDIT_REVEAL_VERB))),
+                "offered a reveal for nothing on {id}",
+            );
+            assert!(
+                box_["placeholder"]
+                    .as_str()
+                    .is_some_and(|hint| !hint.is_empty()),
+                "{id} would draw a mask over nothing",
+            );
+        }
+    }
+
+    // Save and Cancel are PINNED, not scrolled: the form is taller than the rail.
+    #[test]
+    fn the_edit_form_pins_its_save() {
+        let footer = edit_footer_widgets(&stored_everything_draft());
+        let ids: Vec<&str> = footer
+            .iter()
+            .filter_map(|widget| widget["id"].as_str())
+            .collect();
+        assert_eq!(ids, ["edit-save", "edit-cancel"]);
+        assert_eq!(footer[0]["primary"], true, "Save is the primary action");
+        // Nothing loaded, nothing to save.
+        assert!(edit_footer_widgets(&EditDraft::default()).is_empty());
+        // …and the form itself no longer carries them, or there would be two.
+        let widgets = edit_tab_widgets(&stored_everything_draft(), None);
         assert!(
-            serde_json::to_string(&widgets)
-                .unwrap()
-                .contains("stores no password"),
-            "silence is not an answer",
+            !widgets.iter().any(|widget| widget["id"] == "edit-save"),
+            "Save is drawn twice",
         );
     }
 
@@ -5729,16 +6018,24 @@ mod tests {
         );
         let wire = serde_json::to_string(&revealed).unwrap();
         assert!(wire.contains(secret), "the eye showed nothing");
-        // ...directly under ITS OWN row, never under another value's title.
-        let at = revealed
+        // ...IN ITS OWN BOX, readable, and in no other widget. The eye's whole
+        // job is to put the value where the user is looking; a value that came
+        // back still behind ● would be a press that did nothing.
+        let carriers: Vec<&str> = revealed
             .iter()
-            .position(|widget| widget["text"] == secret)
-            .expect("the revealed label");
+            .filter(|widget| widget["value"] == secret || widget["text"] == secret)
+            .filter_map(|widget| widget["id"].as_str())
+            .collect();
         assert_eq!(
-            revealed[at - 1]["id"],
-            "password",
-            "a revealed value landed under the wrong row",
+            carriers,
+            ["edit_password"],
+            "a revealed value landed somewhere other than its own field",
         );
+        let box_ = one_widget(&revealed, "edit_password");
+        assert_eq!(box_["secret"], false, "the eye showed dots");
+        // It is STILL declared `stored`, which is what keeps yggterm from
+        // folding it into the form draft and re-sending it on the next action.
+        assert_eq!(box_["stored"], true);
 
         // The very next render — any caller, any reason — is built without it.
         let again = serde_json::to_string(&edit_tab_widgets(&draft, None)).unwrap();
