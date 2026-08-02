@@ -90,8 +90,28 @@ enum Command {
         field: GetField,
     },
     /// Print an item's current TOTP code — `rbw code` parity.
+    ///
+    /// Refuses on a host whose kernel says its clock is not disciplined: a
+    /// 30 s window tolerates one window of skew, and manin was 72 s out while
+    /// minting confident, always-wrong codes. `--ignore-clock` waives that
+    /// after you have read what is wrong; `ychrome-vault clock` shows it.
     #[command(alias = "code")]
-    Totp { name: String, user: Option<String> },
+    Totp {
+        name: String,
+        user: Option<String>,
+        /// Mint anyway on an undisciplined clock. The code will very probably
+        /// be rejected; this exists for a host you have verified by other means.
+        #[arg(long)]
+        ignore_clock: bool,
+    },
+    /// Print what the KERNEL says about this host's clock, as JSON.
+    ///
+    /// Needs no unlock. ⚠ Do NOT diagnose from `chronyc tracking`'s
+    /// `Last offset`/`RMS offset` — they reported perfect tracking on a host
+    /// that was 72 s out. `timedatectl`'s `System clock synchronized:` and
+    /// `chronyc tracking`'s `System time :` are the lines that tell the truth,
+    /// and this verb reads the same kernel state they do.
+    Clock,
     /// List an item's stored passkeys as `rpId<TAB>user<TAB>credentialId<TAB>created`.
     ///
     /// Metadata only — the passkey private key is never printed, and a listing
@@ -143,29 +163,53 @@ enum Command {
     /// Change fields on an existing item. Fields you do not name are preserved
     /// — including the notes, custom fields, favorite flag and password history
     /// this client does not otherwise model.
+    ///
+    /// Every change is RE-READ after the write and the result names what
+    /// actually landed; an edit the server took but a re-read cannot see is
+    /// reported as a failure.
     Edit {
         name: String,
         user: Option<String>,
-        /// New item name.
+        /// New item name (the entry's title).
         #[arg(long)]
         rename: Option<String>,
         /// New username.
         #[arg(long)]
         set_user: Option<String>,
-        /// Replaces the item's entire uri list with this one uri.
+        /// Replaces the item's ENTIRE uri list. Repeat for several uris, in
+        /// order. A uri the item already stores keeps its match type.
         #[arg(long)]
-        uri: Option<String>,
+        uri: Vec<String>,
         #[arg(long)]
         totp: Option<String>,
         /// Clear the authenticator secret entirely (removes a value mis-stored
-        /// in the TOTP slot). Cannot be combined with --totp.
+        /// in the TOTP slot). The same thing as `--clear totp`, kept because it
+        /// shipped first.
         #[arg(long, conflicts_with = "totp")]
         clear_totp: bool,
+        /// Remove a field's value rather than replacing it. Repeatable. This is
+        /// the ONLY way to empty a field: setting one to "" is refused, because
+        /// a stored empty string and an absent value are different facts.
+        #[arg(long, value_name = "FIELD")]
+        clear: Vec<ClearFieldArg>,
         #[arg(long)]
         notes: Option<String>,
         /// Move the item to this existing folder.
         #[arg(long)]
         folder: Option<String>,
+        /// Set a custom field: `--set-field NAME=VALUE`. Repeatable. Creates the
+        /// field if it is absent. A field that is already HIDDEN stays hidden —
+        /// updating a secret must never expose it as a side effect.
+        #[arg(long, value_name = "NAME=VALUE")]
+        set_field: Vec<String>,
+        /// Set a HIDDEN custom field, reading its value from stdin like a
+        /// password. One per edit, because stdin carries exactly one value.
+        #[arg(long, value_name = "NAME", conflicts_with = "password")]
+        set_hidden_field: Option<String>,
+        /// Delete a custom field. Repeatable. A name the item does not carry is
+        /// an error, not a silent no-op.
+        #[arg(long, value_name = "NAME")]
+        remove_field: Vec<String>,
         /// Read a new password from stdin. The old one is kept in the item's
         /// password history.
         #[arg(long)]
@@ -245,6 +289,48 @@ enum Command {
 /// doc comment promised four fields, the match accepted five, and the error
 /// message named a different four. A whitelist that disagrees with its own help
 /// is how `totp-secret` came to be undocumented but working.
+/// The fields `edit --clear` can remove.
+///
+/// A thin clap shell over [`ychrome_vault::model::ClearField`], which is the
+/// real owner: the spelling, the refusals and the patcher all read from there,
+/// and this exists only because clap cannot derive `ValueEnum` on a type in
+/// another crate. The `From` below is the ONE place the two meet.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ClearFieldArg {
+    Notes,
+    Totp,
+    Username,
+    /// The whole uri list.
+    Uri,
+    /// Move the item out of every folder.
+    Folder,
+}
+
+impl From<ClearFieldArg> for ychrome_vault::model::ClearField {
+    fn from(arg: ClearFieldArg) -> Self {
+        use ychrome_vault::model::ClearField;
+        match arg {
+            ClearFieldArg::Notes => ClearField::Notes,
+            ClearFieldArg::Totp => ClearField::Totp,
+            ClearFieldArg::Username => ClearField::Username,
+            ClearFieldArg::Uri => ClearField::Uri,
+            ClearFieldArg::Folder => ClearField::Folder,
+        }
+    }
+}
+
+/// `NAME=VALUE` for `--set-field`. The name may not be empty; the value may
+/// contain `=` (a token or a URL routinely does), so only the FIRST `=` splits.
+fn parse_name_value(pair: &str) -> Result<(String, String)> {
+    let (name, value) = pair
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("expected NAME=VALUE, got {pair:?}"))?;
+    if name.trim().is_empty() {
+        bail!("a custom field needs a name: {pair:?}");
+    }
+    Ok((name.to_string(), value.to_string()))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum GetField {
     Password,
@@ -463,10 +549,22 @@ fn main() -> Result<()> {
             println!("{}", required_field(&reply, key, &name)?);
             Ok(())
         }
-        Command::Totp { name, user } => {
-            let response =
-                agent::request(&dir, &json!({"op": "totp", "name": name, "user": user}))?;
+        Command::Totp {
+            name,
+            user,
+            ignore_clock,
+        } => {
+            let response = agent::request(
+                &dir,
+                &json!({"op": "totp", "name": name, "user": user,
+                        "ignore_clock": ignore_clock}),
+            )?;
             println!("{}", required_field(&response, "code", &name)?);
+            Ok(())
+        }
+        Command::Clock => {
+            let response = agent::request(&dir, &json!({"op": "clock"}))?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
             Ok(())
         }
         Command::Passkeys { name, user } => {
@@ -615,28 +713,85 @@ fn main() -> Result<()> {
             uri,
             totp,
             clear_totp,
+            clear,
             notes,
             folder,
+            set_field,
+            set_hidden_field,
+            remove_field,
             password,
             generate,
             length,
             no_symbols,
         } => {
-            let password = password.then(|| read_secret("new password")).transpose()?;
+            // `--clear-totp` is the same request as `--clear totp`; it folds in
+            // here, at the CLI edge, so the enum stays the single owner and the
+            // two spellings cannot mean different things.
+            let mut clear: Vec<Value> = clear
+                .into_iter()
+                .map(|field| json!(ychrome_vault::model::ClearField::from(field).as_str()))
+                .collect();
+            if clear_totp {
+                clear.push(json!(ychrome_vault::model::ClearField::Totp.as_str()));
+            }
+
+            let mut fields: Vec<Value> = Vec::new();
+            for pair in &set_field {
+                let (field, value) = parse_name_value(pair)?;
+                fields.push(json!({"name": field, "action": "set", "value": value}));
+            }
+            for field in &remove_field {
+                fields.push(json!({"name": field, "action": "remove"}));
+            }
+            // Exactly one stdin read per invocation, and clap has already ruled
+            // out asking for both. A hidden custom field is a secret like a
+            // password, so it comes the same way a password does rather than
+            // through an argv every `ps` on this host can read.
+            let mut hidden_value = None;
+            if let Some(field) = &set_hidden_field {
+                hidden_value = Some(read_secret(&format!("value for custom field {field:?}"))?);
+            }
+            let password = match (password, hidden_value) {
+                (true, _) => Some(read_secret("new password")?),
+                (false, Some(value)) => {
+                    let field = set_hidden_field.clone().expect("read under this flag");
+                    fields.push(json!({
+                        "name": field, "action": "set-hidden", "value": value,
+                    }));
+                    None
+                }
+                (false, None) => None,
+            };
+
             let response = agent::request(
                 &dir,
                 &json!({
                     "op": "edit", "name": name, "user": user,
-                    "rename": rename, "set_user": set_user, "uri": uri,
-                    "totp": totp, "clear_totp": clear_totp, "notes": notes, "folder": folder,
+                    "rename": rename, "set_user": set_user, "uris": uri,
+                    "totp": totp, "clear": clear, "notes": notes, "folder": folder,
+                    "fields": fields,
                     "password": password,
                     "generate": generate, "length": length, "symbols": !no_symbols,
                 }),
             )?;
+            // ⛔ NO RECEIPT MEANS NO PROOF, AND AN AGENT OUTLIVES ITS BINARY.
+            // An agent older than this CLI silently ignores every argument it
+            // does not know — `uris`, `clear`, `fields` — and would otherwise
+            // report a cheerful success for an edit that changed nothing. It
+            // cannot fake `verified`, so its absence is the tell.
+            let Some(verified) = response.get("verified").and_then(Value::as_array) else {
+                bail!(
+                    "this vault agent is older than this binary: it did not verify the \
+                     edit, and it silently ignores the fields it does not know. \
+                     Run `ychrome-vault handover` and retry."
+                );
+            };
             print_json(&json!({
                 "edited": response["name"],
                 "id": response["id"],
                 "generated_password": response["generated_password"],
+                // Which changes a re-read actually found. Names, never values.
+                "verified": verified,
             }))
         }
         Command::Rm {

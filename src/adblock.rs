@@ -335,6 +335,13 @@ fn build_into(dir: &Path, loaded: Vec<(String, String)>) -> Result<Conversion> {
         crate::abp::generate_cosmetic_script(&conversion.procedural, &ruleset_version()),
     )
     .with_context(|| format!("writing {}.js", crate::abp::COSMETIC_SCRIPT_STEM))?;
+    // …and so is the scriptlet script. Same conversion, same reason: one owner
+    // of "what the filter lists say".
+    std::fs::write(
+        dir.join(format!("{}.js", crate::abp::SCRIPTLET_SCRIPT_STEM)),
+        crate::abp::generate_scriptlet_script(&conversion.scriptlets, &ruleset_version()),
+    )
+    .with_context(|| format!("writing {}.js", crate::abp::SCRIPTLET_SCRIPT_STEM))?;
     Ok(conversion)
 }
 
@@ -351,6 +358,26 @@ pub fn run(verb: Option<&str>, args: &[String]) -> Result<()> {
         Some("lists") => {
             for list in &LISTS {
                 println!("{:<24} {}\n{:<24} {}", list.name, list.url, "", list.why);
+            }
+            // The scriptlet library, ordered by what it unlocks. A `##+js(...)`
+            // naming something absent here is COUNTED as dropped, not run, so
+            // this list is the honest answer to "which of them work".
+            let total: usize = crate::abp::SCRIPTLETS.iter().map(|s| s.filters).sum();
+            println!(
+                "\nscriptlets implemented ({} of them, covering ~{total} filters in these lists):",
+                crate::abp::SCRIPTLETS.len()
+            );
+            for entry in crate::abp::SCRIPTLETS {
+                println!(
+                    "  {:<26} {:>5} filters{}",
+                    entry.canonical,
+                    entry.filters,
+                    if entry.aliases.is_empty() {
+                        String::new()
+                    } else {
+                        format!("   aka {}", entry.aliases.join(", "))
+                    }
+                );
             }
             Ok(())
         }

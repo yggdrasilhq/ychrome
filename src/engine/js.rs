@@ -388,3 +388,79 @@ pub const RESTORE_PLACE: &str = r#"(place) => {
   return { fields_restored: fields, fields_missing: missing,
            scroll_y: Math.round(window.scrollY) };
 }"#;
+
+// ===== CAPTURE (docs/agent-engine.md §4, `/engine/shot`) =====================
+//
+// Three reads and one driver, and between them they are the whole reason a
+// cropped capture can be trusted. The engine never converts CSS pixels to
+// device pixels by ASSUMING a ratio: it takes the snapshot, divides its real
+// width by the document width these probes report, and crops with the number
+// that came back. `devicePixelRatio` is reported alongside so a caller can see
+// when the two disagree, but nothing depends on it.
+
+/// The page's own geometry, in CSS pixels, at the instant a capture crops
+/// against it.
+///
+/// `doc_w`/`doc_h` are the SCROLLABLE document — the region
+/// `SnapshotRegion::FullDocument` renders — and they are the denominator of the
+/// CSS→device scale. `view_w`/`view_h` are what a `region=viewport` capture
+/// covers. All five are reported in the capture's metadata header, because a
+/// crop that silently used the wrong denominator produces a plausible-looking
+/// PNG of the wrong part of the page, and there is no way to see that from the
+/// image alone.
+pub const SHOT_METRICS: &str = r#"(() => {
+  const d = document.documentElement, b = document.body;
+  const max = (...v) => v.reduce((a, n) => (n > a ? n : a), 0);
+  return {
+    doc_w: max(d ? d.scrollWidth : 0, b ? b.scrollWidth : 0,
+               d ? d.clientWidth : 0, window.innerWidth || 0),
+    doc_h: max(d ? d.scrollHeight : 0, b ? b.scrollHeight : 0,
+               d ? d.clientHeight : 0, window.innerHeight || 0),
+    view_w: window.innerWidth || 0,
+    view_h: window.innerHeight || 0,
+    scroll_x: Math.round(window.scrollX || 0),
+    scroll_y: Math.round(window.scrollY || 0),
+    dpr: window.devicePixelRatio || 1
+  };
+})()"#;
+
+/// The DOCUMENT-space CSS rect of one member of the click pool.
+///
+/// Deliberately reads `__ychromeClickPool` rather than running its own
+/// `querySelectorAll`: `region=element` then resolves a selector through
+/// EXACTLY the machinery `/engine/input` clicks through — same hittable filter,
+/// same `nth` default, same `{matches, hittable, hidden, zero_size}` account —
+/// so "screenshot the button I am about to click" cannot pick a different
+/// element than the click will. A second selector resolver beside that one is
+/// precisely the divergence AGENTS.md forbids.
+///
+/// Document space, not viewport space, because a full-document snapshot is
+/// addressed in document space and an element below the fold has to be
+/// croppable without scrolling to it first.
+pub const SHOT_POOL_RECT: &str = r#"(index) => {
+  const pool = window.__ychromeClickPool || [];
+  const el = pool[index] || null;
+  if (!el) return { found: false };
+  const r = el.getBoundingClientRect();
+  return {
+    found: true,
+    tag: el.tagName ? el.tagName.toLowerCase() : '',
+    x: r.left + (window.scrollX || 0),
+    y: r.top + (window.scrollY || 0),
+    w: r.width,
+    h: r.height
+  };
+}"#;
+
+/// One step of the lazy-load pre-scroll, and the read that proves it landed.
+///
+/// ⚠ **A pre-scroll cannot be one `eval`.** Lazy images load from an
+/// `IntersectionObserver` callback and a `fetch`, both of which need event-loop
+/// turns the page never gets while a single synchronous script is running. A
+/// loop that scrolls the whole document inside one eval therefore returns
+/// having triggered nothing. So the loop lives in Rust, one step per call with
+/// a settle between them, and this is the step.
+pub const SHOT_SCROLL_TO: &str = r#"(y) => {
+  window.scrollTo(0, y);
+  return { scroll_y: Math.round(window.scrollY || 0) };
+}"#;
