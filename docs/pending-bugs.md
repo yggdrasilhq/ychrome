@@ -65,11 +65,24 @@ predates the field. But:
   documented zero-cost remedy is unavailable exactly when it is needed**, and
   the pane's own advice sends the user in a circle.
 
-**Fixes owed:** (a) `handover` must compare the installed binary's IDENTITY
-(mtime+size, or a hash) against what the agent actually exec'd, never the path;
-(b) once an agent reports it, the pane shows **"Last synced <time> · Sync now"**
-as a plain fact and keeps the warning for the genuine failure case only;
-(c) sync on a schedule/staleness rule rather than making the user press it.
+**Fixes owed:** ~~(a) `handover` must compare the installed binary's IDENTITY~~
+✅ **(a) DONE 2026-08-02** (`ce0a7ec`): `exe_stamp` now captures the running
+binary's stamp ONCE, pinned at `serve_on`, instead of re-reading the path's
+mtime on every call — which after an in-place install described the SUCCESSOR
+and made the identity check blind to the change it exists to detect.
+⚠ **Honesty about this one: the reported refusal did NOT reproduce.** On Linux a
+replaced binary readlinks as `<path> (deleted)`, so the stale agent stamped
+itself `(deleted)@0`, `agent_stale` read **true**, and `ychrome-vault handover`
+went through **with the unlock preserved** (verified live on guihost: 1120 items,
+no master password re-entry). The fix removes the dependency on that procfs
+detail, which does not hold if an installer overwrites in place and keeps the
+inode.
+✅ **The agent-side half of (b) is also cleared**: the post-handover agent
+reports `last_sync_unix` (measured `1785682003`). What remains of (b) is purely
+the PANE — show **"Last synced <time> · Sync now"** as a plain fact and keep the
+warning for the genuine failure case only.
+**(c) still owed:** sync on a schedule/staleness rule rather than making the
+user press it.
 
 ⚠ Same family as three other findings today: a version-gated hot-restart that
 cannot swap a same-version binary, `ctl --help` exiting 0 on a build without the
