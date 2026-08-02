@@ -77,6 +77,216 @@ fn vault_status() -> Result<Value> {
     ychrome_vault_proto::status(&vault_dir()?)
 }
 
+/// Said ONCE per process, not once per `/policy` fetch — the GUI refetches
+/// whenever the policy stamp moves, and a line that repeats forever is a line
+/// nobody reads (the same reasoning as the daemon's staleness notice).
+///
+/// ⚠ THIS LINE IS NOT THE USER-FACING SURFACE, AND ON 2026-08-01 IT REACHED
+/// NOBODY. ychrome's stderr is the PTY it was launched in; it is not in
+/// `~/.yggterm`, not in the GUI's `app-launch-logs`, and not anywhere an
+/// operator greps. The user met the failure at a Forgejo 2FA prompt as "Your
+/// browser does not currently support WebAuthn" while this line existed and had
+/// nowhere to land. [`passkey_shim_widgets`] is the surface that answers that;
+/// this stays for the log-reading case and is deliberately secondary.
+fn announce_vault_agent_predates_passkey_scoping() {
+    static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ANNOUNCED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    eprintln!(
+        "ychrome: the running vault agent predates the `passkey-hosts` op, so the \
+         WebAuthn shim is installed on NO site and passkey logins will not work."
+    );
+    eprintln!("ychrome: hand the agent over to the current binary:  ychrome-vault handover");
+}
+
+/// Whether the WebAuthn shim is installable, and when it is not, WHY.
+///
+/// ONE owner for a fact two surfaces need: `/policy` turns it into match
+/// patterns, and the vault pane turns it into something the user can read. They
+/// must never derive it separately — a browser that silently disables passkeys
+/// while the pane reports a healthy vault is exactly the 2026-08-01 failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PasskeyShimState {
+    /// Installable, scoped to these rpIds (never empty).
+    ScopedTo(Vec<String>),
+    /// The vault is readable and holds no passkey at all. Correct and common:
+    /// every page keeps a pristine `navigator`.
+    NoStoredPasskeys,
+    /// Locked, or no agent. A ceremony needs an unlocked agent anyway, so no
+    /// shim is the honest state — but the user must be told, because the PAGE
+    /// will blame their browser.
+    VaultUnavailable(String),
+    /// ⛔ THE ONE THAT LOOKS HEALTHY AND IS NOT. The agent is running and
+    /// unlocked and simply does not know the op this browser needs, so passkeys
+    /// are off on EVERY site while `status` reports a perfectly good vault.
+    ///
+    /// Measured on the GUI host 2026-08-01: `status` answered `state: unlocked`,
+    /// `agent_stale: false`, 1116 items — and the same socket answered
+    /// `unknown op "passkey-hosts"`. `agent_stale` compares the agent against
+    /// the INSTALLED `ychrome-vault`, and both were the same six-day-old
+    /// binary, so it is structurally incapable of catching this. Only asking
+    /// for the op finds it.
+    AgentPredatesBrowser,
+}
+
+/// Ask the vault where the shim may be installed. THE ONE call site of the
+/// `passkey-hosts` probe (a lock in this file's tests pins that).
+fn passkey_shim_state() -> PasskeyShimState {
+    const RP_ID_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+    let Ok(dir) = vault_dir() else {
+        return PasskeyShimState::VaultUnavailable("no vault directory on this host".into());
+    };
+    let reply = match ychrome_vault_proto::request_with_timeout(
+        &dir,
+        &json!({ "op": "passkey-hosts" }),
+        RP_ID_PROBE_BUDGET,
+    ) {
+        Ok(reply) => reply,
+        Err(error) => {
+            // The proto crate rewrites `unknown op` into a sentence naming the
+            // cause; that rewrite is the only way to tell "too old" from
+            // "locked", and the two need opposite remedies.
+            if error.to_string().contains("predates this binary") {
+                announce_vault_agent_predates_passkey_scoping();
+                return PasskeyShimState::AgentPredatesBrowser;
+            }
+            return PasskeyShimState::VaultUnavailable(error.to_string());
+        }
+    };
+    let rp_ids: Vec<String> = reply["rp_ids"]
+        .as_array()
+        .map(|hosts| {
+            hosts
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if rp_ids.is_empty() {
+        return PasskeyShimState::NoStoredPasskeys;
+    }
+    PasskeyShimState::ScopedTo(rp_ids)
+}
+
+/// What the vault pane says about the shim. Empty when there is nothing the
+/// user needs to act on.
+///
+/// ⛔ THE PAGE CANNOT TELL THEM. A site whose ceremony finds no
+/// `navigator.credentials` reports "your browser does not support WebAuthn",
+/// which is true of the engine and useless as a remedy. This pane is already on
+/// screen when that happens, and it is the only surface that knows why.
+///
+/// Secret-free: a count of hosts, never the host list. Which sites you hold
+/// passkeys for is the user's business and does not belong in a schema that
+/// crosses the OSC channel.
+fn passkey_shim_widgets(state: &PasskeyShimState) -> Vec<Value> {
+    match state {
+        // Working, and silence is right: a banner on every render for a healthy
+        // subsystem is a banner nobody reads when it finally matters.
+        PasskeyShimState::ScopedTo(_) | PasskeyShimState::NoStoredPasskeys => Vec::new(),
+        PasskeyShimState::AgentPredatesBrowser => vec![
+            json!({"kind": "section", "text": "Passkeys are off"}),
+            json!({
+                "kind": "label", "muted": true,
+                "text": "This host's vault agent is older than this browser and does not \
+                         answer the request that decides where passkeys work, so passkey \
+                         sign-in is disabled on every site. A site will tell you your \
+                         browser does not support WebAuthn; this is the real reason. \
+                         Install the current ychrome-vault on this host, then hand the \
+                         agent over — it keeps the vault unlocked.",
+            }),
+            json!({
+                "kind": "button", "id": "hand_over_agent", "action": "hand_over_agent",
+                "primary": true, "label": "Hand the agent over (keeps the unlock)",
+            }),
+        ],
+        PasskeyShimState::VaultUnavailable(reason) => vec![
+            json!({"kind": "section", "text": "Passkeys are off"}),
+            json!({
+                "kind": "label", "muted": true,
+                "text": format!(
+                    "Passkey sign-in needs a reachable, unlocked vault on this host, and \
+                     the shim is decided when a web surface OPENS. {reason}. Unlock the \
+                     vault, then open the page in a new web surface.",
+                ),
+            }),
+        ],
+    }
+}
+
+/// A WebKit match pattern covering an rpId and its subdomains.
+///
+/// WebAuthn scopes a credential to the rpId and any subdomain of it (a passkey
+/// for `example.com` is usable on `login.example.com`), so the pattern has to
+/// admit both. Two patterns rather than one because `*://*.example.com/*` does
+/// NOT match the bare `example.com` in WebKit's grammar.
+pub(crate) fn rp_id_match_patterns(rp_id: &str) -> Vec<String> {
+    let host = rp_id.trim().trim_matches('.').to_ascii_lowercase();
+    // A pattern built from a host containing a separator would silently widen
+    // the scope — `*://*./*` matches everything. Refuse rather than over-admit.
+    if host.is_empty() || host.contains(['/', ':', '*', ' ', '?', '#']) {
+        return Vec::new();
+    }
+    vec![format!("*://{host}/*"), format!("*://*.{host}/*")]
+}
+
+/// The passkey shim, installed ONLY for the hosts this vault holds a passkey
+/// for. Empty means install nothing, and empty is the common, correct answer.
+///
+/// ⛔ A LOCKED OR UNREACHABLE VAULT INSTALLS NOTHING, AND THAT IS NOT A
+/// REGRESSION. A ceremony needs an unlocked agent regardless, so a shim
+/// installed over a locked vault could only ever fail the ceremony it advertised
+/// — while still telling every page it touches that this browser has a platform
+/// authenticator. Silence is both honest and strictly safer.
+///
+/// ⛔ THIS DOES NOT TOUCH THE USER-PRESENCE INVARIANT. Scoping decides WHERE
+/// `navigator.credentials` is patched, nothing more. Every ceremony still goes
+/// through `/fido2/*`, still needs the per-page bearer token, and still blocks
+/// on an explicit GUI grant. An agent cannot approve its own ceremony, before
+/// this change or after it.
+///
+/// ⛔ TIGHTLY BOUNDED, BECAUSE `/policy` IS ON A PATH THAT ALREADY FAILS BADLY.
+/// A surface whose policy fetch fails is created UNBLOCKED and runs without
+/// adblock or userscripts for its whole life (`yggterm/docs/web-surfaces.md`),
+/// so making this route wait on another process is how a slow vault agent turns
+/// into an unprotected browser. Measured while adding it: the default read
+/// budget pushed `tests/daemon_staleness.rs` from 8.5 s to 23-30 s and made its
+/// control-endpoint reads time out. The agent is host-local and answers in
+/// microseconds when it is there at all, so anything slower is a failure, and a
+/// failure means no shim.
+fn passkey_shim_scripts(state: &ControlState) -> Vec<crate::userscript::Userscript> {
+    // ⛔ ONE FAILURE HERE IS NOT LIKE THE OTHERS, AND IT MUST NOT BE SILENT. A
+    // locked or absent vault installing no shim is correct — a ceremony needs an
+    // unlocked agent anyway. But an agent that simply PREDATES this op is
+    // unlocked and working, and answering it with silence turns passkeys off
+    // everywhere while looking exactly like the healthy case. That is the
+    // deploy-ordering hazard of this change, it reached the user on 2026-08-01,
+    // and the remedy is [`passkey_shim_widgets`] in the pane — a stderr line
+    // reached nobody.
+    let patterns: Vec<String> = match passkey_shim_state() {
+        PasskeyShimState::ScopedTo(rp_ids) => rp_ids
+            .iter()
+            .flat_map(|rp_id| rp_id_match_patterns(rp_id))
+            .collect(),
+        PasskeyShimState::NoStoredPasskeys
+        | PasskeyShimState::VaultUnavailable(_)
+        | PasskeyShimState::AgentPredatesBrowser => Vec::new(),
+    };
+    if patterns.is_empty() {
+        return Vec::new();
+    }
+    // MAIN world, not the isolated default every user script gets: the shim
+    // exists to be called BY THE PAGE (`navigator.credentials`), and a patch
+    // installed in an isolated world is invisible from the page that needs it.
+    let mut script =
+        crate::userscript::Userscript::new(state.signer.shim_userscript()).in_main_world();
+    script.matches = patterns;
+    vec![script]
+}
+
 /// Re-word the one failure the user can act on. The agent replies "the vault is
 /// locked"; point them at the fix, exactly as the old CLI shell-out did.
 fn with_readable_error(result: Result<Value>) -> Result<Value> {
@@ -312,36 +522,116 @@ pub(crate) struct Refusal {
     pub(crate) body: Value,
 }
 
+/// Can the client that registered this session deliver the GUI's token at all?
+///
+/// The token has exactly one courier: the `sidebar ; declare` OSC the session's
+/// own `ychrome` CLI writes to its PTY. A CLI built before the gate existed
+/// (2026-07-28) emits a declare with no `control_token` field, so the GUI holds
+/// nothing to present and **every GUI-only route 403s for the life of that
+/// process** — while `/policy`, `/zoom` and `/ping` keep answering, so ad
+/// blocking and userscripts look perfectly healthy. Neither a daemon handover
+/// nor a GUI restart changes it; only cycling that CLI does.
+///
+/// This is not inferred. The client ASSERTS it in the same `register` round trip
+/// that mints the token (`declares_control_token`), which is the only place the
+/// fact can be known first-hand: an old binary cannot claim a capability whose
+/// name it has never heard, and nothing else has to guess its vintage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenCourier {
+    /// The registered client declares the token. A refusal here is about THIS
+    /// request (a page, or a GUI holding an older generation's token), not about
+    /// the session being permanently undrivable.
+    Live,
+    /// The registered client never claimed the capability. Carries its pid for
+    /// the JOURNAL only — see [`gui_only_refusal`] on why the body stays
+    /// pid-free.
+    Absent { client_pid: i32 },
+    /// **Deliberately not consulted.** A CORS preflight is a PAGE asking whether
+    /// it may drive a GUI-only route cross-origin, and the answer is no whatever
+    /// the session's client vintage is. Telling that page which vintage runs on
+    /// the host would be a fact about the machine handed to the exact caller
+    /// this gate exists to refuse, so the preflight asks a different question and
+    /// gets a page-facing answer.
+    NotAsked,
+}
+
 /// The refusal for a GUI-only route reached without the control token. Names
-/// the route and the reason.
+/// the route, the reason, and — this is the part that took a live incident to
+/// learn — **what the reader can do about it**.
 ///
 /// `presented` is what the caller sent, and only its PRESENCE is recorded — a
 /// refusal is exactly the moment an attacker's guess would be written down, and
 /// an audit line that echoes the credential it is protecting (into a file that
 /// outlives the request, and that a support paste would carry) is worse than no
 /// audit line at all.
-pub(crate) fn gui_only_refusal(method: &str, path: &str, presented: Option<&str>) -> Refusal {
-    let reason = if presented.is_some() {
-        "the X-Ychrome-Control token did not match this session"
-    } else {
-        "no X-Ychrome-Control token was presented"
+///
+/// The BODY is page-reachable (that is the whole reason this gate exists), so it
+/// carries prose and no host facts; the client pid rides the journal line, which
+/// a page cannot read.
+pub(crate) fn gui_only_refusal(
+    method: &str,
+    path: &str,
+    presented: Option<&str>,
+    courier: TokenCourier,
+) -> Refusal {
+    // Three distinct failures wore one message until 2026-07-31, and the one
+    // that actually happens — a pre-gate CLI that can never deliver the token —
+    // was the one the message did not describe. The user saw "control endpoint
+    // returned 403" and had nothing to act on.
+    let (reason, remedy) = match (courier, presented.is_some()) {
+        (TokenCourier::Absent { .. }, _) => (
+            "the ychrome CLI serving this session predates the control-token gate, so it \
+             declares no token and this route can never answer",
+            "restarting the daemon does not fix it and neither does restarting the GUI: \
+             press Ctrl+C in that session's terminal and run ychrome again. \
+             `ychrome status` marks every session in this state.",
+        ),
+        (TokenCourier::Live, true) => (
+            "the X-Ychrome-Control token did not match this session",
+            "the caller is holding a token from an earlier daemon generation; the session's \
+             CLI re-declares the current one on its next heartbeat (~4s). If it persists, \
+             that CLI is no longer registering, so restart it.",
+        ),
+        (TokenCourier::Live | TokenCourier::NotAsked, false) => (
+            "no X-Ychrome-Control token was presented",
+            "this endpoint is reachable from a page through the yggterm-appctl bridge, so \
+             mutating routes require the control token ychrome declares to the GUI over \
+             OSC 7717. A page cannot hold it, and a pre-gate GUI does not send it.",
+        ),
+        (TokenCourier::NotAsked, true) => (
+            "the X-Ychrome-Control token did not match this session",
+            "this endpoint is reachable from a page through the yggterm-appctl bridge, so \
+             mutating routes require the control token ychrome declares to the GUI over \
+             OSC 7717.",
+        ),
     };
+    let mut data = json!({
+        "method": method,
+        "path": path,
+        "reason": reason,
+        "token_presented": presented.is_some(),
+        "token_courier": match courier {
+            TokenCourier::Live => "live",
+            TokenCourier::Absent { .. } => "absent",
+            TokenCourier::NotAsked => "not_asked",
+        },
+    });
+    if let TokenCourier::Absent { client_pid } = courier {
+        data["client_pid"] = json!(client_pid);
+    }
     Refusal {
         event: "control_refused",
-        data: json!({
-            "method": method,
-            "path": path,
-            "reason": reason,
-            "token_presented": presented.is_some(),
-        }),
+        data,
         body: json!({
-            "error": format!(
-                "forbidden: {path} is GUI-only and {reason}. This endpoint is \
-                 reachable from a page through the yggterm-appctl bridge, so \
-                 mutating routes require the control token ychrome declares to \
-                 the GUI over OSC 7717."
-            ),
+            "error": format!("forbidden: {path} is GUI-only and {reason}. {remedy}"),
             "route": path,
+            // A machine-readable handle on WHICH of the three it was, so the GUI
+            // (or an agent) can act without parsing prose.
+            "cause": match courier {
+                TokenCourier::Absent { .. } => "client_predates_control_token",
+                _ if presented.is_some() => "token_mismatch",
+                _ => "token_absent",
+            },
         }),
     }
 }
@@ -562,7 +852,13 @@ pub fn emit_declare(
     policy_version: &str,
     zoom_version: &str,
 ) {
-    let payload = declare_payload(session, control, control_token, policy_version, zoom_version);
+    let payload = declare_payload(
+        session,
+        control,
+        control_token,
+        policy_version,
+        zoom_version,
+    );
     emit_osc("declare", &payload.to_string());
 }
 
@@ -625,14 +921,27 @@ fn emit_osc(action: &str, payload: &str) {
 /// former needs no state, the latter reads the session's command queue, which
 /// lives on the daemon, not here. Everything else (panes, policy, zoom,
 /// appearance, actions, the WebAuthn signer) is the app's, and answers here.
-pub(crate) fn dispatch(state: &ControlState, req: &ParsedRequest) -> (u16, Value) {
+///
+/// `courier` is the session's registration fact, not this request's: it is what
+/// turns a bare 403 into a refusal that names the cause and the remedy. See
+/// [`TokenCourier`].
+pub(crate) fn dispatch(
+    state: &ControlState,
+    req: &ParsedRequest,
+    courier: TokenCourier,
+) -> (u16, Value) {
     // THE GATE. Nothing below this line may run for a GUI-only route reached
     // without the GUI's token — the next arms unlock the vault, fill a
     // credential into the page and rewrite the profile's content policy, and the
     // control port is page-reachable through yggterm's `yggterm-appctl://`
     // bridge. Before 2026-07-27 `POST /action` had no gate at all.
     if requires_gui_token(&req.method, &req.path) && !state.gui_authorized(req) {
-        let refusal = gui_only_refusal(&req.method, &req.path, req.control_token.as_deref());
+        let refusal = gui_only_refusal(
+            &req.method,
+            &req.path,
+            req.control_token.as_deref(),
+            courier,
+        );
         journal_refusal(&refusal);
         return (403, refusal.body);
     }
@@ -657,6 +966,23 @@ pub(crate) fn dispatch(state: &ControlState, req: &ParsedRequest) -> (u16, Value
         // for the current page's host on navigation and falls back to its global
         // "Ychrome Global Zoom" — the GUI does the matching, ychrome owns the map.
         ("GET", "/zoom") => (200, crate::webzoom::to_json()),
+        // CAMERA AND MICROPHONE, per origin. yggterm owns the engine mechanics
+        // (the `permission-request` gate and the native prompt); this endpoint is
+        // the MEMORY, and it is the only one — see [`crate::webmedia`].
+        //
+        // With an `origin`, this answers one live `getUserMedia()` ask and the
+        // GUI acts on the verdict. Without one, it is the whole map, which is
+        // what the settings pane's review-and-revoke list renders.
+        //
+        // GUI-only (the default in `route_access`): a page must never be able to
+        // read — let alone write — what the human decided about its camera.
+        ("GET", "/media-permission") => (200, media_permission_query(query)),
+        ("POST", "/media-permission") => {
+            if req.body.is_null() {
+                return (400, json!({ "error": "bad request" }));
+            }
+            media_permission_write(&req.body)
+        }
         // The EFFECTIVE web-content policy for the profile this ychrome is
         // running: every enable/disable decision already made, PLUS the passkey
         // shim prepended (document-start, so `navigator.credentials` is patched
@@ -664,13 +990,28 @@ pub(crate) fn dispatch(state: &ControlState, req: &ParsedRequest) -> (u16, Value
         ("GET", "/policy") => {
             let profile = state.pane.lock().unwrap().profile.clone();
             let mut policy = crate::webpolicy::policy(&profile);
-            // MAIN world, not the isolated default every user script gets: the
-            // shim exists to be called BY THE PAGE (`navigator.credentials`),
-            // and a patch installed in an isolated world is invisible from the
-            // page that needs it.
-            policy.prepend(
-                crate::userscript::Userscript::new(state.signer.shim_userscript()).in_main_world(),
-            );
+            // ⛔ THE SHIM IS SCOPED TO THE HOSTS A PASSKEY ACTUALLY EXISTS FOR.
+            //
+            // It used to be installed on EVERY page, unconditionally. On a page
+            // it touches, `window.PublicKeyCredential` becomes DEFINED and
+            // `isUserVerifyingPlatformAuthenticatorAvailable()` answers true —
+            // on an engine (WebKitGTK 2.52.5) that has no WebAuthn at all, where
+            // both read `undefined` untouched. Claiming a platform authenticator
+            // this browser cannot have is an anomaly no real GNOME Web shows,
+            // and a bot check reads it. `all_frames: false` did not save it: an
+            // interstitial managed challenge is served as the TOP-FRAME document
+            // at the site's own URL, so it runs in exactly the patched world.
+            //
+            // Making the shim "look native" cannot work — the engine genuinely
+            // lacks WebAuthn, so ANY presence of these APIs is the anomaly. Only
+            // absence is native, and per-origin installation is how you get it.
+            //
+            // ⚠ This is an agent-socket round trip, so it must never move onto
+            // the `policy_version` path — that stamp is recomputed on the ~4 s
+            // heartbeat and must stay free of socket IO.
+            for script in passkey_shim_scripts(state) {
+                policy.prepend(script);
+            }
             (200, policy.to_json())
         }
         ("POST", "/action") => {
@@ -704,6 +1045,75 @@ pub(crate) fn dispatch(state: &ControlState, req: &ParsedRequest) -> (u16, Value
         }
         _ => (404, json!({})),
     }
+}
+
+/// `GET /media-permission` — either the verdict for ONE live ask, or the whole
+/// remembered map.
+///
+/// The verdict form always answers with a decision word; there is no error shape
+/// the GUI could misread as a grant. An origin nothing can be keyed to (a
+/// `file://` page, a blank tab) reports `ask`, so the human still decides and
+/// nothing is written down for it.
+fn media_permission_query(query: &str) -> Value {
+    let Some(origin) = query_value(query, "origin").filter(|origin| !origin.is_empty()) else {
+        return crate::webmedia::to_json();
+    };
+    let audio = query_value(query, "audio").as_deref() == Some("1");
+    let video = query_value(query, "video").as_deref() == Some("1");
+    let sites = crate::webmedia::sites();
+    let decisions = crate::webmedia::decisions_for(&sites, &origin);
+    json!({
+        "origin": crate::webmedia::normalize_origin(&origin),
+        "decision": crate::webmedia::verdict(&sites, &origin, audio, video).as_str(),
+        "camera": decisions.camera.as_str(),
+        "microphone": decisions.microphone.as_str(),
+    })
+}
+
+/// `POST /media-permission` — remember what the human said.
+///
+/// `{"origin": "https://…", "camera": "allow"|"deny"|"ask", "microphone": …}`.
+/// Either device key may be omitted; an omitted key is left alone, so "the user
+/// allowed the microphone" does not silently clear a camera block. `ask` forgets.
+///
+/// A page the GUI could not reduce to an origin is refused rather than stored
+/// under a key that would never match again.
+fn media_permission_write(body: &Value) -> (u16, Value) {
+    let Some(origin) = body["origin"].as_str().filter(|origin| !origin.is_empty()) else {
+        return (
+            400,
+            json!({ "error": "media permission write needs an origin" }),
+        );
+    };
+    if crate::webmedia::normalize_origin(origin).is_none() {
+        return (
+            400,
+            json!({ "error": format!("no origin to remember a decision for: {origin}") }),
+        );
+    }
+    for (key, device) in [
+        ("camera", crate::webmedia::Device::Camera),
+        ("microphone", crate::webmedia::Device::Microphone),
+    ] {
+        let Some(raw) = body[key].as_str() else {
+            continue;
+        };
+        let decision = crate::webmedia::Decision::from_str(raw);
+        if let Err(error) = crate::webmedia::set(origin, device, decision) {
+            return (500, json!({ "error": error.to_string() }));
+        }
+    }
+    let sites = crate::webmedia::sites();
+    let decisions = crate::webmedia::decisions_for(&sites, origin);
+    (
+        200,
+        json!({
+            "ok": true,
+            "origin": crate::webmedia::normalize_origin(origin),
+            "camera": decisions.camera.as_str(),
+            "microphone": decisions.microphone.as_str(),
+        }),
+    )
 }
 
 pub(crate) fn query_value(query: &str, key: &str) -> Option<String> {
@@ -762,10 +1172,24 @@ pub(crate) fn respond_ndjson_head(stream: &mut impl Write) {
 /// `image/png` per docs/agent-engine.md §4: a screenshot is bytes the HTTP
 /// layer can carry natively, and base64 inside JSON would be a second encoding
 /// of it.
-pub(crate) fn respond_bytes(mut stream: impl Write, status: u16, content_type: &str, body: &[u8]) {
+///
+/// `extra_headers` is already-formatted `Name: value\r\n` lines, or empty. It
+/// exists for `/engine/shot`, whose body must stay pure PNG bytes (`--out`
+/// writes it straight to a file) while the capture still has to be able to say
+/// WHAT it captured. Each line is written verbatim, so a caller building one
+/// owes it a value with no CR or LF in it — `engine::api::shot_meta_header` is
+/// the only builder and it enforces that by serialising compact JSON.
+pub(crate) fn respond_bytes(
+    mut stream: impl Write,
+    status: u16,
+    content_type: &str,
+    extra_headers: &str,
+    body: &[u8],
+) {
     let head = format!(
         "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\n\
-         Content-Length: {len}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+         Content-Length: {len}\r\nCache-Control: no-store\r\n{extra_headers}\
+         Connection: close\r\n\r\n",
         len = body.len(),
     );
     let _ = stream.write_all(head.as_bytes());
@@ -833,7 +1257,9 @@ pub(crate) fn respond_preflight(mut stream: impl Write, path: &str) {
     let access = route_access(path);
     if access != RouteAccess::PageSigner {
         if access == RouteAccess::GuiOnly {
-            let refusal = gui_only_refusal("OPTIONS", path, None);
+            // `NotAsked`: a preflight is a page-origin question, so the answer
+            // must not describe the host's own client. See [`TokenCourier`].
+            let refusal = gui_only_refusal("OPTIONS", path, None, TokenCourier::NotAsked);
             // Rationed like every other refusal: a preflight is as cheap for a
             // page to loop as the real request is.
             journal_refusal(&refusal);
@@ -1040,6 +1466,12 @@ fn unlocked_schema(state: &PaneState, host: Option<&str>, status: &Value) -> Val
             {"id": "tools", "label": "Tools"},
         ],
     })];
+
+    // ⛔ ABOVE THE TABS, ON EVERY TAB, BECAUSE IT IS NOT A TAB'S PROBLEM. A
+    // browser whose passkeys are off is off for every site, and the user
+    // arrives at this pane from a login page that just blamed their browser.
+    // Silent when the shim is fine, which is nearly always.
+    widgets.extend(passkey_shim_widgets(&passkey_shim_state()));
 
     match state.tab.as_str() {
         "add" => {
@@ -1336,6 +1768,31 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 ),
             }
         }
+        // The CHEAP remedy for an agent older than this browser: exec the
+        // installed binary in place, same pid, same socket, vault still
+        // unlocked. `restart_agent` below is the fallback that costs a master
+        // password, and it is deliberately the second offer.
+        //
+        // ⚠ It execs the INSTALLED `ychrome-vault`, which the agent chooses —
+        // never this process. If that binary is itself old, the handover is
+        // refused ("it is the binary already running") rather than looping, and
+        // the operator has to install the new one first. Verification lives in
+        // `ychrome_vault_proto::handover`, one owner shared with the CLI.
+        "hand_over_agent" => {
+            match vault_dir().and_then(|dir| ychrome_vault_proto::handover(&dir)) {
+                Ok(reply) if reply["handed_over"].as_bool().unwrap_or(false) => merge(
+                    reschema(state, host.as_deref()),
+                    json!({ "toast": "Agent handed over — passkeys are on again, in web surfaces opened from now on." }),
+                ),
+                // Accepted but unproven is a FAILURE here, not a partial success:
+                // the second round trip found the old binary still answering.
+                Ok(_) => json!({
+                    "toast": "The agent is still running its old binary. Install the current \
+                              ychrome-vault on this host, then try again.",
+                }),
+                Err(error) => json!({ "toast": error.to_string() }),
+            }
+        }
         "restart_agent" => match vault_dir().and_then(|dir| ychrome_vault_proto::stop(&dir)) {
             Ok(_) => {
                 // The agent held the keys, so the vault is locked now and the old
@@ -1503,6 +1960,11 @@ const USERSCRIPT_ACTION_PREFIX: &str = "userscript:";
 const USERSCRIPT_DELETE_PREFIX: &str = "userscript-delete:";
 /// Install a bundled extension by its catalog stem (the "Add an extension" list).
 const INSTALL_ACTION_PREFIX: &str = "install:";
+/// Set one SponsorBlock category's behaviour: `sponsorblock:<category>:<behaviour>`.
+/// ⚠ It must not be a prefix of `USERSCRIPT_ACTION_PREFIX` or vice versa — the
+/// dispatch is a `starts_with` chain, and `sponsorblock:` deliberately does not
+/// collide with `userscript:sponsorblock`, which is the on/off toggle.
+const SPONSORBLOCK_ACTION_PREFIX: &str = "sponsorblock:";
 
 /// The per-site zoom controls' action ids.
 const ZOOM_IN_ACTION: &str = "zoom-in";
@@ -1514,8 +1976,22 @@ const ZOOM_RESET_ACTION: &str = "zoom-reset";
 /// them (`surface_prefs` on the reply). ychrome stores neither.
 const VERTICAL_TABS_ACTION: &str = "tabs-vertical";
 const RESTORE_TABS_ACTION: &str = "tabs-restore";
-/// Pick the browser identity. Carries the preset id after the prefix.
+/// Pick the browser-wide identity. Carries the preset id after the prefix.
 const USER_AGENT_ACTION_PREFIX: &str = "user-agent:";
+/// Pick the identity for the LIVE PAGE'S HOST only. Carries the preset id after
+/// the prefix. Separate from [`USER_AGENT_ACTION_PREFIX`] because they write
+/// different keys of the same config and a shared prefix would make the
+/// narrower, safer one reachable by a typo in the broader one.
+const SITE_IDENTITY_ACTION_PREFIX: &str = "site-identity:";
+/// Drop this site's identity override; it falls back to the browser default.
+const SITE_IDENTITY_RESET_ACTION: &str = "site-identity-reset";
+/// Change ONE device's remembered decision for ONE origin. The tail is
+/// `<origin>:<device>:<decision>` and is parsed FROM THE RIGHT, because an
+/// origin legitimately contains colons (`https://example.com:8443`).
+const MEDIA_PERMISSION_ACTION_PREFIX: &str = "media-permission:";
+/// Forget everything remembered for one origin — the pane's Revoke. Checked
+/// BEFORE [`MEDIA_PERMISSION_ACTION_PREFIX`], which is a prefix of it.
+const MEDIA_PERMISSION_FORGET_PREFIX: &str = "media-permission-forget:";
 
 /// What the GUI reports about the live surface, on the schema GET (as query
 /// params) and on every action (as `values`). All non-secret, and none of it is
@@ -1598,14 +2074,174 @@ fn browsing_widgets(page: &PageContext) -> Vec<Value> {
     ]
 }
 
-/// The browser identity. The default UA a WebKitGTK build sends describes Safari
-/// on Linux — a browser that does not exist — and UA-allowlisting edges refuse
-/// it outright (claude.ai answers "Request not allowed"). Presented as a row per
-/// preset rather than a free-text field: the failure mode of a hand-typed UA is a
-/// site quietly serving you the wrong code, which is worse than not offering it.
+/// The per-site browser identity row, drawn in "This site".
+///
+/// This is where an identity override BELONGS: a badly-coded portal that gates
+/// on the UA string is one site, and making the whole browser lie for it is what
+/// puts an inconsistent fingerprint in front of every OTHER site's bot check.
+/// The default row is "WebKit (this engine)", which sets nothing.
+fn current_site_identity_widgets(
+    host: Option<&str>,
+    sites: &std::collections::BTreeMap<String, crate::useragent::Preset>,
+    global: crate::useragent::Preset,
+) -> Vec<Value> {
+    let Some(host) = host.filter(|host| !host.is_empty()) else {
+        return Vec::new();
+    };
+    let effective = crate::useragent::preset_for_host(sites, global, host);
+    let overridden = crate::sitehost::lookup(sites, host).is_some();
+    let subtitle = if overridden {
+        format!("{} · this site", effective.label())
+    } else {
+        format!("{} · browser default", effective.label())
+    };
+    // One "Use" per OTHER preset, plus Reset once an override exists — the same
+    // vocabulary as the zoom row directly above it.
+    let mut actions: Vec<Value> = crate::useragent::Preset::ALL
+        .iter()
+        .filter(|preset| **preset != effective)
+        .map(|preset| {
+            json!({
+                "action": format!("{SITE_IDENTITY_ACTION_PREFIX}{}", preset.id()),
+                "label": preset.label(),
+                "title": format!("Identify as {} on {host} only", preset.label()),
+            })
+        })
+        .collect();
+    if overridden {
+        actions.push(json!({
+            "action": SITE_IDENTITY_RESET_ACTION,
+            "label": "Reset",
+            "title": "Use the browser default identity here",
+        }));
+    }
+    vec![
+        json!({
+            "kind": "list-row",
+            "id": "site-identity",
+            "title": format!("Identity on {host}"),
+            "subtitle": subtitle,
+            "actions": actions,
+        }),
+        json!({
+            "kind": "label",
+            "muted": true,
+            "text": crate::useragent::OVERRIDE_WARNING,
+        }),
+    ]
+}
+
+/// Read one `media-permission:<origin>:<device>:<decision>` action.
+///
+/// ⛔ Parsed FROM THE RIGHT. An origin carries colons of its own — the scheme's,
+/// and a non-default port's (`https://example.com:8443`) — so a left-to-right
+/// split would cut the origin in half and write the decision under a key that
+/// can never match the page again. That failure is silent: the pane would say
+/// "blocked" and the site would keep being allowed.
+///
+/// Pure, so the parse can be proven against a colon-bearing origin without a
+/// disk write. `None` for an unrecognised device; an unrecognised DECISION is
+/// [`crate::webmedia::Decision::Ask`], never a grant.
+fn parse_media_permission_action(
+    action: &str,
+) -> Option<(String, crate::webmedia::Device, crate::webmedia::Decision)> {
+    let tail = action.strip_prefix(MEDIA_PERMISSION_ACTION_PREFIX)?;
+    let mut parts = tail.rsplitn(3, ':');
+    let decision = parts.next().unwrap_or_default();
+    let device = parts.next().unwrap_or_default();
+    let origin = parts.next()?;
+    Some((
+        origin.to_string(),
+        crate::webmedia::Device::from_str(device)?,
+        crate::webmedia::Decision::from_str(decision),
+    ))
+}
+
+/// The camera/microphone section: every origin that has been answered once, and
+/// the way back out of each answer.
+///
+/// Review and revoke is the whole job here. Notice what is deliberately ABSENT:
+/// there is no way to GRANT a device from this pane. A capture grant is only
+/// ever created at the moment a page actually asked, in yggterm's prompt, with
+/// the site named — inventing a second door here would mean a grant could exist
+/// without anyone having seen which page it was for.
+///
+/// `Ask` is absence, so an origin with nothing remembered has no row at all;
+/// the list is exactly the set of decisions the user could want to take back.
+fn media_permission_widgets(
+    sites: &std::collections::BTreeMap<String, crate::webmedia::SiteDecisions>,
+) -> Vec<Value> {
+    use crate::webmedia::{Decision, Device};
+    let mut widgets = vec![json!({"kind": "section", "text": "Camera & microphone"})];
+    if sites.is_empty() {
+        widgets.push(json!({
+            "kind": "label",
+            "muted": true,
+            "text": "No site has been given the camera or the microphone. yggterm asks the \
+                     first time a page tries, and remembers only what you tell it to.",
+        }));
+        return widgets;
+    }
+    for (origin, decisions) in sites {
+        let word = |decision: Decision| match decision {
+            Decision::Allow => "allowed",
+            Decision::Deny => "blocked",
+            Decision::Ask => "asks",
+        };
+        // ⛔ ONE action, and it must stay one. The rail's `list-row` gives the
+        // actions all the width they ask for and lets the TITLE take what is
+        // left, under `overflow:hidden; white-space:nowrap`. Measured live in the
+        // rail (2026-08-01): with a "Block camera" + "Block microphone" +
+        // "Revoke" row, the title element came back **0 px wide** — the origin,
+        // the one fact this whole section exists to show, painted nothing at all,
+        // and the user was left with three buttons and no idea which site they
+        // acted on. On a security-review surface that is worse than no row.
+        //
+        // The tri-state is still fully reachable without more buttons here:
+        // ALLOW and DENY are both made at the prompt (where the site is named
+        // and the page actually asked), and Revoke is the way back to ASK.
+        let actions = vec![json!({
+            "action": format!("{MEDIA_PERMISSION_FORGET_PREFIX}{origin}"),
+            "label": "Revoke",
+            "title": format!("Forget every camera and microphone decision for {origin}"),
+        })];
+        widgets.push(json!({
+            "kind": "list-row",
+            "id": format!("media-permission-{origin}"),
+            "title": origin,
+            "subtitle": format!(
+                "Camera {} · mic {}",
+                word(decisions.camera),
+                word(decisions.microphone),
+            ),
+            "actions": actions,
+        }));
+    }
+    widgets.push(json!({
+        "kind": "label",
+        "muted": true,
+        "text": "Revoking takes effect on the next request: the page is asked to be asked \
+                 about again, and a stream it already holds is not retroactively cut.",
+    }));
+    widgets
+}
+
+/// The browser-wide identity. The default is the engine's OWN UA, which is the
+/// coherent one: a bot check that scores consistency (Cloudflare's managed
+/// challenge) passes a browser whose UA, JS environment and TLS all agree, and
+/// challenges one whose UA claims a platform the page contradicts. Presented as
+/// a row per preset rather than a free-text field: the failure mode of a
+/// hand-typed UA is a site quietly serving you the wrong code.
 fn user_agent_widgets() -> Vec<Value> {
     let current = crate::useragent::preset();
     let mut widgets = vec![json!({"kind": "section", "text": "Browser identity"})];
+    widgets.push(json!({
+        "kind": "label",
+        "muted": true,
+        "text": "This is the identity every site gets. Prefer a per-site override in \
+                 “This site” above — a browser-wide spoof puts the same inconsistency in \
+                 front of every login you have.",
+    }));
     for preset in crate::useragent::Preset::ALL {
         let selected = preset == current;
         // "This is the one in use" is SELECTION, not a status dot — yggterm
@@ -1693,6 +2329,7 @@ fn settings_schema(profile: &str, page: &PageContext) -> Value {
         page,
         &crate::webzoom::sites(),
         &crate::webpolicy::state(profile),
+        &crate::webmedia::sites(),
     )
 }
 
@@ -1701,11 +2338,20 @@ fn settings_schema_from(
     page: &PageContext,
     zoom_sites: &std::collections::BTreeMap<String, f64>,
     state: &crate::webpolicy::PolicyState,
+    media_sites: &std::collections::BTreeMap<String, crate::webmedia::SiteDecisions>,
 ) -> Value {
     let (host, live_zoom, secure) = (page.host(), page.zoom, page.secure);
     let mut widgets = vec![json!({"kind": "section", "text": "This site"})];
     widgets.extend(current_site_zoom_widgets(host, live_zoom, zoom_sites));
     widgets.extend(current_site_security_widgets(host, secure));
+    // The per-site identity override, beside the per-site zoom: both are "this
+    // one site behaves differently", both keyed by host, both matched by
+    // `sitehost`. A user looking for either finds them in one place.
+    widgets.extend(current_site_identity_widgets(
+        host,
+        &crate::useragent::sites(),
+        crate::useragent::preset(),
+    ));
 
     // Tabs first among the browser-wide settings: it is the one that changes what
     // the window looks like.
@@ -1736,6 +2382,10 @@ fn settings_schema_from(
                      writable, or run `ychrome adblock update` on this host.",
         }));
     }
+
+    // Hardware capture, beside ad blocking: both are "what may a page do to me",
+    // and this is the one the user comes looking for when they want a grant back.
+    widgets.extend(media_permission_widgets(media_sites));
 
     // SponsorBlock is a userscript, but a flagship one, so it gets its own named
     // section with a friendly toggle — pulled out of the generic list below.
@@ -1842,8 +2492,14 @@ fn current_site_security_widgets(host: Option<&str>, secure: Option<bool>) -> Ve
 }
 
 /// The SponsorBlock section. Installed ⇒ a friendly toggle (its state is the
-/// `sponsorblock.js` vs `.js.disabled` rename, exactly like any userscript).
+/// `sponsorblock.js` vs `.js.disabled` rename, exactly like any userscript),
+/// then one row per category so the user can say what each one should do.
 /// Not installed ⇒ nothing here; it appears under "Add an extension" instead.
+///
+/// The category rows are drawn from `crate::sponsorblock`, which is the one
+/// owner of the catalogue, the defaults and the stored choices. The pane
+/// re-derives none of it: a category added there appears here with no change,
+/// and the buttons it offers are that category's own `options`.
 fn sponsorblock_widgets(state: &crate::webpolicy::PolicyState) -> Vec<Value> {
     let installed = state
         .userscripts
@@ -1868,7 +2524,89 @@ fn sponsorblock_widgets(state: &crate::webpolicy::PolicyState) -> Vec<Value> {
     if let Some(refusal) = &script.refusal {
         widgets.push(json!({ "kind": "label", "muted": true, "text": refusal }));
     }
+    // The per-category rows only when the script is on: offering a choice that
+    // nothing will act on is worse than offering none.
+    if !script.enabled {
+        return widgets;
+    }
+    for (category, behaviour) in crate::sponsorblock::effective() {
+        widgets.push(sponsorblock_category_row(category, behaviour));
+    }
+    widgets.push(json!({
+        "kind": "label",
+        "muted": true,
+        "text": "Segments come from the community database at sponsor.ajay.app, asked \
+                 for by hash prefix so it is never told which video you are watching. \
+                 ychrome submits nothing and votes on nothing.",
+    }));
     widgets
+}
+
+/// The action id for "put `<category>` into `<behaviour>`". One string, parsed
+/// back by `run_settings_action` — the row and the handler agree by
+/// construction rather than by two matching format strings.
+fn sponsorblock_action(category: &str, behaviour: &str) -> String {
+    format!("{SPONSORBLOCK_ACTION_PREFIX}{category}:{behaviour}")
+}
+
+/// One category as a list-row: what it does now in the subtitle, and a button
+/// for each state it is NOT in.
+///
+/// The current state is deliberately absent from the buttons rather than shown
+/// pressed: `list-row` actions render as plain buttons with no selected state,
+/// so a row offering "Auto-skip" while already auto-skipping is a control that
+/// appears to do nothing when clicked.
+fn sponsorblock_category_row(
+    category: &'static crate::sponsorblock::Category,
+    behaviour: &'static str,
+) -> Value {
+    let actions: Vec<Value> = category
+        .options
+        .iter()
+        .filter(|option| **option != behaviour)
+        .map(|option| {
+            json!({
+                "action": sponsorblock_action(category.id, option),
+                "label": sponsorblock_behaviour_label(option),
+                "title": format!(
+                    "{}: {}",
+                    category.label,
+                    sponsorblock_behaviour_title(option),
+                ),
+            })
+        })
+        .collect();
+    json!({
+        "kind": "list-row",
+        "id": format!("sponsorblock-{}", category.id),
+        "title": category.label,
+        "subtitle": format!(
+            "{} — {}",
+            sponsorblock_behaviour_label(behaviour),
+            category.description,
+        ),
+        "actions": actions,
+    })
+}
+
+fn sponsorblock_behaviour_label(behaviour: &str) -> &'static str {
+    match behaviour {
+        crate::sponsorblock::AUTO => "Auto-skip",
+        crate::sponsorblock::MANUAL => "Skip button",
+        crate::sponsorblock::MUTE => "Mute",
+        crate::sponsorblock::SHOW => "Show",
+        _ => "Off",
+    }
+}
+
+fn sponsorblock_behaviour_title(behaviour: &str) -> &'static str {
+    match behaviour {
+        crate::sponsorblock::AUTO => "seek past it without asking",
+        crate::sponsorblock::MANUAL => "offer a skip button while it plays",
+        crate::sponsorblock::MUTE => "mute it rather than seek past it",
+        crate::sponsorblock::SHOW => "mark it on the seek bar",
+        _ => "ignore it entirely",
+    }
 }
 
 /// One managed userscript as a list-row: its on/off state in the subtitle, an
@@ -1950,6 +2688,62 @@ fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
         });
     }
 
+    // Camera/microphone. Forget is checked FIRST: `media-permission-forget:` and
+    // `media-permission:` share a stem, and a prefix match on the shorter one
+    // would swallow the Revoke button whole.
+    if let Some(origin) = action.strip_prefix(MEDIA_PERMISSION_FORGET_PREFIX) {
+        return match crate::webmedia::forget(origin) {
+            Ok(()) => redraw(json!({
+                "toast": format!("{origin} will be asked about again."),
+            })),
+            Err(error) => json!({ "toast": error.to_string() }),
+        };
+    }
+    if action.starts_with(MEDIA_PERMISSION_ACTION_PREFIX) {
+        let Some((origin, device, decision)) = parse_media_permission_action(action) else {
+            return json!({ "toast": "Unknown device." });
+        };
+        return match crate::webmedia::set(&origin, device, decision) {
+            Ok(()) => redraw(json!({
+                "toast": format!(
+                    "{} on {origin}: {}.",
+                    device.label(),
+                    match decision {
+                        crate::webmedia::Decision::Allow => "allowed",
+                        crate::webmedia::Decision::Deny => "blocked",
+                        crate::webmedia::Decision::Ask => "will be asked about again",
+                    },
+                ),
+            })),
+            Err(error) => json!({ "toast": error.to_string() }),
+        };
+    }
+
+    // The per-site identity, checked BEFORE the browser-wide one so the narrower
+    // action can never be swallowed by a prefix match on the broader.
+    if action == SITE_IDENTITY_RESET_ACTION || action.starts_with(SITE_IDENTITY_ACTION_PREFIX) {
+        let Some(host) = page.host() else {
+            return json!({ "toast": "No site is open to set an identity for." });
+        };
+        let wanted = action.strip_prefix(SITE_IDENTITY_ACTION_PREFIX);
+        let outcome = crate::useragent::set_site(host, wanted);
+        let toast = match wanted {
+            // ⚠ Say the cost at the moment of the choice, not in a doc nobody
+            // reads. A spoof that breaks a fingerprint-gated login fails as a
+            // challenge that never clears, which reads like the SITE being
+            // broken — so the user has to be told it was this switch.
+            Some(_) => format!(
+                "Identity for {host} changed. Reloading. {}",
+                crate::useragent::OVERRIDE_WARNING
+            ),
+            None => format!("{host} is back on the browser default identity. Reloading."),
+        };
+        return match outcome {
+            Ok(()) => redraw(json!({ "reload_surface": true, "toast": toast })),
+            Err(error) => redraw(json!({ "toast": error.to_string() })),
+        };
+    }
+
     if let Some(preset) = action.strip_prefix(USER_AGENT_ACTION_PREFIX) {
         return match crate::useragent::set_preset(preset) {
             // The UA is fixed when the webview is CREATED, so an in-page reload
@@ -1983,6 +2777,19 @@ fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
         script if script.starts_with(USERSCRIPT_DELETE_PREFIX) => {
             let stem = script.trim_start_matches(USERSCRIPT_DELETE_PREFIX);
             crate::webpolicy::delete_userscript(stem)
+        }
+        // `sponsorblock:<category>:<behaviour>`. Checked BEFORE the userscript
+        // arm even though the two prefixes cannot collide, so the ordering says
+        // out loud which one owns the string.
+        category if category.starts_with(SPONSORBLOCK_ACTION_PREFIX) => {
+            let rest = category.trim_start_matches(SPONSORBLOCK_ACTION_PREFIX);
+            match rest.split_once(':') {
+                Some((id, behaviour)) => crate::sponsorblock::set_behaviour(id, behaviour),
+                None => Err(anyhow::anyhow!(
+                    "malformed SponsorBlock action {category:?} \
+                     (want sponsorblock:<category>:<behaviour>)"
+                )),
+            }
         }
         install if install.starts_with(INSTALL_ACTION_PREFIX) => {
             let stem = install.trim_start_matches(INSTALL_ACTION_PREFIX);
@@ -2212,7 +3019,21 @@ mod tests {
              array only",
         );
         assert!(
-            arm.contains(".in_main_world()"),
+            arm.contains("passkey_shim_scripts(state)"),
+            "the /policy route must source the shim from its one owner, which is \
+             also where the per-origin scoping lives",
+        );
+        // The main-world requirement did not go away when the shim moved into
+        // `passkey_shim_scripts` for scoping — it moved with it. Anchored on
+        // that function for the same reason this test was anchored on the route
+        // arm: an `.in_main_world()` anywhere else must not satisfy it.
+        let builder = source
+            .split("fn passkey_shim_scripts(state: &ControlState) -> Vec<crate::userscript::Userscript> {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n}").next())
+            .expect("passkey_shim_scripts is present");
+        assert!(
+            builder.contains(".in_main_world()"),
             "the passkey shim was left on the isolated default, where its patch \
              to `navigator.credentials` is invisible to every page that calls it",
         );
@@ -2330,6 +3151,227 @@ mod tests {
         std::collections::BTreeMap::new()
     }
 
+    /// No origin has been answered about the camera or the microphone. The
+    /// DEFAULT state of a fresh profile, and the one every pre-existing settings
+    /// test means when it says nothing about capture.
+    fn no_media() -> std::collections::BTreeMap<String, crate::webmedia::SiteDecisions> {
+        std::collections::BTreeMap::new()
+    }
+
+    /// ⛔ THE parse lock for the capture pane. An origin with a NON-DEFAULT PORT
+    /// carries three colons of its own, so a left-to-right split writes the
+    /// decision under `https` and the user's Block silently does nothing while
+    /// the pane reports success. Proven here rather than in a live click,
+    /// because that failure looks like a working button.
+    #[test]
+    fn a_capture_action_is_read_from_the_right_so_a_ported_origin_survives() {
+        use crate::webmedia::{Decision, Device};
+        assert_eq!(
+            parse_media_permission_action("media-permission:http://127.0.0.1:8099:camera:deny"),
+            Some((
+                "http://127.0.0.1:8099".to_string(),
+                Device::Camera,
+                Decision::Deny
+            )),
+        );
+        assert_eq!(
+            parse_media_permission_action("media-permission:https://example.com:microphone:ask"),
+            Some((
+                "https://example.com".to_string(),
+                Device::Microphone,
+                Decision::Ask
+            )),
+        );
+        // Unknown device: refused, not guessed.
+        assert_eq!(
+            parse_media_permission_action("media-permission:https://a.test:speaker:allow"),
+            None,
+        );
+        // An unknown DECISION word degrades to Ask, never to a grant.
+        assert_eq!(
+            parse_media_permission_action("media-permission:https://a.test:camera:yes")
+                .map(|parsed| parsed.2),
+            Some(Decision::Ask),
+        );
+        // A different action is not this one.
+        assert_eq!(parse_media_permission_action("zoom-in"), None);
+    }
+
+    /// Revoke and set share a stem, and the shorter one is a prefix of the
+    /// longer. If the dispatcher ever checks `media-permission:` first, Revoke is
+    /// swallowed and parses as an origin of `forget` — so the ORDER is the lock.
+    #[test]
+    fn revoke_is_not_swallowed_by_the_set_action_prefix() {
+        assert!(
+            MEDIA_PERMISSION_FORGET_PREFIX
+                .starts_with(MEDIA_PERMISSION_ACTION_PREFIX.trim_end_matches(':'))
+        );
+        let revoke = format!("{MEDIA_PERMISSION_FORGET_PREFIX}https://example.com");
+        assert!(
+            revoke
+                .strip_prefix(MEDIA_PERMISSION_FORGET_PREFIX)
+                .is_some()
+        );
+        let body = include_str!("sidebar.rs");
+        let forget_at = body
+            .find("if let Some(origin) = action.strip_prefix(MEDIA_PERMISSION_FORGET_PREFIX)")
+            .expect("the Revoke arm is gone from run_settings_action");
+        let set_at = body
+            .find("if action.starts_with(MEDIA_PERMISSION_ACTION_PREFIX)")
+            .expect("the set arm is gone from run_settings_action");
+        assert!(
+            forget_at < set_at,
+            "the set arm is checked before Revoke; `media-permission:` is a prefix \
+             of `media-permission-forget:`, so every Revoke click would be read as \
+             a set with a nonsense origin",
+        );
+    }
+
+    /// The pane REVIEWS and REVOKES, and — deliberately — offers no way to grant.
+    #[test]
+    fn the_settings_pane_lists_every_remembered_origin_with_a_way_out() {
+        use crate::webmedia::{Decision, SiteDecisions};
+        let media: std::collections::BTreeMap<String, SiteDecisions> = [
+            (
+                "https://meet.example.com".to_string(),
+                SiteDecisions {
+                    camera: Decision::Allow,
+                    microphone: Decision::Allow,
+                },
+            ),
+            (
+                "https://ads.example.net".to_string(),
+                SiteDecisions {
+                    camera: Decision::Deny,
+                    microphone: Decision::Ask,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let schema = settings_schema_from(
+            "work",
+            &PageContext::default(),
+            &no_zoom(),
+            &policy_state(true, &[]),
+            &media,
+        );
+        let widgets = schema["widgets"].as_array().expect("widgets");
+        let row = |id: &str| {
+            widgets
+                .iter()
+                .find(|widget| widget["id"] == id)
+                .unwrap_or_else(|| panic!("no {id} row in {schema}"))
+        };
+        let granted = row("media-permission-https://meet.example.com");
+        assert_eq!(granted["title"], "https://meet.example.com");
+        let subtitle = granted["subtitle"].as_str().expect("subtitle");
+        assert!(
+            subtitle.contains("Camera allowed") && subtitle.contains("mic allowed"),
+            "the row does not say what is remembered: {subtitle}",
+        );
+        let blocked = row("media-permission-https://ads.example.net");
+        let blocked_subtitle = blocked["subtitle"].as_str().expect("subtitle");
+        assert!(
+            blocked_subtitle.contains("Camera blocked") && blocked_subtitle.contains("mic asks"),
+            "a blocked camera and an untouched mic must read differently: \
+             {blocked_subtitle}",
+        );
+        // ⛔ EXACTLY ONE action per row, and it is Revoke. Measured live in the
+        // rail (2026-08-01): a three-action row squeezed the TITLE element to
+        // **0 px** under `overflow:hidden; white-space:nowrap`, so the origin —
+        // the one fact this section exists to show — painted nothing and the
+        // user could not tell which site the buttons belonged to. Every extra
+        // button here is width taken from the site name.
+        for (id, row_value) in [
+            ("https://meet.example.com", &granted),
+            ("https://ads.example.net", &blocked),
+        ] {
+            let actions = row_value["actions"].as_array().expect("actions");
+            assert_eq!(
+                actions.len(),
+                1,
+                "{id}: {} actions on a capture row — the rail gives the actions \
+                 their width first and the title takes what is left, so this \
+                 blanks the origin",
+                actions.len(),
+            );
+            assert_eq!(actions[0]["label"], "Revoke");
+        }
+        // ⛔ Nothing in this pane hands out a device.
+        let text = schema.to_string();
+        assert!(
+            !text.contains(":camera:allow") && !text.contains(":microphone:allow"),
+            "the settings pane offers a GRANT action; a capture grant may only be \
+             created at the moment a page asked, in yggterm's prompt",
+        );
+    }
+
+    #[test]
+    fn the_settings_pane_says_so_when_nothing_is_remembered() {
+        let schema = settings_schema_from(
+            "work",
+            &PageContext::default(),
+            &no_zoom(),
+            &policy_state(true, &[]),
+            &no_media(),
+        );
+        let text = schema.to_string();
+        assert!(
+            text.contains("Camera & microphone"),
+            "the capture section is missing entirely",
+        );
+        assert!(
+            text.contains("No site has been given the camera or the microphone"),
+            "the empty state does not tell the user what the default is",
+        );
+    }
+
+    /// `GET /media-permission` answers ONE live ask with a decision word, and
+    /// with no origin it is the whole map the pane renders.
+    #[test]
+    fn the_control_endpoint_answers_a_live_ask_and_serves_the_whole_map() {
+        // No origin: the map shape, whatever is on this host's disk.
+        let all = media_permission_query("");
+        assert!(
+            all.get("sites").is_some(),
+            "the map form lost its `sites` key"
+        );
+        // With an origin: always a decision word, never an error shape the GUI
+        // could misread. An origin nothing was remembered for asks.
+        let one = media_permission_query("origin=https%3A%2F%2Fnobody.invalid&audio=1&video=1");
+        assert_eq!(one["decision"], "ask");
+        assert_eq!(one["camera"], "ask");
+        assert_eq!(one["microphone"], "ask");
+        assert_eq!(one["origin"], "https://nobody.invalid");
+        // A page with no origin to key a decision to still asks.
+        let none = media_permission_query("origin=about%3Ablank&audio=1&video=0");
+        assert_eq!(none["decision"], "ask");
+        assert_eq!(none["origin"], Value::Null);
+        // A write with no usable origin is REFUSED rather than stored under a key
+        // that could never match again.
+        let (status, _) = media_permission_write(&json!({
+            "origin": "about:blank", "camera": "allow"
+        }));
+        assert_eq!(status, 400);
+        let (status, _) = media_permission_write(&json!({ "camera": "allow" }));
+        assert_eq!(status, 400);
+    }
+
+    /// ⛔ A page must never be able to read or write what the human decided about
+    /// its camera. The control port is page-reachable through yggterm's
+    /// `yggterm-appctl://` bridge, so this route living outside the token gate
+    /// would put the whole capture memory on the web.
+    #[test]
+    fn the_capture_memory_is_gui_only() {
+        assert!(requires_gui_token("GET", "/media-permission"));
+        assert!(requires_gui_token("POST", "/media-permission"));
+        assert!(matches!(
+            route_access("/media-permission"),
+            RouteAccess::GuiOnly
+        ));
+    }
+
     // The "This site" row shows the override number and a Reset when a site is
     // custom; on the global it shows the GUI's reported number and no Reset.
     #[test]
@@ -2390,6 +3432,7 @@ mod tests {
             &PageContext::default(),
             &no_zoom(),
             &policy_state(true, &[]),
+            &no_media(),
         );
         assert_eq!(schema["title"], "YChrome Settings");
         assert!(
@@ -2407,7 +3450,13 @@ mod tests {
             restore_tabs: false,
             ..PageContext::default()
         };
-        let schema = settings_schema_from("work", &page, &no_zoom(), &policy_state(true, &[]));
+        let schema = settings_schema_from(
+            "work",
+            &page,
+            &no_zoom(),
+            &policy_state(true, &[]),
+            &no_media(),
+        );
         let widgets = schema["widgets"].as_array().expect("widgets");
         let toggle = |id: &str| {
             widgets
@@ -2459,6 +3508,7 @@ mod tests {
             &PageContext::default(),
             &no_zoom(),
             &policy_state(true, &[]),
+            &no_media(),
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
         for preset in crate::useragent::Preset::ALL {
@@ -2487,11 +3537,116 @@ mod tests {
             &PageContext::default(),
             &no_zoom(),
             &policy_state(false, &[]),
+            &no_media(),
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
         assert!(
             !widgets.iter().any(|w| w["id"] == "adblock-enabled"),
             "offered an adblock toggle with no ruleset installed"
+        );
+    }
+
+    // Every catalogued category gets a row, and the row offers exactly the
+    // states it is NOT in. Asserted structurally against
+    // `crate::sponsorblock`'s catalogue rather than against a hand-written list
+    // of eleven ids, so a category added there is covered the day it lands and
+    // a pane that quietly drops one goes red.
+    #[test]
+    fn every_sponsorblock_category_gets_a_row_offering_the_states_it_is_not_in() {
+        let schema = settings_schema_from(
+            "work",
+            &PageContext::default(),
+            &no_zoom(),
+            &policy_state(true, &[("sponsorblock", true)]),
+            &no_media(),
+        );
+        let widgets = schema["widgets"].as_array().expect("widgets");
+        let live: std::collections::HashMap<&str, &str> = crate::sponsorblock::effective()
+            .into_iter()
+            .map(|(category, behaviour)| (category.id, behaviour))
+            .collect();
+        for category in crate::sponsorblock::catalog() {
+            let row = widgets
+                .iter()
+                .find(|w| w["id"] == format!("sponsorblock-{}", category.id))
+                .unwrap_or_else(|| panic!("no settings row for {}", category.id));
+            assert_eq!(row["kind"], "list-row");
+            assert_eq!(row["title"], category.label);
+            let current = live[category.id];
+            let offered: Vec<&str> = row["actions"]
+                .as_array()
+                .expect("actions")
+                .iter()
+                .map(|a| a["action"].as_str().expect("action id"))
+                .collect();
+            let expected: Vec<String> = category
+                .options
+                .iter()
+                .filter(|option| **option != current)
+                .map(|option| format!("sponsorblock:{}:{option}", category.id))
+                .collect();
+            assert_eq!(
+                offered, expected,
+                "{} offers the wrong states (it is currently {current})",
+                category.id
+            );
+            assert!(
+                !offered.contains(&format!("sponsorblock:{}:{current}", category.id).as_str()),
+                "{} offers a button for the state it is already in",
+                category.id
+            );
+        }
+    }
+
+    // The action id the row emits must be the one the dispatcher parses. These
+    // are two different pieces of code agreeing on one string, which is exactly
+    // where a format-string edit on one side ships a dead button.
+    #[test]
+    fn a_category_action_id_round_trips_through_the_dispatchers_parser() {
+        for category in crate::sponsorblock::catalog() {
+            for option in category.options {
+                let action = sponsorblock_action(category.id, option);
+                let rest = action
+                    .strip_prefix(SPONSORBLOCK_ACTION_PREFIX)
+                    .unwrap_or_else(|| panic!("{action} lost its prefix"));
+                let (id, behaviour) = rest
+                    .split_once(':')
+                    .unwrap_or_else(|| panic!("{action} has no behaviour half"));
+                assert_eq!(id, category.id);
+                assert_eq!(behaviour, *option);
+                assert!(
+                    crate::sponsorblock::find(id).is_some(),
+                    "{action} names a category the catalogue does not have"
+                );
+            }
+        }
+        // The on/off toggle's id must not be eaten by the category arm.
+        assert!(
+            !format!("{USERSCRIPT_ACTION_PREFIX}sponsorblock")
+                .starts_with(SPONSORBLOCK_ACTION_PREFIX),
+            "the SponsorBlock on/off toggle would be parsed as a category action"
+        );
+    }
+
+    // A disabled script offers no category rows: a control that nothing will
+    // act on is worse than no control.
+    #[test]
+    fn a_disabled_sponsorblock_offers_no_category_rows() {
+        let schema = settings_schema_from(
+            "work",
+            &PageContext::default(),
+            &no_zoom(),
+            &policy_state(true, &[("sponsorblock", false)]),
+            &no_media(),
+        );
+        let widgets = schema["widgets"].as_array().expect("widgets");
+        assert!(
+            !widgets.iter().any(|w| {
+                w["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("sponsorblock-"))
+            }),
+            "category rows drawn for a script that is switched off"
         );
     }
 
@@ -2504,6 +3659,7 @@ mod tests {
             &PageContext::default(),
             &no_zoom(),
             &policy_state(true, &[("sponsorblock", true), ("darkmode", false)]),
+            &no_media(),
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
         // SponsorBlock: its own toggle, friendly label, NOT in the generic list.
@@ -2547,7 +3703,13 @@ mod tests {
         let mut state = policy_state(true, &[("broken", true)]);
         state.userscripts[0].refusal =
             Some("Refused — not injected: @exclude https://*.youtube.com/embed/*".to_string());
-        let schema = settings_schema_from("work", &PageContext::default(), &no_zoom(), &state);
+        let schema = settings_schema_from(
+            "work",
+            &PageContext::default(),
+            &no_zoom(),
+            &state,
+            &no_media(),
+        );
         let widgets = schema["widgets"].as_array().expect("widgets");
         let row = widgets
             .iter()
@@ -2586,6 +3748,7 @@ mod tests {
             &PageContext::default(),
             &no_zoom(),
             &policy_state(true, &[("sponsorblock", true)]),
+            &no_media(),
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
         assert!(
@@ -3010,6 +4173,14 @@ mod tests {
         ControlState::new("default", "sess-1", 41234)
     }
 
+    /// Every gate lock below is about the REQUEST — which credential it carried
+    /// and which route it aimed at — so they all drive a session whose client
+    /// does declare the token. The courier's own arms are locked separately in
+    /// `a_refusal_names_which_of_the_three_failures_it_is`.
+    fn dispatch_live(state: &ControlState, req: &ParsedRequest) -> (u16, Value) {
+        dispatch(state, req, TokenCourier::Live)
+    }
+
     /// A request as a page would make it: whatever the page can set, and
     /// nothing it cannot. The fido2 token is deliberately fillable — every page
     /// in the profile holds it, baked into the shim userscript — which is
@@ -3035,7 +4206,7 @@ mod tests {
     #[test]
     fn an_untokened_action_post_is_refused_and_the_refusal_names_the_route() {
         let state = control_state();
-        let (status, body) = dispatch(
+        let (status, body) = dispatch_live(
             &state,
             &page_request(
                 "POST",
@@ -3043,7 +4214,10 @@ mod tests {
                 json!({"pane": SETTINGS_PANE, "action": "reload-surface", "values": {}}),
             ),
         );
-        assert_eq!(status, 403, "an untokened /action must be refused: {body:?}");
+        assert_eq!(
+            status, 403,
+            "an untokened /action must be refused: {body:?}"
+        );
         assert_eq!(body["route"], "/action");
         let error = body["error"].as_str().unwrap_or_default();
         assert!(
@@ -3065,9 +4239,13 @@ mod tests {
         let stolen = ParsedRequest {
             fido2_token: Some(state.signer.token.clone()),
             control_token: Some(state.signer.token.clone()),
-            ..page_request("POST", "/action", json!({"pane": SETTINGS_PANE, "action": "x"}))
+            ..page_request(
+                "POST",
+                "/action",
+                json!({"pane": SETTINGS_PANE, "action": "x"}),
+            )
         };
-        let (status, body) = dispatch(&state, &stolen);
+        let (status, body) = dispatch_live(&state, &stolen);
         assert_eq!(
             status, 403,
             "the shim's token must not gate /action: {body:?}"
@@ -3087,7 +4265,7 @@ mod tests {
     #[test]
     fn the_guis_tokened_action_reaches_the_real_dispatch() {
         let state = control_state();
-        let (status, body) = dispatch(
+        let (status, body) = dispatch_live(
             &state,
             &gui_request(
                 &state,
@@ -3109,9 +4287,10 @@ mod tests {
     #[test]
     fn the_pane_schema_is_gui_only_but_still_answers_the_gui() {
         let state = control_state();
-        let (status, _) = dispatch(&state, &page_request("GET", "/pane/settings", Value::Null));
+        let (status, _) =
+            dispatch_live(&state, &page_request("GET", "/pane/settings", Value::Null));
         assert_eq!(status, 403, "an untokened pane fetch must be refused");
-        let (status, body) = dispatch(
+        let (status, body) = dispatch_live(
             &state,
             &gui_request(&state, "GET", "/pane/settings", Value::Null),
         );
@@ -3130,7 +4309,7 @@ mod tests {
     fn policy_and_zoom_reads_stay_open_to_an_untokened_caller() {
         let state = control_state();
         for path in ["/policy", "/zoom"] {
-            let (status, body) = dispatch(&state, &page_request("GET", path, Value::Null));
+            let (status, body) = dispatch_live(&state, &page_request("GET", path, Value::Null));
             assert_eq!(status, 200, "{path} must stay open, got {status} {body:?}");
         }
         assert_eq!(route_access("/policy"), RouteAccess::Open);
@@ -3144,7 +4323,7 @@ mod tests {
     #[test]
     fn the_gate_leaves_fido2_alone() {
         let state = control_state();
-        let unauthorized = dispatch(
+        let unauthorized = dispatch_live(
             &state,
             &page_request("POST", "/fido2/get", json!({"rpId": "example.com"})),
         );
@@ -3157,7 +4336,7 @@ mod tests {
             fido2_token: Some(state.signer.token.clone()),
             ..page_request("POST", "/fido2/get", Value::Null)
         };
-        let (status, _) = dispatch(&state, &shimmed);
+        let (status, _) = dispatch_live(&state, &shimmed);
         assert_eq!(
             status, 400,
             "a signer-tokened page route must reach the signer (400 = its own bad-request), \
@@ -3165,7 +4344,7 @@ mod tests {
         );
         let grant = page_request("POST", "/fido2/deny", json!({"request_id": "nope"}));
         assert_ne!(
-            dispatch(&state, &grant).0,
+            dispatch_live(&state, &grant).0,
             403,
             "grant/deny authenticate on the request_id and must not need the control token"
         );
@@ -3178,12 +4357,15 @@ mod tests {
     /// someone deliberately writes it into the open list.
     #[test]
     fn an_unclassified_route_is_gui_only_by_default() {
-        assert_eq!(route_access("/some-route-added-later"), RouteAccess::GuiOnly);
+        assert_eq!(
+            route_access("/some-route-added-later"),
+            RouteAccess::GuiOnly
+        );
         assert_eq!(route_access("/action"), RouteAccess::GuiOnly);
         assert_eq!(route_access("/pane/vault"), RouteAccess::GuiOnly);
         let state = control_state();
         assert_eq!(
-            dispatch(
+            dispatch_live(
                 &state,
                 &page_request("POST", "/some-route-added-later", json!({}))
             )
@@ -3336,7 +4518,7 @@ mod tests {
                      GUI's token"
                 );
                 assert_eq!(
-                    dispatch(&state, &page_request(method, path, json!({}))).0,
+                    dispatch_live(&state, &page_request(method, path, json!({}))).0,
                     403,
                     "{method} {path} must be refused for an untokened caller, not \
                      fall through to a 404 that a new dispatch arm would turn into \
@@ -3347,7 +4529,7 @@ mod tests {
 
         // The GUI itself is never blocked by this: it presents the token.
         assert_eq!(
-            dispatch(&state, &gui_request(&state, "POST", "/zoom", json!({}))).0,
+            dispatch_live(&state, &gui_request(&state, "POST", "/zoom", json!({}))).0,
             404,
             "a tokened write reaches the dispatch table (404 = no such arm today), \
              so the gate is refusing the CALLER, not the method"
@@ -3364,7 +4546,7 @@ mod tests {
     #[test]
     fn a_refusal_is_journalled_and_carries_no_token() {
         let presented = "s3cr3t-guess-the-attacker-sent";
-        let refusal = gui_only_refusal("POST", "/action", Some(presented));
+        let refusal = gui_only_refusal("POST", "/action", Some(presented), TokenCourier::Live);
         assert_eq!(refusal.event, "control_refused");
         assert_eq!(refusal.data["path"], "/action");
         assert_eq!(refusal.data["method"], "POST");
@@ -3416,6 +4598,99 @@ mod tests {
             !gate.contains("route_access(&req.path) == RouteAccess::GuiOnly"),
             "the gate is back to a path-only classification, so a `POST /zoom` arm \
              added later would be page-callable"
+        );
+    }
+
+    /// THE LIVE BUG, 2026-07-31: the user's vault and settings panes rendered
+    /// one line, `control endpoint returned 403`, and there was nothing in it to
+    /// act on. Three different failures wore that one message, and the one that
+    /// was actually happening — a `ychrome` CLI older than the gate, which can
+    /// never deliver the token however new the daemon and the GUI are — was the
+    /// one the message did not describe. A refusal that cannot be acted on is
+    /// only half a refusal.
+    #[test]
+    fn a_refusal_names_which_of_the_three_failures_it_is() {
+        let pre_gate = gui_only_refusal(
+            "GET",
+            "/pane/vault",
+            None,
+            TokenCourier::Absent { client_pid: 4242 },
+        );
+        let error = pre_gate.body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("predates the control-token gate"),
+            "the cause must be named: {error}"
+        );
+        assert!(
+            error.contains("Ctrl+C") && error.contains("run ychrome again"),
+            "the REMEDY must be named, and it is the only one that works: {error}"
+        );
+        assert!(
+            error.contains("restarting the daemon does not fix it"),
+            "the remedy people reach for first must be ruled out, or they will \
+             restart the daemon six times: {error}"
+        );
+        assert_eq!(pre_gate.body["cause"], "client_predates_control_token");
+        assert_eq!(pre_gate.data["client_pid"], 4242);
+
+        // The body is PAGE-REACHABLE — that is the whole reason this gate
+        // exists — so the pid rides the journal line and nothing else.
+        assert!(
+            !pre_gate.body.to_string().contains("4242"),
+            "a page must not learn host facts from a refusal: {}",
+            pre_gate.body
+        );
+
+        // A live courier and a wrong token is a transient, not a dead session:
+        // the client re-declares the current token within ~4s. Telling that
+        // reader to restart their browser would be wrong advice.
+        let mismatch = gui_only_refusal("POST", "/action", Some("old"), TokenCourier::Live);
+        let error = mismatch.body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("earlier daemon generation") && error.contains("~4s"),
+            "a stale token is self-healing and must say so: {error}"
+        );
+        assert_eq!(mismatch.body["cause"], "token_mismatch");
+        assert!(mismatch.data["client_pid"].is_null());
+
+        // And a page reaching a GUI-only route gets the page-facing answer.
+        let from_page = gui_only_refusal("POST", "/action", None, TokenCourier::Live);
+        assert_eq!(from_page.body["cause"], "token_absent");
+        assert!(
+            from_page.body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("yggterm-appctl bridge")
+        );
+    }
+
+    /// A CORS preflight is a PAGE asking to drive a GUI-only route
+    /// cross-origin. It must be refused whatever the session's client vintage
+    /// is, and — the part worth a lock — it must not answer with a fact about
+    /// the host's own CLI, which would hand the caller this gate exists to
+    /// refuse a piece of reconnaissance.
+    #[test]
+    fn a_preflight_never_reports_the_hosts_client_vintage() {
+        let refusal = gui_only_refusal("OPTIONS", "/action", None, TokenCourier::NotAsked);
+        let error = refusal.body["error"].as_str().unwrap_or_default();
+        assert!(
+            !error.contains("predates") && !error.contains("Ctrl+C"),
+            "a preflight answer must describe the ROUTE, not the host: {error}"
+        );
+        assert_eq!(refusal.data["token_courier"], "not_asked");
+
+        // ANCHOR: and the preflight responder must keep asking with `NotAsked`.
+        // Passing the session's real courier here is a one-word edit that no
+        // other lock in this file would notice.
+        let source = include_str!("sidebar.rs");
+        let body = source
+            .split("pub(crate) fn respond_preflight(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("respond_preflight body present");
+        assert!(
+            body.contains("TokenCourier::NotAsked"),
+            "the preflight must not consult the session's courier"
         );
     }
 
@@ -3511,5 +4786,270 @@ mod tests {
             !raw.contains("Access-Control-Allow-Origin"),
             "an /engine/* reply must not advertise CORS: {raw:?}"
         );
+    }
+
+    // ── THE PASSKEY SHIM'S SCOPE ────────────────────────────────────────────
+    // Installed on every page, the shim DEFINES window.PublicKeyCredential and
+    // answers isUserVerifyingPlatformAuthenticatorAvailable() true — on an
+    // engine that has no WebAuthn at all, where both read undefined. A bot
+    // check reads that mismatch, and an interstitial managed challenge is
+    // served as the TOP-FRAME document at the site's own URL, so all_frames:
+    // false never protected it.
+
+    // WebAuthn scopes a credential to the rpId AND its subdomains, so both must
+    // match. They are two patterns because WebKit's `*://*.example.com/*` does
+    // NOT admit the bare `example.com`.
+    #[test]
+    fn an_rp_id_matches_itself_and_its_subdomains() {
+        let patterns = rp_id_match_patterns("example.com");
+        assert!(
+            patterns.contains(&"*://example.com/*".to_string()),
+            "the bare rpId must match: {patterns:?}"
+        );
+        assert!(
+            patterns.contains(&"*://*.example.com/*".to_string()),
+            "a passkey for example.com is usable on login.example.com: {patterns:?}"
+        );
+    }
+
+    // ⛔ A PATTERN IS A SCOPE. Anything that could widen one to every site must
+    // produce NO pattern rather than a permissive one — `*://*./*` is every page
+    // on the web, which is the exact state this whole change exists to end.
+    #[test]
+    fn a_malformed_rp_id_yields_no_pattern_rather_than_a_wide_one() {
+        for bad in [
+            "",
+            "   ",
+            "*",
+            "evil.com/*",
+            "https://evil.com",
+            "a b",
+            "x?y",
+            "h#f",
+            "host:443",
+        ] {
+            assert!(
+                rp_id_match_patterns(bad).is_empty(),
+                "{bad:?} must produce no pattern at all, never a widened one"
+            );
+        }
+        // …and a well-formed one still works after all that refusing.
+        assert_eq!(rp_id_match_patterns("github.com").len(), 2);
+    }
+
+    // The shim must never be installed unscoped. An empty `matches` means EVERY
+    // URL (see `Userscript::matches`), so a shim with no patterns is precisely
+    // the old bug wearing the new code's clothes.
+    #[test]
+    fn the_shim_is_never_installed_with_an_empty_match_list() {
+        let source = include_str!("sidebar.rs");
+        let body = source
+            .split("fn passkey_shim_scripts(state: &ControlState) -> Vec<crate::userscript::Userscript> {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n}").next())
+            .expect("passkey_shim_scripts body present");
+        assert!(
+            body.contains("if patterns.is_empty()") && body.contains("return Vec::new()"),
+            "no rpIds must mean NO shim: an empty matches list means every URL, \
+             which is the unscoped shim this change removes"
+        );
+        assert!(
+            body.contains("script.matches = patterns"),
+            "the shim must carry its match patterns"
+        );
+    }
+
+    // ⛔⛔ THE USER-PRESENCE INVARIANT IS NOT A SCOPING QUESTION. Scoping decides
+    // WHERE navigator.credentials is patched. Every ceremony still goes through
+    // the token-gated /fido2/* routes and still blocks on an explicit GUI grant.
+    // An agent must never be able to approve its own ceremony.
+    #[test]
+    fn scoping_the_shim_does_not_touch_the_presence_gate() {
+        let source = include_str!("sidebar.rs");
+        assert!(
+            source.contains(
+                r#"if page_route && !state.signer.authorized(req.fido2_token.as_deref())"#
+            ),
+            "the page-facing /fido2 routes must still be bearer-token gated"
+        );
+        for route in ["/fido2/get", "/fido2/create", "/fido2/grant", "/fido2/deny"] {
+            assert!(source.contains(route), "{route} must still exist");
+        }
+    }
+
+    // ⛔ THE FAILURE THAT REACHED THE USER ON 2026-08-01. A vault agent older
+    // than this browser answers `status` perfectly — unlocked, 1116 items,
+    // `agent_stale: false`, because the agent and the INSTALLED ychrome-vault
+    // were the same binary — while answering `unknown op "passkey-hosts"` on the
+    // same socket. Passkeys were off on every site, the pane said nothing, and
+    // the page said "your browser does not support WebAuthn".
+    #[test]
+    fn an_agent_older_than_this_browser_is_reported_in_the_pane() {
+        let widgets = passkey_shim_widgets(&PasskeyShimState::AgentPredatesBrowser);
+        assert!(
+            !widgets.is_empty(),
+            "this state must never be silent in the pane"
+        );
+        let text = serde_json::to_string(&widgets).unwrap();
+        assert!(
+            text.contains("WebAuthn"),
+            "the pane must connect itself to the words the PAGE showed the user: {text}"
+        );
+        assert!(
+            widgets
+                .iter()
+                .any(|widget| widget["action"] == "hand_over_agent"),
+            "the remedy that keeps the unlock must be one click: {text}"
+        );
+    }
+
+    // A working shim is SILENT. A banner rendered on every schema for a healthy
+    // subsystem is a banner nobody reads when it finally matters.
+    #[test]
+    fn a_healthy_shim_says_nothing() {
+        for state in [
+            PasskeyShimState::ScopedTo(vec!["example.com".into()]),
+            PasskeyShimState::NoStoredPasskeys,
+        ] {
+            assert!(
+                passkey_shim_widgets(&state).is_empty(),
+                "{state:?} must be silent"
+            );
+        }
+    }
+
+    // ⛔ THE PANE MUST NOT LEAK WHICH SITES YOU HOLD PASSKEYS FOR. The schema
+    // crosses the OSC channel to the GUI; an rpId list is the user's business.
+    #[test]
+    fn the_pane_never_names_the_hosts_a_passkey_exists_for() {
+        let state = PasskeyShimState::ScopedTo(vec!["bank.example".into()]);
+        let text = serde_json::to_string(&passkey_shim_widgets(&state)).unwrap();
+        assert!(
+            !text.contains("bank.example"),
+            "an rpId reached the schema: {text}"
+        );
+    }
+
+    // A locked or unreachable vault is a DIFFERENT story from an agent that is
+    // too old, and the two need opposite remedies: unlock versus hand over.
+    #[test]
+    fn an_unavailable_vault_tells_the_user_to_unlock_and_reopen() {
+        let widgets = passkey_shim_widgets(&PasskeyShimState::VaultUnavailable(
+            "the vault is locked".into(),
+        ));
+        let text = serde_json::to_string(&widgets).unwrap();
+        assert!(text.contains("Unlock"), "{text}");
+        // The shim is chosen when a surface OPENS, so unlocking alone is not
+        // enough and saying only "unlock" would be a stale answer.
+        assert!(text.contains("new web surface"), "{text}");
+        assert!(
+            !widgets
+                .iter()
+                .any(|widget| widget["action"] == "hand_over_agent"),
+            "handing the agent over does not unlock a vault: {text}"
+        );
+    }
+
+    // ⛔ ONE OWNER FOR THE DECISION. `/policy` decides where to install the shim
+    // and the pane explains why it did not; if they probed separately, a browser
+    // could disable passkeys while the pane reported everything fine — which is
+    // exactly what happened before this existed.
+    #[test]
+    fn the_shim_decision_and_the_pane_read_the_same_owner() {
+        let production = include_str!("sidebar.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source before the test module");
+        assert_eq!(
+            production.matches("fn passkey_shim_state()").count(),
+            1,
+            "there must be exactly one owner of the shim decision"
+        );
+        for caller in ["fn passkey_shim_scripts(", "fn unlocked_schema("] {
+            let body = production
+                .split(caller)
+                .nth(1)
+                .and_then(|suffix| suffix.split("\n}").next())
+                .unwrap_or_else(|| panic!("{caller} is present"));
+            assert!(
+                body.contains("passkey_shim_state()"),
+                "{caller} must read the shared owner rather than probing on its own"
+            );
+        }
+    }
+
+    // ⛔ THE POLICY STAMP WAS BLIND TO THE SHIM, WHICH MADE THE FAILURE
+    // PERMANENT. Measured on the GUI host: `sidebar_contribution/policy` recorded
+    // `userscripts: 6` then `userscripts: 5` under ONE unchanged
+    // `policy_version` (`ebc219f7d40ddc53`), and the GUI refetches only when
+    // that stamp moves — so no surface could ever recover the shim.
+    #[test]
+    fn the_policy_stamp_moves_when_the_vault_agent_is_replaced() {
+        let production = include_str!("webpolicy.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source before the test module");
+        let body = production
+            .split("pub fn policy_version(profile: &str) -> String {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n}").next())
+            .expect("policy_version is present");
+        assert!(
+            body.contains("passkey_shim_stamp()"),
+            "the stamp must cover the vault facts that decide the shim's scope, \
+             or a handed-over agent never reaches an open surface"
+        );
+        let stamp = production
+            .split("fn passkey_shim_stamp() -> String {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n}").next())
+            .expect("passkey_shim_stamp is present");
+        // STAT-ONLY: this runs on the ~4s re-declare, where a socket round trip
+        // was already measured to wreck the surface tests.
+        assert!(
+            !stamp.contains("request") && !stamp.contains("passkey-hosts"),
+            "the stamp runs on the heartbeat and must never do socket IO"
+        );
+        assert!(
+            stamp.contains("pid_path") && stamp.contains("installed_vault_exe_stamp"),
+            "a handover rewrites agent.pid and an install moves the binary's mtime; \
+             those two stats are what make a recovered agent reach a surface"
+        );
+    }
+
+    // The probe is a unix-socket round trip. On the ~4s heartbeat path that
+    // would be a per-beat socket call, which the bug entry rules out explicitly.
+    #[test]
+    fn the_rp_id_probe_stays_off_the_heartbeat_path() {
+        // PRODUCTION CODE ONLY, and the needle is assembled at runtime, or this
+        // test's own prose would satisfy the search it is performing.
+        let production = include_str!("sidebar.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source before the test module");
+        let probe = format!("\"op\": \"passkey-{}\"", "hosts");
+        assert_eq!(
+            production.matches(probe.as_str()).count(),
+            1,
+            "the rpId probe is a unix-socket round trip and must have exactly \
+             ONE call site (`passkey_shim_scripts`); a second one is how it \
+             reaches a hot path"
+        );
+        // The ~4s heartbeat is `emit_declare`/`declare_payload`; the `/policy`
+        // route is refetched only when the stamp MOVES. Neither declare function
+        // may reach the probe, directly or through the shim builder.
+        for name in ["pub fn emit_declare(", "fn declare_payload("] {
+            let body = production
+                .split(name)
+                .nth(1)
+                .and_then(|suffix| suffix.split("\n}").next())
+                .unwrap_or_else(|| panic!("{name} is present"));
+            assert!(
+                !body.contains(probe.as_str()) && !body.contains("passkey_shim_scripts"),
+                "{name} runs on the ~4s heartbeat and must stay free of socket \
+                 IO — the rpId probe belongs on the /policy route, which is \
+                 fetched only when the policy stamp moves"
+            );
+        }
     }
 }

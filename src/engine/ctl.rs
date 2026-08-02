@@ -24,12 +24,25 @@ use serde_json::{Value, json};
 /// Verbs that stream NDJSON rather than answering with one object.
 const STREAMING: [&str; 1] = ["batch"];
 
+/// The header a `/engine/shot` reply carries its account in, folded for the
+/// case-insensitive compare. The router's spelling is
+/// `api::SHOT_META_HEADER`; this is the same name, and the test below holds
+/// them together so a rename cannot land on one side only.
+const SHOT_META_HEADER: &str = "x-ychrome-shot";
+
 pub fn run(args: &[String]) -> Result<()> {
     let Some(verb) = args.first() else {
         bail!(
             "usage: ychrome ctl <verb> [key=value ...] [--out FILE]\n\
              verbs: open close pages goto nav wait eval dom shot input\n\
-             \x20      park resume pool metrics budget batch egress identity status"
+             \x20      park resume pool metrics budget batch egress identity status\n\
+             \n\
+             shot regions (all four write PNG bytes; --out catches them):\n\
+             \x20  region=viewport                       what is on screen (default)\n\
+             \x20  region=full                           the whole scrollable document\n\
+             \x20  region=element selector='#main'       one element, cropped from the full page\n\
+             \x20  region=rect rect='{{\"x\":0,\"y\":0,\"w\":800,\"h\":600}}'  a document-space area\n\
+             \x20  prescroll=true                        walk the page first so lazy images load"
         );
     };
     let mut body = serde_json::Map::new();
@@ -67,13 +80,26 @@ pub fn run(args: &[String]) -> Result<()> {
     stream.flush()?;
 
     let mut reader = BufReader::new(stream);
-    let (status, content_type) = read_head(&mut reader)?;
+    let (status, content_type, shot_meta) = read_head(&mut reader)?;
 
     if let Some(path) = out_path {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes)?;
+        // A NON-2xx body is an error message, not an image. Writing it to the
+        // caller's `--out` path would leave a "PNG" that is really a line of
+        // JSON, which is a file a script then feeds to something that reports a
+        // decode failure three steps away from the actual refusal.
+        if !(200..300).contains(&status) {
+            eprintln!("{}", String::from_utf8_lossy(&bytes).trim());
+            return exit_status(status);
+        }
         std::fs::write(&path, &bytes)?;
-        println!("{} bytes -> {path}", bytes.len());
+        // The ACCOUNT on stdout, the pixels in the file. A cropped capture that
+        // could only answer with bytes could not tell a caller which element it
+        // cropped to, and that is the one thing the image cannot show. One JSON
+        // object, so a recipe pipes it to `jget` exactly like every other verb's
+        // reply instead of parsing a sentence.
+        println!("{}", out_report(shot_meta.as_deref(), &path, bytes.len()));
         return exit_status(status);
     }
 
@@ -98,6 +124,26 @@ pub fn run(args: &[String]) -> Result<()> {
     reader.read_to_string(&mut text)?;
     println!("{}", text.trim());
     exit_status(status)
+}
+
+/// What `--out` prints: the capture's own account with the file it landed in
+/// folded into the SAME object.
+///
+/// Pure, so the shape a recipe parses is a unit test rather than something only
+/// a live engine can produce. A reply with no account (any binary verb that is
+/// not `shot`) still answers with an object, never a sentence — `bytes` and
+/// `out` are the two facts that always exist.
+fn out_report(meta: Option<&str>, path: &str, bytes: usize) -> String {
+    let mut object = meta
+        .and_then(|meta| serde_json::from_str::<Value>(meta).ok())
+        .and_then(|value| match value {
+            Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default();
+    object.insert("out".to_string(), json!(path));
+    object.insert("bytes".to_string(), json!(bytes));
+    Value::Object(object).to_string()
 }
 
 /// A `key=value` argument's value: JSON when it parses as JSON, string
@@ -138,7 +184,10 @@ fn connect() -> Result<UnixStream> {
 }
 
 /// Read the status line and headers, leaving the reader positioned at the body.
-fn read_head(reader: &mut BufReader<UnixStream>) -> Result<(u16, String)> {
+///
+/// Answers the content type AND the capture account, because a binary reply's
+/// only channel for saying what it is IS a header.
+fn read_head(reader: &mut BufReader<UnixStream>) -> Result<(u16, String, Option<String>)> {
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let status: u16 = line
@@ -147,18 +196,22 @@ fn read_head(reader: &mut BufReader<UnixStream>) -> Result<(u16, String)> {
         .and_then(|code| code.parse().ok())
         .with_context(|| format!("the daemon did not answer with HTTP: {line:?}"))?;
     let mut content_type = String::new();
+    let mut shot_meta = None;
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header)? == 0 || header.trim().is_empty() {
             break;
         }
-        if let Some((name, value)) = header.split_once(':')
-            && name.eq_ignore_ascii_case("content-type")
-        {
+        let Some((name, value)) = header.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-type") {
             content_type = value.trim().to_ascii_lowercase();
+        } else if name.eq_ignore_ascii_case(SHOT_META_HEADER) {
+            shot_meta = Some(value.trim().to_string());
         }
     }
-    Ok((status, content_type))
+    Ok((status, content_type, shot_meta))
 }
 
 #[cfg(test)]
@@ -187,13 +240,52 @@ mod tests {
         }
     }
 
+    // The two halves of ONE wire name. A rename on the router side that did
+    // not reach the client would leave `--out` silently printing a byte count
+    // where the capture's account should be, which reads as success.
+    #[test]
+    fn the_client_reads_the_header_the_router_writes() {
+        assert_eq!(
+            SHOT_META_HEADER,
+            crate::engine::api::SHOT_META_HEADER.to_ascii_lowercase()
+        );
+    }
+
+    // `--out` answers with ONE json object: the capture's account plus where
+    // the bytes went. A recipe parses this the same way it parses every other
+    // verb's reply, so a capture is not the one verb that needs a sentence
+    // parser.
+    #[test]
+    fn out_reports_one_object_with_the_account_folded_in() {
+        let meta = r#"{"region":"full","width":1280,"height":4200}"#;
+        let report: Value = serde_json::from_str(&out_report(Some(meta), "/tmp/a.png", 91234))
+            .expect("a json object");
+        assert_eq!(report["region"], json!("full"));
+        assert_eq!(report["height"], json!(4200));
+        assert_eq!(report["out"], json!("/tmp/a.png"));
+        assert_eq!(report["bytes"], json!(91234));
+    }
+
+    // A binary reply with NO account still answers with an object. The two
+    // facts that always exist are the file and its size.
+    #[test]
+    fn out_without_an_account_is_still_an_object() {
+        let report: Value =
+            serde_json::from_str(&out_report(None, "/tmp/b.png", 7)).expect("a json object");
+        assert_eq!(report["out"], json!("/tmp/b.png"));
+        assert_eq!(report["bytes"], json!(7));
+    }
+
     // A bare `pg_000001` must NOT become a number, and a URL must not become
     // anything clever. Both are strings; only well-formed JSON is JSON.
     #[test]
     fn ambiguous_scalars_stay_strings() {
         for raw in ["pg_000001", "https://example.com/", "snapshot", "Enter"] {
             let parsed = coerce(raw);
-            assert!(parsed.is_string(), "{raw} should stay a string, got {parsed}");
+            assert!(
+                parsed.is_string(),
+                "{raw} should stay a string, got {parsed}"
+            );
         }
     }
 }

@@ -13,6 +13,18 @@
 const fs = require('fs');
 const vm = require('vm');
 
+// ⚠ THE HARNESS'S OWN PARSER, CAPTURED BEFORE THE SCRIPT UNDER TEST RUNS.
+// The sandbox is handed the HOST's `JSON` and `Response` on purpose (the script
+// must patch the very objects a page would see), which means that from the
+// moment it runs, a plain `JSON.parse` here goes through ITS hook. Every
+// assertion below would then be reading an object the parse hook had already
+// cleaned — and a completely dead `fetch` hook would still pass. So the harness
+// parses with these, and the script never gets to answer a question about
+// itself.
+const nativeParse = JSON.parse;
+const nativeStringify = JSON.stringify;
+const nativeResponseJson = Response.prototype.json;
+
 const scriptPath = process.argv[2];
 const hostname = process.argv[3] || 'www.youtube.com';
 const source = fs.readFileSync(scriptPath, 'utf8');
@@ -26,7 +38,7 @@ const ASSET_URL = 'https://www.youtube.com/s/player/abc123/base.js';
 // walks. A synthetic fixture proves the walk works on a shape someone imagined;
 // this proves AD_FIELDS still names what YouTube is really sending.
 const REAL_PLAYER_URL = 'https://www.youtube.com/youtubei/v1/player?real=1';
-const realPlayerResponse = () => JSON.parse(fs.readFileSync(
+const realPlayerResponse = () => nativeParse(fs.readFileSync(
     require('path').join(__dirname, 'youtube-player-response-captured.json'), 'utf8'));
 
 // The shape this whole script exists to edit. Ad fields at the top level, one
@@ -67,12 +79,12 @@ function check(name, condition, detail) {
 // nothing that would answer a question on its behalf.
 
 const bodies = {
-    [PLAYER_URL]: JSON.stringify(playerResponseFixture()),
+    [PLAYER_URL]: nativeStringify(playerResponseFixture()),
     // A non-player URL whose body is VALID JSON carrying the ad field names. It
     // is valid on purpose: if the URL guard is fake, the prune bites here and
     // the body comes back rewritten, which the pass-through check catches.
     [ASSET_URL]: '{"adPlacements":[1],"adSlots":[2],"note":"not a player response"}',
-    [REAL_PLAYER_URL]: JSON.stringify(realPlayerResponse()),
+    [REAL_PLAYER_URL]: nativeStringify(realPlayerResponse()),
 };
 
 const warnings = [];
@@ -206,6 +218,15 @@ if (!onYouTube) {
         Object.prototype.hasOwnProperty.call(FakeXHR.prototype, 'send')
             && FakeXHR.prototype.send.toString().indexOf('_raw') !== -1,
     );
+    // The parse hooks are the widest thing this script installs — `JSON.parse`
+    // is called on every site in the browser, thousands of times a page. If the
+    // host guard ever stops covering them, this blocker becomes a tax on the
+    // whole web instead of a fix for one site.
+    check('self-guard leaves JSON.parse untouched off youtube', sandbox.JSON.parse === nativeParse);
+    check(
+        'self-guard leaves Response.prototype.json untouched off youtube',
+        Response.prototype.json === nativeResponseJson,
+    );
     console.log(`ALL OK (${checks.length} checks, host=${hostname})`);
     process.exit(0);
 }
@@ -216,10 +237,15 @@ check(
     'the XHR hook replaced XMLHttpRequest.prototype.send',
     FakeXHR.prototype.send.toString().indexOf('_raw') === -1,
 );
+check('the parse hook replaced JSON.parse', sandbox.JSON.parse !== nativeParse);
+check(
+    'the parse hook replaced Response.prototype.json',
+    Response.prototype.json !== nativeResponseJson,
+);
 
 function assertPruned(label, data) {
     for (const field of AD_FIELDS) {
-        check(`${label} drops ${field}`, data[field] === undefined, JSON.stringify(data[field]));
+        check(`${label} drops ${field}`, data[field] === undefined, nativeStringify(data[field]));
     }
     check(
         `${label} drops the nested adBreakHeartbeatParams`,
@@ -236,7 +262,7 @@ function assertPruned(label, data) {
         `${label} keeps playerConfig's non-ad fields`,
         data.playerConfig.audioConfig.loudnessDb === 1.5,
     );
-    const text = JSON.stringify(data);
+    const text = nativeStringify(data);
     for (const field of AD_FIELDS) {
         check(`${label} leaves no trace of ${field}`, text.indexOf(field) === -1);
     }
@@ -246,7 +272,20 @@ async function main() {
     // 1. fetch, the path the modern player actually uses.
     const resp = await sandbox.fetch(PLAYER_URL);
     check('the fetch hook passes the request through to the real fetch', originalFetchCalls === 1);
-    const pruned = JSON.parse(await resp.text());
+    const prunedText = await resp.text();
+    // THE TRAP THIS LOCKS. The fetch hook decides whether to rewrite a body by
+    // parsing it and seeing whether anything was removed. If it parsed with the
+    // HOOKED `JSON.parse`, the parse hook would clean the object first, the
+    // fetch hook would find nothing left to remove, and it would hand back the
+    // ORIGINAL TEXT — ad fields intact — to any caller that reads the body as
+    // text. Two working layers, cancelling out, silently. Reading the raw text
+    // (never the hooked parser) is the only way to see it.
+    check(
+        'the fetch hook REWRITES the body text, not just the object a parse yields',
+        !AD_FIELDS.some((field) => prunedText.indexOf(field) !== -1),
+        prunedText.slice(0, 200),
+    );
+    const pruned = nativeParse(prunedText);
     assertPruned('fetch', pruned);
 
     // 2. A URL the guard must NOT touch comes back byte-identical.
@@ -258,13 +297,75 @@ async function main() {
     const xhr = new sandbox.XMLHttpRequest();
     xhr.open('POST', PLAYER_URL);
     xhr.send();
-    assertPruned('xhr.responseText', JSON.parse(xhr.responseText));
-    assertPruned('xhr.response', JSON.parse(xhr.response));
+    assertPruned('xhr.responseText', nativeParse(xhr.responseText));
+    assertPruned('xhr.response', nativeParse(xhr.response));
 
     const plain = new sandbox.XMLHttpRequest();
     plain.open('GET', ASSET_URL);
     plain.send();
     check('a non-player XHR is passed through unrewritten', plain.responseText === bodies[ASSET_URL]);
+
+    // 3b. THE PARSE FUNNEL — `JSON.parse`. This is the route the modern player
+    // actually reads its answer through: measured on one cold watch-page load,
+    // NINE parses of 60-260 KB strings, every one still carrying all four ad
+    // fields, none of them through the fetch hook. Everything above this line
+    // could work perfectly and the user would still see ads.
+    //
+    // Note this parses the SAME text the fetch case used. If the prune only
+    // happened on the way in through `fetch`, this comes back unpruned.
+    const parsedByHook = sandbox.JSON.parse(nativeStringify(playerResponseFixture()));
+    assertPruned('JSON.parse', parsedByHook);
+    check(
+        'the JSON.parse hook records which funnel bit',
+        sandbox.__yga_state.hooks.json_parse >= 1,
+        nativeStringify(sandbox.__yga_state.hooks),
+    );
+
+    // …and the negative, which is the whole cost argument: a string with no ad
+    // field in it is parsed and handed back untouched, with the same keys and
+    // the same values. `JSON.parse` runs thousands of times a page.
+    const innocentText = '{"a":1,"b":{"c":[1,2,3]},"note":"nothing to do with ads"}';
+    const innocent = sandbox.JSON.parse(innocentText);
+    check(
+        'a JSON string with no ad field is returned untouched',
+        nativeStringify(innocent) === innocentText,
+        nativeStringify(innocent),
+    );
+
+    // 3c. THE PARSE FUNNEL — `Response.prototype.json`. The player replays
+    // payloads it already holds by CONSTRUCTING a Response in JavaScript and
+    // reading it back; measured, three such calls per cold load, each carrying
+    // the four ad fields, each on a Response whose `.url` is the empty string
+    // because nothing fetched it. A URL-matching hook cannot see those at all,
+    // so a synthetic Response is exactly the case to lock.
+    const synthetic = new Response(nativeStringify(playerResponseFixture()), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+    });
+    check('a JS-constructed Response really has no url (or this proves nothing)',
+        synthetic.url === '');
+    // ⚠ THE JS PARSER IS TAKEN AWAY FOR THIS ONE, AND THAT IS THE POINT.
+    // A browser implements `Response.prototype.json()` natively: it decodes the
+    // body and parses it without ever consulting the page's `JSON.parse`, which
+    // is exactly why this second hook has to exist. Node's implementation does
+    // route through the live global `JSON.parse`, so leaving the parse hook in
+    // place would let it do all the work and this check would pass on a script
+    // whose `Response.json` hook was deleted. Restoring the native parser for
+    // the duration makes node behave like the engine we ship on.
+    const hookedParse = JSON.parse;
+    JSON.parse = nativeParse;
+    let syntheticJson;
+    try {
+        syntheticJson = await synthetic.json();
+    } finally {
+        JSON.parse = hookedParse;
+    }
+    assertPruned('Response.json', syntheticJson);
+    check(
+        'the Response.json hook records which funnel bit',
+        sandbox.__yga_state.hooks.response_json >= 1,
+        nativeStringify(sandbox.__yga_state.hooks),
+    );
 
     // 4. The inline `var ytInitialPlayerResponse = {...}` a cold load ships.
     sandbox.ytInitialPlayerResponse = playerResponseFixture();
@@ -280,13 +381,13 @@ async function main() {
         realBefore.adPlacements !== undefined && realBefore.adBreakHeartbeatParams !== undefined,
     );
     const realResp = await sandbox.fetch(REAL_PLAYER_URL);
-    const real = JSON.parse(await realResp.text());
+    const real = nativeParse(await realResp.text());
     for (const field of AD_FIELDS) {
         check(`real capture: ${field} is gone`, real[field] === undefined);
     }
     check(
         'real capture: no ad field name survives anywhere in the body',
-        !AD_FIELDS.some((field) => JSON.stringify(real).indexOf(field) !== -1),
+        !AD_FIELDS.some((field) => nativeStringify(real).indexOf(field) !== -1),
     );
     for (const kept of ['streamingData', 'videoDetails', 'playabilityStatus', 'captions',
         'playerConfig', 'microformat', 'annotations', 'storyboards']) {
@@ -295,8 +396,8 @@ async function main() {
     }
     check(
         'real capture: the video itself is intact',
-        JSON.stringify(real.streamingData) === JSON.stringify(realBefore.streamingData)
-            && JSON.stringify(real.videoDetails) === JSON.stringify(realBefore.videoDetails),
+        nativeStringify(real.streamingData) === nativeStringify(realBefore.streamingData)
+            && nativeStringify(real.videoDetails) === nativeStringify(realBefore.videoDetails),
     );
 
     // 5. LAYER 2 — the DOM belt, DRIVEN. `dispatchNavigate` fires the same
@@ -335,7 +436,7 @@ async function main() {
     check(
         '…and the warning names the world/AD_FIELDS check when nothing was pruned',
         warnings.some((line) => line.indexOf('youtube-adblock') !== -1),
-        JSON.stringify(warnings),
+        nativeStringify(warnings),
     );
 
     // (d) The negative that matters: with no ad on screen, nothing is touched.

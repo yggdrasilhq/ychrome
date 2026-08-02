@@ -13,6 +13,7 @@
 
 pub mod agent;
 pub mod api;
+pub mod clock;
 pub mod crypto;
 pub mod fido2;
 pub mod generator;
@@ -22,6 +23,7 @@ pub mod session;
 pub mod totp;
 pub mod watchtower;
 
+pub use clock::{ClockState, ClockUntrusted};
 pub use crypto::{AsymEncString, CryptoError, EncString, Kdf, MasterKey, PrivateKey, SymmetricKey};
 pub use generator::{DEFAULT_LENGTH, MIN_LENGTH, generate_password};
 pub use matching::{

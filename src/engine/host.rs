@@ -35,7 +35,7 @@ use gdk::prelude::*;
 use glib::translate::{ToGlibPtr, ToGlibPtrMut};
 use gtk::prelude::*;
 use javascriptcore::ValueExt;
-use serde_json::Value;
+use serde_json::{Value, json};
 use webkit2gtk::{LoadEvent, SettingsExt, SnapshotOptions, SnapshotRegion, WebView, WebViewExt};
 
 use super::substrate::{self, HeadlessDisplay, Probe, Substrate};
@@ -103,8 +103,60 @@ fn with_page<T>(id: &str, responder: Responder<T>, f: impl FnOnce(&Page, Respond
     });
     match view {
         Some(page) => f(&page, responder),
-        None => responder.fail(format!("no page {id:?}")),
+        None => responder.fail(super::pool::no_such_page(id).to_string()),
     }
+}
+
+/// Which region of the page a snapshot covers.
+///
+/// ⭐ **WebKitGTK answers BOTH natively**, and that is the finding that decides
+/// the whole capture design. `WebKitSnapshotRegion` has a `FULL_DOCUMENT`
+/// member, so a full-page capture is ONE engine call that renders the document
+/// at its laid-out size — not a scroll-and-stitch. The stitch was the obvious
+/// fallback and it is strictly worse: it seams at every step, it duplicates
+/// every `position: fixed` header once per tile, and it leaves the page
+/// scrolled somewhere the caller did not put it.
+///
+/// What full-document does NOT fix is content that has never been laid out
+/// because it has never been near the viewport. That is a lazy-load problem,
+/// not a snapshot problem, and `/engine/shot`'s `prescroll` is its answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShotRegion {
+    /// What is on screen: the view's own width x height.
+    Visible,
+    /// The whole scrollable document, however far below the fold it runs.
+    FullDocument,
+}
+
+impl ShotRegion {
+    fn webkit(self) -> SnapshotRegion {
+        match self {
+            ShotRegion::Visible => SnapshotRegion::Visible,
+            ShotRegion::FullDocument => SnapshotRegion::FullDocument,
+        }
+    }
+
+    /// The name this region answers to on the wire, and in the capture's
+    /// metadata. One spelling, read by the router and echoed to the caller.
+    pub fn id(self) -> &'static str {
+        match self {
+            ShotRegion::Visible => "viewport",
+            ShotRegion::FullDocument => "full",
+        }
+    }
+}
+
+/// A crop, in DEVICE pixels of the snapshot surface it applies to.
+///
+/// Device pixels, not CSS pixels, because that is the only space in which a
+/// crop is unambiguous: the caller speaks CSS and the conversion happens once,
+/// against the snapshot's MEASURED size, in `api::device_rect`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PixelRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
 }
 
 /// A viewport readback: the PNG bytes AND the raw pixels behind them.
@@ -122,6 +174,66 @@ pub struct Shot {
 }
 
 impl Shot {
+    /// Cut a device-pixel rect out of this shot, re-encoding the PNG from the
+    /// pixels already in hand.
+    ///
+    /// No second engine round trip, and that is the point: an element capture
+    /// and a rect capture are the SAME full-document snapshot with a different
+    /// window onto it, so they cannot disagree about what the page looked like.
+    /// Two snapshots taken a scroll apart could, and on an animating page they
+    /// would.
+    ///
+    /// `rect` must already be clamped inside `width x height` — `device_rect`
+    /// is the one place that clamping happens, and a rect that survived it is
+    /// non-empty by construction. This refuses rather than panics if it did
+    /// not, because a silently empty crop is a blank PNG that looks like a
+    /// rendering bug.
+    pub fn crop(&self, rect: PixelRect) -> Result<Shot> {
+        if rect.w <= 0 || rect.h <= 0 {
+            bail!("crop {rect:?} is empty");
+        }
+        if rect.x < 0 || rect.y < 0 || rect.x + rect.w > self.width || rect.y + rect.h > self.height
+        {
+            bail!(
+                "crop {rect:?} falls outside the {}x{} snapshot",
+                self.width,
+                self.height
+            );
+        }
+        let stride = cairo::Format::ARgb32
+            .stride_for_width(rect.w as u32)
+            .map_err(|error| anyhow::anyhow!("cairo stride for {}: {error}", rect.w))?;
+        let mut out = vec![0u8; (stride * rect.h) as usize];
+        for row in 0..rect.h {
+            let src = ((rect.y + row) * self.stride + rect.x * 4) as usize;
+            let dst = (row * stride) as usize;
+            let bytes = (rect.w * 4) as usize;
+            let Some(slice) = self.bgra.get(src..src + bytes) else {
+                bail!("crop {rect:?} ran off the end of the pixel buffer");
+            };
+            out[dst..dst + bytes].copy_from_slice(slice);
+        }
+        let surface = ImageSurface::create_for_data(
+            out.clone(),
+            cairo::Format::ARgb32,
+            rect.w,
+            rect.h,
+            stride,
+        )
+        .map_err(|error| anyhow::anyhow!("cairo surface for crop: {error}"))?;
+        let mut png = Vec::new();
+        surface
+            .write_to_png(&mut png)
+            .map_err(|error| anyhow::anyhow!("PNG encode failed: {error}"))?;
+        Ok(Shot {
+            width: rect.w,
+            height: rect.h,
+            stride,
+            png,
+            bgra: out,
+        })
+    }
+
     /// Count pixels darker than `threshold` luminance inside a rect. The
     /// engine's answer to "did those words actually paint" — a blank canvas
     /// scores zero no matter what the DOM claims.
@@ -303,6 +415,62 @@ impl Engine {
         })
     }
 
+    /// Apply the browser identity this host has recorded for a URL's host.
+    ///
+    /// Per SITE, like [`Engine::apply_zoom`], and for the same reason: the
+    /// override belongs to the site, not to the page object. Unlike zoom it must
+    /// run BEFORE the navigation — the UA is a request header, so applying it
+    /// afterwards would identify the browser correctly only from the SECOND load
+    /// onwards, which is the load a bot check has already scored.
+    ///
+    /// A host with no override falls back to the profile's identity, and with no
+    /// global preset either that is `None` — WebKitGTK's own UA, which is the
+    /// coherent one. Setting `None` explicitly matters: without it a page would
+    /// keep whatever the previous navigation set, so one visit to an
+    /// override-marked site would leak that identity onto every site after it.
+    pub fn apply_identity(&self, id: &str, url: &str) -> Result<Option<String>> {
+        let host = url::Url::parse(url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_string));
+        let agent = match host.as_deref() {
+            Some(host) => crate::useragent::effective_for_host(host),
+            None => crate::useragent::effective(),
+        };
+        let id = id.to_string();
+        let applied = agent.clone();
+        on_engine(Duration::from_secs(10), move |responder| {
+            let agent = applied.clone();
+            with_page(&id, responder, move |page, responder| {
+                let settings: webkit2gtk::Settings =
+                    WebViewExt::settings(&page.view).unwrap_or_default();
+                settings.set_user_agent(agent.as_deref());
+                WebViewExt::set_settings(&page.view, &settings);
+                responder.ok(agent)
+            })
+        })
+    }
+
+    /// Journal what the MAIN FRAME's last load actually returned: the committed
+    /// url, the HTTP status, and the Cloudflare headers that name a bot check.
+    ///
+    /// ⭐ This exists because a challenge loop, a blocked asset and a jar that
+    /// does not persist all LOOK IDENTICAL from outside — the page comes back,
+    /// it is not what you asked for, and nothing anywhere says why. `cf-mitigated`
+    /// is the header Cloudflare sets when it served a challenge instead of the
+    /// origin's response, so a run of loads carrying it IS the loop, stated.
+    ///
+    /// Best-effort by construction: `main_resource` is `None` before the first
+    /// commit and a data: URL has no response. A missing field is reported
+    /// absent, never guessed.
+    pub fn trace_main_frame(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        on_engine(Duration::from_secs(10), move |responder| {
+            with_page(&id, responder, move |page, responder| {
+                responder.ok(main_frame_trace(&page.view))
+            })
+        })
+    }
+
     /// Point a profile's network at a SOCKS endpoint (or back to direct).
     pub fn set_egress(&self, profile: &str, socks: Option<String>) -> Result<()> {
         let profile = profile.to_string();
@@ -350,7 +518,7 @@ impl Engine {
                     unsafe { page.window.destroy() };
                     responder.ok(())
                 }
-                None => responder.fail(format!("no page {id:?}")),
+                None => responder.fail(super::pool::no_such_page(&id).to_string()),
             }
         })
     }
@@ -424,13 +592,28 @@ impl Engine {
         serde_json::from_str(&raw).with_context(|| format!("engine eval returned non-JSON: {raw}"))
     }
 
-    /// Snapshot the visible viewport.
+    /// Snapshot the visible viewport. The default capture, and the one every
+    /// caller before regions existed was asking for.
     pub fn shot(&self, id: &str) -> Result<Shot> {
+        self.shot_region(id, ShotRegion::Visible)
+    }
+
+    /// Snapshot one region of a page.
+    ///
+    /// The budget scales with the region because they are not the same job: a
+    /// viewport readback is a compositor blit, while a full-document snapshot
+    /// re-renders a document that may be twenty screens tall. 30 s was tuned
+    /// for the former and a long page hits it honestly.
+    pub fn shot_region(&self, id: &str, region: ShotRegion) -> Result<Shot> {
         let id = id.to_string();
-        on_engine(Duration::from_secs(30), move |responder| {
+        let budget = match region {
+            ShotRegion::Visible => Duration::from_secs(30),
+            ShotRegion::FullDocument => Duration::from_secs(120),
+        };
+        on_engine(budget, move |responder| {
             with_page(&id, responder, move |page, responder| {
                 page.view.snapshot(
-                    SnapshotRegion::Visible,
+                    region.webkit(),
                     SnapshotOptions::NONE,
                     None::<&gio::Cancellable>,
                     move |result| {
@@ -725,6 +908,50 @@ impl Drop for Engine {
         }
         drop(self.display.take());
     }
+}
+
+/// The headers worth naming in a load trace. Deliberately a SHORT list of
+/// non-secret response headers: `cf-mitigated` says a bot check answered instead
+/// of the origin, `cf-ray` is the id Cloudflare's own support asks for, `server`
+/// says who answered at all, and `content-type` separates "a challenge page" from
+/// "the JSON your app expected". No `set-cookie`, ever — a clearance cookie is a
+/// credential and a journal is not the place for one.
+const TRACED_HEADERS: [&str; 4] = ["cf-mitigated", "cf-ray", "server", "content-type"];
+
+/// Read the main frame's last response. See [`Engine::trace_main_frame`].
+fn main_frame_trace(view: &WebView) -> Value {
+    use webkit2gtk::{URIResponseExt, WebResourceExt};
+
+    let uri = view.uri().map(|uri| uri.to_string());
+    let Some(response) = view
+        .main_resource()
+        .and_then(|resource| resource.response())
+    else {
+        // Honest absence. Before the first commit there IS no response, and a
+        // zero status would read as a measurement.
+        return json!({ "url": uri, "response": Value::Null });
+    };
+    let status = response.status_code();
+    let mut headers = serde_json::Map::new();
+    if let Some(raw) = response.http_headers() {
+        for name in TRACED_HEADERS {
+            if let Some(value) = raw.one(name) {
+                headers.insert(name.to_string(), json!(value.to_string()));
+            }
+        }
+    }
+    json!({
+        "url": uri,
+        "response": {
+            "status": status,
+            "headers": headers,
+            // The named verdict, so a caller does not have to know Cloudflare's
+            // header vocabulary to see the loop. `cf-mitigated: challenge` is
+            // set on exactly the responses where a bot check replaced the page.
+            "bot_check": headers.get("cf-mitigated").is_some()
+                || matches!(status, 403 | 503) && headers.get("cf-ray").is_some(),
+        },
+    })
 }
 
 /// Arm a one-shot wait for the next load to settle, resolving to the committed
@@ -1094,6 +1321,86 @@ mod tests {
             png: Vec::new(),
             bgra: vec![value; (width * height * 4) as usize],
         }
+    }
+
+    // ---- crop -------------------------------------------------------------
+
+    // A crop must move the PIXELS, not just the numbers. This paints a marker
+    // block, cuts it out, and reads the marker back at the crop's origin — a
+    // crop that only resized the header would score zero here.
+    #[test]
+    fn a_crop_carries_the_pixels_it_names() {
+        let mut shot = solid(64, 64, 0xff);
+        for row in 20..30 {
+            for col in 10..25 {
+                let offset = (row * shot.stride + col * 4) as usize;
+                shot.bgra[offset..offset + 4].copy_from_slice(&[0, 0, 0, 0xff]);
+            }
+        }
+        let cut = shot
+            .crop(PixelRect {
+                x: 10,
+                y: 20,
+                w: 15,
+                h: 10,
+            })
+            .expect("crop inside the surface");
+        assert_eq!((cut.width, cut.height), (15, 10));
+        // Every pixel of the crop is the marker, and none of the white around it.
+        assert_eq!(cut.dark_pixels(0, 0, 15, 10, 128), 15 * 10);
+        // And it really re-encoded: a PNG, not the parent's bytes.
+        assert!(
+            cut.png.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "crop must re-encode a PNG"
+        );
+        assert!(shot.png.is_empty(), "the parent shot is not mutated");
+    }
+
+    // A crop the caller could not have meant is a REFUSAL. An empty or
+    // out-of-bounds one used to be the sort of thing that produced a blank
+    // image and a confused hour.
+    #[test]
+    fn a_crop_outside_the_surface_is_refused() {
+        let shot = solid(32, 32, 0xff);
+        for rect in [
+            PixelRect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 10,
+            },
+            PixelRect {
+                x: -1,
+                y: 0,
+                w: 10,
+                h: 10,
+            },
+            PixelRect {
+                x: 30,
+                y: 0,
+                w: 10,
+                h: 10,
+            },
+            PixelRect {
+                x: 0,
+                y: 30,
+                w: 10,
+                h: 10,
+            },
+        ] {
+            assert!(
+                shot.crop(rect).is_err(),
+                "{rect:?} should have been refused"
+            );
+        }
+    }
+
+    // The wire names of the two regions are read by the router and echoed to
+    // the caller; they are the CLI's vocabulary, so they are pinned.
+    #[test]
+    fn the_shot_regions_answer_to_their_wire_names() {
+        assert_eq!(ShotRegion::Visible.id(), "viewport");
+        assert_eq!(ShotRegion::FullDocument.id(), "full");
     }
 
     #[test]

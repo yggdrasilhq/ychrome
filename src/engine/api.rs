@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
-use super::host::{Engine, InputEvent, NavAction};
+use super::host::{Engine, InputEvent, NavAction, PixelRect, ShotRegion};
 use super::js;
 use super::pool::{self, pool};
 use crate::sidebar::ParsedRequest;
@@ -42,7 +42,21 @@ pub type NdjsonBody = Box<dyn FnOnce(&mut dyn std::io::Write) + Send>;
 
 pub enum Reply {
     Json(u16, Value),
-    Png(Vec<u8>),
+    /// PNG bytes plus the ACCOUNT of them, which rides in the
+    /// `X-Ychrome-Shot` response header rather than in the body.
+    ///
+    /// A capture that answers only with pixels cannot say what it captured, and
+    /// for a CROPPED capture that is not a nicety: the difference between "the
+    /// element" and "the wrong element at the same size" is invisible in the
+    /// image. The header carries the region, the measured CSS→device scale, the
+    /// document geometry the crop was computed against, and the selector
+    /// account — the same `{matches, hittable, nth}` shape `/engine/input`
+    /// reports. Body stays pure image bytes, so `--out` still writes a file
+    /// nothing has to strip a wrapper off.
+    Png {
+        png: Vec<u8>,
+        meta: Value,
+    },
     /// A streaming NDJSON body. The closure writes one JSON object per line as
     /// each result lands, so a caller sees page 1 while page 300 is still
     /// loading. §4 specifies this for `/engine/batch`; Phase D shipped a JSON
@@ -132,7 +146,7 @@ pub fn dispatch(request: &ParsedRequest) -> Reply {
     let reply = route(&verb, request);
     let (status, error) = match &reply {
         Reply::Json(status, body) => (*status, body.get("error").and_then(Value::as_str)),
-        Reply::Png(_) | Reply::Ndjson(_) => (200, None),
+        Reply::Png { .. } | Reply::Ndjson(_) => (200, None),
     };
     crate::daemon::journal(
         "engine.verb",
@@ -214,10 +228,14 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
             let loaded = if url == "about:blank" {
                 Ok(String::new())
             } else {
-                // Zoom is per SITE, so it is applied per navigation, from
-                // `webzoom`'s recorded sites — never remembered here.
+                // Identity BEFORE the navigation — the UA is a request header,
+                // so applying it after the load would identify the browser
+                // correctly only from the second load on. Zoom is per SITE too
+                // but it is a rendering fact, so it rides after.
+                let _ = engine.apply_identity(&id, url);
                 let done = engine.goto(&id, url, GOTO_TIMEOUT);
                 let _ = engine.apply_zoom(&id, url);
+                journal_main_frame(&engine, &id, "engine.load.open");
                 done
             };
             pool().unpin(&id);
@@ -267,9 +285,13 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
             else {
                 return Reply::bad(400, "goto needs a page_id and a url");
             };
+            // Same order as `open`: identity first (it is a request header),
+            // zoom after (it is a rendering fact), then the trace.
+            let _ = engine.apply_identity(&id, url);
             match engine.goto(&id, url, GOTO_TIMEOUT) {
                 Ok(_) => {
                     let _ = engine.apply_zoom(&id, url);
+                    journal_main_frame(&engine, &id, "engine.load.goto");
                     Reply::Json(200, page_status(&engine, &id))
                 }
                 Err(error) => Reply::bad(502, error.to_string()),
@@ -287,9 +309,12 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
         }
         "shot" => match page_id {
             None => Reply::bad(400, "shot needs a page_id"),
-            Some(id) => match engine.shot(&id) {
-                Ok(shot) => Reply::Png(shot.png),
-                Err(error) => Reply::bad(404, error.to_string()),
+            Some(id) => match capture(&engine, &id, &request.body) {
+                Ok((shot, meta)) => Reply::Png {
+                    png: shot.png,
+                    meta,
+                },
+                Err((status, message)) => Reply::bad(status, message),
             },
         },
         "input" => {
@@ -509,7 +534,12 @@ const DRIVES_A_PAGE: [&str; 7] = ["goto", "nav", "eval", "shot", "dom", "input",
 pub fn json_status(reply: Reply) -> (u16, Value) {
     match reply {
         Reply::Json(status, body) => (status, body),
-        Reply::Png(png) => (200, json!({ "png_bytes": png.len() })),
+        Reply::Png { png, meta } => {
+            let mut body = meta;
+            body["ok"] = json!(true);
+            body["png_bytes"] = json!(png.len());
+            (200, body)
+        }
         Reply::Ndjson(write_body) => {
             let mut buffer = Vec::new();
             write_body(&mut buffer);
@@ -1113,6 +1143,461 @@ fn click_point_from_measure(
     Ok((x, y))
 }
 
+// ===== CAPTURE ==============================================================
+//
+// `/engine/shot` is four modes over ONE snapshot primitive. `viewport` and
+// `full` are the two regions WebKitGTK renders natively; `element` and `rect`
+// are a full-document snapshot with a window onto it, cropped from the pixels
+// already in hand rather than re-snapped. Doing it that way is not an
+// optimisation — a second snapshot taken a scroll or an animation frame later
+// would let an element capture and the full-page capture it claims to be a part
+// of show different content.
+
+/// The response header a PNG reply carries its account in.
+///
+/// Spelled once, here, and read by the CLI at `ctl::SHOT_META_HEADER` — the two
+/// halves of one wire name. Lower-case because HTTP header names are
+/// case-insensitive and the client folds before comparing.
+pub const SHOT_META_HEADER: &str = "X-Ychrome-Shot";
+
+/// Format the capture account as ONE header line, or nothing.
+///
+/// Compact JSON, so it cannot contain a bare CR or LF and cannot therefore
+/// split the response — a header built by string-joining caller-supplied values
+/// is a response-splitting bug waiting for a page title with a newline in it,
+/// and the selector account carries page-derived strings (`tag`). `serde_json`
+/// escapes both, by construction.
+pub fn shot_meta_header(meta: &Value) -> String {
+    let line = meta.to_string();
+    if line.contains(['\r', '\n']) {
+        return String::new();
+    }
+    format!("{SHOT_META_HEADER}: {line}\r\n")
+}
+
+/// A rect in DOCUMENT-space CSS pixels — the space the page speaks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CssRect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+/// What `/engine/shot`'s `region` asked for.
+enum CaptureMode {
+    /// What is on screen right now.
+    Viewport,
+    /// The whole scrollable document.
+    Full,
+    /// One element, resolved through the SAME pool a click resolves through.
+    Element {
+        selector: String,
+        nth: Option<usize>,
+        require_unique: bool,
+        /// CSS pixels of breathing room on every side. A control cropped to its
+        /// exact border box is legible but contextless; a caller asking "what
+        /// does this look like" usually wants a little of what is around it.
+        padding: f64,
+    },
+    /// A caller-chosen rect. THIS is the CLI's "selection area": a human drags
+    /// a rectangle, an agent names one, and both arrive here.
+    Rect(CssRect),
+}
+
+impl CaptureMode {
+    /// Parse the `region` argument, naming every alias it accepts.
+    ///
+    /// `page`/`document` alias `full` and `visible` aliases `viewport` because
+    /// those are the words the rest of the world uses for these two things, and
+    /// an agent that guesses one of them should get a capture rather than a
+    /// lecture. Everything else is refused BY NAME with the list.
+    fn parse(body: &Value) -> std::result::Result<CaptureMode, (u16, String)> {
+        let region = body
+            .get("region")
+            .and_then(Value::as_str)
+            .unwrap_or("viewport");
+        let bad = |message: String| (400u16, message);
+        match region {
+            "viewport" | "visible" => Ok(CaptureMode::Viewport),
+            "full" | "page" | "document" | "fullpage" | "full_page" => Ok(CaptureMode::Full),
+            "element" => {
+                let Some(selector) = body.get("selector").and_then(Value::as_str) else {
+                    return Err(bad(
+                        "region=element needs a `selector` (a CSS selector, resolved through the \
+                         same hittable pool /engine/input clicks through)"
+                            .to_string(),
+                    ));
+                };
+                Ok(CaptureMode::Element {
+                    selector: selector.to_string(),
+                    nth: body.get("nth").and_then(Value::as_u64).map(|n| n as usize),
+                    require_unique: body
+                        .get("require_unique")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    padding: body.get("padding").and_then(Value::as_f64).unwrap_or(0.0),
+                })
+            }
+            "rect" | "selection" | "area" => {
+                let rect = body.get("rect").unwrap_or(&Value::Null);
+                let read = |key: &str| rect.get(key).and_then(Value::as_f64);
+                let (Some(x), Some(y), Some(w), Some(h)) =
+                    (read("x"), read("y"), read("w"), read("h"))
+                else {
+                    return Err(bad(
+                        "region=rect needs `rect={\"x\":..,\"y\":..,\"w\":..,\"h\":..}` in \
+                         DOCUMENT-space CSS pixels (page coordinates, not viewport ones — add \
+                         window.scrollY to a getBoundingClientRect top)"
+                            .to_string(),
+                    ));
+                };
+                if !(w > 0.0 && h > 0.0) {
+                    return Err(bad(format!(
+                        "region=rect needs a positive w and h; got {w}x{h}"
+                    )));
+                }
+                Ok(CaptureMode::Rect(CssRect { x, y, w, h }))
+            }
+            other => Err(bad(format!(
+                "unknown shot region {other:?} (viewport|full|element|rect)"
+            ))),
+        }
+    }
+
+    /// Which native region this mode snapshots. Everything that crops takes the
+    /// FULL DOCUMENT, so an element below the fold captures without scrolling.
+    fn region(&self) -> ShotRegion {
+        match self {
+            CaptureMode::Viewport => ShotRegion::Visible,
+            _ => ShotRegion::FullDocument,
+        }
+    }
+}
+
+/// How long each pre-scroll step gets to let the page react.
+///
+/// A lazy image loads from an `IntersectionObserver` callback and a `fetch`,
+/// neither of which runs while our own script holds the thread. 120 ms is the
+/// same settle the click resolver uses for a `scrollIntoView` — one number for
+/// "give the page a turn", not two.
+const PRESCROLL_SETTLE: Duration = Duration::from_millis(120);
+
+/// The most pre-scroll steps one capture will take.
+///
+/// Bounded because an infinite-scroll feed has no bottom, and a capture that
+/// walks one forever is a hung request rather than a thorough one. 60 steps at
+/// ~90% of a viewport each is roughly 54 screens.
+const PRESCROLL_CAP: usize = 60;
+
+/// One capture: the request body in, the pixels and the account of them out.
+///
+/// Errors carry their own status because they are genuinely different kinds:
+/// 400 for a request the caller can fix, 404 for a page that is not there, 502
+/// for a snapshot the engine could not take.
+fn capture(
+    engine: &Engine,
+    id: &str,
+    body: &Value,
+) -> std::result::Result<(super::host::Shot, Value), (u16, String)> {
+    let mode = CaptureMode::parse(body)?;
+    let region = mode.region();
+
+    // The pre-scroll runs FIRST, before anything is measured: it is the only
+    // step that changes the document's height, and a scale computed before it
+    // would be a scale for a shorter page.
+    let prescroll = if body.get("prescroll").and_then(Value::as_bool) == Some(true) {
+        Some(prescroll(engine, id))
+    } else {
+        None
+    };
+
+    let metrics = engine
+        .eval(id, js::SHOT_METRICS)
+        .map_err(|error| (404u16, error.to_string()))?;
+    let doc_w = metrics["doc_w"].as_f64().unwrap_or(0.0);
+    let doc_h = metrics["doc_h"].as_f64().unwrap_or(0.0);
+
+    // The element's rect is read BEFORE the snapshot, in the same quiet page
+    // state, so the crop and the pixels describe one instant.
+    let (crop_css, selector_report) = match &mode {
+        CaptureMode::Viewport | CaptureMode::Full => (None, None),
+        CaptureMode::Rect(rect) => (Some(*rect), None),
+        CaptureMode::Element {
+            selector,
+            nth,
+            require_unique,
+            padding,
+        } => {
+            let (rect, report) = element_rect(engine, id, selector, *nth, *require_unique)
+                .map_err(|error| (400u16, error.to_string()))?;
+            let padded = CssRect {
+                x: rect.x - padding,
+                y: rect.y - padding,
+                w: rect.w + padding * 2.0,
+                h: rect.h + padding * 2.0,
+            };
+            (Some(padded), Some(report))
+        }
+    };
+
+    let shot = engine
+        .shot_region(id, region)
+        .map_err(|error| (502u16, error.to_string()))?;
+
+    // THE SCALE IS MEASURED, NEVER ASSUMED. `devicePixelRatio` and the page
+    // zoom both move it, and on a headless X server the two do not always agree
+    // with each other; dividing the snapshot's real width by the width it
+    // rendered cannot be wrong about the thing it is used for.
+    let css_w = match region {
+        ShotRegion::FullDocument => doc_w,
+        ShotRegion::Visible => metrics["view_w"].as_f64().unwrap_or(0.0),
+    };
+    let scale = if css_w > 0.0 {
+        shot.width as f64 / css_w
+    } else {
+        1.0
+    };
+
+    let mut meta = json!({
+        "region": region.id(),
+        "mode": match &mode {
+            CaptureMode::Viewport => "viewport",
+            CaptureMode::Full => "full",
+            CaptureMode::Element { .. } => "element",
+            CaptureMode::Rect(_) => "rect",
+        },
+        "page_id": id,
+        "width": shot.width,
+        "height": shot.height,
+        "scale": scale,
+        "document": {
+            "w": doc_w,
+            "h": doc_h,
+            "view_w": metrics["view_w"],
+            "view_h": metrics["view_h"],
+            "dpr": metrics["dpr"],
+            "scroll_y": metrics["scroll_y"],
+        },
+    });
+    if let Some(prescroll) = prescroll {
+        meta["prescroll"] = prescroll;
+    }
+    if let Some(report) = selector_report {
+        meta["selector"] = report;
+    }
+
+    let Some(css) = crop_css else {
+        return Ok((shot, meta));
+    };
+    let device =
+        device_rect(css, scale, (shot.width, shot.height)).map_err(|error| (400u16, error))?;
+    let cropped = shot
+        .crop(device)
+        .map_err(|error| (500u16, error.to_string()))?;
+    meta["crop"] = json!({
+        "css": { "x": css.x, "y": css.y, "w": css.w, "h": css.h },
+        "device": { "x": device.x, "y": device.y, "w": device.w, "h": device.h },
+    });
+    meta["width"] = json!(cropped.width);
+    meta["height"] = json!(cropped.height);
+    Ok((cropped, meta))
+}
+
+/// Walk the document top to bottom, one viewport at a time, and put the scroll
+/// back where it was.
+///
+/// ⚠ **This is the answer to the thing a full-document snapshot genuinely
+/// cannot do.** `SnapshotRegion::FullDocument` renders the document as it is
+/// LAID OUT; content that has never been near the viewport has never loaded, so
+/// a lazily-loaded page captures as a full-height document of empty boxes. The
+/// snapshot is not lying — the images really are not there yet.
+///
+/// Best-effort and reported as such: `steps` and `final_height` say what it
+/// actually did, and a page that grew past [`PRESCROLL_CAP`] says `capped:
+/// true` rather than pretending it reached the bottom.
+fn prescroll(engine: &Engine, id: &str) -> Value {
+    let start = engine
+        .eval(id, js::SHOT_METRICS)
+        .ok()
+        .and_then(|m| m["scroll_y"].as_f64())
+        .unwrap_or(0.0);
+    let mut steps = 0usize;
+    let mut y = 0.0f64;
+    let mut height = 0.0f64;
+    let mut capped = false;
+    loop {
+        let Ok(metrics) = engine.eval(id, js::SHOT_METRICS) else {
+            break;
+        };
+        height = metrics["doc_h"].as_f64().unwrap_or(0.0);
+        let step = (metrics["view_h"].as_f64().unwrap_or(600.0) * 0.9).max(200.0);
+        if y >= height {
+            break;
+        }
+        if steps >= PRESCROLL_CAP {
+            capped = true;
+            break;
+        }
+        if engine
+            .eval(id, &format!("({})({y})", js::SHOT_SCROLL_TO))
+            .is_err()
+        {
+            break;
+        }
+        std::thread::sleep(PRESCROLL_SETTLE);
+        steps += 1;
+        y += step;
+    }
+    // Put the page back where the caller left it. A capture must not be a
+    // navigation side effect.
+    let _ = engine.eval(id, &format!("({})({start})", js::SHOT_SCROLL_TO));
+    json!({
+        "steps": steps,
+        "settle_ms": PRESCROLL_SETTLE.as_millis(),
+        "final_height": height,
+        "capped": capped,
+        "restored_scroll_y": start,
+    })
+}
+
+/// Resolve a selector to its DOCUMENT-space rect, through the click pool.
+///
+/// Same pool, same hittable filter, same `nth` default, same counts as
+/// `/engine/input` — so `region=element` and a click on that selector can never
+/// name different elements. That reuse is the whole reason this is six lines
+/// and not a second resolver.
+fn element_rect(
+    engine: &Engine,
+    id: &str,
+    selector: &str,
+    nth: Option<usize>,
+    require_unique: bool,
+) -> Result<(CssRect, Value)> {
+    let quoted = serde_json::to_string(selector)?;
+    let pool = engine.eval(id, &format!("({})({quoted})", js::CLICK_POOL))?;
+    if let Some(reason) = pool["bad_selector"].as_str() {
+        bail!("{selector:?} is not a valid CSS selector ({reason})");
+    }
+    let matches = pool["matches"].as_u64().unwrap_or(0);
+    let hittable = pool["hittable"].as_u64().unwrap_or(0) as usize;
+    if matches == 0 {
+        bail!("no element matches {selector:?}");
+    }
+    if hittable == 0 {
+        bail!(
+            "no_hittable_match ({selector:?} matched {matches} element(s) and none of them has a \
+             visible box to capture: {} zero_size_element, {} hidden)",
+            pool["zero_size"].as_u64().unwrap_or(0),
+            pool["hidden"].as_u64().unwrap_or(0)
+        );
+    }
+    if require_unique && hittable > 1 {
+        bail!(
+            "ambiguous_selector ({selector:?} has {hittable} hittable match(es) of {matches} and \
+             the caller required exactly one — pass `nth` to choose between them)"
+        );
+    }
+    let index = nth.unwrap_or(0);
+    if index >= hittable {
+        bail!(
+            "no element matches {selector:?} at hittable index {index} — it has {hittable} \
+             hittable match(es) of {matches}"
+        );
+    }
+    let measured = engine.eval(id, &format!("({})({index})", js::SHOT_POOL_RECT))?;
+    if measured["found"].as_bool() != Some(true) {
+        bail!(
+            "handle_lost ({selector:?} hittable match {index} left the pool before it could be measured)"
+        );
+    }
+    let (Some(x), Some(y), Some(w), Some(h)) = (
+        measured["x"].as_f64(),
+        measured["y"].as_f64(),
+        measured["w"].as_f64(),
+        measured["h"].as_f64(),
+    ) else {
+        bail!("{selector:?} resolved to no rect");
+    };
+    Ok((
+        CssRect { x, y, w, h },
+        json!({
+            "selector": selector,
+            "matches": matches,
+            "hittable": hittable,
+            "hidden": pool["hidden"],
+            "zero_size": pool["zero_size"],
+            "nth": index,
+            "ambiguous": hittable > 1,
+            "tag": measured["tag"],
+        }),
+    ))
+}
+
+/// CSS rect + measured scale -> the device-pixel rect to cut, clamped to the
+/// snapshot.
+///
+/// PURE, and that is deliberate: every interesting way a crop goes wrong (an
+/// element scrolled off the captured document, a rect the caller measured
+/// against a different zoom, a half-pixel border) is decided here and lockable
+/// without an engine.
+///
+/// Rounds OUTWARD — floor the origin, ceil the far edge — so a 1 px border is
+/// never shaved off by rounding. Clamps to the snapshot rather than refusing a
+/// rect that merely overhangs, because an element flush with the right edge of
+/// the document legitimately measures a fraction of a pixel wider than the
+/// document is. An EMPTY intersection is refused by name: a blank PNG looks
+/// like a rendering bug and would be debugged as one.
+fn device_rect(
+    css: CssRect,
+    scale: f64,
+    bounds: (i32, i32),
+) -> std::result::Result<PixelRect, String> {
+    let (max_w, max_h) = bounds;
+    let left = (css.x * scale).floor() as i64;
+    let top = (css.y * scale).floor() as i64;
+    let right = ((css.x + css.w) * scale).ceil() as i64;
+    let bottom = ((css.y + css.h) * scale).ceil() as i64;
+    let x = left.clamp(0, max_w as i64);
+    let y = top.clamp(0, max_h as i64);
+    let w = right.clamp(0, max_w as i64) - x;
+    let h = bottom.clamp(0, max_h as i64) - y;
+    if w <= 0 || h <= 0 {
+        return Err(format!(
+            "the requested crop ({:.1},{:.1} {:.1}x{:.1} CSS px at scale {scale:.3}) does not \
+             overlap the {max_w}x{max_h} capture — a rect is in DOCUMENT coordinates, so a \
+             viewport-relative one measured while the page was scrolled will land off the top",
+            css.x, css.y, css.w, css.h
+        ));
+    }
+    Ok(PixelRect {
+        x: x as i32,
+        y: y as i32,
+        w: w as i32,
+        h: h as i32,
+    })
+}
+
+/// Record what the main frame's load actually RETURNED, on the daemon journal.
+///
+/// ⭐ Nothing used to write this down, and that is why three completely
+/// different failures were indistinguishable from the outside: a bot-check
+/// challenge loop, an asset the content filter ate, and a cookie jar that never
+/// persisted all present as "the page came back and it is not the page". One
+/// line per main-frame load, carrying the status and Cloudflare's own headers,
+/// separates them without anybody having to reproduce the failure first.
+///
+/// Best-effort and silent on error: a trace that could break a navigation would
+/// be worse than no trace.
+fn journal_main_frame(engine: &Engine, id: &str, event: &str) {
+    if let Ok(mut trace) = engine.trace_main_frame(id) {
+        if let Some(object) = trace.as_object_mut() {
+            object.insert("page_id".to_string(), json!(id));
+        }
+        crate::daemon::journal(event, trace);
+    }
+}
+
 /// The one `page` status shape (§4), built in one place so no route grows its
 /// own. The governance fields the spec lists (`rss_mb`, `cpu_pct_1m`, park
 /// state) belong to Phase D and are absent rather than faked — a zero would
@@ -1379,8 +1864,10 @@ pub fn bench(pages: usize) -> Result<Value> {
     let mut shot_bytes = Vec::new();
     for (id, _) in &opened {
         match dispatch(&request("shot", json!({ "page_id": id }))) {
-            Reply::Png(png) if png.starts_with(b"\x89PNG\r\n\x1a\n") => shot_bytes.push(png.len()),
-            Reply::Png(_) => failures.push(format!("{id}: readback was not a PNG")),
+            Reply::Png { png, .. } if png.starts_with(b"\x89PNG\r\n\x1a\n") => {
+                shot_bytes.push(png.len())
+            }
+            Reply::Png { .. } => failures.push(format!("{id}: readback was not a PNG")),
             other => {
                 let (status, body) = json_status(other);
                 failures.push(format!("{id}: shot -> {status} {body}"));
@@ -1430,6 +1917,143 @@ pub fn bench(pages: usize) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- capture ----------------------------------------------------------
+
+    // The four regions, plus the aliases an agent will reach for. A refusal
+    // here is a capture that did not happen, so every spelling this accepts is
+    // written down rather than discovered.
+    #[test]
+    fn shot_regions_parse_including_their_aliases() {
+        let mode = |body: Value| CaptureMode::parse(&body).map(|m| m.region());
+        assert_eq!(mode(json!({})).unwrap(), ShotRegion::Visible);
+        for word in ["viewport", "visible"] {
+            assert_eq!(
+                mode(json!({ "region": word })).unwrap(),
+                ShotRegion::Visible,
+                "{word}"
+            );
+        }
+        for word in ["full", "page", "document", "fullpage", "full_page"] {
+            assert_eq!(
+                mode(json!({ "region": word })).unwrap(),
+                ShotRegion::FullDocument,
+                "{word}"
+            );
+        }
+        // Everything that CROPS snapshots the full document — an element below
+        // the fold must capture without the caller scrolling to it first.
+        assert_eq!(
+            mode(json!({ "region": "element", "selector": "h1" })).unwrap(),
+            ShotRegion::FullDocument
+        );
+        assert_eq!(
+            mode(json!({ "region": "rect", "rect": {"x":0,"y":0,"w":10,"h":10} })).unwrap(),
+            ShotRegion::FullDocument
+        );
+    }
+
+    // A capture the caller cannot fix must not answer 200 with a plausible
+    // image of the wrong thing. Each of these is a REFUSAL, and the message
+    // has to name what was missing.
+    #[test]
+    fn a_capture_that_cannot_be_taken_is_refused_by_name() {
+        let refuse = |body: Value| match CaptureMode::parse(&body) {
+            Ok(_) => panic!("{body} should have been refused"),
+            Err((status, message)) => {
+                assert_eq!(status, 400, "{body}");
+                message
+            }
+        };
+        assert!(refuse(json!({ "region": "element" })).contains("selector"));
+        assert!(refuse(json!({ "region": "rect" })).contains("DOCUMENT-space"));
+        assert!(
+            refuse(json!({ "region": "rect", "rect": {"x":0,"y":0,"w":0,"h":10} }))
+                .contains("positive")
+        );
+        assert!(refuse(json!({ "region": "thumbnail" })).contains("viewport|full|element|rect"));
+    }
+
+    // The CSS->device conversion, which is where a crop silently captures the
+    // wrong part of the page. Rounds OUTWARD so a 1px border survives, and
+    // clamps rather than refusing a rect that merely overhangs.
+    #[test]
+    fn a_crop_rounds_outward_and_clamps_to_the_capture() {
+        let rect = CssRect {
+            x: 10.4,
+            y: 20.6,
+            w: 100.2,
+            h: 50.1,
+        };
+        // Scale 1: floor the origin, ceil the far edge.
+        assert_eq!(
+            device_rect(rect, 1.0, (1000, 1000)).unwrap(),
+            PixelRect {
+                x: 10,
+                y: 20,
+                w: 101,
+                h: 51
+            }
+        );
+        // Scale 2: the SAME CSS rect covers twice the pixels.
+        assert_eq!(
+            device_rect(rect, 2.0, (1000, 1000)).unwrap(),
+            PixelRect {
+                x: 20,
+                y: 41,
+                w: 202,
+                h: 101
+            }
+        );
+        // An element flush with the document's right edge measures a fraction
+        // wider than the document; clamping is right and refusing is not.
+        let overhang = CssRect {
+            x: 900.0,
+            y: 0.0,
+            w: 100.6,
+            h: 10.0,
+        };
+        assert_eq!(
+            device_rect(overhang, 1.0, (1000, 1000)).unwrap(),
+            PixelRect {
+                x: 900,
+                y: 0,
+                w: 100,
+                h: 10
+            }
+        );
+    }
+
+    // ⛔ AN EMPTY CROP MUST NOT PRODUCE A BLANK PNG. That is the failure that
+    // gets debugged as a rendering bug for an hour, and the message says the
+    // one thing a caller in this position has got wrong: viewport coordinates
+    // where document coordinates were asked for.
+    #[test]
+    fn a_crop_that_misses_the_capture_is_refused_not_blanked() {
+        let miss = CssRect {
+            x: 0.0,
+            y: 5000.0,
+            w: 100.0,
+            h: 100.0,
+        };
+        let error = device_rect(miss, 1.0, (1000, 900)).unwrap_err();
+        assert!(error.contains("does not overlap"), "{error}");
+        assert!(error.contains("DOCUMENT coordinates"), "{error}");
+    }
+
+    // The account rides in a HEADER, so it must never be able to end the
+    // headers early. Page-derived strings reach it (the element's tag), and a
+    // response split is what a newline in one would buy.
+    #[test]
+    fn the_capture_account_cannot_split_the_response() {
+        let header = shot_meta_header(&json!({ "tag": "div\r\nX-Evil: 1", "region": "full" }));
+        assert!(header.starts_with(SHOT_META_HEADER), "{header}");
+        assert_eq!(header.matches("\r\n").count(), 1, "{header}");
+        assert!(
+            header.contains("X-Evil"),
+            "the value is escaped, not dropped: {header}"
+        );
+    }
 
     // Path ownership must be exact. `/engineering` is not ours, and a daemon
     // that grabbed it would shadow a legacy route by prefix accident.
