@@ -307,6 +307,36 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
                 Err(error) => Reply::bad(400, error.to_string()),
             }
         }
+        // Autofill a vault item into the page's login form.
+        //
+        // The reply names the FIELDS that were filled and never a value, which
+        // is the same contract the sidebar's fill action keeps. `filled` is the
+        // script's own verdict — "filled", "user-only" or "no-fields" — so a
+        // caller can tell "the vault answered but the page had no password
+        // field" from "the vault refused", instead of both arriving as a bare
+        // success the way they would if this returned only `ok`.
+        "fill" => {
+            let (Some(id), Some(entry)) =
+                (page_id, request.body.get("entry").and_then(Value::as_str))
+            else {
+                return Reply::bad(400, "fill needs a page_id and entry");
+            };
+            let user = request.body.get("user").and_then(Value::as_str);
+            match crate::sidebar::vault_fill_script(entry, user) {
+                // A locked or absent agent is the vault's answer, not the
+                // page's, so it is a 502 and says so — an agent that reads
+                // "fill failed" as "wrong selector" will hunt the DOM for an
+                // hour over a vault nobody unlocked.
+                Err(error) => Reply::bad(502, format!("vault: {error}")),
+                Ok(script) => match engine.eval(&id, &script) {
+                    Ok(value) => Reply::Json(
+                        200,
+                        json!({ "ok": true, "entry": entry, "filled": value }),
+                    ),
+                    Err(error) => Reply::bad(400, error.to_string()),
+                },
+            }
+        }
         "shot" => match page_id {
             None => Reply::bad(400, "shot needs a page_id"),
             Some(id) => match capture(&engine, &id, &request.body) {
@@ -523,7 +553,9 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
 /// `park` is deliberately absent: parking a page must not first resume it.
 /// `close` is absent for the same reason — forgetting a parked page should not
 /// cost a page load.
-const DRIVES_A_PAGE: [&str; 7] = ["goto", "nav", "eval", "shot", "dom", "input", "wait"];
+const DRIVES_A_PAGE: [&str; 8] = [
+    "goto", "nav", "eval", "shot", "dom", "input", "wait", "fill",
+];
 
 /// A reply's status and body, for callers that only need the pair.
 ///
@@ -2246,6 +2278,45 @@ mod tests {
             !js::CLICK_MEASURE.contains("hit.contains(el)"),
             "an ancestor that contains the target is not the target: a click there reaches the \
              ANCESTOR, and this clause is exactly how a hidden decoy passed for a live control"
+        );
+    }
+
+    /// `fill` drives a named page, so it must resume a parked one like every
+    /// other page-driving verb. Leaving it out of this list is not a small
+    /// bug: the governor would be free to park the page between `open` and
+    /// `fill`, and the fill would then land on nothing while answering 200.
+    #[test]
+    fn fill_drives_a_page_and_so_must_resume_one() {
+        assert!(
+            DRIVES_A_PAGE.contains(&"fill"),
+            "fill targets a page_id; omitting it lets the governor park the page under it"
+        );
+    }
+
+    /// ⛔ THE SECRET MUST NOT BE REACHABLE FROM THE REPLY, and the cheapest way
+    /// to keep that true is for this route never to hold the password itself.
+    /// It asks `sidebar::vault_fill_script` for a SCRIPT and evals it, so the
+    /// value exists only inside the page-bound string.
+    ///
+    /// This test guards the shape rather than the runtime, because the runtime
+    /// needs an unlocked agent: if someone ever "simplifies" this route by
+    /// fetching the password here to build the JSON, the literal below appears
+    /// and this fails.
+    #[test]
+    fn the_fill_route_never_names_a_password_field() {
+        let source = include_str!("api.rs");
+        let route = source
+            .split("\"fill\" => {")
+            .nth(1)
+            .expect("the fill route exists");
+        let body = &route[..route.find("\"shot\" =>").unwrap_or(route.len())];
+        assert!(
+            !body.contains("password"),
+            "the fill route must hand off to vault_fill_script, not touch the secret itself"
+        );
+        assert!(
+            body.contains("vault_fill_script"),
+            "the fill route must go through the sidebar's vault path"
         );
     }
 }
