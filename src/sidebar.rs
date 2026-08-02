@@ -29,7 +29,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde_json::{Value, json};
 use ychrome_vault_proto::CIPHER_TYPE_CARD;
 
@@ -2693,13 +2693,18 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 // The password comes off the host's agent, goes straight into the
                 // eval script, and is dropped. It never enters a schema, the OSC
                 // stream, or yggterm's state.
-                Ok(reply) => {
-                    let password = reply["entry"]["password"].as_str().unwrap_or_default();
-                    json!({
+                // A password-less item (a card, a username-only note) reaches
+                // this arm now that `get` no longer refuses one. Filling an
+                // empty string would look like success and leave the page
+                // blank, so name the fact instead — the same sentence the
+                // agent used to raise.
+                Ok(reply) => match reply["entry"]["password"].as_str() {
+                    Some(password) if !password.is_empty() => json!({
                         "eval": fill_script(&user, password),
                         "toast": format!("Filled {name}."),
-                    })
-                }
+                    }),
+                    _ => json!({ "toast": format!("{name} has no password") }),
+                },
                 Err(error) => json!({ "toast": error.to_string() }),
             }
         }
@@ -3771,7 +3776,13 @@ pub(crate) fn vault_fill_script(name: &str, user: Option<&str>) -> Result<String
         "user": user.map_or(Value::Null, |u| Value::String(u.to_string())),
     }))?;
     let entry = &reply["entry"];
-    let password = entry["password"].as_str().unwrap_or_default();
+    // `get` hands back the whole entry and leaves the judgement here: a login
+    // fill without a password is not a fill, and reporting one would be the
+    // silent success this codebase treats as worse than an error.
+    let password = match entry["password"].as_str() {
+        Some(password) if !password.is_empty() => password,
+        _ => bail!("{name} has no password"),
+    };
     let username = user
         .or_else(|| entry["username"].as_str())
         .unwrap_or_default();

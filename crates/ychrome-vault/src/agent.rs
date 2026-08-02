@@ -786,19 +786,25 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             state.touch();
             Ok(serde_json::to_value(report)?)
         }
+        // Returns the whole entry and lets the CALLER decide which field it
+        // needed. It used to refuse outright when the item had no password,
+        // which made `get --field username` unreadable for every password-less
+        // login — the error named a field the caller had not asked for. That
+        // cost real trust once: an agent reading a PAN out of the vault hit
+        // "has no password", fell back to `list`, and picked the wrong row.
+        // A missing password is now `null` here; the two consumers that need
+        // one (the sidebar's fill paths) refuse it themselves, and the CLI's
+        // `required_field` still says "has no password" for `--field password`.
         "get" => {
             let name = string("name").ok_or_else(|| anyhow!("get needs a name"))?;
             let vault = unlocked(&state)?;
             let items = vault.items();
             let item = resolve(&items, &name, string("user").as_deref())?;
-            let password = vault
-                .password(&item.id)
-                .ok_or_else(|| anyhow!("{} has no password", item.name))?;
             let entry = json!({
                 "id": item.id,
                 "name": item.name,
                 "username": item.username,
-                "password": password,
+                "password": vault.password(&item.id),
             });
             state.touch();
             Ok(json!({ "entry": entry }))
@@ -1918,6 +1924,17 @@ mod tests {
                 password: enc("hunter2"),
                 ..Default::default()
             },
+            // A LOGIN carrying a username and NO password — the shape a vault
+            // takes when the useful value IS the identifier (a customer number,
+            // an identity number) and there is nothing to sign in with. Not a
+            // card, so the card reads do not cover it.
+            RawCipher {
+                id: "un".to_string(),
+                item_type: 1,
+                name: enc("idnumber.example"),
+                username: enc("111122223333"),
+                ..Default::default()
+            },
             // A CARD: type 3, no login block, so it has no password at all —
             // the shape of the 130 items in the real vault that `get` refuses.
             // Its fields live only in the raw record, like notes.
@@ -1984,7 +2001,7 @@ mod tests {
 
         let items = dispatch(&json!({"op": "list"}), &state).unwrap();
         let items = items["items"].as_array().unwrap();
-        assert_eq!(items.len(), 3, "two logins and a card");
+        assert_eq!(items.len(), 4, "three logins (one password-less) and a card");
         assert_eq!(items[0]["name"], "GitHub", "sorted by lowercased name");
         assert!(items[0]["has_totp"].as_bool().unwrap());
         // Metadata must never carry the secret itself.
@@ -2087,18 +2104,41 @@ mod tests {
         assert!(none["passkeys"].as_array().unwrap().is_empty());
     }
 
+    /// A username-only login must answer `get`, because the CLI reads
+    /// `--field username` out of that same reply.
+    ///
+    /// The regression this pins: `get` used to demand a password before it
+    /// looked at anything else, so every password-less item was unreadable and
+    /// the error named a field the caller had not asked for. An agent hunting a
+    /// PAN hit that wall, fell back to matching rows out of `list`, and picked
+    /// a DIFFERENT PERSON'S row — which very nearly went into a legal filing.
+    /// A refusal that misnames its own cause is how a caller ends up somewhere
+    /// worse than a clean failure.
+    #[test]
+    fn get_answers_for_a_login_that_has_no_password() {
+        let state = synthetic_state();
+
+        let got = dispatch(&json!({"op": "get", "name": "idnumber.example"}), &state).unwrap();
+        assert_eq!(got["entry"]["username"], "111122223333");
+        assert!(got["entry"]["password"].is_null(), "{got}");
+
+        // The one with a password is untouched by the relaxation.
+        let login = dispatch(&json!({"op": "get", "name": "ygg.example"}), &state).unwrap();
+        assert_eq!(login["entry"]["password"], "hunter2");
+    }
+
     // A card is metadata over the socket and a secret only through the op the
     // injector uses. The 130 items in the real vault with no password are mostly
-    // cards, and `get` refuses every one of them before it looks at `--field`.
+    // cards; `get` reports that absence as a null field rather than an error.
     #[test]
     fn agent_serves_card_metadata_without_the_number() {
         let state = synthetic_state();
 
-        // `get` still refuses a card, and now the LIST says why: not a login.
-        let error = dispatch(&json!({"op": "get", "name": "HDFC"}), &state)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("has no password"), "{error}");
+        // `get` answers for a card now, with a NULL password rather than an
+        // error, so a caller asking for another field is not turned away by a
+        // fact about a field it never wanted. The LIST says why it has none.
+        let got = dispatch(&json!({"op": "get", "name": "HDFC"}), &state).unwrap();
+        assert!(got["entry"]["password"].is_null(), "{got}");
         let list = dispatch(&json!({"op": "list"}), &state).unwrap();
         let card_row = list["items"]
             .as_array()
@@ -2367,7 +2407,11 @@ mod tests {
         // The live list never shows the trashed item...
         let live = dispatch(&json!({"op": "list"}), &state).unwrap();
         let live = live["items"].as_array().unwrap();
-        assert_eq!(live.len(), 3, "two logins and a card, none of them trashed");
+        assert_eq!(
+            live.len(),
+            4,
+            "three logins and a card, none of them trashed"
+        );
         assert!(
             live.iter()
                 .all(|item| item["name"] != "deleted-site.example")
