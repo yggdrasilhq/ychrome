@@ -450,14 +450,13 @@ now takes:
 Which leaves room for the thing the user actually needs — an explicit, per-field,
 one-render read:
 
-- **Reveal (`👁`)** — on the Edit tab, one row per value the entry HOLDS
-  (password, verification code, authenticator key, notes, each custom field).
-  Pressing it fetches that ONE field from the agent and renders it under its own
-  row. The value is a **parameter** threaded from the action into the schema that
-  action returns: `PaneState` has no field for it, the `GET /pane/vault` route
-  can only build through the no-reveal owner, and the next render — a refetch,
-  another click, reopening the panel — is built without it. There is nothing to
-  expire and nothing to forget.
+- **Reveal (`👁`)** — on the Edit tab, ON THE FIELD ITSELF. Pressing it fetches
+  that ONE field from the agent and swaps it into that box, readable, for that
+  one render. The value is a **parameter** threaded from the action into the
+  schema that action returns: `PaneState` has no field for it, the
+  `GET /pane/vault` route can only build through the no-reveal owner, and the
+  next render — a refetch, another click, reopening the panel — is built without
+  it. There is nothing to expire and nothing to forget.
 - **Copy (`⧉`)** — the same read, handed to the GUI as an `eval` that calls
   `navigator.clipboard.writeText`. The clipboard belongs to the machine the GUI
   runs on, which over ssh is not this one, so the value takes the same road a
@@ -482,7 +481,46 @@ one-render read:
 - Which field a verb acts on has ONE encoding, `sidebar::StoredField` — the row
   menu, the eye, the copy and the custom-field removal all parse the same spec
   (`password`, `totp`, `totp-secret`, `notes`, `field:<NAME>`), and it is also
-  the one place that knows which agent op reads which field.
+  the one place that knows which agent op reads which field. On the Edit tab the
+  spec travels in the ACTION NAME (`edit-reveal:password`), the `copy-row:`
+  grammar: an inline field's press carries the WIDGET's id, and a widget slot is
+  not a domain identity.
+
+### The form the second report asked for (2026-08-02, evening)
+
+The first answer to "I cannot see what is stored" was a separate **Stored
+values** section: a list of rows with eyes, under the form. The user looked at it
+beside Bitwarden's Edit Login and reported again — *"I cannot see passwords in
+edit mode and our vault UX looks so lifeless with dullness everywhere"* — because
+a list of rows beneath a column of blank boxes is not what edit mode looks like
+in any client. So the form took Bitwarden's shape:
+
+- **Item details · Login credentials · Autofill options · Additional options**,
+  each a CARD, in that order.
+- The mask, the eye and the copy are **on the field**. A password box shows
+  **mask dots** at rest, an eye and a copy inside its trailing edge, and a `⟳`
+  that arms a roll for the next save (which replaced the "Roll a new password
+  instead" toggle — one owner for the flag, and Bitwarden has no toggle either).
+- **Save is pinned**, in the pane's footer bar, wearing the accent.
+
+Two mechanisms in yggterm make that safe, and they are why this is not a
+pre-filled form wearing a disguise:
+
+1. **The dots are a PLACEHOLDER** (`stored: true` on the widget), never a value.
+   A placeholder cannot be submitted, cannot be read back by an action, and
+   vanishes on the first keystroke. The form still declares every secret box
+   empty — the lock `the_edit_form_declares_every_secret_box_empty` still passes
+   unchanged.
+2. **A revealed value is display-only.** yggterm pushes a `stored` field's
+   declared value to the DOM and keeps it out of the form draft, so pressing the
+   eye and then Save does not re-send the password nobody touched. Typing does
+   reach the draft, so a REPLACEMENT is sent and a REVEAL never is. That is what
+   lets one box be both "here is your password" and our "an empty box means leave
+   this alone".
+
+Custom fields stay ROWS: their values have no in-place write path (a field is set
+through the name/value pair), and a typeable box that does nothing on save would
+be a lie about the affordance.
 
 ## Writes
 

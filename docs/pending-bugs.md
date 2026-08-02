@@ -17,26 +17,48 @@ attached to still run the old binary, and retiring them is his call.
 User-tested the sidebar against the real Bitwarden extension side by side,
 2026-08-02, with screenshots. Three gaps; two are closed, one remains.
 
-### 1. Edit could not SHOW a stored value — ✅ CLOSED 2026-08-02, live-proven
+### 1. Edit could not SHOW a stored value — ✅ CLOSED 2026-08-02, twice, live-proven
 
 The user's words: *"I cannot edit the existing fields or see them to manually
 copy paste."* The pane was a REPLACE form, not an EDIT form, so you could not
 check what was stored or copy it by hand — the fallback every other client gives
 you when autofill misses.
 
-**What landed.** The Edit tab now lists one row per value the entry HOLDS
-(password, verification code, authenticator key, notes, each custom field —
-from `has_password`/`has_totp` in the listing plus one `notes` probe, booleans
-only), each with a `👁` and a `⧉`. The eye fetches ONE field and renders it under
-its own row for that one render.
+**The first fix** put a separate "Stored values" section under the form: one row
+per value the entry HOLDS, each with a `👁` and a `⧉`.
 
-⛔ The empty-box rule was a real invariant, not laziness, and it is intact: the
-form is still never pre-filled. A revealed value is a **parameter**, not state —
-`PaneState` cannot hold one, `GET /pane/vault` builds through the no-reveal
-owner, and the next render is built without it. The invariant is now stated in
-the form that actually matters: **a secret is never in a schema AT REST or in a
-LISTING.** Locked by `the_schema_route_cannot_carry_a_revealed_value` and
-`a_revealed_value_lives_in_exactly_one_render`.
+**The user reported again the same evening**, side by side with Bitwarden:
+*"I cannot see passwords in edit mode and our vault UX looks so lifeless with
+dullness everywhere."* A list of rows beneath a column of blank boxes is not what
+edit mode looks like in any client — the mask, the eye and the copy belong ON the
+field.
+
+**What landed (final).** The form is Bitwarden's Edit Login: **Item details ·
+Login credentials · Autofill options · Additional options**, each a card. The
+password box shows mask dots at rest with `👁`, `⧉` and a `⟳` (arms a roll for
+the next save; it replaced the "Roll a new password instead" toggle, so the flag
+has one owner) inside its trailing edge. Save is pinned in the pane footer,
+wearing the accent. Custom fields stay rows — their values have no in-place write
+path, and a typeable box that does nothing on save would lie about the
+affordance.
+
+⛔ The empty-box rule was a real invariant, not laziness, and it is intact — and
+now held by CONSTRUCTION rather than by care. The mask dots are a **placeholder**
+(`stored: true` on the widget), so they cannot be submitted or read back; and
+yggterm keeps a `stored` field's declared value OUT of the form draft, so a
+revealed password cannot be re-sent on the next action. A revealed value is still
+a **parameter**, not state — `PaneState` cannot hold one, `GET /pane/vault`
+builds through the no-reveal owner, and the next render is built without it.
+**A secret is never in a schema AT REST or in a LISTING.** Locked by
+`the_schema_route_cannot_carry_a_revealed_value`,
+`a_revealed_value_lives_in_exactly_one_render`,
+`the_edit_form_declares_every_secret_box_empty` and
+`the_edit_form_puts_the_mask_the_eye_and_the_copy_on_the_field`.
+
+⚠ **Needs the yggterm side.** The mask, the inline verbs, the cards and the
+pinned footer are yggterm schema fields (`stored`, `actions`, `card`, footer
+`primary`) shipped on `lane/dev/youthful-inputs`. On an older GUI the schema
+degrades to plain boxes — the form still works, it just draws flat.
 
 ### 2. No copy actions on a row — ✅ CLOSED 2026-08-02, live-proven
 
