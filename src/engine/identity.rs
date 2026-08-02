@@ -102,7 +102,7 @@ fn build(profile: &str) -> Result<ProfileIdentity> {
     // `<base_cache_directory>/WebKitCache`, so the engine filled
     // `<profile>/cache/WebKitCache` while the visible browser filled
     // `<profile>/WebKitCache` and NEITHER could read the other's records.
-    // Measured on dev and jojo before the fix: three profiles on each host
+    // Measured on dev and the GUI host before the fix: three profiles on each host
     // carried BOTH trees, one written by the engine and one by the surface.
     // Every engine page therefore refetched assets the user's own browser had
     // on disk a second earlier, and vice versa — "one browser" was true for

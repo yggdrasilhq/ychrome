@@ -90,13 +90,14 @@ yggterm's `docs/web-surfaces.md`).
 
 ## License
 
-**Split-licensed** — see `LICENSE`.
+- source code: `GPL-3.0-or-later` — the browser ships a compiled derivative of
+  nine GPL/CC-BY-SA filter lists
+- `crates/ychrome-vault` and `crates/ychrome-vault-proto`: `Apache-2.0` — they
+  are reusable infrastructure, not browser code
+- repository documentation (`*.md`) and skills: `CC BY-SA 4.0`
 
-- The browser (root `ychrome` package) is **GPL-3.0-or-later**, because it ships
-  a compiled derivative of nine GPL/CC-BY-SA filter lists.
-- `crates/ychrome-vault` and `crates/ychrome-vault-proto` remain **Apache-2.0**;
-  they are reusable infrastructure, not browser code.
-- `yggterm` / `libyggterm` are unaffected and remain Apache-2.0 — ychrome has no
-  dependency edge on them.
+See `LICENSE` (the full GPL-3.0 text), `LICENSE-CC-BY-SA-4.0`, and `NOTICE`.
 
-Upstream notices: `THIRD-PARTY-NOTICES.md`.
+Contributions need a signed CLA, because this project is also licensed
+commercially. See `CONTRIBUTING.md` and `CLA.md` — it is a page, you keep your
+copyright, and it takes one line to sign.

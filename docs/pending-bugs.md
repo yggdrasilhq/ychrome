@@ -6,7 +6,7 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > the last pass: the daemon socket singleton, Xvfb reaping on retire, `ctl`
 > naming the daemon generation, the mis-clicked hidden duplicate, `ychrome-vault
 > totp` minting on a skewed clock, the two separate HTTP caches, second-invocation
-> tab routing, and the engine's reachability off jojo. **Eight entries remain,
+> tab routing, and the engine's reachability off the GUI host. **Eight entries remain,
 > and three of them are ⚠ minor or a known-flaky test.**
 
 ---
@@ -52,7 +52,7 @@ site you have no passkey for sees a pristine `navigator`.
 browser does not currently support WebAuthn."* — *"How am I supposed to use the
 passkey?"*
 
-**Two independent faults, both measured on jojo. Neither was the documented
+**Two independent faults, both measured on the GUI host. Neither was the documented
 "the vault holds no passkey for this host" case:** `ychrome-vault passkeys
 <host>` returns a real credential for it.
 
@@ -174,7 +174,7 @@ his decision to make. Options, so the next reader does not start from scratch:
 3. decline, and keep the notice as the whole answer.
 
 ⚠ **Not live-proven.** The notice needs two live clients contending for one
-profile on jojo, which needs a yggterm GUI + daemon deploy — and
+profile on the GUI host, which needs a yggterm GUI + daemon deploy — and
 `yggterm/docs/pending-bugs.md` still carries "REMOTE ROWS WEDGE IN
 `RemoteBootstrap` AFTER A DAEMON VERSION HANDOVER", which wedged 15 rows on the
 last bump. The rule and the words are unit-locked and mutation-proven; the
@@ -292,7 +292,7 @@ answers "did anyone forget to cycle the clients" in one command.
 
 ---
 
-## ~~★★ THE ENGINE ONLY EXISTS ON jojo~~ — CLOSED 2026-08-01
+## ~~★★ THE ENGINE ONLY EXISTS ON THE GUI HOST~~ — CLOSED 2026-08-01
 
 `ychrome ctl pages` answers `{"ok":true,"pages":[]}` on **dev**, and the engine
 was driven there end to end for the click-resolver and screenshot work. Agent
@@ -312,8 +312,8 @@ sessions:
   operator's screen; it is the subject of `dream-detached-agent-surfaces.md` and
   of the detached-by-default rule in `yggterm/docs/agent-surface-attachment.md`.
 - **§1 Unlock request** and **§6 Autofill-from-vault.** The vault is the standing
-  friction: it is LOCKED on oc and dev (as root it answers `not_configured`) and
-  resolves only on jojo, and `fill-vault` needs a mapped surface so it is
+  friction: it is LOCKED on a headless host and dev (as root it answers `not_configured`) and
+  resolves only on the GUI host, and `fill-vault` needs a mapped surface so it is
   unavailable on exactly the detached surfaces agents are told to prefer. Every
   run pays this toll by hand.
 - **§3 OTP from the data-fabric** and **§5 Extract surface** — the same shape.
