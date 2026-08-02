@@ -7,6 +7,76 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ★★★ THE VAULT PANE IS NOT AT PARITY: no stored values, no copy, no last-sync
+
+**Status:** OPEN
+
+User-tested the sidebar against the real Bitwarden extension side by side,
+2026-08-02, with screenshots. Three distinct gaps.
+
+### 1. Edit cannot SHOW a stored value, so it cannot be copied or verified
+
+Bitwarden's Edit Login renders the stored **password** and **authenticator key**
+as masked fields with a REVEAL eye (and a regenerate control), plus the
+passkey's creation date and per-URI rows. Ours renders a "Replace a secret"
+block whose boxes are empty by design, explained as *"These boxes are empty
+because this pane never carries a stored secret."*
+
+The user's words: *"I cannot edit the existing fields or see them to manually
+copy paste."* That is the whole complaint — the pane is a REPLACE form, not an
+EDIT form, so you cannot check what is stored or copy it by hand, which is the
+fallback every other client gives you when autofill misses.
+
+⛔ The empty-box rule was a real invariant, not laziness: a schema travels
+app → OSC → GUI and is re-sent on every refresh, so a secret placed in it is
+broadcast repeatedly. **The fix is not to prefill the form.** It is an explicit
+per-field REVEAL action — the user presses the eye, the pane fetches that ONE
+value and renders it for that one render, exactly as Bitwarden's eye does — plus
+a COPY action. The invariant becomes "a secret is never in a schema AT REST or
+in a LISTING", which is the property that actually matters.
+
+### 2. No copy actions on a row
+
+Bitwarden's row overflow offers **Copy username · Copy password · Copy
+verification code**, plus launch-URI, Edit, Clone, Archive, Delete. Ours offers
+fill ⧉, totp ⏱ and edit ✎ only — every affordance is "put it in the page", none
+is "give it to me". A user who needs the value anywhere else (another app, a
+terminal, a form we mis-detect) has no route.
+
+### 3. The sync line is a warning where a fact belongs — and the cause is ours
+
+The pane shows: *"This host's vault agent does not report when it last synced,
+so nothing here can tell you whether it is current. Install the current
+ychrome-vault and hand the agent over."* The user: *"our sync now option should
+have last synced time and then sync now button … A warning text is
+non-confidence inspiring."*
+
+**Root cause, measured 2026-08-02 — and the advice in that warning does not
+work.** `status_json` (the ONE status builder, `agent.rs:1772`) always sets
+`last_sync_unix`. The RUNNING agent's status has no such key at all — proven by
+asking `~/.yggterm/vault/agent.sock` directly, not the CLI. So the agent
+predates the field. But:
+
+- `agent_stale` reads **false**, because it compares the agent against the
+  INSTALLED binary and cannot see a missing FIELD;
+- ⛔ **`ychrome-vault handover` REFUSES**: *"is the binary this agent is ALREADY
+  running — nothing to hand over"*. It compares the PATH, and an in-place binary
+  replace leaves the path identical while the code differs. **So the one
+  documented zero-cost remedy is unavailable exactly when it is needed**, and
+  the pane's own advice sends the user in a circle.
+
+**Fixes owed:** (a) `handover` must compare the installed binary's IDENTITY
+(mtime+size, or a hash) against what the agent actually exec'd, never the path;
+(b) once an agent reports it, the pane shows **"Last synced <time> · Sync now"**
+as a plain fact and keeps the warning for the genuine failure case only;
+(c) sync on a schedule/staleness rule rather than making the user press it.
+
+⚠ Same family as three other findings today: a version-gated hot-restart that
+cannot swap a same-version binary, `ctl --help` exiting 0 on a build without the
+verb, and `agent_stale`. **An identity check that cannot see the change it
+exists to detect.**
+
+
 ## ★★ A CLIENT-SIDE VIEW SWAP STALLS: the URL changes, the screen does not
 
 **Status:** OPEN
