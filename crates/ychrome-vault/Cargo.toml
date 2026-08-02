@@ -50,3 +50,8 @@ zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 hex = "0.4"
+# `tests/live_edit.rs` only: provisions a SCRATCH vaultwarden account and reads
+# raw ciphers back, so the edit path can be exercised end to end against a real
+# server without ever touching anyone's real vault. Already in the dependency
+# tree above; this makes it visible to the integration test.
+reqwest = { version = "0.13.3", default-features = false, features = ["blocking", "json", "rustls"] }

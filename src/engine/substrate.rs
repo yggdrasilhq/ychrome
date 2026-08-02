@@ -216,6 +216,112 @@ pub struct HeadlessDisplay {
 const FIRST_DISPLAY: u32 = 90;
 const LAST_DISPLAY: u32 = 160;
 
+/// Is this process an `Xvfb` that the engine started and then lost?
+///
+/// Pure so the judgement can be tested without a process table. Every clause is
+/// load-bearing, and the `ppid` one is the safety property:
+///
+/// - **`ppid == 1` — orphaned.** A display that any daemon still owns has that
+///   daemon as its parent. This is what makes the sweep safe next to a daemon
+///   running under a DIFFERENT `HOME` (a yggterm under-glass sandbox has its
+///   own `daemon.lock`, so our singleton says nothing about it) — its Xvfb is
+///   its child, so it can never be selected here. An orphaned one is garbage no
+///   matter which daemon started it.
+/// - **argv shape** — exactly what `HeadlessDisplay::start` spawns, so an Xvfb
+///   some other tool orphaned with different geometry or flags is left alone.
+/// - **display in range** — `:0`-`:89` belong to real sessions.
+pub(crate) fn is_an_orphaned_engine_display(argv: &[String], ppid: u32) -> bool {
+    if ppid != 1 {
+        return false;
+    }
+    let [program, display, screen_flag, screen, geometry, nolisten, tcp] = argv else {
+        return false;
+    };
+    if !std::path::Path::new(program)
+        .file_name()
+        .is_some_and(|name| name == "Xvfb")
+    {
+        return false;
+    }
+    if screen_flag != "-screen" || screen != "0" || nolisten != "-nolisten" || tcp != "tcp" {
+        return false;
+    }
+    // `WIDTHxHEIGHTx24`, the only geometry this module ever asks for.
+    let mut parts = geometry.split('x');
+    let ok_geometry = matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(w), Some(h), Some("24"), None)
+            if w.parse::<u32>().is_ok() && h.parse::<u32>().is_ok()
+    );
+    if !ok_geometry {
+        return false;
+    }
+    display
+        .strip_prefix(':')
+        .and_then(|number| number.parse::<u32>().ok())
+        .is_some_and(|number| (FIRST_DISPLAY..=LAST_DISPLAY).contains(&number))
+}
+
+/// Kill every `Xvfb` the engine started and then lost. Returns the displays reaped.
+///
+/// ⛔ CALL THIS ONLY WHILE HOLDING THE DAEMON SINGLETON. It is the startup half
+/// of display cleanup: `Engine`'s `Drop` reaps the display on the graceful path,
+/// and the daemon's signal handler covers SIGTERM, but nothing can run on
+/// SIGKILL — so an ungracefully-killed daemon leaves an X server alive until the
+/// host reboots.
+///
+/// Measured on dev, 2026-07-31: **15 orphaned `Xvfb` across `:90`-`:104`**, one
+/// per daemon lost to the socket race, each still holding ~30 MB and a display
+/// number the next engine had to skip. That is why displays climbed to `:105`.
+pub fn reap_orphaned_displays() -> Vec<String> {
+    let our_uid = unsafe { libc::getuid() };
+    let mut reaped = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return reaped;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        // Ours only. A process we do not own is never ours to kill.
+        let Ok(meta) = std::fs::metadata(entry.path()) else {
+            continue;
+        };
+        if std::os::unix::fs::MetadataExt::uid(&meta) != our_uid {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let argv: Vec<String> = raw
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect();
+        let Some(ppid) = read_ppid(&entry.path()) else {
+            continue;
+        };
+        if !is_an_orphaned_engine_display(&argv, ppid) {
+            continue;
+        }
+        // SIGTERM: Xvfb removes its own /tmp/.X<n>-lock on a clean exit, which
+        // is what frees the display number for the next engine.
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        reaped.push(argv[1].clone());
+    }
+    reaped
+}
+
+/// `PPid` from `/proc/<pid>/status`. `stat` is not used: a process whose name
+/// contains a space or parenthesis makes its field offsets unparseable.
+fn read_ppid(proc_dir: &Path) -> Option<u32> {
+    let status = std::fs::read_to_string(proc_dir.join("status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .and_then(|value| value.trim().parse().ok())
+}
+
 impl HeadlessDisplay {
     /// Start Xvfb on the first display number nothing else has claimed.
     ///
@@ -447,5 +553,78 @@ mod tests {
         let probes = probe_all();
         assert_eq!(probes[0].substrate, Substrate::WpePlatformHeadless);
         assert_eq!(probes[1].substrate, Substrate::WebKitGtkHeadless);
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    fn ours() -> Vec<String> {
+        argv(&["Xvfb", ":97", "-screen", "0", "1280x900x24", "-nolisten", "tcp"])
+    }
+
+    // ⛔⛔ THE SAFETY PROPERTY OF THE WHOLE SWEEP. A display with a living parent
+    // belongs to a living daemon — possibly one under a different HOME, whose
+    // singleton we know nothing about — and killing it would take down a working
+    // engine mid-page. Only init-parented orphans are ever ours to reap.
+    #[test]
+    fn a_display_with_a_living_parent_is_never_reaped() {
+        assert!(
+            !is_an_orphaned_engine_display(&ours(), 3816657),
+            "an Xvfb whose daemon is still alive MUST be left alone"
+        );
+        assert!(
+            is_an_orphaned_engine_display(&ours(), 1),
+            "an orphaned engine display is garbage and must be reaped"
+        );
+    }
+
+    // The sweep runs on a shared host. Anything that is not byte-for-byte the
+    // command this module spawns is somebody else's process.
+    #[test]
+    fn only_this_modules_own_command_shape_is_reaped() {
+        for (why, command) in [
+            ("a real session's display", argv(&["Xvfb", ":0", "-screen", "0", "1280x900x24", "-nolisten", "tcp"])),
+            ("below the engine's range", argv(&["Xvfb", ":89", "-screen", "0", "1280x900x24", "-nolisten", "tcp"])),
+            ("above the engine's range", argv(&["Xvfb", ":161", "-screen", "0", "1280x900x24", "-nolisten", "tcp"])),
+            ("a different program", argv(&["Xorg", ":97", "-screen", "0", "1280x900x24", "-nolisten", "tcp"])),
+            ("listening on tcp — not our flags", argv(&["Xvfb", ":97", "-screen", "0", "1280x900x24"])),
+            ("another tool's depth", argv(&["Xvfb", ":97", "-screen", "0", "1280x900x16", "-nolisten", "tcp"])),
+            ("not a geometry at all", argv(&["Xvfb", ":97", "-screen", "0", "big", "-nolisten", "tcp"])),
+            ("empty argv", argv(&[])),
+        ] {
+            assert!(
+                !is_an_orphaned_engine_display(&command, 1),
+                "{why}: MUST NOT be reaped ({command:?})"
+            );
+        }
+        // The path form still counts — `Command::new("Xvfb")` may resolve to one.
+        assert!(is_an_orphaned_engine_display(
+            &argv(&["/usr/bin/Xvfb", ":90", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"]),
+            1
+        ));
+    }
+
+    // The predicate must accept exactly what `start` spawns. If that command
+    // ever changes, this fails rather than the sweep silently reaping nothing.
+    #[test]
+    fn the_predicate_matches_the_command_start_actually_spawns() {
+        let source = include_str!("substrate.rs");
+        let body = source
+            .split("pub fn start(width: i32, height: i32) -> Result<HeadlessDisplay> {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n    }").next())
+            .expect("start body present");
+        for flag in ["-screen", "-nolisten", "tcp"] {
+            assert!(
+                body.contains(flag),
+                "start() no longer passes {flag}, so the reaper's shape check is \
+                 stale and every orphaned display would survive it"
+            );
+        }
+        assert!(
+            body.contains("{width}x{height}x24"),
+            "start() no longer spawns the WxHx24 geometry the reaper matches on"
+        );
     }
 }

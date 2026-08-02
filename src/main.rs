@@ -30,8 +30,11 @@ mod manifest;
 mod passkey;
 mod provision;
 mod sidebar;
+mod sitehost;
+mod sponsorblock;
 mod useragent;
 mod userscript;
+mod webmedia;
 mod webpolicy;
 mod webzoom;
 use clap::Parser;
@@ -283,6 +286,40 @@ fn print_site_lore(url: &str) {
     );
 }
 
+/// Register, then declare what THAT registration returned. The ONE way this
+/// program emits a `sidebar ; declare`, and the reason it takes no endpoint
+/// argument: there is no variable a caller could hand it, so it cannot publish
+/// an endpoint that is not the daemon's current answer. Returns whether it
+/// declared.
+///
+/// **Why by construction and not by a refresh someone remembers to call.** The
+/// declare carries the control url AND the control token, and both move together
+/// when a daemon is handed over (a fresh listener, a freshly minted token). The
+/// previous shape kept the last-known endpoint in a `control` local and
+/// re-declared it whenever the re-register failed — which is exactly what
+/// happens DURING a handover, so the client published a url+token pair belonging
+/// to a daemon that had already exited. If the successor happened to re-bind the
+/// same port, the GUI then held a live url with a dead token and every pane and
+/// action 403'd until the next declare corrected it.
+///
+/// A missed declare is cheap: it is the contribution's ~4s liveness signal
+/// against the GUI's 15s expiry, so one skipped tick costs nothing, and the
+/// honest silence lets a contribution expire rather than pinning the rail to an
+/// endpoint nobody serves.
+fn declare_current(session: &str, profile: &str) -> bool {
+    let Some(endpoint) = daemon::register_supervised(session, profile) else {
+        return false;
+    };
+    sidebar::emit_declare(
+        session,
+        &endpoint.url,
+        &endpoint.token,
+        &webpolicy::policy_version(profile),
+        &webzoom::zoom_version(),
+    );
+    true
+}
+
 fn drive_surface(
     session: &str,
     url: &str,
@@ -303,23 +340,9 @@ fn drive_surface(
     // document-start. Open first and the GUI's first apply pass sees a surface
     // with no contribution and builds it unblocked — no userscripts, no adblock,
     // silently, for the life of that webview.
-    let mut control: Option<daemon::ControlEndpoint> =
-        match daemon::register_supervised(session, profile) {
-            Some(endpoint) => {
-                sidebar::emit_declare(
-                    session,
-                    &endpoint.url,
-                    &endpoint.token,
-                    &webpolicy::policy_version(profile),
-                    &webzoom::zoom_version(),
-                );
-                Some(endpoint)
-            }
-            None => {
-                eprintln!("ychrome: sidebar unavailable (daemon did not come up)");
-                None
-            }
-        };
+    if !declare_current(session, profile) {
+        eprintln!("ychrome: sidebar unavailable (daemon did not come up)");
+    }
     emit_web_surface_osc("open", session, url, title, profile, start_page);
     eprintln!(
         "ychrome: web surface open — {url} [{profile}]  (Ctrl+C to close, Ctrl+Z / yggterm Zzz to suspend)"
@@ -327,24 +350,6 @@ fn drive_surface(
     print_site_lore(url);
     let mut ticks: u32 = 0;
     let mut last_tick = std::time::Instant::now();
-    // Re-declare with the CURRENT control url — it moves if the daemon respawned
-    // onto a fresh listener. The declare IS the contribution's liveness signal,
-    // and it must precede an "open" so a recreated surface never loads before its
-    // policy (userscripts inject at document-start).
-    // The declare carries the control TOKEN as well as the url — the GUI cannot
-    // drive a pane without it (see `sidebar::ControlState::control_token`), so a
-    // moved endpoint means both halves are re-declared together or neither is.
-    let redeclare = |control: &Option<daemon::ControlEndpoint>| {
-        if let Some(endpoint) = control {
-            sidebar::emit_declare(
-                session,
-                &endpoint.url,
-                &endpoint.token,
-                &webpolicy::policy_version(profile),
-                &webzoom::zoom_version(),
-            );
-        }
-    };
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(200));
         // A large gap between ticks means we were suspended (Ctrl+Z /
@@ -354,8 +359,7 @@ fn drive_surface(
         // deliberately cannot re-CREATE a surface, and an "open" with an
         // unchanged URL is liveness-idempotent GUI-side.
         if last_tick.elapsed() > Duration::from_secs(3) {
-            control = daemon::register_supervised(session, profile).or(control);
-            redeclare(&control);
+            declare_current(session, profile);
             emit_web_surface_osc("open", session, url, title, profile, start_page);
         }
         last_tick = std::time::Instant::now();
@@ -368,11 +372,7 @@ fn drive_surface(
             // reaper drops a session whose client goes quiet) and re-earns it
             // after a daemon respawn. A moved control url means a new listener —
             // re-declare so the GUI follows it.
-            let refreshed = daemon::register_supervised(session, profile);
-            if refreshed.is_some() && refreshed != control {
-                control = refreshed;
-            }
-            redeclare(&control);
+            declare_current(session, profile);
         }
     }
     sidebar::emit_close(session);
@@ -766,7 +766,14 @@ fn run_thin_client_picker(session: &str) -> Result<()> {
     // `drive_surface`, the ONE loop that declares the sidebar before it opens.
     {
         let t = target.lock().unwrap();
-        emit_web_surface_osc(t.action, session, &t.url, &t.title, &t.profile, t.start_page);
+        emit_web_surface_osc(
+            t.action,
+            session,
+            &t.url,
+            &t.title,
+            &t.profile,
+            t.start_page,
+        );
         eprintln!("ychrome: profile picker open — {picker_url}  (Ctrl+C to close)");
     }
     let mut ticks: u32 = 0;
@@ -781,7 +788,12 @@ fn run_thin_client_picker(session: &str) -> Result<()> {
         {
             let t = target.lock().unwrap();
             if t.action == "open" {
-                break Some((t.url.clone(), t.title.clone(), t.profile.clone(), t.start_page));
+                break Some((
+                    t.url.clone(),
+                    t.title.clone(),
+                    t.profile.clone(),
+                    t.start_page,
+                ));
             }
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -790,7 +802,14 @@ fn run_thin_client_picker(session: &str) -> Result<()> {
         // re-announce the picker.
         if last_tick.elapsed() > Duration::from_secs(3) {
             let t = target.lock().unwrap();
-            emit_web_surface_osc(t.action, session, &t.url, &t.title, &t.profile, t.start_page);
+            emit_web_surface_osc(
+                t.action,
+                session,
+                &t.url,
+                &t.title,
+                &t.profile,
+                t.start_page,
+            );
         }
         last_tick = std::time::Instant::now();
         ticks += 1;
@@ -870,7 +889,9 @@ fn run_status(as_json: bool) -> Result<()> {
     // which it only does when surfaces are attached. Say which of the two facts
     // is keeping the old code alive, and name the verb that ends it.
     if stale {
-        println!("  [STALE] this daemon is serving old code: the binary on disk changed after it started.");
+        println!(
+            "  [STALE] this daemon is serving old code: the binary on disk changed after it started."
+        );
         if held > 0 {
             println!(
                 "  [STALE] {held} live surface(s) are attached, so nothing retired it for you."
@@ -897,6 +918,35 @@ fn run_status(as_json: bool) -> Result<()> {
                 if routable { "yes" } else { "no" }
             );
         }
+        // A session whose CLI predates the control-token gate keeps its ad
+        // blocking and its userscripts (those routes are open) and silently
+        // cannot open its vault or settings pane, forever. It is invisible
+        // everywhere else, so it is named here with the only thing that fixes
+        // it — the same standard as the [STALE] daemon lines above.
+        //
+        // EXPLICITLY false, never merely absent. A daemon older than this field
+        // omits it — and that daemon has no gate at all, so its panes work and a
+        // warning would be a false alarm on the one deploy where everything is
+        // fine. Silence means "not asked", not "no".
+        let no_courier: Vec<&str> = sessions
+            .iter()
+            .filter(|session| session["control_token_declared"].as_bool() == Some(false))
+            .filter_map(|session| session["env_id"].as_str())
+            .collect();
+        if !no_courier.is_empty() {
+            println!(
+                "  [NO PANES] {} session(s) run a ychrome CLI that predates the control-token \
+                 gate, so their vault and settings panes answer 403 and cannot open:",
+                no_courier.len()
+            );
+            for env in &no_courier {
+                println!("  [NO PANES]   {env}");
+            }
+            println!(
+                "  [NO PANES] ad blocking and userscripts are unaffected. A daemon restart does \
+                 NOT fix this. Press Ctrl+C in each session's terminal and run ychrome again."
+            );
+        }
     }
     Ok(())
 }
@@ -918,8 +968,12 @@ fn run_daemon_verb(sub: Option<&str>, as_json: bool) -> Result<()> {
             }
             let new_pid = done["pid"].as_u64().unwrap_or(0);
             match done["old_pid"].as_u64() {
-                Some(old) => println!("ychrome daemon restarted: pid {old} retired, pid {new_pid} now serving"),
-                None => println!("ychrome daemon started: pid {new_pid} now serving (none was running)"),
+                Some(old) => println!(
+                    "ychrome daemon restarted: pid {old} retired, pid {new_pid} now serving"
+                ),
+                None => {
+                    println!("ychrome daemon started: pid {new_pid} now serving (none was running)")
+                }
             }
             let rows = done["sessions_reattaching"]
                 .as_array()
@@ -1052,7 +1106,93 @@ const RESERVED_SUBCOMMANDS: &[&str] = &[
     "adblock",
     "ctl",
     "engine",
+    "identity",
 ];
+
+/// `ychrome identity [<host>] [--set <preset>|--reset] [--json]`.
+///
+/// With no host it reports the browser-wide decision and every per-site
+/// override. With a host it reports what that ONE site gets, which is the
+/// question a user actually has ("why does this login keep looping?").
+///
+/// The warning is printed on every `--set`, not tucked into `--help`: a spoofed
+/// identity that breaks a fingerprint-gated login fails as a challenge that
+/// never clears, and nothing on screen would otherwise connect the two.
+fn run_identity_verb(args: &[String]) -> Result<()> {
+    let as_json = args.iter().any(|arg| arg == "--json");
+    let host = args
+        .iter()
+        .find(|arg| !arg.starts_with("--"))
+        .map(String::as_str);
+    let set = args
+        .iter()
+        .position(|arg| arg == "--set")
+        .and_then(|index| args.get(index + 1))
+        .map(String::as_str);
+    let reset = args.iter().any(|arg| arg == "--reset");
+
+    if set.is_some() || reset {
+        match host {
+            Some(host) => {
+                useragent::set_site(host, set)?;
+                if set.is_some() {
+                    eprintln!("ychrome: {}", useragent::OVERRIDE_WARNING);
+                }
+            }
+            // No host means the browser-wide decision. `--reset` there is the
+            // engine preset, which IS the default — spelled out rather than
+            // silently doing nothing.
+            None => useragent::set_preset(set.unwrap_or("engine"))?,
+        }
+    }
+
+    let global = useragent::preset();
+    let sites = useragent::sites();
+    if as_json {
+        let effective = host.map(|host| {
+            serde_json::json!({
+                "host": host,
+                "preset": useragent::preset_for_host(&sites, global, host).id(),
+                "user_agent": useragent::effective_for_host(host),
+            })
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "preset": global.id(),
+                "user_agent": useragent::effective(),
+                "sites": useragent::sites_json(),
+                "site": effective,
+            }))?
+        );
+        return Ok(());
+    }
+    // `(engine default)` rather than an invented string: WebKitGTK owns its own
+    // UA, and printing a copy here is how a stale constant gets born.
+    let show = |ua: Option<String>| ua.unwrap_or_else(|| "(engine default)".to_string());
+    println!(
+        "browser-wide: {} — {}",
+        global.label(),
+        show(useragent::effective())
+    );
+    if sites.is_empty() {
+        println!("per-site overrides: none");
+    } else {
+        println!("per-site overrides:");
+        for (site, preset) in &sites {
+            println!("  {site}: {}", preset.label());
+        }
+    }
+    if let Some(host) = host {
+        println!(
+            "\n{host}: {} — {}",
+            useragent::preset_for_host(&sites, global, host).label(),
+            show(useragent::effective_for_host(host))
+        );
+    }
+    Ok(())
+}
 
 /// Whether `token` is subcommand-shaped rather than URL-shaped: a single bare
 /// label with no scheme, no dot, no port and no path.
@@ -1127,6 +1267,14 @@ fn main() -> Result<()> {
     if raw.get(1).map(String::as_str) == Some("engine") {
         let as_json = raw.iter().any(|arg| arg == "--json");
         engine::run_verb_and_exit(raw.get(2).map(String::as_str), as_json);
+    }
+    // `identity` — read or set what this browser says it is. The settings pane
+    // is the same decision through a different door; this one exists because a
+    // host with no GUI still has to be able to answer "what am I sending, and to
+    // whom", and because an override is a thing an agent should be able to
+    // PROVE it set rather than click and hope.
+    if raw.get(1).map(String::as_str) == Some("identity") {
+        return run_identity_verb(&raw[2..]);
     }
 
     // ⛔ A SUBCOMMAND-SHAPED TOKEN MUST NEVER FALL THROUGH INTO THE URL.
@@ -1316,9 +1464,21 @@ fn main() -> Result<()> {
         builder = builder.with_proxy_config(proxy_config);
     }
     // The same identity the thin-client surfaces get (yggterm applies it there,
-    // from `/policy`). A standalone window is the same browser: it must not be the
-    // one place claude.ai still answers "Request not allowed".
-    if let Some(user_agent) = crate::useragent::effective() {
+    // from `/policy`). A standalone window is the same browser.
+    //
+    // Resolved against THIS window's host, so a per-site override applies here
+    // too: wry fixes the UA at webview creation and a standalone window opens on
+    // exactly one URL, so the host is known at the only moment that matters.
+    // With no override and no global preset this is `None` — WebKitGTK's own
+    // identity, which is the coherent one (see `useragent`).
+    let identity_host = Url::parse(&final_url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_string));
+    let user_agent = match identity_host.as_deref() {
+        Some(host) => crate::useragent::effective_for_host(host),
+        None => crate::useragent::effective(),
+    };
+    if let Some(user_agent) = user_agent {
         builder = builder.with_user_agent(&user_agent);
     }
 
@@ -1452,6 +1612,56 @@ mod second_invocation_tests {
         }
     }
 
+    /// THE STALE DECLARE, made impossible rather than merely avoided.
+    ///
+    /// The declare carries the control url AND the control token, and a daemon
+    /// handover moves both at once. The loop used to keep the last-known
+    /// endpoint in a local and re-declare it whenever the re-register failed —
+    /// which is exactly what happens DURING a handover — so it published a pair
+    /// belonging to a daemon that had already exited. This locks the shape that
+    /// removes the possibility: exactly one `emit_declare` in the whole program,
+    /// inside a function that registers first and takes no endpoint to be handed
+    /// a stale one.
+    #[test]
+    fn a_declare_can_only_carry_a_registration_it_just_made() {
+        let source = include_str!("main.rs");
+        let product = source
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("the product half of main.rs");
+        assert_eq!(
+            product.matches("sidebar::emit_declare(").count(),
+            1,
+            "a second declare call site is a second place a cached endpoint can \
+             be published; there is one, and it is `declare_current`"
+        );
+        let body = product
+            .split("fn declare_current(session: &str, profile: &str) -> bool {")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("declare_current body present");
+        assert!(
+            body.contains("daemon::register_supervised(session, profile)")
+                && body.contains("sidebar::emit_declare("),
+            "the declare must be fed by a registration made in the same call"
+        );
+        let drive = product
+            .split("fn drive_surface(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n/// The surface the picker").next())
+            .expect("drive_surface body present");
+        assert!(
+            !drive.contains("ControlEndpoint"),
+            "the surface loop is holding an endpoint across ticks again — that \
+             variable is the only way a dead url+token pair reaches the GUI"
+        );
+        assert!(
+            !drive.contains("emit_declare"),
+            "the loop declares directly again, bypassing the register-then-declare \
+             pairing that makes staleness impossible"
+        );
+    }
+
     /// Every verb `main` actually dispatches must be in `RESERVED_SUBCOMMANDS`.
     /// Without this, adding a verb and forgetting to reserve it silently
     /// restores the swallow-as-URL bug for that one name.
@@ -1466,7 +1676,10 @@ mod second_invocation_tests {
             .next()
             .expect("the pre-clap dispatch region");
         let mut dispatched: Vec<String> = Vec::new();
-        for piece in body.split("raw.get(1).map(String::as_str) == Some(\"").skip(1) {
+        for piece in body
+            .split("raw.get(1).map(String::as_str) == Some(\"")
+            .skip(1)
+        {
             let name = piece.split('"').next().expect("verb literal closes");
             dispatched.push(name.to_string());
         }

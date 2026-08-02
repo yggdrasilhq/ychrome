@@ -35,9 +35,15 @@ src/abp.rs                      ABP/uBO filter syntax -> WebKit content-blocker 
                                 gated on what the engine MEASURABLY accepts
 src/adblock.rs                  the filter-list roster, `ychrome adblock update|status|lists`,
                                 the ruleset's provenance sidecar
+assets/web-scriptlets/runtime.js   the `##+js(...)` scriptlet library (OURS, not uBO's;
+                                see docs/adblock.md §5 before touching it)
 src/provision.rs                the BUNDLED-ASSET RECONCILER: one owner of "is this
-                                host's copy current?" (docs/adblock.md §5)
+                                host's copy current?" (docs/adblock.md §6)
 src/webzoom.rs                  per-site zoom overrides (web-zoom.json)
+src/useragent.rs                the browser IDENTITY: the global preset + per-site
+                                overrides (ychrome/user-agent.json), `ychrome identity`
+src/sitehost.rs                 THE per-site host rule (normalize + longest-suffix),
+                                shared by webzoom and useragent — one owner, never re-derived
 src/extensions.rs               the bundled userscript catalog ("Add an extension")
 assets/web-userscripts/         bundled scripts embedded by extensions.rs
 crates/ychrome-vault/src/
@@ -97,7 +103,28 @@ record) and `Vault::edit_body` patches **that**:
 - `revisionDate` is echoed as `lastKnownRevisionDate`, so a stale client is
   **refused** instead of clobbering a concurrent edit.
 - Replacing a password prepends the old ciphertext to `passwordHistory`.
-- Clearing a field is rejected rather than encrypting `""`.
+- Setting a field to `""` is rejected rather than encrypting an empty string.
+  Removing a value is a SEPARATE request, `--clear <notes|totp|username|uri|folder>`
+  — one owner, `model::ClearField`. There is no `--clear password` on purpose.
+- **Custom fields are editable too** (`--set-field NAME=VALUE`,
+  `--set-hidden-field NAME` reading the value from stdin, `--remove-field NAME`).
+  The field ENTRY is mutated, never rebuilt — it carries `linkedId` and future
+  keys. `--set-field` on an already-hidden field KEEPS it hidden: updating a
+  secret must never expose it. A linked field, a duplicated name, and removing a
+  field that is not there are all refused rather than guessed.
+- **`--uri` is a repeatable list**, and a uri the item already stores is carried
+  over as its stored OBJECT — a uri is not a string, it carries `match` and
+  `uriChecksum`.
+- ⛔ **Every edit is RE-READ before it is reported.** A 200 from `PUT` says the
+  server took a body, not that the field landed. `edit_item` re-syncs, runs
+  `Vault::verify_edit`, and fails the whole edit if a change is not visible. The
+  reply's `verified` list carries field LABELS (`password`, `field:API Key`,
+  `clear:notes`), never values — and its ABSENCE is how the CLI detects an agent
+  too old to have checked, which would otherwise have ignored every new argument
+  in silence.
+- ⚠ **Absent is not empty on the write side either.** The agent's decoder used to
+  drop an empty value, so `--notes ""` arrived as "no fields named". `edit_value`
+  preserves it so `edit_body` refuses it. Found by the live round trip.
 
 ### Two unlocked agents WILL go stale against each other
 
@@ -164,12 +191,23 @@ ychrome-vault configure --server https://vault.example.com --email you@example.c
 read -rs PW; echo "$PW" | ychrome-vault unlock
 ychrome-vault list                     # name<TAB>user<TAB>folder   (--json for exact bytes)
 ychrome-vault get NAME [USER]          # --field password|username|totp|totp-secret|notes
-ychrome-vault totp NAME [USER]         # 6-digit code
+ychrome-vault totp NAME [USER]         # 6-digit code; REFUSES on an
+                                       # undisciplined host clock
+                                       # (--ignore-clock waives)
+ychrome-vault clock                    # the kernel's own NTP state, as JSON.
+                                       # ⚠ chrony's Last/RMS offset lines report
+                                       # perfect tracking on a host 72 s out
 ychrome-vault card NAME [USER]         # brand<TAB>holder<TAB>expM<TAB>expY<TAB>last4
 ychrome-vault match HOST               # strict: the ONE entry an auto-fill may use
 ychrome-vault suggest HOST             # loose: rows the sidebar floats up (secret-free)
 ychrome-vault add NAME [USER] --generate --uri https://...
 ychrome-vault edit NAME [USER] --generate            # rotate; everything else preserved
+ychrome-vault edit NAME --rename TITLE --set-user U --notes N --folder F
+ychrome-vault edit NAME --uri URL --uri URL2         # replaces the whole list
+ychrome-vault edit NAME --set-field "API Key=v"      # custom fields, at last
+ychrome-vault edit NAME --set-hidden-field NAME      # value from STDIN, like a password
+ychrome-vault edit NAME --remove-field NAME
+ychrome-vault edit NAME --clear notes --clear totp   # remove, not blank
 ychrome-vault rm NAME [USER]           # -> TRASH.  --permanent destroys it.
 ychrome-vault generate 24              # local dice, no vault touched
 ychrome-vault sync | lock | stop-agent | ping | status | diagnose | check
@@ -213,12 +251,9 @@ ychrome-vault sync | lock | stop-agent | ping | status | diagnose | check
 
 ## Fleet, build, deploy
 
-A small x86_64 Debian fleet. Only the ROLES matter here, and there are three:
-the **GUI host** (the live desktop — yggterm GUI + daemon), one or more
-**headless hosts** (build/agent work, no GUI client registered), and the
-**hypervisor host** that carries the guests. ⚠ One ssh alias on this fleet loops
-back to the very machine you are on, so "deploy to both" can silently be one
-host — check `machine-id` rather than trusting two names to mean two boxes.
+Hosts: **dev, the GUI host, a headless host, and two service hosts** — all x86_64 Debian.
+**`pi` and `dev` are the SAME MACHINE** (machine-id `03d282108f6f`; `ssh dev`
+loops back). The GUI host is the live desktop (yggterm GUI + daemon).
 
 **There is no deploy script.** `scripts/deploy-fleet.sh` does not exist and never
 did (a memory note claims otherwise — it is wrong). The fleet-binary-sync hook
@@ -264,6 +299,14 @@ what you touched. `cargo clippy` has 3 pre-existing warnings and one pre-existin
 ```sh
 # Crypto end-to-end, in-process, leaving any running agent alone:
 read -rs PW; echo "$PW" | ychrome-vault check
+
+# The WHOLE edit surface, end to end, against a scratch server you own — never
+# the operator's vault (it registers its own account and creates its own items):
+docker run -d --name ychrome-vault-scratch -e SIGNUPS_ALLOWED=true \
+  -e ROCKET_PORT=8080 -e I_REALLY_WANT_VOLATILE_STORAGE=true \
+  -p 127.0.0.1:8087:8080 vaultwarden/server:latest
+YCHROME_VAULT_TEST_SERVER=http://127.0.0.1:8087 \
+  cargo test -p ychrome-vault --test live_edit -- --ignored --nocapture
 
 # Prove an edit preserved an UNMODELLED field (the whole point of raw retention):
 ychrome-vault edit ITEM --notes "stamp"
@@ -376,6 +419,14 @@ prerequisite).
   daemon running while the fix sits on disk cannot silently recur. Every reply on
   the socket carries `pid`, `stale` and `live_sessions`, whatever the op, so a
   verb cannot answer without saying whether it is old code.
+- ⚠ **`control_token_declared: false` on a row means that session's vault and
+  settings panes CANNOT open** — its CLI predates the control-token gate and
+  never declares the GUI's credential, so every GUI-only route 403s for the life
+  of that process while ad blocking and userscripts keep working. Neither a
+  daemon restart nor a GUI restart fixes it; only cycling that CLI does. The
+  human `status` prints a `[NO PANES]` block naming each one. First diagnostic
+  for "the panes will not open" (2026-07-31). Detail: `docs/protocol.md`
+  §"The third mixed case".
 
 Proven end-to-end on dev via socket + curl (register → skew-honest refuse →
 `?session=` ping → route → envelope drain → at-least-once re-send → ack →
@@ -421,9 +472,10 @@ GUI's webview, so we serve the *effective* policy and yggterm applies it:
   document-start, so yggterm holds the surface's creation until the policy
   lands. Open first and the surface is built unblocked — no userscripts, no
   adblock, silently, forever.
-- **The ruleset is 146,748 real rules now, not 60 hand-typed ones**, generated
+- **The ruleset is 146,817 real rules now, not 60 hand-typed ones**, generated
   from nine upstream lists by `src/abp.rs` and committed gzipped at
-  `assets/web-adblock/rules.json.gz`. **Read `docs/adblock.md` before touching
+  `assets/web-adblock/rules.json.gz`, plus TWO generated userscripts from the
+  same call: `cosmetic-filters.js` and `scriptlets.js`. **Read `docs/adblock.md` before touching
   any of it** — it carries the measured WebKit limits, and they are the whole
   design: 150,000 rules is a hard ceiling, the regex dialect has NO alternation,
   and ONE bad network rule fails the entire compile (no ad blocking at all)
@@ -443,6 +495,51 @@ GUI's webview, so we serve the *effective* policy and yggterm applies it:
   returns `{"reload_surface": true}`, NOT `eval: location.reload()`: a content
   filter and its userscripts bind to the WEBVIEW at creation, so an in-page reload
   leaves them attached. Only destroy-and-recreate applies a new policy.
+
+## ⭐ Browser identity (`src/useragent.rs`) — the default is the ENGINE'S OWN UA
+
+**Changed 2026-07-31 after a user could not clear a Cloudflare challenge on a
+login.** An anti-bot edge scores CONSISTENCY across the JS environment, TLS and
+the UA; it does not blocklist engines (GNOME Web is this same WebKitGTK and
+passes daily). The old default was Safari-on-macOS, which produced this,
+measured on the engine plane:
+
+```
+navigator.userAgent -> "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) … Safari/605.1.15"
+navigator.platform  -> "Linux x86_64"
+```
+
+One line of page script catches that. **The default is now `Preset::Engine`,
+which resolves to `None` — "leave WebKitGTK's own UA alone".** The module
+deliberately does NOT hold the engine's string (a test enforces it): WebKitGTK
+owns its identity, so an engine upgrade moves the UA and ychrome ships no new
+constant. For the record, WebKitGTK 2.52.5 on this fleet sends
+`Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko)
+Version/60.5 Safari/605.1.15`.
+
+- **Overrides are PER SITE**, in the same file as the global preset
+  (`~/.yggterm/ychrome/user-agent.json`, `{preset, sites:{host:preset}}`) —
+  never a second store. Matching is `sitehost`'s longest-suffix walk, the same
+  one the zoom map uses.
+- **`ychrome identity [<host>] [--set safari|chrome|engine] [--reset] [--json]`**
+  reads and writes it. Every `--set` prints the warning, because a spoof that
+  breaks a fingerprint-gated login fails as a challenge that never clears.
+- The settings pane draws it TWICE, on purpose: a per-site row under "This site"
+  (with the warning) and the browser-wide picker under "Browser identity" (which
+  now says to prefer the per-site one).
+- **`/policy` carries `user_agent` (global, applied at webview creation) AND
+  `user_agent_sites` (host → resolved UA string, `null` = the engine's own).**
+  The engine already applies the per-site map on every navigation
+  (`Engine::apply_identity`, BEFORE `goto` — the UA is a request header).
+  ⚠ **yggterm does not consume `user_agent_sites` yet**, so on the visible
+  surface a per-site override still needs the GUI companion change: match the
+  live page's host the way it already does for `/zoom`, then
+  `WebKitSettings::set_user_agent`.
+- **claude.ai really does UA-gate, and it still reproduces** (in a real WebKit
+  surface, not curl): engine identity → `403 {"error":{"type":"forbidden"}}`;
+  the Safari preset → `200` at `/login`. That is what the per-site layer is FOR
+  — one entry for claude.ai, every other site coherent. Do not answer it by
+  making the global default lie again.
 
 ## Per-site zoom (`src/webzoom.rs`) — the settings pane's "This site" row
 
@@ -469,7 +566,9 @@ profiles — zoom is readability, not identity).
 `settings_schema_from` draws, in order: **This site** (per-site zoom + an honest
 HTTPS connection line from `values.secure`; full cert detail is future, needs
 WebKit's TLS cert), **Ad blocking**, **SponsorBlock** (the `sponsorblock`
-userscript promoted to its own friendly toggle), **Userscripts** (every OTHER
+userscript promoted to its own friendly toggle, plus one `list-row` per
+category from `src/sponsorblock.rs` whose buttons are the states it is NOT
+in), **Userscripts** (every OTHER
 script as a `list-row` with Enable/Disable + Delete actions), and **Add an
 extension** (the `extensions.rs` catalog, filtered to what is not installed).
 
@@ -490,13 +589,27 @@ extension** (the `extensions.rs` catalog, filtered to what is not installed).
 
 ### The bundled catalog (`src/extensions.rs` + `assets/web-userscripts/`)
 
-Five entries: `cosmetic-filters` (GENERATED — the cosmetic rules WebKit cannot
-express, `:has-text()` and `:style()`, 1,122 of them over 704 domains, produced
-by the same `abp::convert` that makes the ruleset and installed alongside it),
-`sponsorblock`, `youtube-adblock`, `idcac`, `unblock-select`. The
-catalog is the ONLY roster — nothing else enumerates them, so add here and every
-surface inherits. Every script self-guards by hostname, because the injection
-plane has no matching: document-start, top frame, MAIN world, every page.
+Six entries: `cosmetic-filters` and `scriptlets` (both GENERATED by the same
+`abp::convert` that makes the ruleset and installed alongside it), plus
+`sponsorblock`, `youtube-adblock`, `idcac`, `unblock-select`. The catalog is the
+ONLY roster — nothing else enumerates them, so add here and every surface
+inherits. Every hand-written script self-guards by hostname; the two generated
+ones are `@match`-scoped instead, so WebKit does the matching in the engine.
+
+- **`scriptlets` is the `##+js(...)` plane, added 2026-07-31.** 3,341 scriptlet
+  invocations over 5,338 domains, run by a library of OUR OWN implementations at
+  `assets/web-scriptlets/runtime.js`. Two things will bite a future change:
+  **(a)** `abp::SCRIPTLETS` (what gets routed) and `runtime.js` (what can run)
+  are ONE contract, locked by
+  `extensions.rs::the_scriptlet_table_and_the_runtime_are_one_contract` — a name
+  in one and not the other reports thousands of filters supported and then
+  ignores them; **(b)** the script runs in the **MAIN world** and must, because
+  every scriptlet edits page globals. ⚠ uBO is GPLv3 and this repo is Apache:
+  implementations are written from the documented filter behaviour, never
+  transcribed. `trusted-click-element` (886 filters, the single biggest gap) is
+  deliberately NOT implemented — it clicks page elements a filter names, mostly
+  consent dialogs, and `idcac_clicks_nothing_that_consents` is a rule a
+  filter-driven auto-clicker would walk straight through.
 
 - **The 2x-ads bug, so it is never rediagnosed from scratch.** The user
   reported "I still see youtube ads! They are sped up to 2x automatically!" The
@@ -509,13 +622,23 @@ plane has no matching: document-start, top frame, MAIN world, every page.
   `src/provision.rs` exists so the stale-copy half cannot recur.
 - **`youtube-adblock` rots on YouTube's schedule, and that is expected.** YouTube
   ads are FIRST-PARTY, so no URL-matching filter can reach them; the script
-  deletes the ad fields out of the `/youtubei/v1/player` response before the
-  player reads it. The load-bearing shape is the `AD_FIELDS` list —
-  `adPlacements`, `adSlots`, `playerAds`, `adBreakHeartbeatParams` — hooked into
-  `window.fetch`, `XMLHttpRequest.prototype.open/send`, and a setter on
-  `window.ytInitialPlayerResponse` for the inline copy a cold load ships. When
-  ads come back, read a live `/youtubei/v1/player` response and update that list
-  FIRST; the DOM skip-button layer below it is a belt, not the mechanism.
+  deletes the ad fields out of the player response before the player reads it.
+  The load-bearing shape is the `AD_FIELDS` list — `adPlacements`, `adSlots`,
+  `playerAds`, `adBreakHeartbeatParams`.
+- ⚠ **HOOK THE PARSE, NOT THE TRANSPORT (v1.2.0, 2026-07-31).** v1.1.0 hooked
+  `window.fetch`, XHR and the inline `ytInitialPlayerResponse` and the user still
+  saw ads. Measured on one cold watch page: the fetch hook saw ZERO real player
+  responses (its one `/youtubei/v1/player` call was a 328-byte field probe),
+  while `JSON.parse` was handed the real one 30 times and
+  `Response.prototype.json` twice more — the latter on Responses whose `.url` is
+  the EMPTY STRING, built in JS by the page, which no URL hook can ever see. On
+  the second video of a session `player.getPlayerResponse()` still answered
+  `["playerAds","adPlacements","adBreakHeartbeatParams"]`. So `JSON.parse` and
+  `Response.prototype.json` are the funnels; the transports are not. When ads
+  come back, check `window.__yga_state.hooks` FIRST — it says which funnel bit.
+  ⚠ `pruneText` must parse with the `nativeParse` captured BEFORE hooking, or
+  the two layers cancel out silently (the parse hook cleans the object, the
+  rewrite then finds nothing to remove, and the ORIGINAL text goes to the page).
 - The lock that matters is `youtube_adblock_actually_prunes_a_player_response`:
   it runs the body the CATALOG serves under node against a fixture player
   response (`tests/fixtures/youtube-adblock-harness.js`), so a prune that stops
@@ -532,6 +655,21 @@ plane has no matching: document-start, top frame, MAIN world, every page.
   of `SHA-256(videoID)`, matched in the browser. There is deliberately no
   fallback to the by-id endpoint — without `crypto.subtle` it makes no request.
   Do not "fix" that by restoring `?videoID=`.
+- **`sponsorblock` v2.0.0 asks for all ELEVEN categories and all five action
+  types.** v1 asked for three categories and took the API's default
+  `actionTypes` — measured over 881 videos with segments, **48.7% had nothing in
+  those three**, which is what "SponsorBlock is broken" was. Behaviour is
+  per-category (auto / button / mute / off), owned by `src/sponsorblock.rs`,
+  stored in `~/.yggterm/web-userscripts/sponsorblock.config.json`, and delivered
+  to the page as a synthetic `window.__ysbConfig` preamble that
+  `webpolicy::policy()` injects ahead of the script. It is NOT a file: splicing
+  settings into `sponsorblock.js` would fork the host's copy from the bundle and
+  `provision` would then never update it.
+- **⚠ PROBE SPONSORBLOCK BY `data-ysb`, NOT by a global.** It runs in the
+  isolated world, so `ychrome ctl eval js='window.__ysb'` reads `undefined` on a
+  perfectly healthy script — that is a property of worlds, not a diagnosis.
+  Use `js='document.documentElement.getAttribute("data-ysb")'`, which carries
+  videoId, lookups, skipped, duration, segments and their behaviours.
 
 ## Still open
 - **`restore`** (`PUT /api/ciphers/{id}/restore`) — `rm` has no undo, and because
@@ -563,6 +701,40 @@ trigger a ceremony, never answer one. Do not propose an auto-consent path.
 
 ⚠ Still owed: full crypto E2E against a real relying party.
 
+### ⛔ THE SHIM IS PER-ORIGIN NOW, AND THAT HAS TWO SHARP EDGES
+
+Since `e3aaa9d` the `navigator.credentials` shim is installed ONLY on the rpIds
+the vault holds a passkey for (an unconditional shim advertised a platform
+authenticator WebKitGTK does not have, and bot checks read it). Both edges bit
+on 2026-08-01 — see `docs/pending-bugs.md`.
+
+1. **The browser needs the agent's `passkey-hosts` op, and an agent outlives its
+   binary.** An agent that predates it turns passkeys off on EVERY site while
+   `status` reads perfectly healthy. **`agent_stale` cannot see this** — it
+   compares the agent against the INSTALLED binary, and both are the old one.
+   Ask the socket directly:
+
+   ```sh
+   printf '{"op":"passkey-hosts"}\n' | nc -U ~/.yggterm/vault/agent.sock
+   # unknown op  =>  passkeys are OFF everywhere on this host
+   ```
+
+   Remedy, **in this order**: install the current `ychrome-vault`, THEN
+   `ychrome-vault handover` (it execs the *installed* binary, so a stale
+   installed binary makes the handover a no-op). The vault pane now shows this
+   state with a one-click button; a stderr line reached nobody.
+
+2. **The shim is chosen when a SURFACE OPENS.** yggterm applies userscripts at
+   surface creation and refetches `/policy` only when `policy_version` moves, so
+   a vault that becomes usable later does not reach an open surface. The stamp
+   now covers `agent.pid` and the installed vault binary (stat-only — never put
+   a socket call on that path), but a plain lock -> unlock still needs the
+   surface REOPENED.
+
+3. ⚠ **You cannot ENROL a passkey on a site you have none for** — no passkey
+   means no shim means no `create()`. Every credential in this vault came from
+   another browser. Do not "fix" this by widening the scope back.
+
 
 ## The agent engine (`src/engine/`) — headless browsing, `ychrome ctl`
 
@@ -575,7 +747,7 @@ ychrome ctl open url=https://example.com/ [profile=work]   # -> {page_id, ...}
 ychrome ctl goto  page_id=pg_000001 url=…
 ychrome ctl eval  page_id=pg_000001 js=document.title
 ychrome ctl dom   page_id=pg_000001 mode=snapshot           # the structured read
-ychrome ctl shot  page_id=pg_000001 --out shot.png          # image/png bytes
+ychrome ctl shot  page_id=pg_000001 --out shot.png          # image/png bytes (see below)
 ychrome ctl input page_id=pg_000001 events='[{"type":"click","selector":"#go"}]'
 ychrome ctl wait  page_id=pg_000001 until='{"js":"…"}' timeout_ms=8000
 ychrome ctl batch open='[{"url":"…"},…]' concurrency=8      # streams NDJSON
@@ -648,8 +820,64 @@ fix it. **`wait` is the fix.** The same rule covers navigation, lazy content and
 anything a framework renders asynchronously. An unmet wait returns
 `{"met": false, "reason": …}` — a fact to branch on, never an exception.
 
-Worked examples: `assets/engine-recipes/{crawl-and-extract,form-fill,watch-page-until}.sh`.
-`run-all.sh` runs all three; green on dev, the GUI host and a headless host.
+Worked examples:
+`assets/engine-recipes/{crawl-and-extract,form-fill,watch-page-until,capture-page}.sh`.
+`run-all.sh` runs all four; green on dev, the GUI host and a headless host.
+
+### Screenshots — four regions, one snapshot primitive
+
+```sh
+p=$(ychrome ctl open url=https://example.com/ | jq -r .page_id)
+
+ychrome ctl shot page_id=$p                                   --out shot.png   # viewport
+ychrome ctl shot page_id=$p region=full                       --out page.png   # WHOLE document
+ychrome ctl shot page_id=$p region=full prescroll=true        --out page.png   # + lazy content
+ychrome ctl shot page_id=$p region=element selector='#main' padding=8 --out el.png
+ychrome ctl shot page_id=$p region=rect \
+    rect='{"x":0,"y":1100,"w":700,"h":400}'                   --out area.png   # selection area
+```
+
+`--out` writes the PNG and prints ONE json object — the capture's own account
+(`region`, `width`, `height`, the measured `scale`, the document geometry,
+`crop.css`/`crop.device`, the `selector` counts, the `prescroll` report) plus
+`out` and `bytes`. Over the socket that account is the `X-Ychrome-Shot`
+response header; the body stays pure PNG. A refusal exits non-zero and writes
+**no** file.
+
+- **Full page is NATIVE.** `SnapshotRegion::FullDocument` renders the whole
+  laid-out document in one call. There is no scroll-and-stitch and there must
+  not be one: a stitch seams at every step, repeats every `position: fixed`
+  header once per tile, and leaves the page scrolled where the caller did not
+  put it. Proven on a 1280x2910 fixture: one header, no seam.
+- **`element` and `rect` are that same snapshot, cropped from pixels already in
+  hand** — never a second snapshot, so an element capture and the full page it
+  claims to be part of cannot show different content.
+- **The CSS→device scale is MEASURED** (snapshot width ÷ reported document
+  width), never assumed from `devicePixelRatio`. `dpr` is reported alongside so
+  a disagreement is visible.
+- ⛔ **`rect` is in DOCUMENT coordinates.** A `getBoundingClientRect().top` is
+  viewport-relative — add `window.scrollY` first. A crop that misses is
+  refused BY NAME rather than answered with a blank PNG, because a blank PNG
+  gets debugged as a rendering bug.
+- **`region=element` resolves through the SAME hittable pool `/engine/input`
+  clicks through** (same filter, same `nth` default, same
+  `{matches, hittable, hidden, zero_size}` account). "Screenshot the button I
+  am about to click" therefore cannot pick a different element than the click.
+
+### ⚠ `region=full` does NOT load what was never near the viewport
+
+A full-document snapshot renders what is **laid out**. A lazily-loaded page has
+never run its `IntersectionObserver` callbacks below the fold, so it captures as
+a full-height document of empty boxes — and the snapshot is not lying, the
+images really are not there yet.
+
+`prescroll=true` walks the document one viewport at a time with a 120 ms settle
+between steps, then puts the scroll back. It **cannot** be one `eval`: a
+synchronous scroll loop never yields the event-loop turns the observers and
+fetches need, so the loop lives in Rust with the settle between steps. Measured
+side by side on a five-band fixture: without it three bands stayed unloaded;
+with it, all five. The walk is capped at 60 steps and says `capped: true`
+rather than pretending it reached the bottom of an infinite feed.
 
 ### What the engine gives you that a lab browser cannot
 
@@ -661,6 +889,44 @@ X in the visible surface is logged in here.
 Input is **real**: `GdkEvent`s through `gtk_main_do_event`, so `isTrusted` is
 true, `:hover` applies and default actions fire. A `dispatchEvent` cannot do any
 of that, and the difference is the whole point.
+
+### ⛔ The engine's cookie jar was MEMORY-ONLY until 2026-07-31
+
+A `WebsiteDataManager` with base directories still gets a non-persistent cookie
+store — WebKitGTK persists only when someone calls `set_persistent_storage`.
+wry does that for the visible surface and the standalone window; `identity.rs`
+built its manager by hand and never did. So **every engine page started with an
+empty jar and threw its cookies away on exit**, invisibly, while the profile
+directory filled with cache and storage and looked alive. The Phase C claim "a
+page logged in in the visible surface is logged in here" was false, and
+`parity.rs`'s cookie test passed only because both its pages share one process.
+
+Fixed: `<profile>/cookies`, Netscape text, wry's exact path and format, so the
+engine and the surface really are one jar. Locked by
+`the_profiles_cookie_jar_is_made_persistent_at_the_wrys_own_path` (source-level,
+because the failure is silent and no live assertion would have caught it).
+
+Proof recipe, and the differential that makes it airtight:
+
+```sh
+export HOME=/tmp/ycf          # SHALLOW — the socket path is bounded by SUN_LEN
+ychrome ctl open url=https://example.com/ profile=default
+ychrome ctl eval page_id=pg_000001 js='document.cookie="k=v; path=/; max-age=3600"'
+ls $HOME/.yggterm/web-profiles/default/cookies    # MUST exist. Old binary: absent.
+ychrome daemon restart
+ychrome ctl open url=https://example.com/ profile=default
+ychrome ctl eval page_id=pg_000001 js='document.cookie'   # MUST still be "k=v"
+```
+
+### Main-frame load tracing — `engine.load.open` / `engine.load.goto`
+
+Every main-frame load journals `{page_id, url, response:{status, headers,
+bot_check}}` to `~/.yggterm/ychrome/journal.jsonl`. It exists because a bot-check
+challenge loop, an asset the content filter ate, and a jar that does not persist
+all present identically ("the page came back and it is not the page"). Headers
+are a short allowlist — `cf-mitigated`, `cf-ray`, `server`, `content-type` — and
+never `set-cookie`, because a clearance cookie is a credential. `bot_check` is
+true when `cf-mitigated` is present, or on a 403/503 carrying a `cf-ray`.
 
 ### What a future agent must NOT assume
 
@@ -681,10 +947,11 @@ of that, and the difference is the whole point.
 - **The daemon's HOME must be shallow.** The socket path is bounded by
   `SUN_LEN` (~108 bytes); a deep `$HOME` fails with `path must be shorter than
   SUN_LEN`. This bites when testing under a scratch HOME.
-- **SponsorBlock's runtime state has never been observed in the engine.** Driven
-  at `youtube.com` under an isolated HOME, `window.__ysb` stayed `undefined`
-  after 15 s although the page loaded; its state looks watch-page-only. The
-  userscript plane itself IS proven. Do not assume this one works.
+- ~~**SponsorBlock's runtime state has never been observed in the engine.**~~
+  **CLOSED 2026-07-31.** The old note read `window.__ysb` from a page-world
+  `eval`, which cannot see an isolated-world global — the instrument was wrong,
+  not the script. Observed live in the engine on dev: segments fetched, and the
+  player jumped 157.88 → 208.28 past a sponsor. Probe with `data-ysb`.
 - **Stop the daemon with the `stop` op, not `kill`.** SIGTERM skips
   `engine::api::shutdown()`, so the engine's headless display is orphaned.
 
