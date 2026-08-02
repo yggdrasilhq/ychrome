@@ -132,3 +132,83 @@ it in front of the operator.
 `ipindiaonline.gov.in/trademarkefiling/user/How-To-Register.aspx`, verbatim:
 "Steps to Register for eFiling with Esign — 1. Procure an esign(signerid) from Web URL to
 procure esign." So the ONE artefact to carry out of eMudhra is the **signer ID**.
+
+## ekyc-enrolment-aadhaar-otp-route · WORKS
+task: 
+model: claude-opus-5
+date: 2026-08-02
+tags: 
+
+Continues `turnstile-gone-signup-fully-drivable`. Everything from the payment return to the
+video page, measured live. **Only the video is human.**
+
+## After PayU: `PaperlessIndividual.jsp` — FOUR KYC routes, not the guide's two
+
+The 2021 eSign User Guide (linked from IP India) documents Aadhaar-XML and PAN. The live portal
+offers four, and the best one is not in the guide:
+
+| Mode | radio id | What it costs |
+|---|---|---|
+| **Aadhaar eKYC (OTP)** ⭐ | `#rdoAadhaarOtpBased` | one Aadhaar OTP + a video. **No XML, no uploads.** |
+| Aadhaar eKYC (Biometric) | `#rdoAadhaarBioBased` | a UIDAI-compatible reader; skips the video |
+| Aadhaar eKYC (Offline XML) | `#rdoAadhaar` | the guide's route: a UIDAI ZIP + share code, then a video |
+| PAN | `#rdoPan` | upload PAN + address proof, then show BOTH **in original** on camera |
+
+⛔ **Do not build the XML route.** It needs `resident.uidai.gov.in/offline-kyc`, which **no longer
+resolves at all** (it is `myaadhaar.uidai.gov.in/offline-ekyc`, an SPA behind a captcha). The OTP
+route makes the whole detour unnecessary.
+
+`#authenticateAadhaarOTP` navigates to **`aadhaarauth.e-mudhra.com/index.jsp`**:
+`#txtAadhaar` (password, ml 19, auto-formats to `XXXX XXXX XXXX`) · `#chkConsent4` (the UIDAI
+consent declaration — a legal attestation, get the operator's word before ticking it) ·
+`#btnOnlineAadhaarOTP` (GET OTP) · `#txtOnlineAadharAuthOTP` (**6** digits) ·
+`#btnAuthenticateOnlineAadhaar`. Sender `BV-ADHAAR-G`. Success navigates BACK to
+`PaperlessIndividual.jsp` with a NEW `X=` token and UIDAI's name/Aadhaar filled in read-only.
+UIDAI also mails an "Authentication Successful" notice — a free independent confirmation.
+
+## Applicant details, then credentials
+
+Revealed after the Aadhaar hop: `#Male|#Female|#Others` (gender arrives UNCHECKED even though
+UIDAI knows it) · `#txtOnlineAadhaarEmail` · `#txtOnlineAadhaarPanNumber` ·
+`#onlineAadhaarNameInDscPAN|Aadhaar` · `#txtOnlineAadhaarNameAsInPAN` ·
+`#userdateAadhaar` / `#usermonthAadhaar` (value `1` = January) / `#useryearAadhaar` ·
+submit `#btnAuthOnlineAadhaarApplicantDetails`.
+
+⚠ **`Name (As in PAN)` is MANDATORY even when the DSC name is taken from Aadhaar.** Selecting
+"As in Aadhaar" does not hide it; submitting without it raises a modal "Please enter the Name as
+in PAN." The `?` beside it only opens a help modal — there is no lookup. **Ask the operator for
+the exact printed name; do not infer it from the Aadhaar name.**
+
+Next screen: `#txtLoginUsername` (ml 24) · `#txtLoginDesiredPswd` + `#txtLoginConfirmPswd`
+(**the 6-digit signing PIN** — guide s.3: every future eSign authenticates PIN + OTP, so this is
+the credential that makes later filings agent-drivable; generate it and vault it, read-back
+verified) · `#txtEmailID` · `#btnGetOTP` · `#LoginmobileOTP` (**4** digits, despite the id, and
+it is the EMAIL otp) · `#btnAuthloginAndOtpDetails`.
+
+⭐ **The email OTP is mail, not SMS** — from the site's own do-not-reply sender, subject "Email
+Verification OTP - KYC Enrolment", 10-minute validity. A mail CLI reads it with no phone
+involved. Only the two MOBILE otps need the handset.
+
+## `VideoVerification.jsp` — the one human step
+
+Allots the **Signer ID** (shown under "Enrolment Information", alongside a 3-digit **Video Code**
+the applicant must read aloud). 40 seconds, `#VRM_startRecordingbutton`, preview before submit.
+Their stated rejection criteria: unclear audio/video, or a cap/headgear/eyeglasses/headphones.
+Originals held at the edges, 4-5 seconds each.
+
+## Re-login and the status dashboard
+
+The session drops quickly. `Login.jsp` is mobile + OTP again, but the OTP box here is a
+**SEGMENTED four-input** (`#otp1`..`#otp4`, submit `#authenticateMobileOTP`) — fill each box and
+dispatch `input`/`keyup` per box, or use `web do fill --selector-set`. A "sent" msgBox with an
+OK button covers the form first; dismiss it.
+
+Lands on **`TrackOrderStatus.jsp`**: application number, a percentage, and two lists —
+KYC Enrolment (Enrolment Information, Mobile Verification, Email Verification, Video Recording,
+Photograph, Credential Setup) then Approval and Download (**eMudhra: Approval of Application**,
+then **Applicant eSign**). At 80% with all six Completed, everything left is theirs. The header
+badge reads "Pending from Subscriber" even while the body says "Pending for eMudhra Approval" —
+**believe the step list, not the badge.**
+
+⚠ Every field on this dashboard is masked (name and PAN both starred out), so it confirms
+WHICH values were used only to someone who already knows them.
