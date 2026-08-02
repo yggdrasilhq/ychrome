@@ -27,7 +27,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -106,15 +106,38 @@ impl AgentState {
     }
 }
 
-/// Identifies the exact binary an agent is running: path plus mtime.
+/// Identifies the exact binary this PROCESS is running: path plus mtime.
 ///
 /// A vault agent outlives the binary that spawned it, so after a rebuild the
 /// old process keeps answering with old code — a `get` works, a newly added op
 /// comes back "unknown op", and the confusion is total. Clients compare this
 /// stamp against their own and say so.
+///
+/// ⛔ **CAPTURED ONCE, and that is the whole point.** This used to re-read the
+/// path's mtime on every call, which means that after the usual in-place
+/// install the running agent read the SUCCESSOR's mtime and reported it as its
+/// own. Two things then broke in the same direction, both silently:
+/// `agent_stale` compared the agent against the installed binary and saw no
+/// difference, and `handover` refused with "is the binary this agent is ALREADY
+/// running — nothing to hand over". So the one zero-cost remedy for a stale
+/// agent was unavailable exactly when it was needed, and the pane's own advice
+/// sent the user in a circle. An identity that is re-derived from the thing it
+/// is supposed to be distinguished FROM cannot detect the change it exists to
+/// detect.
 pub fn exe_stamp() -> String {
+    static RUNNING: OnceLock<String> = OnceLock::new();
+    RUNNING.get_or_init(read_exe_stamp).clone()
+}
+
+fn read_exe_stamp() -> String {
     std::env::current_exe()
-        .map(|path| ychrome_vault_proto::exe_stamp_of(&path))
+        .map(|path| {
+            // A replaced binary leaves this process's `/proc/self/exe` pointing
+            // at the unlinked inode, which readlink reports as "<path>
+            // (deleted)". Keep the suffix: it is true, and a stamp that quietly
+            // dropped it would compare equal to the successor again.
+            ychrome_vault_proto::exe_stamp_of(&path)
+        })
         .unwrap_or_default()
 }
 
@@ -295,6 +318,12 @@ fn serve_on(
     listener: UnixListener,
     adopted: Option<Result<HandoverPayload>>,
 ) -> Result<()> {
+    // Pin our own identity BEFORE serving anything. `exe_stamp` memoises, but
+    // memoising on first USE would capture whatever is on disk at that moment —
+    // and the moment that matters is a deploy, when the file has just been
+    // replaced. Taking it here means the stamp always describes the binary this
+    // process actually exec'd.
+    let _ = exe_stamp();
     std::fs::write(pid_path(dir), std::process::id().to_string())
         .with_context(|| format!("writing {}", pid_path(dir).display()))?;
     std::fs::set_permissions(pid_path(dir), std::fs::Permissions::from_mode(0o600))?;
@@ -2656,7 +2685,37 @@ mod tests {
         assert!(same.contains("ALREADY running"), "{same}");
         // A different binary is what a handover is FOR.
         assert!(handover_refusal("/somewhere/else@1", Some(&exe)).is_none());
+
+        // ★ THE REGRESSION THIS CASE EXISTS FOR. The deploy that needs a
+        // handover REPLACES the installed file, which bumps its mtime. If the
+        // running agent's stamp is re-read from disk instead of captured at
+        // startup, it becomes the successor's stamp and the two compare EQUAL —
+        // so `handover` refuses precisely when it is required, and `agent_stale`
+        // reads false on a genuinely stale agent.
+        let before = ychrome_vault_proto::exe_stamp_of(&exe);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&exe, b"#!/bin/true\n# rebuilt\n").unwrap();
+        let after = ychrome_vault_proto::exe_stamp_of(&exe);
+        assert_ne!(before, after, "an in-place replace must change the stamp");
+        assert!(
+            handover_refusal(&before, Some(&exe)).is_none(),
+            "an agent that captured its stamp at startup must still be able to \
+             hand over to the binary that replaced it"
+        );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The stamp must not move under a running process.
+    ///
+    /// Cheap, but it is the property the fix turns on: if someone re-introduces
+    /// a per-call read, the agent starts describing whatever is installed now
+    /// rather than what it is running.
+    #[test]
+    fn the_running_exe_stamp_is_captured_once_and_never_moves() {
+        let first = exe_stamp();
+        let second = exe_stamp();
+        assert_eq!(first, second);
+        assert!(!first.is_empty(), "a process should know its own binary");
     }
 
     // The payload is the only thing that survives the exec, so its framing is
