@@ -182,6 +182,70 @@ fn passkey_shim_state() -> PasskeyShimState {
 /// Secret-free: a count of hosts, never the host list. Which sites you hold
 /// passkeys for is the user's business and does not belong in a schema that
 /// crosses the OSC channel.
+/// The one door to enrolling a passkey on a site the vault has never seen.
+///
+/// Silent when the shim already covers this host (the ordinary case: you have a
+/// passkey there, so `create()` and `get()` both work), and silent when the shim
+/// is off for a reason the user must fix first — arming would promise something
+/// that cannot happen.
+fn passkey_enrol_widgets(host: Option<&str>, shim: &PasskeyShimState) -> Vec<Value> {
+    let Some(host) = host.map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()) else {
+        return Vec::new();
+    };
+    // A broken/absent shim has its own banner above; do not stack a second ask.
+    let covered = match shim {
+        PasskeyShimState::ScopedTo(rp_ids) => rp_ids.iter().any(|rp_id| {
+            let rp = rp_id.trim().trim_matches('.').to_ascii_lowercase();
+            host == rp || host.ends_with(&format!(".{rp}"))
+        }),
+        PasskeyShimState::NoStoredPasskeys => false,
+        PasskeyShimState::VaultUnavailable(_) | PasskeyShimState::AgentPredatesBrowser => {
+            return Vec::new()
+        }
+    };
+    if covered {
+        return Vec::new();
+    }
+    if rp_id_match_patterns(&host).is_empty() {
+        return Vec::new();
+    }
+    if passkey_enrol_armed().contains(&host) {
+        return vec![
+            json!({"kind": "section", "text": "Passkey enrolment armed"}),
+            json!({
+                "kind": "label", "muted": true,
+                "text": format!(
+                    "{host} may now ask this browser to create a passkey. \
+                     ⚠ REOPEN THE TAB first — the shim is installed when a surface is \
+                     built, so a page that is already open was built without it.",
+                ),
+            }),
+            json!({
+                "kind": "button", "id": "passkey_disarm", "action": "passkey-disarm",
+                "value": host, "label": "Disarm",
+                "title": "Stop offering passkey enrolment on this site",
+            }),
+        ];
+    }
+    vec![
+        json!({"kind": "section", "text": "Passkeys"}),
+        json!({
+            "kind": "label", "muted": true,
+            "text": format!(
+                "This vault holds no passkey for {host}, so this browser does not offer \
+                 one there — that scoping is deliberate, because a browser that patches \
+                 `navigator.credentials` everywhere is one a bot check can spot. Arm it \
+                 to enrol here.",
+            ),
+        }),
+        json!({
+            "kind": "button", "id": "passkey_arm", "action": "passkey-arm",
+            "value": host, "label": "Enrol a passkey here",
+            "title": "Let this site ask this browser to create a passkey",
+        }),
+    ]
+}
+
 fn passkey_shim_widgets(state: &PasskeyShimState) -> Vec<Value> {
     match state {
         // Working, and silence is right: a banner on every render for a healthy
@@ -223,6 +287,36 @@ fn passkey_shim_widgets(state: &PasskeyShimState) -> Vec<Value> {
 /// for `example.com` is usable on `login.example.com`), so the pattern has to
 /// admit both. Two patterns rather than one because `*://*.example.com/*` does
 /// NOT match the bare `example.com` in WebKit's grammar.
+/// Hosts the user has explicitly armed for passkey ENROLMENT this session.
+///
+/// Deliberately process-local: a restart forgets it. An armed host is an
+/// exception to the fingerprinting scope, and an exception that outlives the
+/// intention behind it is just the old bug with extra steps.
+fn passkey_enrol_armed_store() -> &'static Mutex<std::collections::BTreeSet<String>> {
+    static ARMED: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
+    ARMED.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+}
+
+fn passkey_enrol_armed() -> std::collections::BTreeSet<String> {
+    passkey_enrol_armed_store().lock().unwrap().clone()
+}
+
+/// Returns true when the host was newly armed, false when it was already.
+fn passkey_enrol_arm(host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    // Refuse anything `rp_id_match_patterns` would refuse, at the door, rather
+    // than storing a value that silently produces no pattern later.
+    if rp_id_match_patterns(&host).is_empty() {
+        return false;
+    }
+    passkey_enrol_armed_store().lock().unwrap().insert(host)
+}
+
+fn passkey_enrol_disarm(host: &str) {
+    let host = host.trim().to_ascii_lowercase();
+    passkey_enrol_armed_store().lock().unwrap().remove(&host);
+}
+
 pub(crate) fn rp_id_match_patterns(rp_id: &str) -> Vec<String> {
     let host = rp_id.trim().trim_matches('.').to_ascii_lowercase();
     // A pattern built from a host containing a separator would silently widen
@@ -266,7 +360,7 @@ fn passkey_shim_scripts(state: &ControlState) -> Vec<crate::userscript::Userscri
     // deploy-ordering hazard of this change, it reached the user on 2026-08-01,
     // and the remedy is [`passkey_shim_widgets`] in the pane — a stderr line
     // reached nobody.
-    let patterns: Vec<String> = match passkey_shim_state() {
+    let mut patterns: Vec<String> = match passkey_shim_state() {
         PasskeyShimState::ScopedTo(rp_ids) => rp_ids
             .iter()
             .flat_map(|rp_id| rp_id_match_patterns(rp_id))
@@ -275,6 +369,25 @@ fn passkey_shim_scripts(state: &ControlState) -> Vec<crate::userscript::Userscri
         | PasskeyShimState::VaultUnavailable(_)
         | PasskeyShimState::AgentPredatesBrowser => Vec::new(),
     };
+    // ⛔ ENROLMENT WAS IMPOSSIBLE, AND SCOPING IS WHY. The patterns above come
+    // only from rp_ids the vault ALREADY holds a credential for, so a site you
+    // have no passkey for sees a pristine `navigator` — right for the
+    // fingerprinting fix, and it also means `navigator.credentials.create()`
+    // can never be called there. Every passkey in this vault was enrolled in
+    // some other browser. The user hit exactly this on a Google sign-in.
+    //
+    // The fix is NOT to widen the scope back. It is this: the user asks, in the
+    // pane, to enrol on the site they are looking at, and the anomaly exists
+    // only on a page a human deliberately armed. Arming is per-process and
+    // never persisted — a browser restart forgets it, which is the failure mode
+    // you want for a deliberate exception.
+    patterns.extend(
+        passkey_enrol_armed()
+            .iter()
+            .flat_map(|host| rp_id_match_patterns(host)),
+    );
+    patterns.sort();
+    patterns.dedup();
     if patterns.is_empty() {
         return Vec::new();
     }
@@ -1713,6 +1826,7 @@ fn unlocked_schema(state: &PaneState, host: Option<&str>, status: &Value) -> Val
     // arrives at this pane from a login page that just blamed their browser.
     // Silent when the shim is fine, which is nearly always.
     widgets.extend(passkey_shim_widgets(&passkey_shim_state()));
+    widgets.extend(passkey_enrol_widgets(host, &passkey_shim_state()));
 
     match state.tab.as_str() {
         "add" => {
@@ -2625,14 +2739,39 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 Err(error) => json!({ "toast": error.to_string() }),
             }
         }
+        "passkey-arm" => {
+            if passkey_enrol_arm(&value) {
+                let mut reply = reschema(state, host.as_deref());
+                reply["toast"] = json!(format!(
+                    "{value} can now ask for a passkey. Reopen the tab so the page is \
+                     built with it."
+                ));
+                reply
+            } else {
+                json!({ "toast": format!("{value} is not a host a passkey can scope to.") })
+            }
+        }
+        "passkey-disarm" => {
+            passkey_enrol_disarm(&value);
+            let mut reply = reschema(state, host.as_deref());
+            reply["toast"] = json!(format!("Passkey enrolment disarmed for {value}."));
+            reply
+        }
         "totp" => {
             let (name, user) = split_row_id(&value);
             match vault_op(json!({"op": "totp", "name": name, "user": opt_field(&user)})) {
                 Ok(reply) => {
                     let code = reply["code"].as_str().unwrap_or_default();
+                    // ⛔ The toast may only claim what is true on EVERY rung of
+                    // `totp_script`. It said "Filled" unconditionally while the
+                    // script was returning 'no-otp-field' — the user was told
+                    // the job was done and then watched a login fail.
                     json!({
                         "eval": totp_script(code),
-                        "toast": format!("Filled {name}'s authenticator code."),
+                        "toast": format!(
+                            "{name}'s code is ready — filled if the page had a field, \
+                             otherwise copied and shown on the page."
+                        ),
                     })
                 }
                 Err(error) => json!({ "toast": error.to_string() }),
@@ -3674,16 +3813,91 @@ fn card_fill_script(
     )
 }
 
+/// ⛔ **A CODE THE PAGE WOULD NOT TAKE MUST STILL REACH THE USER.**
+///
+/// This used to `querySelector` one selector list, `return 'no-otp-field'` when
+/// it matched nothing, and the caller toasted *"Filled …'s authenticator code"*
+/// either way — a lie-of-success on the exact flow where it hurts, because the
+/// user is mid-login with a code that expires in seconds. The user's report:
+/// *"In google TOTP our vault UI could not detect what to fill … on other
+/// clients I can just press edit beside the entry and copy paste the TOTP
+/// myself."* Every other client has a manual path; ours had none.
+///
+/// So the fill is now the FIRST rung of three, not the only one:
+///   1. fill a field we recognise — including inside same-origin iframes, which
+///      is where a Google 2FA input usually lives;
+///   2. else copy to the clipboard;
+///   3. else paint the code in the page, selectable, so it can always be read.
+///
+/// ⛔ The code deliberately does NOT go into the pane schema. A schema travels
+/// app → OSC → GUI and is re-sent on every refresh; `fill` already states that
+/// invariant for the password and it holds for a one-time code too. The eval is
+/// transient and consumed once, which is why the fallback lives in the page.
 fn totp_script(code: &str) -> String {
     format!(
         r#"(function() {{
 {SET_FIELD}
-  const otp = document.querySelector(
-    'input[autocomplete="one-time-code"], input[name*=otp i], input[name*=totp i], input[id*=otp i], input[name*=code i]');
-  if (!otp) return 'no-otp-field';
-  ychromeSet(otp, {code});
-  otp.focus();
-  return 'filled';
+  const SELECTOR = 'input[autocomplete="one-time-code"], input[name*=otp i], ' +
+    'input[name*=totp i], input[id*=otp i], input[name*=code i]';
+  function findField(doc) {{
+    const direct = doc.querySelector(SELECTOR);
+    if (direct) return direct;
+    // Same-origin frames only; a cross-origin one throws and is skipped.
+    for (const frame of Array.from(doc.querySelectorAll('iframe'))) {{
+      try {{
+        const inner = frame.contentDocument;
+        if (!inner) continue;
+        const hit = findField(inner);
+        if (hit) return hit;
+      }} catch (e) {{ /* cross-origin: not ours to read */ }}
+    }}
+    return null;
+  }}
+  function show(code, reason) {{
+    const old = document.getElementById('__ychrome_totp');
+    if (old) old.remove();
+    const box = document.createElement('div');
+    box.id = '__ychrome_totp';
+    box.setAttribute('style', [
+      'position:fixed', 'z-index:2147483647', 'top:16px', 'right:16px',
+      'padding:12px 14px', 'border-radius:10px', 'background:#262a33',
+      'color:#e5e5e5', 'font:600 22px/1.2 ui-monospace,monospace',
+      'letter-spacing:.14em', 'box-shadow:0 6px 24px rgba(0,0,0,.45)',
+      'border:1px solid #3b414f', 'user-select:all', 'cursor:text',
+    ].join(';'));
+    box.textContent = code;
+    const note = document.createElement('div');
+    note.setAttribute('style',
+      'font:400 11px/1.4 system-ui,sans-serif;letter-spacing:0;opacity:.7;margin-top:6px;user-select:none');
+    note.textContent = reason;
+    box.appendChild(note);
+    document.body.appendChild(box);
+    // One code, one window. It expires; the box must not outlive it.
+    setTimeout(function() {{ const b = document.getElementById('__ychrome_totp'); if (b) b.remove(); }}, 30000);
+    box.addEventListener('click', function() {{
+      const range = document.createRange();
+      range.selectNodeContents(box.firstChild ? box : box);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }});
+  }}
+  const otp = findField(document);
+  if (otp) {{
+    ychromeSet(otp, {code});
+    otp.focus();
+    return 'filled';
+  }}
+  try {{
+    if (navigator.clipboard && navigator.clipboard.writeText) {{
+      navigator.clipboard.writeText({code}).then(
+        function() {{ show({code}, 'no field found — copied, and here to read'); }},
+        function() {{ show({code}, 'no field found — select to copy'); }});
+      return 'copied';
+    }}
+  }} catch (e) {{ /* fall through to the visible rung */ }}
+  show({code}, 'no field found — select to copy');
+  return 'shown';
 }})()"#,
         code = js_string(code),
     )
@@ -4539,6 +4753,98 @@ mod tests {
 
     /// A row's actions minus the ones every row carries, so a test about WHICH
     /// injector an item gets is not also a test of how many affordances exist.
+    /// ⛔ THE OTHER HALF OF THE 2026-08-02 REPORT: *"I cannot enter the passkey
+    /// when anyone requests me … there is no clicking to give passkey or save a
+    /// passkey."* Per-origin scoping made enrolment impossible on any site the
+    /// vault had never seen, which is every site you have not already enrolled
+    /// on — Google included. The answer is a deliberate per-site arm, not a
+    /// wider default.
+    #[test]
+    fn a_site_with_no_passkey_can_be_armed_for_enrolment() {
+        let host = "arm-test.example";
+        assert!(!passkey_enrol_armed().contains(host), "starts unarmed");
+
+        // The pane offers the door when the shim does not already cover the host.
+        let offer = passkey_enrol_widgets(
+            Some(host),
+            &PasskeyShimState::ScopedTo(vec!["other.example".into()]),
+        );
+        assert!(
+            offer.iter().any(|w| w["action"] == "passkey-arm"),
+            "no way to arm enrolment on a site the vault has never seen"
+        );
+
+        assert!(passkey_enrol_arm(host), "arming a good host must take");
+        assert!(!passkey_enrol_arm(host), "arming twice must not re-report");
+        assert!(passkey_enrol_armed().contains(host));
+
+        // ...and an armed host must actually reach the shim's match patterns,
+        // which is the whole point: the widget without the pattern is theatre.
+        let patterns: Vec<String> = passkey_enrol_armed()
+            .iter()
+            .flat_map(|h| rp_id_match_patterns(h))
+            .collect();
+        assert!(patterns.contains(&format!("*://{host}/*")));
+        let production = include_str!("sidebar.rs");
+        let builder = production
+            .split("fn passkey_shim_scripts(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n}").next())
+            .expect("passkey_shim_scripts is present");
+        assert!(
+            builder.contains("passkey_enrol_armed()"),
+            "the armed hosts never reach the shim, so arming does nothing"
+        );
+
+        // A host that cannot become a safe pattern is refused at the door.
+        assert!(!passkey_enrol_arm("*"), "a wildcard would widen the scope to everything");
+        assert!(!passkey_enrol_arm(""), "empty is not a host");
+
+        passkey_enrol_disarm(host);
+        assert!(!passkey_enrol_armed().contains(host), "disarm must actually clear it");
+    }
+
+    /// ⛔ THE 2026-08-02 REPORT, IN ONE ASSERTION. The user could not finish a
+    /// Google login: the pane found no field to fill, said "Filled …" anyway,
+    /// and left no way to read the code. A one-time code that reaches nobody is
+    /// worth exactly as much as no code, and the toast made it look like a
+    /// success — so the script must carry a fallback for the case where the
+    /// page has no field WE recognise, and the toast must be true on every rung.
+    #[test]
+    fn a_code_the_page_will_not_take_still_reaches_the_user() {
+        let script = totp_script("123456");
+        assert!(
+            script.contains("clipboard"),
+            "no clipboard rung: a page with no recognised field leaves the user stranded"
+        );
+        assert!(
+            script.contains("__ychrome_totp"),
+            "no visible rung: the clipboard can be refused, and then nothing shows the code"
+        );
+        assert!(
+            script.contains("contentDocument"),
+            "same-origin frames are not searched, and a 2FA input usually lives in one"
+        );
+        // The old shape: one query, then give up with a value nobody read.
+        assert!(
+            !script.contains("return 'no-otp-field'"),
+            "the script still bails without delivering the code"
+        );
+
+        // And the sentence the user actually sees may not overclaim. The old one
+        // was an unconditional "Filled {name}'s authenticator code."
+        let production = include_str!("sidebar.rs");
+        let totp_arm = production
+            .split(r#""totp" => {"#)
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n        }").next())
+            .expect("the totp action arm is present");
+        assert!(
+            !totp_arm.contains(r#"format!("Filled {name}"#),
+            "the toast claims a fill it cannot know happened"
+        );
+    }
+
     fn fill_actions(row: &Value) -> Vec<&str> {
         row["actions"]
             .as_array()
