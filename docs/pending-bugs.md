@@ -11,6 +11,11 @@ Entries are removed in the same commit as their verified fix. Newest first.
 
 ---
 
+> **This file is the ONE answer to "what is open" for ychrome.** Open items
+> only; an entry is deleted in the same commit as its verified fix and git
+> remembers it. The law, the owner table for every other question, and how to
+> search the archive are in `yggterm/docs/docs-ssot.md`.
+
 ## ★★★ THE PASSKEY SHIM PATCHES `navigator.credentials` ON EVERY PAGE, INCLUDING A CHALLENGE PAGE
 
 **Found 2026-07-31 while investigating why a Cloudflare challenge on a
@@ -292,13 +297,6 @@ answers "did anyone forget to cycle the clients" in one command.
 
 ---
 
-## ~~★★ THE ENGINE ONLY EXISTS ON THE GUI HOST~~ — CLOSED 2026-08-01
-
-`ychrome ctl pages` answers `{"ok":true,"pages":[]}` on **dev**, and the engine
-was driven there end to end for the click-resolver and screenshot work. Agent
-browsing no longer has to burn the operator's laptop. `fleet-binary-sync`
-carries the binary; nothing further is owed here.
-
 ## ★★ THE `dream-control-surfaces` ITEMS ARE BUGS, NOT ASPIRATIONS
 
 `docs/dream-control-surfaces.md` is filed as a dream document. The operator's
@@ -323,28 +321,6 @@ acceptance test, or state explicitly which are declined and why. The `dream-*`
 documents should hold *design*, never *the only record that something is
 missing*. Same applies to `dream-detached-agent-surfaces.md`, whose §5 control
 and §7 table are already bug-shaped.
-
-## ~~⚠ UNVERIFIED SIGHTING — a second invocation may not route into an existing surface~~ — CLOSED
-
-**Fixed and merged** (`lane/dev/second-invocation-tab`, `b85cdd4`): a second
-invocation opens a tab and never replaces the running page. Left here only as a
-heading so the sighting is not re-filed.
-
-<details><summary>original note</summary>
-
-Carried over from the (now closed) subcommand-swallow entry, because it was
-never reproduced and should not be lost with its parent.
-
-When a surface already exists for a profile, `ychrome <new-url> --profile <p>`
-is documented to route the new URL into it (`--here` opts out). In one
-observation the surface **stayed on the previous URL** instead. It has not been
-re-tested, so this is a sighting, not a bug report. It matters because it is
-what blocked building a page-of-my-own control for the injection question — see
-`dream-detached-agent-surfaces.md` §5.
-
----
-
-</details>
 
 ## ⚠ FLAKY TEST — `daemon_staleness` fails on a busy host, and it is NOT the code
 
