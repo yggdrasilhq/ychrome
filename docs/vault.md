@@ -741,6 +741,18 @@ Ordered by value per unit of work, honestly:
 - **`add` against a real server** — proven on `vault.example.com`: an item was created,
   `cipher_count` went 1107 → 1108, `get` round-tripped the exact generated
   password, and `match` resolved it by its stored URI.
+- **The pane's REVEAL and COPY** — proven live on the GUI host, 2026-08-02,
+  against a THROWAWAY vault (`provision_a_scratch_vault_for_a_live_proof` +
+  a docker vaultwarden + a scratch `HOME` with its own ychrome daemon and its own
+  agent), driven through a SHADOW client so the operator's own screen never
+  moved. Seen in pixels: the Edit tab's "Stored values" rows, the eye painting one
+  value with "Shown once", the very next schema refetch showing that row bare
+  again, and the row's right-click menu offering Copy username / password /
+  verification code. Seen through the page: `navigator.clipboard.writeText`
+  RESOLVES from a GUI-injected eval on an https surface, and `readText()` reads
+  the value back at the right LENGTH (20 for the generated password, 18 for the
+  notes) — the value itself never printed. Not yet exercised: the
+  not-a-secure-context branch on a plain http page.
 - **The full edit surface against a real server** — proven on a SCRATCH
   vaultwarden (`2026.6.0`, gitHash `2629bcbe`) in
   `crates/ychrome-vault/tests/live_edit.rs`, which registers its own throwaway
