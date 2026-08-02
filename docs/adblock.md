@@ -17,7 +17,7 @@ that produces the ruleset, and both are scoped by `@match` so WebKit matches
 them in the engine.
 
 Everything below that is stated as a number was measured on **WebKitGTK 2.52.5**
-(the version on dev and on guihost, checked with `pkg-config --modversion
+(the version on dev and on the GUI host, checked with `pkg-config --modversion
 webkit2gtk-4.1`) by compiling probe rulesets through
 `WebKitUserContentFilterStore`, and on the **2026-07-31** snapshot of the
 upstream filter lists.
@@ -399,12 +399,12 @@ naming each list, its licence and its source URL, and ideally the same text in
 `src/provision.rs` is the one owner of "is this host's copy current?".
 
 Two bugs made it necessary, and both were silent. The `youtube-adblock.js` on
-guihost predated the script's own metadata block, so it parsed to the documented
+the GUI host predated the script's own metadata block, so it parsed to the documented
 defaults, so it ran in the **isolated** world, where its `window.fetch` and
 `ytInitialPlayerResponse` patches are invisible to the page. Only the DOM
 fallback ran — which used to force `playbackRate = 16`, clamped by WebKit to
 about 2x. The user saw every ad, at double speed. Separately, the adblock
-ruleset had to be copied by hand; it was on guihost and had never been on dev,
+ruleset had to be copied by hand; it was on the GUI host and had never been on dev,
 where ad blocking was therefore off with nothing anywhere saying so.
 
 Every bundled asset now declares a version — `@version` in a userscript's
@@ -700,7 +700,7 @@ missing filter, it is no ad blocking at all.
 keys, the compile cost, and that the shipped ruleset compiles — all by running
 `WebKitUserContentFilterStore` on this host (the 2026-07-31 regeneration
 compiles in 14.8 s). The reconciler's five verdicts, end to end over a scratch
-`$HOME`, including guihost's exact header-less `youtube-adblock` and a hand-copied
+`$HOME`, including the GUI host's exact header-less `youtube-adblock` and a hand-copied
 60-rule `rules.json`. The YouTube prune, against a real captured response. The
 generated cosmetic script, against a stub DOM. The SponsorBlock hash-prefix
 endpoint, against the live API.
@@ -716,7 +716,7 @@ endpoint, against the live API.
   its rules installed, `failed:0`; `example.com` → `window.__yggScriptlets`
   **undefined**, which is the performance contract holding on a real page.
 
-**Not proven.** Nothing has been exercised in the yggterm GUI on guihost: no
+**Not proven.** Nothing has been exercised in the yggterm GUI on the GUI host: no
 faithful screenshot of a page with the new ruleset attached, no measurement of
 the GUI's startup with a 146,817-rule filter. That needs a deploy, and the
 deploy needs the `load`-first change in §1 first.
