@@ -63,3 +63,72 @@ curl-drivable once its own TLS chain fix is in (see that site's lore).
 
 What to ask him to bring back: the **eSign ID / signer ID**. That is the only artefact the
 IPO portal needs — it is entered once during IPO registration.
+
+## turnstile-gone-signup-fully-drivable · WORKS
+task: 
+model: claude-opus-5
+date: 2026-08-02
+tags: 
+
+**SUPERSEDES the 2026-07-31 `turnstile-600010-blocks-agent-signup` entry above.**
+Re-tested on a clean load: Turnstile now **solves itself in ychrome/WebKitGTK**. The
+hidden `cf-turnstile-response` input carried a full token on first paint, with no
+`turnstile.render()` call and no error 600010. "Get OTP" fired for real: the anchor
+flipped to "Resend OTP", `#otpTimer3Block` went `display:block` with "Resend OTP in 57
+seconds", the resource log showed the POST to `https://emudhradigital.com/CreateNewUser`,
+and the SMS arrived (sender `AD-eMuDSC-S`, **4 digits**).
+
+**Lesson worth more than the recipe: a Cloudflare verdict is a SERVER-SIDE POLICY, not a
+property of the browser.** Two days turned BLOCKED into WORKS with no change on our side.
+Re-probe a Turnstile/WAF wall before believing your own lore; the cost is one page load.
+
+## Signup, end to end (all agent-driven, ~3 minutes)
+
+URL: `CreateNewUser.jsp?src=c44ead5fdecd48ecac24f` (keep `src` — it is `allianceID`, and it
+is what ties the account to the IP India trademark e-filing integration).
+`#userTypeValue=1` (Individual) and `#resedentialValue=1` (Indian) are already the defaults.
+
+1. `#authenticatemobile` <- 10-digit mobile, native-setter fill + input/change/keyup/blur.
+2. `#btnauthenticatemobileOTP` — plain `el.click()` is enough (`onclick="getMobileOTP()"`).
+   No pointer-event sequence needed.
+3. Read the 4-digit code off the phone. `#authenticatemobileOTP` is `type=password`,
+   maxlength 4; same native-setter fill.
+4. `#btnauthenticatemobile` (Login) -> **account created**, redirect straight to
+   `makePayment.jsp?X=<opaque>`. There is no separate "create account" screen.
+
+## The billing screen (also fully agent-driven)
+
+Title "Make Payment: eMudhra eKYC Portal". Plan is FIXED by the alliance link, no selector:
+**One Year 100 Transactions, Rs250 + taxes** (= Rs295 with 18% GST). This CONFIRMS the
+100-transaction tier still exists — a 2021-guide figure that had been flagged unverified.
+
+- `#gstno` radio is pre-checked (individual -> No), `#gstNumber` stays empty
+- `#retailBillingEmailID` — text
+- `#billingAddress` — TEXTAREA (use `HTMLTextAreaElement.prototype` for the native setter,
+  not `HTMLInputElement.prototype`)
+- `#billingCountry` — India is value `1`, already selected
+- `#billingPincode` — text; **filling it auto-selects `#billingDistrict`** (Kolkata = 15)
+- `#billingState` — West Bengal is `WB19`; codes are `<2-letter><number>`, not plain names
+- Submit is `#proceedBtnPriceSummary` -> `submitBillingDetails()` -> PayU
+  (cards / net-banking / UPI / wallets; a voucher field exists there)
+
+## Camera and mic WORK in the ychrome surface — the video KYC needs no other browser
+
+Measured on this page after `server app open <session> --view preview`:
+`getUserMedia({video:true,audio:true})` returned live tracks
+`Integrated Camera (V4L2)` + the host's analog audio. `window.isSecureContext` true.
+So the whole eMudhra lane — signup, payment, enrolment, live video KYC — can run in ONE
+co-browse surface with the operator only doing the payment and showing his face/documents.
+
+⚠ `web await` needs `--await-timeout`, NOT `--wait-timeout` (that flag belongs to `web
+wait`). An unrecognized flag silently falls back to ~15s and the camera probe reads as
+`await_timeout`, which looks exactly like a hung permission dialog.
+⚠ A surface can be live and `mapped:true` while the SESSION still shows the terminal — the
+page is a tab nobody is looking at. `server app open <session> --view preview` is what puts
+it in front of the operator.
+
+## What the IPO portal needs back
+
+`ipindiaonline.gov.in/trademarkefiling/user/How-To-Register.aspx`, verbatim:
+"Steps to Register for eFiling with Esign — 1. Procure an esign(signerid) from Web URL to
+procure esign." So the ONE artefact to carry out of eMudhra is the **signer ID**.
