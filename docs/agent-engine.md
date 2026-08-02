@@ -303,7 +303,16 @@ POST /input {page_id, events: [
                                          zero_size, nth, ambiguous, x, y, tag}…]}
   | 400 {ok:false, error}                         # the BATCH is malformed
   | 409 {ok:false, error, dispatched, failed_at, resolved}   # the PAGE refused
-POST /fill  {page_id, selector?, entry?}          # vault autofill, reuses /fill machinery
+POST /fill  {page_id, entry, user?}               # vault autofill — SHIPPED 2026-08-02
+  → {ok, entry, filled: "filled"|"user-only"|"no-fields"}
+  | 502 {error: "vault: …"}                       # the VAULT refused (locked, no item)
+    `user` disambiguates when one item name holds several logins.
+    The reply names FIELDS, never a value: the secret comes off the host's
+    vault agent, goes straight into the eval script, and is dropped.
+    ⚠ This line described a route that did not exist for months, and the
+    gap was only found when a run needed it and had to put the payload in a
+    0600 file instead. A documented verb with no implementation is worse
+    than an undocumented one: it is read as a capability and planned around.
 ```
 
 Input dispatch goes through the WPE view backend's event API
