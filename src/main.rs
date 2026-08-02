@@ -32,6 +32,7 @@ mod provision;
 mod sidebar;
 mod sitehost;
 mod sponsorblock;
+mod tlspin;
 mod useragent;
 mod userscript;
 mod webmedia;
@@ -134,6 +135,59 @@ fn open_tunnel(via: &str) -> Result<Tunnel> {
 /// INVOKING host — the same location the yggterm GUI uses for a session's
 /// surface, so a profile means the same identity whether ychrome renders it
 /// itself (standalone) or hands it to the yggterm viewport (thin-client).
+/// Let a page load when its certificate is one this host has explicitly pinned.
+///
+/// WebKitGTK's `load-failed-with-tls-errors` is the ONE place a refusal can be
+/// reconsidered, and it hands us the certificate that failed. We answer only for
+/// a (host, certificate) pair already recorded in `tls-pins.json` — and a pin is
+/// only ever written for a chain OpenSSL verified against the system store (see
+/// [`tlspin`]). Anything else returns `false` and the refusal stands, which is
+/// the behaviour every other site keeps.
+///
+/// The refusal it exists for is not a bad certificate: it is a server sending a
+/// jumbled chain whose good path GnuTLS will not search for. Without this, the
+/// only thing that satisfies GnuTLS is trusting a retired root machine-wide.
+#[cfg(target_os = "linux")]
+fn install_tls_pin_handler(webview: &wry::WebView) {
+    use webkit2gtk::gio::prelude::TlsCertificateExt;
+    use webkit2gtk::{WebContextExt, WebViewExt};
+    use wry::WebViewExtUnix;
+
+    let pins = tlspin::load();
+    if pins.is_empty() {
+        return;
+    }
+    webview
+        .webview()
+        .connect_load_failed_with_tls_errors(move |view, failing_uri, certificate, _errors| {
+            let Some(host) = url::Url::parse(failing_uri)
+                .ok()
+                .and_then(|parsed| parsed.host_str().map(str::to_string))
+            else {
+                return false;
+            };
+            let Some(der) = certificate.certificate() else {
+                return false;
+            };
+            let Some(pin) = tlspin::matching(&pins, &host, &der) else {
+                return false;
+            };
+            let Some(context) = view.web_context() else {
+                return false;
+            };
+            // Scoped to this host by the API itself, so the exception cannot
+            // leak to another site even if the same certificate turns up there.
+            context.allow_tls_certificate_for_host(certificate, &host);
+            eprintln!(
+                "ychrome: allowed the pinned certificate for {host} ({}) — {}",
+                &pin.sha256[..pin.sha256.len().min(16)],
+                pin.reason
+            );
+            view.load_uri(failing_uri);
+            true
+        });
+}
+
 pub(crate) fn profile_dir(profile: &str) -> Result<PathBuf> {
     if profile.contains('/') || profile.contains("..") || profile.is_empty() {
         bail!("profile name must be a plain name, not a path: {profile:?}");
@@ -1107,6 +1161,7 @@ const RESERVED_SUBCOMMANDS: &[&str] = &[
     "ctl",
     "engine",
     "identity",
+    "tls",
 ];
 
 /// `ychrome identity [<host>] [--set <preset>|--reset] [--json]`.
@@ -1275,6 +1330,14 @@ fn main() -> Result<()> {
     // PROVE it set rather than click and hope.
     if raw.get(1).map(String::as_str) == Some("identity") {
         return run_identity_verb(&raw[2..]);
+    }
+    // `tls` — the per-host exception list for servers whose chain is valid but
+    // presented in an order GnuTLS will not search (see `tlspin`). Dispatched
+    // here with the others so it is auditable from a host with no GUI: the
+    // question "what has this browser been told to excuse, and why" must be
+    // answerable without opening a window.
+    if raw.get(1).map(String::as_str) == Some("tls") {
+        return tlspin::run(&raw[2..]);
     }
 
     // ⛔ A SUBCOMMAND-SHAPED TOKEN MUST NEVER FALL THROUGH INTO THE URL.
@@ -1489,7 +1552,9 @@ fn main() -> Result<()> {
         use tao::platform::unix::WindowExtUnix;
         use wry::WebViewBuilderExtUnix;
         let vbox = window.default_vbox().context("no gtk vbox")?;
-        builder.build_gtk(vbox).context("creating webview")?
+        let webview = builder.build_gtk(vbox).context("creating webview")?;
+        install_tls_pin_handler(&webview);
+        webview
     };
 
     event_loop.run(move |event, _, control_flow| {
