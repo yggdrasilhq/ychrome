@@ -251,9 +251,9 @@ ychrome-vault sync | lock | stop-agent | ping | status | diagnose | check
 
 ## Fleet, build, deploy
 
-Five hosts: **dev(=pi), guihost, oc, practice, jyas-webapp** — all x86_64 Debian.
+Hosts: **dev, the GUI host, a headless host, and two service hosts** — all x86_64 Debian.
 **`pi` and `dev` are the SAME MACHINE** (machine-id `03d282108f6f`; `ssh dev`
-loops back). guihost is the live desktop (yggterm GUI + daemon).
+loops back). The GUI host is the live desktop (yggterm GUI + daemon).
 
 **There is no deploy script.** `scripts/deploy-fleet.sh` does not exist and never
 did (a memory note claims otherwise — it is wrong). The fleet-binary-sync hook
@@ -334,7 +334,7 @@ ps -o pid,lstart -p $PID; readlink /proc/$PID/exe   # SAME pid, SAME start time,
                                                     # DIFFERENT exe, no " (deleted)"
 ychrome-vault status | jq '{agent_stale,state,item_count}'
 # state must still be "unlocked" and item_count intact — and no master password
-# was typed. Run it on a host with NO agent first (free), then dev, then guihost.
+# was typed. Run it on a host with NO agent first (free), then dev, then the GUI host.
 ```
 
 **Opening a contributed pane in the live GUI.** `server app right-panel
@@ -613,7 +613,7 @@ ones are `@match`-scoped instead, so WebKit does the matching in the engine.
 
 - **The 2x-ads bug, so it is never rediagnosed from scratch.** The user
   reported "I still see youtube ads! They are sped up to 2x automatically!" The
-  copy of `youtube-adblock.js` on guihost predated the script's metadata block, so
+  copy of `youtube-adblock.js` on the GUI host predated the script's metadata block, so
   it parsed to the DEFAULTS, so it ran in the ISOLATED world, where its
   `window.fetch` patch is invisible to the page. The prune never ran; only the
   DOM fallback did, and it forced `playbackRate = 16`, which WebKit clamps to
@@ -822,7 +822,7 @@ anything a framework renders asynchronously. An unmet wait returns
 
 Worked examples:
 `assets/engine-recipes/{crawl-and-extract,form-fill,watch-page-until,capture-page}.sh`.
-`run-all.sh` runs all four; green on dev, guihost and oc.
+`run-all.sh` runs all four; green on dev, the GUI host and a headless host.
 
 ### Screenshots — four regions, one snapshot primitive
 

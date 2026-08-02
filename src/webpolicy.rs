@@ -328,7 +328,7 @@ pub fn policy_version(profile: &str) -> String {
 /// GUI refetches only when the stamp MOVES — so a surface kept whatever shim
 /// decision happened to be true when it opened, forever.
 ///
-/// Measured on guihost, 2026-08-01, one unchanged `policy_version`
+/// Measured on the GUI host, 2026-08-01, one unchanged `policy_version`
 /// (`ebc219f7d40ddc53`): `sidebar_contribution/policy` recorded
 /// `userscripts: 6` at 14:53 and `userscripts: 5` from 16:07 on, across the
 /// ychrome deploy that landed per-origin scoping. The missing script was the
