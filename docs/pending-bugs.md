@@ -141,7 +141,7 @@ off so the GUI never recompiles a ruleset), a probe row created with
 ⚠ **WHAT IS STILL OWED: THE USER'S OWN DAEMONS.** The pane is served by the
 ychrome DAEMON, and both of this fleet's daemons were holding live surfaces
 (dev: 5, including the linked WhatsApp Web session; the GUI host: 3, two of them
-the trademark filing). Retiring one is the operator's call, not an agent's, so
+mid-task). Retiring one is the operator's call, not an agent's, so
 the binary is installed on both hosts and **the running daemons still serve the
 old pane**. One `ychrome daemon restart` per host adopts it; every session on
 that host re-registers in ~4s and its page reloads.
