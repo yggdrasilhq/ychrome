@@ -7,41 +7,62 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
-## ★★★ THE VAULT PANE IS NOT AT PARITY: no stored values, no copy, no last-sync
+## ★★ THE VAULT PANE'S REVEAL AND COPY ARE BUILT BUT NOT PIXEL-PROVEN, AND SYNC IS STILL A BUTTON
 
-**Status:** OPEN
+**Status:** OPEN — parts 1 and 2 are FIXED IN CODE and proven against a scratch
+vault; what is owed is the live pane on the GUI host, and the schedule.
 
 User-tested the sidebar against the real Bitwarden extension side by side,
-2026-08-02, with screenshots. Three distinct gaps.
+2026-08-02, with screenshots. Three gaps; two are built, one remains.
 
-### 1. Edit cannot SHOW a stored value, so it cannot be copied or verified
-
-Bitwarden's Edit Login renders the stored **password** and **authenticator key**
-as masked fields with a REVEAL eye (and a regenerate control), plus the
-passkey's creation date and per-URI rows. Ours renders a "Replace a secret"
-block whose boxes are empty by design, explained as *"These boxes are empty
-because this pane never carries a stored secret."*
+### 1. Edit could not SHOW a stored value — ✅ BUILT 2026-08-02, live proof owed
 
 The user's words: *"I cannot edit the existing fields or see them to manually
-copy paste."* That is the whole complaint — the pane is a REPLACE form, not an
-EDIT form, so you cannot check what is stored or copy it by hand, which is the
-fallback every other client gives you when autofill misses.
+copy paste."* The pane was a REPLACE form, not an EDIT form, so you could not
+check what was stored or copy it by hand — the fallback every other client gives
+you when autofill misses.
 
-⛔ The empty-box rule was a real invariant, not laziness: a schema travels
-app → OSC → GUI and is re-sent on every refresh, so a secret placed in it is
-broadcast repeatedly. **The fix is not to prefill the form.** It is an explicit
-per-field REVEAL action — the user presses the eye, the pane fetches that ONE
-value and renders it for that one render, exactly as Bitwarden's eye does — plus
-a COPY action. The invariant becomes "a secret is never in a schema AT REST or
-in a LISTING", which is the property that actually matters.
+**What landed.** The Edit tab now lists one row per value the entry HOLDS
+(password, verification code, authenticator key, notes, each custom field —
+from `has_password`/`has_totp` in the listing plus one `notes` probe, booleans
+only), each with a `👁` and a `⧉`. The eye fetches ONE field and renders it under
+its own row for that one render.
 
-### 2. No copy actions on a row
+⛔ The empty-box rule was a real invariant, not laziness, and it is intact: the
+form is still never pre-filled. A revealed value is a **parameter**, not state —
+`PaneState` cannot hold one, `GET /pane/vault` builds through the no-reveal
+owner, and the next render is built without it. The invariant is now stated in
+the form that actually matters: **a secret is never in a schema AT REST or in a
+LISTING.** Locked by `the_schema_route_cannot_carry_a_revealed_value` and
+`a_revealed_value_lives_in_exactly_one_render`.
+
+### 2. No copy actions on a row — ✅ BUILT 2026-08-02, live proof owed
 
 Bitwarden's row overflow offers **Copy username · Copy password · Copy
-verification code**, plus launch-URI, Edit, Clone, Archive, Delete. Ours offers
-fill ⧉, totp ⏱ and edit ✎ only — every affordance is "put it in the page", none
-is "give it to me". A user who needs the value anywhere else (another app, a
-terminal, a form we mis-detect) has no route.
+verification code**. Ours offered fill ⧉, totp ⏱ and edit ✎ — every affordance
+"put it in the page", none "give it to me".
+
+**What landed.** Those three are in the row's right-click `menu` (yggterm's own
+row vocabulary, so a menu item can say what it does in words where a fourth glyph
+in a 300px rail could not), offered only for what the listing says exists. The
+value is handed to the GUI as an `eval` calling `navigator.clipboard.writeText`
+— the clipboard belongs to the GUI's host, so it takes the injector road a fill
+takes. There is no OSC 52 spelling: that would put the secret in the scrollback
+ring.
+
+⚠ **Two honest limits, neither yet observed on a real page.**
+- `navigator.clipboard` exists only in a **secure context**, so on a plain http
+  page there is nothing to write with. The page notice names that and points at
+  the eye. A hidden-textarea `execCommand('copy')` fallback was refused on
+  purpose: it puts the secret in the page's own DOM, where the page can read it,
+  and a user copying a password on some unrelated site did not consent to that.
+- Whether WebKitGTK grants `writeText` to a GUI-injected eval at all (user
+  gesture / focus) is **not measured yet**. If it refuses, the notice says so and
+  the eye is the route; but the "Copied" path has not been seen to fire.
+
+⛔ A card still has neither verb. Number and CVV reach a page only through
+`card-fill` — a PAN in a transcript is durable and cannot be rotated (settled
+2026-07-26).
 
 ### 3. The sync line is a warning where a fact belongs — and the cause is ours
 
@@ -78,11 +99,32 @@ no master password re-entry). The fix removes the dependency on that procfs
 detail, which does not hold if an installer overwrites in place and keeps the
 inode.
 ✅ **The agent-side half of (b) is also cleared**: the post-handover agent
-reports `last_sync_unix` (measured `1785682003`). What remains of (b) is purely
-the PANE — show **"Last synced <time> · Sync now"** as a plain fact and keep the
-warning for the genuine failure case only.
+reports `last_sync_unix` (measured `1785682003`).
+✅ **(b) PANE HALF DONE 2026-08-02**: a current copy reads **"Last synced 3
+minutes ago"** as a muted fact with the Sync now button under it, and carries no
+`⚠` at all. The warning survives for the two cases that earn one — a copy over 30
+minutes old, and an agent that cannot report the fact — and the second now offers
+the one-click **"Hand the agent over (keeps it unlocked)"** button instead of
+prose telling the user to run a command that used to refuse.
 **(c) still owed:** sync on a schedule/staleness rule rather than making the
-user press it.
+user press it. Today the only automatic pull is on pane OPEN, once the copy is
+over 30 minutes old (`refresh_if_stale`), so a pane left open goes stale in
+silence.
+
+⚠ **WHAT IS OWED FOR 1 AND 2: THE PIXEL.** The data path is proven live — the
+scratch-vault fixture (`provision_a_scratch_vault_for_a_live_proof`) plus
+`render_the_vault_pane_against_a_scratch_vault` drives a REAL unlocked agent
+through `run_action`: `edit-reveal` on notes, the authenticator key and a custom
+field returns the stored value, the very next `GET /pane/vault` carries none of
+it, `edit-copy` returns an eval holding the value and a toast that does not, and
+a copy of a field the item lacks refuses by name. What has NOT been seen is the
+pane painted with an eye in it, because the pane is served by the ychrome DAEMON
+and both this fleet's daemons were holding live surfaces (dev: 5, including the
+linked WhatsApp Web session; the GUI host: 3). Retiring one is the operator's
+call, not an agent's. **The observation that closes this: open the vault pane on
+a session whose ychrome daemon is running a binary from 2026-08-02 or later,
+press ✎ on an entry, and see the "Stored values" rows — then press 👁 and watch
+one value appear and be gone on the next redraw.**
 
 ⚠ Same family as three other findings today: a version-gated hot-restart that
 cannot swap a same-version binary, `ctl --help` exiting 0 on a build without the
