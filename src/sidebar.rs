@@ -29,7 +29,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use ychrome_vault_proto::CIPHER_TYPE_CARD;
 
@@ -189,7 +189,10 @@ fn passkey_shim_state() -> PasskeyShimState {
 /// is off for a reason the user must fix first — arming would promise something
 /// that cannot happen.
 fn passkey_enrol_widgets(host: Option<&str>, shim: &PasskeyShimState) -> Vec<Value> {
-    let Some(host) = host.map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()) else {
+    let Some(host) = host
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+    else {
         return Vec::new();
     };
     // A broken/absent shim has its own banner above; do not stack a second ask.
@@ -200,7 +203,7 @@ fn passkey_enrol_widgets(host: Option<&str>, shim: &PasskeyShimState) -> Vec<Val
         }),
         PasskeyShimState::NoStoredPasskeys => false,
         PasskeyShimState::VaultUnavailable(_) | PasskeyShimState::AgentPredatesBrowser => {
-            return Vec::new()
+            return Vec::new();
         }
     };
     if covered {
@@ -5387,11 +5390,17 @@ mod tests {
         );
 
         // A host that cannot become a safe pattern is refused at the door.
-        assert!(!passkey_enrol_arm("*"), "a wildcard would widen the scope to everything");
+        assert!(
+            !passkey_enrol_arm("*"),
+            "a wildcard would widen the scope to everything"
+        );
         assert!(!passkey_enrol_arm(""), "empty is not a host");
 
         passkey_enrol_disarm(host);
-        assert!(!passkey_enrol_armed().contains(host), "disarm must actually clear it");
+        assert!(
+            !passkey_enrol_armed().contains(host),
+            "disarm must actually clear it"
+        );
     }
 
     /// ⛔ THE 2026-08-02 REPORT, IN ONE ASSERTION. The user could not finish a
@@ -5500,7 +5509,10 @@ mod tests {
         // should have last synced time and then sync now button … A warning
         // text is non-confidence inspiring."*
         assert!(text.contains("Last synced 1 minute ago"), "{text}");
-        assert!(!text.contains('\u{26a0}'), "a current vault must not warn: {text}");
+        assert!(
+            !text.contains('\u{26a0}'),
+            "a current vault must not warn: {text}"
+        );
         assert!(
             widgets.iter().any(|widget| widget["action"] == "sync"),
             "sync must be reachable without waiting for it to go stale: {text}"
@@ -5525,7 +5537,9 @@ mod tests {
         // The refusal is fixed (ce0a7ec) and the pane offers the one-click path
         // the passkey notice already offers, on the same action.
         assert!(
-            widgets.iter().any(|widget| widget["action"] == "hand_over_agent"),
+            widgets
+                .iter()
+                .any(|widget| widget["action"] == "hand_over_agent"),
             "no remedy offered for an agent that cannot report its sync: {text}"
         );
     }
@@ -5654,7 +5668,10 @@ mod tests {
         let widgets = edit_tab_widgets(&stored_everything_draft(), None);
         let ids = row_ids(&widgets);
         for expected in ["password", "totp", "totp-secret", "notes", "field:API Key"] {
-            assert!(ids.contains(&expected.to_string()), "no row for {expected}: {ids:?}");
+            assert!(
+                ids.contains(&expected.to_string()),
+                "no row for {expected}: {ids:?}"
+            );
         }
         // Every one of them offers BOTH verbs, and a custom field also offers
         // the removal it always had.
@@ -5718,13 +5735,17 @@ mod tests {
             .position(|widget| widget["text"] == secret)
             .expect("the revealed label");
         assert_eq!(
-            revealed[at - 1]["id"], "password",
+            revealed[at - 1]["id"],
+            "password",
             "a revealed value landed under the wrong row",
         );
 
         // The very next render — any caller, any reason — is built without it.
         let again = serde_json::to_string(&edit_tab_widgets(&draft, None)).unwrap();
-        assert!(!again.contains(secret), "the reveal survived into a later schema");
+        assert!(
+            !again.contains(secret),
+            "the reveal survived into a later schema"
+        );
 
         // And revealing one field does not reveal another.
         let other = serde_json::to_string(&edit_tab_widgets(
@@ -5812,7 +5833,9 @@ mod tests {
             "has_password": false, "has_totp": false,
         }));
         assert!(
-            !card.iter().any(|action| action.starts_with(COPY_ROW_ACTION_PREFIX)),
+            !card
+                .iter()
+                .any(|action| action.starts_with(COPY_ROW_ACTION_PREFIX)),
             "a card grew a copy verb: {card:?}",
         );
     }
@@ -5830,11 +5853,23 @@ mod tests {
             StoredField::Custom("API Key".into()),
             StoredField::Custom("odd:name: with colons".into()),
         ] {
-            assert_eq!(StoredField::parse(&field.spec()), Some(field.clone()), "{field:?}");
+            assert_eq!(
+                StoredField::parse(&field.spec()),
+                Some(field.clone()),
+                "{field:?}"
+            );
             assert!(!field.label().is_empty());
         }
-        assert_eq!(StoredField::parse("card-number"), None, "cards have no reveal");
-        assert_eq!(StoredField::parse("field:"), None, "an unnamed field is not a field");
+        assert_eq!(
+            StoredField::parse("card-number"),
+            None,
+            "cards have no reveal"
+        );
+        assert_eq!(
+            StoredField::parse("field:"),
+            None,
+            "an unnamed field is not a field"
+        );
         assert_eq!(StoredField::parse(""), None);
     }
 
@@ -5852,7 +5887,10 @@ mod tests {
             1,
             "the value must appear only in the clipboard call: {script}",
         );
-        let notices: Vec<&str> = script.match_indices("notice(").map(|(at, _)| &script[at..]).collect();
+        let notices: Vec<&str> = script
+            .match_indices("notice(")
+            .map(|(at, _)| &script[at..])
+            .collect();
         assert!(!notices.is_empty(), "no notice at all");
         for call in notices {
             let line = call.split(");").next().unwrap_or(call);
@@ -6068,7 +6106,10 @@ mod tests {
                 .contains("the personal forge"),
             "the toast carried the value: {copied}",
         );
-        assert!(copied["schema"].is_null(), "a copy must not redraw: {copied}");
+        assert!(
+            copied["schema"].is_null(),
+            "a copy must not redraw: {copied}"
+        );
 
         // The row menu's copy, resolved from a row id rather than the draft.
         let from_row = action(
@@ -6076,10 +6117,7 @@ mod tests {
             &row_id("git.example.org", "avik"),
         );
         let script = from_row["eval"].as_str().expect("a copy script");
-        assert!(
-            script.contains("navigator.clipboard.writeText"),
-            "{script}",
-        );
+        assert!(script.contains("navigator.clipboard.writeText"), "{script}",);
         // A field the item does not have REFUSES by name rather than copying an
         // empty string.
         let refused = action(
@@ -6208,7 +6246,12 @@ mod tests {
         state.seed_add_draft(Some("github.com"));
         // `unlocked_schema`, not `vault_schema`: the latter shells out to
         // `ychrome-vault status`, which a test must never do.
-        let schema = unlocked_schema(&state, Some("github.com"), &json!({"state": "unlocked"}), None);
+        let schema = unlocked_schema(
+            &state,
+            Some("github.com"),
+            &json!({"state": "unlocked"}),
+            None,
+        );
         let widgets = schema["widgets"].as_array().unwrap();
 
         let password = widgets

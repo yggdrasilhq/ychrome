@@ -429,6 +429,61 @@ reached the IDFC transaction-OTP screen, the OTP never arrived, the bank session
 timed out, and a later re-login with a verified-correct credential was refused
 ("Please enter valid credentials"). Nothing was paid by any route.
 
+## Reading a stored value from the pane: reveal and copy
+
+Until 2026-08-02 the pane could put a credential INTO a page and nothing else.
+Every affordance was an injector — fill, card-fill, the authenticator code — and
+the Edit form's boxes were empty by design, with a sentence explaining that the
+pane never carries a stored secret. The user's report, side by side with the
+Bitwarden extension: *"I cannot edit the existing fields or see them to manually
+copy paste."* Reading what is stored is the fallback every other client gives you
+when autofill misses, and this one had none.
+
+**The invariant that produced the empty boxes is real and is unchanged:** a
+schema is re-fetched whenever the panel opens and re-sent on every action, so a
+value placed in one is broadcast for as long as it stays there. Pre-filling the
+form would break that on every render. Stated precisely, and this is the form it
+now takes:
+
+> **A secret is never in a schema AT REST and never in a LISTING.**
+
+Which leaves room for the thing the user actually needs — an explicit, per-field,
+one-render read:
+
+- **Reveal (`👁`)** — on the Edit tab, one row per value the entry HOLDS
+  (password, verification code, authenticator key, notes, each custom field).
+  Pressing it fetches that ONE field from the agent and renders it under its own
+  row. The value is a **parameter** threaded from the action into the schema that
+  action returns: `PaneState` has no field for it, the `GET /pane/vault` route
+  can only build through the no-reveal owner, and the next render — a refetch,
+  another click, reopening the panel — is built without it. There is nothing to
+  expire and nothing to forget.
+- **Copy (`⧉`)** — the same read, handed to the GUI as an `eval` that calls
+  `navigator.clipboard.writeText`. The clipboard belongs to the machine the GUI
+  runs on, which over ssh is not this one, so the value takes the same road a
+  filled password takes: the app computes, the GUI injects. There is deliberately
+  no OSC 52 spelling — that would put the secret in the terminal byte stream and
+  therefore in the scrollback ring.
+- **On a row** (the Fill tab) the copies live in the right-click **menu**: Copy
+  username · Copy password · Copy verification code, offered only for what the
+  secret-free listing says exists (`has_password`, `has_totp`).
+- ⛔ **The copy script never paints the value into the page.** `totp_script`
+  does, and that is right for six digits that expire in half a minute; a stored
+  password is neither. A page can read anything in its own DOM, and a user
+  copying a password on some unrelated site did not consent to giving it to that
+  site. When the clipboard is unavailable — `navigator.clipboard` exists only in
+  a **secure context**, so a plain http page has none — the page notice names the
+  reason and points at the eye. A hidden-textarea `execCommand('copy')` fallback
+  is refused rather than smuggled in: it is the same leak with a shorter life.
+- ⛔ **A card has no reveal and no copy.** Its number and CVV reach a page only
+  through the `card-fill` injector, for the reason there is no CLI verb for them
+  either: a PAN in a transcript is durable and cannot be rotated. Settled
+  2026-07-26.
+- Which field a verb acts on has ONE encoding, `sidebar::StoredField` — the row
+  menu, the eye, the copy and the custom-field removal all parse the same spec
+  (`password`, `totp`, `totp-secret`, `notes`, `field:<NAME>`), and it is also
+  the one place that knows which agent op reads which field.
+
 ## Writes
 
 `add` encrypts every field under the user key locally and `POST`s the
@@ -574,6 +629,9 @@ cell. Verdicts: ✅ have · ⚠ partial · ✗ gap · ⛔ deliberately not.
 | SSH keys | yes | yes | no | ⛔ the ssh-agent is not this tool's job |
 | Create item | yes | yes | `add`, logins only | ⚠ |
 | Edit item | yes | yes | full for logins, from CLI **and** the pane | ✅ |
+| See a stored value in the UI | eye per field | eye per field | eye per field, one render at a time (never pre-filled) | ✅ |
+| Copy a value from a row | username / password / code | same | same, in the row's right-click menu | ✅ |
+| Copy a card number | yes | yes | **no** — injector only, deliberately | ⛔ a PAN in a transcript cannot be rotated |
 | Trash / restore | yes | yes | `rm` (soft by default) / `restore` / `list --trashed` | ✅ |
 | Clone an item | yes | yes | no | ✗ cheap, and genuinely useful |
 | Password history | view | view | preserved on write, not readable | ⚠ |

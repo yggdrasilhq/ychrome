@@ -163,6 +163,41 @@ The row's ✎ opens an Edit form covering what the CLI covers. Two rules shape i
 list — that is an agent older than the browser, which silently drops arguments
 it does not know and would otherwise report a save that changed nothing.
 
+### ⛔ READING a stored value: the eye, the copy, and the rule that survived
+
+**2026-08-02.** The empty boxes were correct and incomplete: the pane could put a
+credential INTO a page and never give one to the user, so *"I cannot edit the
+existing fields or see them to manually copy paste."* The invariant is now stated
+in the form that is actually load-bearing —
+
+> **A secret is never in a schema AT REST and never in a LISTING.**
+
+— which forbids pre-filling the form (a schema is re-fetched on every open and
+re-sent on every action) and permits an explicit per-field read:
+
+- **`👁` on the Edit tab** — one row per value the entry HOLDS (password,
+  verification code, authenticator key, notes, each custom field; from
+  `has_password`/`has_totp` in the listing plus one `notes` probe, booleans only).
+  It fetches ONE field and renders it under its own row. The value is a
+  **parameter**, not state: `PaneState` cannot hold one, `GET /pane/vault` builds
+  through the no-reveal owner, and the next render has it gone. Locked by
+  `the_schema_route_cannot_carry_a_revealed_value` and
+  `a_revealed_value_lives_in_exactly_one_render`.
+- **`⧉`, and Copy username / Copy password / Copy verification code in a row's
+  RIGHT-CLICK menu** — the same read, handed to the GUI as an `eval` calling
+  `navigator.clipboard.writeText`. The clipboard is the GUI host's, which over
+  ssh is not this one, so it takes the injector road like a fill does. ⛔ No
+  OSC 52: that writes the secret into the scrollback ring.
+- ⛔ **The copy script never paints the value into the page** (unlike
+  `totp_script`, which may, because a code expires in 30 s). `navigator.clipboard`
+  exists only in a SECURE CONTEXT, so on an http page the notice names the reason
+  and points at the eye — there is deliberately no hidden-textarea
+  `execCommand('copy')` fallback.
+- ⛔ **Cards have neither.** Number and CVV stay injector-only (2026-07-26).
+- `sidebar::StoredField` is the ONE encoding of "which field" — spec, label, and
+  which agent op reads it — shared by the menu, the eye, the copy and the
+  custom-field removal.
+
 ### Two unlocked agents WILL go stale against each other
 
 Each host's agent caches the vault at its own `unlock`/`sync`. A write from a
