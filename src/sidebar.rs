@@ -182,6 +182,70 @@ fn passkey_shim_state() -> PasskeyShimState {
 /// Secret-free: a count of hosts, never the host list. Which sites you hold
 /// passkeys for is the user's business and does not belong in a schema that
 /// crosses the OSC channel.
+/// The one door to enrolling a passkey on a site the vault has never seen.
+///
+/// Silent when the shim already covers this host (the ordinary case: you have a
+/// passkey there, so `create()` and `get()` both work), and silent when the shim
+/// is off for a reason the user must fix first — arming would promise something
+/// that cannot happen.
+fn passkey_enrol_widgets(host: Option<&str>, shim: &PasskeyShimState) -> Vec<Value> {
+    let Some(host) = host.map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()) else {
+        return Vec::new();
+    };
+    // A broken/absent shim has its own banner above; do not stack a second ask.
+    let covered = match shim {
+        PasskeyShimState::ScopedTo(rp_ids) => rp_ids.iter().any(|rp_id| {
+            let rp = rp_id.trim().trim_matches('.').to_ascii_lowercase();
+            host == rp || host.ends_with(&format!(".{rp}"))
+        }),
+        PasskeyShimState::NoStoredPasskeys => false,
+        PasskeyShimState::VaultUnavailable(_) | PasskeyShimState::AgentPredatesBrowser => {
+            return Vec::new()
+        }
+    };
+    if covered {
+        return Vec::new();
+    }
+    if rp_id_match_patterns(&host).is_empty() {
+        return Vec::new();
+    }
+    if passkey_enrol_armed().contains(&host) {
+        return vec![
+            json!({"kind": "section", "text": "Passkey enrolment armed"}),
+            json!({
+                "kind": "label", "muted": true,
+                "text": format!(
+                    "{host} may now ask this browser to create a passkey. \
+                     ⚠ REOPEN THE TAB first — the shim is installed when a surface is \
+                     built, so a page that is already open was built without it.",
+                ),
+            }),
+            json!({
+                "kind": "button", "id": "passkey_disarm", "action": "passkey-disarm",
+                "value": host, "label": "Disarm",
+                "title": "Stop offering passkey enrolment on this site",
+            }),
+        ];
+    }
+    vec![
+        json!({"kind": "section", "text": "Passkeys"}),
+        json!({
+            "kind": "label", "muted": true,
+            "text": format!(
+                "This vault holds no passkey for {host}, so this browser does not offer \
+                 one there — that scoping is deliberate, because a browser that patches \
+                 `navigator.credentials` everywhere is one a bot check can spot. Arm it \
+                 to enrol here.",
+            ),
+        }),
+        json!({
+            "kind": "button", "id": "passkey_arm", "action": "passkey-arm",
+            "value": host, "label": "Enrol a passkey here",
+            "title": "Let this site ask this browser to create a passkey",
+        }),
+    ]
+}
+
 fn passkey_shim_widgets(state: &PasskeyShimState) -> Vec<Value> {
     match state {
         // Working, and silence is right: a banner on every render for a healthy
@@ -223,6 +287,36 @@ fn passkey_shim_widgets(state: &PasskeyShimState) -> Vec<Value> {
 /// for `example.com` is usable on `login.example.com`), so the pattern has to
 /// admit both. Two patterns rather than one because `*://*.example.com/*` does
 /// NOT match the bare `example.com` in WebKit's grammar.
+/// Hosts the user has explicitly armed for passkey ENROLMENT this session.
+///
+/// Deliberately process-local: a restart forgets it. An armed host is an
+/// exception to the fingerprinting scope, and an exception that outlives the
+/// intention behind it is just the old bug with extra steps.
+fn passkey_enrol_armed_store() -> &'static Mutex<std::collections::BTreeSet<String>> {
+    static ARMED: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
+    ARMED.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+}
+
+fn passkey_enrol_armed() -> std::collections::BTreeSet<String> {
+    passkey_enrol_armed_store().lock().unwrap().clone()
+}
+
+/// Returns true when the host was newly armed, false when it was already.
+fn passkey_enrol_arm(host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    // Refuse anything `rp_id_match_patterns` would refuse, at the door, rather
+    // than storing a value that silently produces no pattern later.
+    if rp_id_match_patterns(&host).is_empty() {
+        return false;
+    }
+    passkey_enrol_armed_store().lock().unwrap().insert(host)
+}
+
+fn passkey_enrol_disarm(host: &str) {
+    let host = host.trim().to_ascii_lowercase();
+    passkey_enrol_armed_store().lock().unwrap().remove(&host);
+}
+
 pub(crate) fn rp_id_match_patterns(rp_id: &str) -> Vec<String> {
     let host = rp_id.trim().trim_matches('.').to_ascii_lowercase();
     // A pattern built from a host containing a separator would silently widen
@@ -266,7 +360,7 @@ fn passkey_shim_scripts(state: &ControlState) -> Vec<crate::userscript::Userscri
     // deploy-ordering hazard of this change, it reached the user on 2026-08-01,
     // and the remedy is [`passkey_shim_widgets`] in the pane — a stderr line
     // reached nobody.
-    let patterns: Vec<String> = match passkey_shim_state() {
+    let mut patterns: Vec<String> = match passkey_shim_state() {
         PasskeyShimState::ScopedTo(rp_ids) => rp_ids
             .iter()
             .flat_map(|rp_id| rp_id_match_patterns(rp_id))
@@ -275,6 +369,25 @@ fn passkey_shim_scripts(state: &ControlState) -> Vec<crate::userscript::Userscri
         | PasskeyShimState::VaultUnavailable(_)
         | PasskeyShimState::AgentPredatesBrowser => Vec::new(),
     };
+    // ⛔ ENROLMENT WAS IMPOSSIBLE, AND SCOPING IS WHY. The patterns above come
+    // only from rp_ids the vault ALREADY holds a credential for, so a site you
+    // have no passkey for sees a pristine `navigator` — right for the
+    // fingerprinting fix, and it also means `navigator.credentials.create()`
+    // can never be called there. Every passkey in this vault was enrolled in
+    // some other browser. The user hit exactly this on a Google sign-in.
+    //
+    // The fix is NOT to widen the scope back. It is this: the user asks, in the
+    // pane, to enrol on the site they are looking at, and the anomaly exists
+    // only on a page a human deliberately armed. Arming is per-process and
+    // never persisted — a browser restart forgets it, which is the failure mode
+    // you want for a deliberate exception.
+    patterns.extend(
+        passkey_enrol_armed()
+            .iter()
+            .flat_map(|host| rp_id_match_patterns(host)),
+    );
+    patterns.sort();
+    patterns.dedup();
     if patterns.is_empty() {
         return Vec::new();
     }
@@ -335,6 +448,68 @@ struct AddDraft {
     seeded_host: Option<String>,
 }
 
+/// The Edit tab's draft.
+///
+/// ⛔ NOT ONE SECRET LIVES HERE, and that is what shapes the whole form. A
+/// schema travels app -> OSC -> GUI, so the pane's standing rule is that it
+/// carries names, usernames and booleans and never a value. An edit form
+/// pre-filled with the current password, authenticator secret, notes or hidden
+/// field values would break that rule on every render.
+///
+/// So the form pre-fills only what a LISTING already knows — name, username,
+/// uris, folder — and every secret box starts EMPTY and means "leave this
+/// alone". Custom fields show their NAMES (the card audit line already sets
+/// that precedent) and never their values. `--clear` is how a value is removed,
+/// exactly as on the CLI, because "I left the box empty" and "I want this gone"
+/// are different requests and guessing between them is data loss.
+#[derive(Default, Clone)]
+struct EditDraft {
+    /// How `list` identifies the item being edited. Empty = nothing loaded.
+    target_name: String,
+    target_user: String,
+    /// The values as LOADED, so a save can send only what actually changed. An
+    /// unchanged field re-encrypted for nothing moves `revisionDate` and makes
+    /// every other client's copy stale for no reason.
+    original: EditFields,
+    /// The values as edited.
+    current: EditFields,
+    /// The item's custom-field names, for the remove list. Names only.
+    field_names: Vec<String>,
+    /// A custom field to set, name here and value on the action only.
+    field_name: String,
+    field_hidden: bool,
+    clear_notes: bool,
+    clear_totp: bool,
+    generate_password: bool,
+}
+
+/// The pre-fillable half of an edit: exactly the fields a secret-free listing
+/// already carries.
+#[derive(Default, Clone, PartialEq, Eq)]
+struct EditFields {
+    name: String,
+    user: String,
+    /// One uri per line — the pane's spelling of the CLI's repeated `--uri`.
+    uris: String,
+    folder: String,
+}
+
+/// How long a vault's copy may go unrefreshed before the pane says so, and
+/// before opening the pane refreshes it.
+///
+/// ⛔ THIS NUMBER IS THE 2026-08-01 BUG. A password corrected in the official
+/// Bitwarden extension was filled from our stale copy into a sign-in form,
+/// because an unlocked agent holds its ciphers until something asks it to
+/// re-pull and nothing ever did — `lock_timeout_secs` is 0 on this fleet, so an
+/// agent can sit unlocked for days. Thirty minutes is the official clients' own
+/// background cadence; matching it means our copy is never older than theirs.
+const STALE_AFTER_SECS: u64 = 30 * 60;
+
+/// Do not re-attempt a FAILING auto-sync more often than this. Without it, a
+/// server that is down would make every click in the pane wait for a network
+/// timeout, since a failed sync leaves the copy stale and re-arms the trigger.
+const SYNC_RETRY_AFTER_SECS: u64 = 60;
+
 /// What the pane is currently showing. Host-resident, like everything else the
 /// app owns: yggterm holds no vault state, not even which tab is selected.
 pub(crate) struct PaneState {
@@ -350,6 +525,17 @@ pub(crate) struct PaneState {
     /// The last watchtower scan. Labels only — the report type cannot carry a
     /// password (see `ychrome_vault::watchtower`).
     watchtower: Option<Value>,
+    edit: EditDraft,
+    /// Why the last sync failed, held until one SUCCEEDS.
+    ///
+    /// ⛔ A TOAST IS NOT A REPORT. A sync that failed and said so for three
+    /// seconds leaves a pane that looks healthy while serving values that are
+    /// hours old — the same silence this whole change exists to end. This stays
+    /// on screen.
+    last_sync_error: Option<String>,
+    /// When a sync was last ATTEMPTED, successful or not, so a failing server
+    /// cannot make every click wait for a timeout.
+    last_sync_attempt: Option<std::time::Instant>,
 }
 
 impl Default for PaneState {
@@ -362,6 +548,9 @@ impl Default for PaneState {
             generate_length: DEFAULT_GENERATE_LENGTH,
             generate_no_symbols: false,
             watchtower: None,
+            edit: EditDraft::default(),
+            last_sync_error: None,
+            last_sync_attempt: None,
         }
     }
 }
@@ -955,7 +1144,7 @@ pub(crate) fn dispatch(
             if pane.tab == "add" {
                 pane.seed_add_draft(host.as_deref());
             }
-            (200, vault_schema(&pane, host.as_deref()))
+            (200, vault_schema(&mut pane, host.as_deref()))
         }
         ("GET", p) if p == format!("/pane/{SETTINGS_PANE}") => {
             let profile = state.pane.lock().unwrap().profile.clone();
@@ -1339,6 +1528,14 @@ fn item_row(item: &Value) -> Value {
             "title": "Fill the authenticator code into the page",
         }));
     }
+    // Editing was CLI-only until 2026-08-01: the pane could create an entry and
+    // fill one, and the user watched it serve a value they had already fixed in
+    // another client with no way to correct it here.
+    actions.push(json!({
+        "action": "edit-open",
+        "label": "✎",
+        "title": "Edit this entry",
+    }));
     json!({
         "kind": "list-row",
         "id": row_id(name, user),
@@ -1425,18 +1622,175 @@ fn locked_schema(status: &Value) -> Value {
     json!({ "title": "Vault", "widgets": widgets })
 }
 
+/// How stale the vault's copy is, and what to do about it.
+///
+/// The vault owns the FACT (`last_sync_unix`); this owns the reading of it, in
+/// one place, so the line the user reads and the decision to auto-refresh can
+/// never disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Freshness {
+    /// Pulled from the server this many seconds ago, recently enough to trust.
+    Fresh(u64),
+    /// This many seconds old. Another client may have changed something since.
+    Stale(u64),
+    /// The agent is older than this browser and does not report the fact. Not
+    /// the same as fresh, and it must not be drawn as fresh.
+    Unknown,
+}
+
+impl Freshness {
+    /// Read the vault's own timestamp. `now_unix` is passed in so this is
+    /// testable without a clock.
+    pub(crate) fn of(status: &Value, now_unix: u64) -> Self {
+        let Some(at) = status["last_sync_unix"].as_u64() else {
+            return Freshness::Unknown;
+        };
+        // A stamp from the future means the clock moved under us; treat it as
+        // "just now" rather than underflowing into a 500-year-old vault.
+        let age = now_unix.saturating_sub(at);
+        if age >= STALE_AFTER_SECS {
+            Freshness::Stale(age)
+        } else {
+            Freshness::Fresh(age)
+        }
+    }
+
+    fn age_secs(&self) -> Option<u64> {
+        match self {
+            Freshness::Fresh(age) | Freshness::Stale(age) => Some(*age),
+            Freshness::Unknown => None,
+        }
+    }
+}
+
+/// `3 hours ago`, `just now`. Coarse on purpose — a vault's freshness is a
+/// judgement, not a stopwatch.
+pub(crate) fn humanise_age(secs: u64) -> String {
+    let plural = |n: u64, unit: &str| {
+        if n == 1 {
+            format!("1 {unit} ago")
+        } else {
+            format!("{n} {unit}s ago")
+        }
+    };
+    // Floored, never rounded up: "2 hours" for 89 minutes overstates how stale
+    // the copy is, and this number is one the user makes a trust decision on.
+    // The ranges are chosen so the floor is always at least 1.
+    match secs {
+        0..=44 => "just now".to_string(),
+        45..=3599 => plural((secs / 60).max(1), "minute"),
+        3600..=86_399 => plural(secs / 3600, "hour"),
+        _ => plural(secs / 86_400, "day"),
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+/// The freshness line, and the failure that is not allowed to disappear.
+///
+/// Rendered at the TOP of the Fill tab, not buried in Tools: filling is where a
+/// stale value does its damage, and it is the tab that is open when it does.
+pub(crate) fn freshness_widgets(freshness: &Freshness, last_error: Option<&str>) -> Vec<Value> {
+    let mut widgets = Vec::new();
+    match freshness {
+        Freshness::Fresh(age) => widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": format!("Synced {}", humanise_age(*age)),
+        })),
+        // NOT muted: this is the line that would have saved a wrong password
+        // being filled into a sign-in form, and it has to read as a warning
+        // rather than as a timestamp.
+        Freshness::Stale(age) => widgets.push(json!({
+            "kind": "label",
+            "text": format!(
+                "⚠ Last synced {} — another client may have changed an entry since.                  Sync before you trust a password from here.",
+                humanise_age(*age),
+            ),
+        })),
+        Freshness::Unknown => widgets.push(json!({
+            "kind": "label",
+            "text": "⚠ This host's vault agent does not report when it last synced,                      so nothing here can tell you whether it is current. Install the                      current ychrome-vault and hand the agent over.",
+        })),
+    }
+    if let Some(error) = last_error {
+        widgets.push(json!({
+            "kind": "label",
+            "text": format!("⚠ The last sync FAILED and the entries below are whatever was already here: {error}"),
+        }));
+    }
+    widgets.push(json!({
+        "kind": "button", "id": "sync", "action": "sync",
+        "label": "Sync now",
+        "primary": matches!(freshness, Freshness::Stale(_)) || last_error.is_some(),
+    }));
+    widgets
+}
+
+/// Re-pull the ciphers when our copy has aged past [`STALE_AFTER_SECS`].
+///
+/// ⛔ THE BUTTON WAS NEVER ENOUGH. A "Re-sync from the server" button already
+/// existed, in the Tools tab, and the vault still served a value that had been
+/// corrected elsewhere hours earlier — because nobody clicks a button for a
+/// problem they cannot see. The pane opens on an explicit click, so refreshing
+/// there costs one round trip at exactly the moment the user is about to rely
+/// on the data.
+///
+/// Self-limiting: a SUCCESS resets the age, so this fires at most once per
+/// staleness window. A FAILURE does not, which is what `SYNC_RETRY_AFTER_SECS`
+/// is for — without it a server that is down would make every click in the pane
+/// wait for a network timeout.
+fn refresh_if_stale(state: &mut PaneState, status: &Value) -> Option<Value> {
+    if !matches!(Freshness::of(status, now_unix()), Freshness::Stale(_)) {
+        return None;
+    }
+    if let Some(attempted) = state.last_sync_attempt
+        && attempted.elapsed().as_secs() < SYNC_RETRY_AFTER_SECS
+    {
+        return None;
+    }
+    Some(run_sync(state))
+}
+
+/// Sync, and record the outcome where the pane can render it. THE one place a
+/// sync is performed, so the button and the automatic refresh cannot drift
+/// about what "synced" means or about how a failure is reported.
+fn run_sync(state: &mut PaneState) -> Value {
+    state.last_sync_attempt = Some(std::time::Instant::now());
+    match vault_op(json!({"op": "sync"})) {
+        Ok(reply) => {
+            state.last_sync_error = None;
+            reply
+        }
+        Err(error) => {
+            state.last_sync_error = Some(error.to_string());
+            Value::Null
+        }
+    }
+}
+
 /// The pane, with lock state resolved. A locked vault shows an unlock form, not
 /// the item list; `status` is the SSOT for it (a cheap agent round-trip). An
 /// error here (agent unreachable) surfaces the reason rather than a broken tab.
 ///
 /// The I/O lives here so [`unlocked_schema`] stays pure and testable without an
 /// agent — a test must never touch the user's real vault.
-fn vault_schema(state: &PaneState, host: Option<&str>) -> Value {
+fn vault_schema(state: &mut PaneState, host: Option<&str>) -> Value {
     // ONE `status` call per schema. It is the SSOT for lock state AND agent
     // staleness, so both branches read the same answer — the Tools tab used to
     // fetch it a second time and could disagree with the gate above it.
     match vault_status() {
         Ok(status) if status["state"].as_str() == Some("unlocked") => {
+            // Refresh FIRST, then re-read: the schema must render the state the
+            // user is about to act on, not the one that triggered the refresh.
+            let status = match refresh_if_stale(state, &status) {
+                Some(_) => vault_status().unwrap_or(status),
+                None => status,
+            };
             unlocked_schema(state, host, &status)
         }
         Ok(status) => locked_schema(&status),
@@ -1472,6 +1826,7 @@ fn unlocked_schema(state: &PaneState, host: Option<&str>, status: &Value) -> Val
     // arrives at this pane from a login page that just blamed their browser.
     // Silent when the shim is fine, which is nearly always.
     widgets.extend(passkey_shim_widgets(&passkey_shim_state()));
+    widgets.extend(passkey_enrol_widgets(host, &passkey_shim_state()));
 
     match state.tab.as_str() {
         "add" => {
@@ -1508,6 +1863,7 @@ fn unlocked_schema(state: &PaneState, host: Option<&str>, status: &Value) -> Val
                 "label": "Save to vault",
             }));
         }
+        "edit" => widgets.extend(edit_tab_widgets(&state.edit)),
         "tools" => {
             widgets.push(json!({"kind": "section", "text": "Vault"}));
             let state_label = status["state"].as_str().unwrap_or("unknown");
@@ -1517,7 +1873,20 @@ fn unlocked_schema(state: &PaneState, host: Option<&str>, status: &Value) -> Val
                 "text": format!("{state_label} · {items} items"),
             }));
             widgets.extend(stale_agent_widgets(status));
-            widgets.push(json!({"kind": "button", "id": "sync", "action": "sync", "label": "Re-sync from the server"}));
+            // The same freshness owner the Fill tab reads, so the two tabs can
+            // never tell the user different stories about the same vault.
+            widgets.extend(freshness_widgets(
+                &Freshness::of(status, now_unix()),
+                state.last_sync_error.as_deref(),
+            ));
+            widgets.push(json!({
+                "kind": "label", "muted": true,
+                "text": "Opening this pane re-syncs automatically once the copy is over \
+                         half an hour old. Nothing is held locally, so a sync never has a \
+                         local change to lose: every edit is written to the server as you \
+                         save it, and a save against a copy the server has since moved past \
+                         is REFUSED rather than merged.",
+            }));
             widgets.push(json!({"kind": "button", "id": "lock", "action": "lock", "label": "Lock the vault"}));
 
             widgets.push(json!({"kind": "section", "text": "Watchtower"}));
@@ -1534,6 +1903,13 @@ fn unlocked_schema(state: &PaneState, host: Option<&str>, status: &Value) -> Val
             }
         }
         _ => {
+            // ⛔ ABOVE THE SEARCH BOX. This is the tab a credential is filled
+            // from, and "how old is this copy" is the fact that separates a
+            // password from a wrong one.
+            widgets.extend(freshness_widgets(
+                &Freshness::of(status, now_unix()),
+                state.last_sync_error.as_deref(),
+            ));
             widgets.push(json!({
                 "kind": "search-box", "id": "query", "action": "search",
                 "placeholder": "Search vault…", "value": state.query,
@@ -1588,6 +1964,136 @@ fn unlocked_schema(state: &PaneState, host: Option<&str>, status: &Value) -> Val
     }
 
     json!({ "title": "Vault", "widgets": widgets })
+}
+
+/// The Edit form.
+///
+/// ⛔ EVERY SECRET BOX IS EMPTY AND MEANS "LEAVE THIS ALONE". A schema goes
+/// app -> OSC -> GUI, and this pane's standing rule is that it carries names,
+/// usernames and booleans — never a value. So this form cannot work the way a
+/// desktop password manager's does (show the current password, let the user
+/// retype it); it works the way the CLI does, where an unnamed field is
+/// preserved and removal is its own request.
+///
+/// That is not a workaround, it is the same "absent is not empty" rule the rest
+/// of the vault runs on: leaving a box blank and asking for a value to be
+/// deleted are different intentions, and a form that conflated them would
+/// destroy notes every time somebody fixed a username.
+fn edit_tab_widgets(draft: &EditDraft) -> Vec<Value> {
+    if draft.target_name.is_empty() {
+        return vec![
+            json!({"kind": "section", "text": "Edit an entry"}),
+            json!({
+                "kind": "label", "muted": true,
+                "text": "Pick an entry on the Fill tab and press ✎ to edit it.",
+            }),
+        ];
+    }
+    let mut widgets = vec![
+        json!({"kind": "section", "text": format!("Editing {}", draft.target_name)}),
+        json!({
+            "kind": "text-input", "id": "edit_name", "label": "Name",
+            "value": draft.current.name,
+        }),
+        json!({
+            "kind": "text-input", "id": "edit_user", "label": "Username",
+            "value": draft.current.user,
+        }),
+        json!({
+            "kind": "text-input", "id": "edit_uris", "label": "URIs (one per line)",
+            "value": draft.current.uris, "multiline": true, "rows": 3,
+            "placeholder": "https://example.com",
+        }),
+        json!({
+            "kind": "text-input", "id": "edit_folder", "label": "Folder",
+            "value": draft.current.folder,
+            "placeholder": "Leave empty to keep it where it is",
+        }),
+        json!({"kind": "section", "text": "Replace a secret"}),
+        json!({
+            "kind": "label", "muted": true,
+            "text": "These boxes are empty because this pane never carries a stored secret.                      Leave one empty and that value is left exactly as it is.",
+        }),
+        json!({
+            "kind": "text-input", "id": "edit_password", "label": "New password",
+            "secret": true, "value": "",
+            "placeholder": "Leave empty to keep the current one",
+        }),
+        json!({
+            "kind": "toggle", "id": "edit_generate", "label": "Roll a new password instead",
+            "value": draft.generate_password,
+        }),
+        json!({
+            "kind": "text-input", "id": "edit_totp", "label": "New authenticator secret",
+            "secret": true, "value": "",
+            "placeholder": "base32 or an otpauth:// URI",
+        }),
+        json!({
+            "kind": "text-input", "id": "edit_notes", "label": "Replace notes",
+            "multiline": true, "rows": 6, "value": "",
+            "placeholder": "Leave empty to keep the current notes",
+        }),
+    ];
+
+    widgets.push(json!({"kind": "section", "text": "Custom fields"}));
+    if draft.field_names.is_empty() {
+        widgets.push(json!({
+            "kind": "label", "muted": true, "text": "This entry carries none.",
+        }));
+    } else {
+        // NAMES ONLY. A custom field's value is a secret as often as not (a
+        // hidden field always is), and the card audit line already settled that
+        // a field NAME may travel where its value may not.
+        for name in &draft.field_names {
+            widgets.push(json!({
+                "kind": "list-row",
+                "id": name,
+                "title": name,
+                "actions": [{
+                    "action": "edit-remove-field",
+                    "label": "🗑",
+                    "title": "Remove this custom field",
+                }],
+            }));
+        }
+    }
+    widgets.push(json!({
+        "kind": "text-input", "id": "edit_field_name", "label": "Field name",
+        "value": draft.field_name, "placeholder": "API Key",
+    }));
+    widgets.push(json!({
+        "kind": "text-input", "id": "edit_field_value", "label": "Field value",
+        "secret": true, "value": "",
+        "placeholder": "Set or replace this field",
+    }));
+    widgets.push(json!({
+        "kind": "toggle", "id": "edit_field_hidden", "label": "Store it hidden",
+        "value": draft.field_hidden,
+    }));
+
+    widgets.push(json!({"kind": "section", "text": "Remove a value"}));
+    widgets.push(json!({
+        "kind": "label", "muted": true,
+        "text": "Emptying a box above keeps the old value. Removing one is this,                  deliberately separate.",
+    }));
+    widgets.push(json!({
+        "kind": "toggle", "id": "edit_clear_notes", "label": "Delete the notes",
+        "value": draft.clear_notes,
+    }));
+    widgets.push(json!({
+        "kind": "toggle", "id": "edit_clear_totp", "label": "Delete the authenticator secret",
+        "value": draft.clear_totp,
+    }));
+
+    widgets.push(json!({
+        "kind": "button", "id": "edit-save", "action": "edit-save", "primary": true,
+        "label": "Save changes",
+    }));
+    widgets.push(json!({
+        "kind": "button", "id": "edit-cancel", "action": "edit-cancel",
+        "label": "Cancel",
+    }));
+    widgets
 }
 
 /// Render a watchtower report. The report carries labels only, so this cannot
@@ -1685,6 +2191,218 @@ fn absorb_draft(state: &mut PaneState, values: &Value) {
     if let Some(no_symbols) = values["generate_no_symbols"].as_str() {
         state.generate_no_symbols = no_symbols == "true";
     }
+    // The edit draft's NON-SECRET half. `edit_password`, `edit_totp`,
+    // `edit_notes` and `edit_field_value` are deliberately absent: they reach
+    // this process on the save action, go straight to the agent, and are
+    // dropped. Keeping them in `PaneState` would be a stored secret with a
+    // lifetime nobody asked for.
+    if let Some(name) = text("edit_name") {
+        state.edit.current.name = name;
+    }
+    if let Some(user) = text("edit_user") {
+        state.edit.current.user = user;
+    }
+    if let Some(uris) = text("edit_uris") {
+        state.edit.current.uris = uris;
+    }
+    if let Some(folder) = text("edit_folder") {
+        state.edit.current.folder = folder;
+    }
+    if let Some(field) = text("edit_field_name") {
+        state.edit.field_name = field;
+    }
+    for (key, slot) in [
+        ("edit_field_hidden", &mut state.edit.field_hidden),
+        ("edit_clear_notes", &mut state.edit.clear_notes),
+        ("edit_clear_totp", &mut state.edit.clear_totp),
+        ("edit_generate", &mut state.edit.generate_password),
+    ] {
+        if let Some(raw) = values[key].as_str() {
+            *slot = raw == "true";
+        }
+    }
+}
+
+/// Read an entry's non-secret half into an edit draft.
+///
+/// ⛔ WHAT IS *NOT* READ IS THE POINT. The password, the authenticator secret,
+/// the notes and every custom field VALUE are deliberately left behind: they
+/// would have to sit in `PaneState` and ride down in a schema, and this pane's
+/// rule is that neither ever happens. `list` already carries everything here
+/// (it is the same secret-free metadata the rows are drawn from) except the
+/// field names, which come from `fields` — from which only the names are taken.
+fn load_edit_draft(name: &str, user: &str) -> Result<EditDraft> {
+    let listed = vault_op(json!({
+        "op": "list", "query": Value::String(name.to_string()), "trashed": false,
+    }))?;
+    let item = listed["items"]
+        .as_array()
+        .and_then(|items| {
+            items.iter().find(|item| {
+                item["name"].as_str() == Some(name)
+                    && item["username"].as_str().unwrap_or_default() == user
+            })
+        })
+        .ok_or_else(|| anyhow::anyhow!("{name} is no longer in the vault — sync and try again"))?;
+
+    let fields = EditFields {
+        name: item["name"].as_str().unwrap_or_default().to_string(),
+        user: item["username"].as_str().unwrap_or_default().to_string(),
+        uris: item["uris"]
+            .as_array()
+            .map(|uris| {
+                uris.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default(),
+        folder: item["folder"].as_str().unwrap_or_default().to_string(),
+    };
+    // Names only, and a failure here is not fatal: an item whose fields cannot
+    // be read is still worth editing for its username.
+    let field_names = vault_op(json!({"op": "fields", "name": name, "user": opt_field(user)}))
+        .ok()
+        .and_then(|reply| reply["fields"].as_array().cloned())
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(|field| field["name"].as_str())
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(EditDraft {
+        target_name: name.to_string(),
+        target_user: user.to_string(),
+        original: fields.clone(),
+        current: fields,
+        field_names,
+        ..EditDraft::default()
+    })
+}
+
+/// Build the `edit` op from the draft and the values the user just typed.
+///
+/// Returns `None` when nothing changed, so an accidental save is a no-op rather
+/// than a write that moves `revisionDate` and makes every other client's copy
+/// stale for nothing.
+///
+/// ⛔ ONLY WHAT CHANGED IS SENT. A pre-filled box that the user did not touch
+/// must not be re-encrypted and re-written: that is what `original` is for.
+/// A secret box that is EMPTY is absent from the request, which is how "leave
+/// it alone" is spelled on the wire — the same `Option` the CLI's flags build.
+fn build_edit_request(draft: &EditDraft, values: &Value) -> Option<Value> {
+    let typed = |key: &str| values[key].as_str().unwrap_or_default();
+    let mut request = json!({
+        "op": "edit",
+        "name": draft.target_name,
+        "user": opt_field(&draft.target_user),
+    });
+    let object = request.as_object_mut().expect("built as an object");
+    let mut changed = false;
+
+    if draft.current.name != draft.original.name && !draft.current.name.trim().is_empty() {
+        object.insert("rename".into(), json!(draft.current.name.trim()));
+        changed = true;
+    }
+    if draft.current.user != draft.original.user {
+        object.insert("set_user".into(), json!(draft.current.user.trim()));
+        changed = true;
+    }
+    if draft.current.uris != draft.original.uris {
+        object.insert("uris".into(), json!(uri_lines(&draft.current.uris)));
+        changed = true;
+    }
+    if draft.current.folder != draft.original.folder && !draft.current.folder.trim().is_empty() {
+        object.insert("folder".into(), json!(draft.current.folder.trim()));
+        changed = true;
+    }
+
+    // The secrets: present only when the user actually typed one.
+    let password = typed("edit_password");
+    if draft.generate_password {
+        object.insert("generate".into(), json!(true));
+        changed = true;
+    } else if !password.is_empty() {
+        object.insert("password".into(), json!(password));
+        changed = true;
+    }
+    let totp = typed("edit_totp");
+    if !totp.is_empty() {
+        object.insert("totp".into(), json!(totp));
+        changed = true;
+    }
+    let notes = typed("edit_notes");
+    if !notes.is_empty() {
+        object.insert("notes".into(), json!(notes));
+        changed = true;
+    }
+
+    let field_value = typed("edit_field_value");
+    if !draft.field_name.trim().is_empty() && !field_value.is_empty() {
+        object.insert(
+            "fields".into(),
+            json!([{
+                "name": draft.field_name.trim(),
+                "action": if draft.field_hidden { "set-hidden" } else { "set" },
+                "value": field_value,
+            }]),
+        );
+        changed = true;
+    }
+
+    let mut clear = Vec::new();
+    if draft.clear_notes {
+        clear.push("notes");
+    }
+    if draft.clear_totp {
+        clear.push("totp");
+    }
+    if !clear.is_empty() {
+        object.insert("clear".into(), json!(clear));
+        changed = true;
+    }
+
+    changed.then_some(request)
+}
+
+/// The agent's edit RECEIPT, or a refusal naming why there is none.
+///
+/// ⛔ AN AGENT OUTLIVES ITS BINARY AND IGNORES ARGUMENTS IT HAS NEVER HEARD OF.
+/// One that predates the edit work would take this request, silently drop
+/// `uris`, `clear` and `fields`, and answer with a cheerful success — the pane
+/// would then report a save that changed nothing. It cannot fake `verified`
+/// (that list comes from re-reading the item after the write), so its absence
+/// is the tell, exactly as on the CLI.
+fn require_verified(reply: Value) -> Result<Vec<String>> {
+    reply["verified"]
+        .as_array()
+        .map(|verified| {
+            verified
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "this host's vault agent is older than the browser and did not verify                  the edit — it silently ignores what it does not know. Hand it over                  from the Tools tab, then try again."
+            )
+        })
+}
+
+/// One uri per line -> the list the agent's `uris` argument wants. Blank lines
+/// are dropped rather than sent: an empty uri is refused by `edit_body`, and a
+/// stray newline in a text box is not a request to be refused.
+fn uri_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
@@ -1735,16 +2453,110 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
             }
             Err(error) => json!({ "toast": error.to_string() }),
         },
-        "sync" => match vault_op(json!({"op": "sync"})) {
-            Ok(reply) => {
-                let count = reply["item_count"].as_u64().unwrap_or(0);
-                merge(
-                    reschema(state, host.as_deref()),
-                    json!({ "toast": format!("Synced {count} items.") }),
-                )
+        // Through `run_sync`, the one owner, so a click and the automatic
+        // refresh report a failure the same way — on screen, not as a toast
+        // that is gone before it is read.
+        "sync" => {
+            let reply = run_sync(&mut state.lock().unwrap());
+            let toast = match reply["item_count"].as_u64() {
+                Some(count) => format!("Synced {count} items."),
+                None => "Sync failed — the reason is in the pane.".to_string(),
+            };
+            merge(reschema(state, host.as_deref()), json!({ "toast": toast }))
+        }
+        // Load an entry into the Edit form. Only what a LISTING already
+        // carries is read here — name, username, folder, uris, and the custom
+        // field NAMES. No password, no authenticator secret, no notes, no field
+        // value: none of those may sit in a schema.
+        "edit-open" => {
+            let (name, user) = split_row_id(&value);
+            match load_edit_draft(&name, &user) {
+                Ok(draft) => {
+                    {
+                        let mut state = state.lock().unwrap();
+                        state.edit = draft;
+                        state.tab = "edit".to_string();
+                    }
+                    reschema(state, host.as_deref())
+                }
+                Err(error) => json!({ "toast": error.to_string() }),
             }
-            Err(error) => json!({ "toast": error.to_string() }),
-        },
+        }
+        "edit-cancel" => {
+            {
+                let mut state = state.lock().unwrap();
+                state.edit = EditDraft::default();
+                state.tab = "fill".to_string();
+            }
+            reschema(state, host.as_deref())
+        }
+        // Removing a custom field is its own request, not a blank box.
+        "edit-remove-field" => {
+            let (target_name, target_user) = {
+                let state = state.lock().unwrap();
+                (
+                    state.edit.target_name.clone(),
+                    state.edit.target_user.clone(),
+                )
+            };
+            let request = json!({
+                "op": "edit", "name": target_name, "user": opt_field(&target_user),
+                "fields": [{"name": value, "action": "remove"}],
+            });
+            match vault_op(request).and_then(require_verified) {
+                Ok(_) => {
+                    // Reload, so the list the user is looking at is the list the
+                    // vault now holds rather than the one we just changed.
+                    if let Ok(draft) = load_edit_draft(&target_name, &target_user) {
+                        state.lock().unwrap().edit = draft;
+                    }
+                    merge(
+                        reschema(state, host.as_deref()),
+                        json!({ "toast": format!("Removed field {value}.") }),
+                    )
+                }
+                Err(error) => json!({ "toast": error.to_string() }),
+            }
+        }
+        "edit-save" => {
+            let request = {
+                let state = state.lock().unwrap();
+                build_edit_request(&state.edit, values)
+            };
+            let Some(request) = request else {
+                return json!({ "toast": "Nothing changed." });
+            };
+            match vault_op(request).and_then(require_verified) {
+                Ok(verified) => {
+                    let (target_name, target_user) = {
+                        let mut state = state.lock().unwrap();
+                        // The rename may have moved the item, so the draft is
+                        // re-anchored on what was saved before it is reloaded.
+                        state.edit.target_name = state.edit.current.name.clone();
+                        state.edit.target_user = state.edit.current.user.clone();
+                        state.edit.field_name.clear();
+                        state.edit.clear_notes = false;
+                        state.edit.clear_totp = false;
+                        state.edit.generate_password = false;
+                        (
+                            state.edit.target_name.clone(),
+                            state.edit.target_user.clone(),
+                        )
+                    };
+                    if let Ok(draft) = load_edit_draft(&target_name, &target_user) {
+                        state.lock().unwrap().edit = draft;
+                    }
+                    merge(
+                        reschema(state, host.as_deref()),
+                        // The RECEIPT, named: `verify_edit` re-read the item and
+                        // these are the changes it could actually see. Labels
+                        // only — the agent never puts a value in this list.
+                        json!({ "toast": format!("Saved and verified: {}.", verified.join(", ")) }),
+                    )
+                }
+                Err(error) => json!({ "toast": error.to_string() }),
+            }
+        }
         "unlock" => {
             // The master password reaches `ychrome-vault unlock` on stdin and is
             // used for this one call — never stored in PaneState, never echoed
@@ -1927,14 +2739,39 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 Err(error) => json!({ "toast": error.to_string() }),
             }
         }
+        "passkey-arm" => {
+            if passkey_enrol_arm(&value) {
+                let mut reply = reschema(state, host.as_deref());
+                reply["toast"] = json!(format!(
+                    "{value} can now ask for a passkey. Reopen the tab so the page is \
+                     built with it."
+                ));
+                reply
+            } else {
+                json!({ "toast": format!("{value} is not a host a passkey can scope to.") })
+            }
+        }
+        "passkey-disarm" => {
+            passkey_enrol_disarm(&value);
+            let mut reply = reschema(state, host.as_deref());
+            reply["toast"] = json!(format!("Passkey enrolment disarmed for {value}."));
+            reply
+        }
         "totp" => {
             let (name, user) = split_row_id(&value);
             match vault_op(json!({"op": "totp", "name": name, "user": opt_field(&user)})) {
                 Ok(reply) => {
                     let code = reply["code"].as_str().unwrap_or_default();
+                    // ⛔ The toast may only claim what is true on EVERY rung of
+                    // `totp_script`. It said "Filled" unconditionally while the
+                    // script was returning 'no-otp-field' — the user was told
+                    // the job was done and then watched a login fail.
                     json!({
                         "eval": totp_script(code),
-                        "toast": format!("Filled {name}'s authenticator code."),
+                        "toast": format!(
+                            "{name}'s code is ready — filled if the page had a field, \
+                             otherwise copied and shown on the page."
+                        ),
                     })
                 }
                 Err(error) => json!({ "toast": error.to_string() }),
@@ -1945,8 +2782,8 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
 }
 
 fn reschema(state: &Mutex<PaneState>, host: Option<&str>) -> Value {
-    let state = state.lock().unwrap();
-    json!({ "schema": vault_schema(&state, host) })
+    let mut state = state.lock().unwrap();
+    json!({ "schema": vault_schema(&mut state, host) })
 }
 
 // ---------------------------------------------------------------------------
@@ -2976,16 +3813,91 @@ fn card_fill_script(
     )
 }
 
+/// ⛔ **A CODE THE PAGE WOULD NOT TAKE MUST STILL REACH THE USER.**
+///
+/// This used to `querySelector` one selector list, `return 'no-otp-field'` when
+/// it matched nothing, and the caller toasted *"Filled …'s authenticator code"*
+/// either way — a lie-of-success on the exact flow where it hurts, because the
+/// user is mid-login with a code that expires in seconds. The user's report:
+/// *"In google TOTP our vault UI could not detect what to fill … on other
+/// clients I can just press edit beside the entry and copy paste the TOTP
+/// myself."* Every other client has a manual path; ours had none.
+///
+/// So the fill is now the FIRST rung of three, not the only one:
+///   1. fill a field we recognise — including inside same-origin iframes, which
+///      is where a Google 2FA input usually lives;
+///   2. else copy to the clipboard;
+///   3. else paint the code in the page, selectable, so it can always be read.
+///
+/// ⛔ The code deliberately does NOT go into the pane schema. A schema travels
+/// app → OSC → GUI and is re-sent on every refresh; `fill` already states that
+/// invariant for the password and it holds for a one-time code too. The eval is
+/// transient and consumed once, which is why the fallback lives in the page.
 fn totp_script(code: &str) -> String {
     format!(
         r#"(function() {{
 {SET_FIELD}
-  const otp = document.querySelector(
-    'input[autocomplete="one-time-code"], input[name*=otp i], input[name*=totp i], input[id*=otp i], input[name*=code i]');
-  if (!otp) return 'no-otp-field';
-  ychromeSet(otp, {code});
-  otp.focus();
-  return 'filled';
+  const SELECTOR = 'input[autocomplete="one-time-code"], input[name*=otp i], ' +
+    'input[name*=totp i], input[id*=otp i], input[name*=code i]';
+  function findField(doc) {{
+    const direct = doc.querySelector(SELECTOR);
+    if (direct) return direct;
+    // Same-origin frames only; a cross-origin one throws and is skipped.
+    for (const frame of Array.from(doc.querySelectorAll('iframe'))) {{
+      try {{
+        const inner = frame.contentDocument;
+        if (!inner) continue;
+        const hit = findField(inner);
+        if (hit) return hit;
+      }} catch (e) {{ /* cross-origin: not ours to read */ }}
+    }}
+    return null;
+  }}
+  function show(code, reason) {{
+    const old = document.getElementById('__ychrome_totp');
+    if (old) old.remove();
+    const box = document.createElement('div');
+    box.id = '__ychrome_totp';
+    box.setAttribute('style', [
+      'position:fixed', 'z-index:2147483647', 'top:16px', 'right:16px',
+      'padding:12px 14px', 'border-radius:10px', 'background:#262a33',
+      'color:#e5e5e5', 'font:600 22px/1.2 ui-monospace,monospace',
+      'letter-spacing:.14em', 'box-shadow:0 6px 24px rgba(0,0,0,.45)',
+      'border:1px solid #3b414f', 'user-select:all', 'cursor:text',
+    ].join(';'));
+    box.textContent = code;
+    const note = document.createElement('div');
+    note.setAttribute('style',
+      'font:400 11px/1.4 system-ui,sans-serif;letter-spacing:0;opacity:.7;margin-top:6px;user-select:none');
+    note.textContent = reason;
+    box.appendChild(note);
+    document.body.appendChild(box);
+    // One code, one window. It expires; the box must not outlive it.
+    setTimeout(function() {{ const b = document.getElementById('__ychrome_totp'); if (b) b.remove(); }}, 30000);
+    box.addEventListener('click', function() {{
+      const range = document.createRange();
+      range.selectNodeContents(box.firstChild ? box : box);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }});
+  }}
+  const otp = findField(document);
+  if (otp) {{
+    ychromeSet(otp, {code});
+    otp.focus();
+    return 'filled';
+  }}
+  try {{
+    if (navigator.clipboard && navigator.clipboard.writeText) {{
+      navigator.clipboard.writeText({code}).then(
+        function() {{ show({code}, 'no field found — copied, and here to read'); }},
+        function() {{ show({code}, 'no field found — select to copy'); }});
+      return 'copied';
+    }}
+  }} catch (e) {{ /* fall through to the visible rung */ }}
+  show({code}, 'no field found — select to copy');
+  return 'shown';
 }})()"#,
         code = js_string(code),
     )
@@ -3822,12 +4734,426 @@ mod tests {
             .iter()
             .map(|action| action["action"].as_str().unwrap())
             .collect();
-        assert_eq!(actions, ["fill", "totp"]);
+        // The FILL half is what varies by item: ⏱ appears only where a secret
+        // actually exists (`rbw list` could not say). ✎ is on every row, so the
+        // list is asserted for the fill actions rather than pinned whole — a
+        // pinned list is how adding a row affordance breaks a test about
+        // secrets.
+        assert_eq!(fill_actions(&row), ["fill", "totp"]);
+        assert!(actions.contains(&"edit-open"), "every row is editable");
 
         let plain = item_row(&json!({"name": "n", "username": "", "has_totp": false}));
-        let actions = plain["actions"].as_array().unwrap();
-        assert_eq!(actions.len(), 1, "no authenticator secret, no ⏱ button");
+        assert_eq!(
+            fill_actions(&plain),
+            ["fill"],
+            "no authenticator secret, no ⏱ button"
+        );
         assert_eq!(plain["subtitle"], "");
+    }
+
+    /// A row's actions minus the ones every row carries, so a test about WHICH
+    /// injector an item gets is not also a test of how many affordances exist.
+    /// ⛔ THE OTHER HALF OF THE 2026-08-02 REPORT: *"I cannot enter the passkey
+    /// when anyone requests me … there is no clicking to give passkey or save a
+    /// passkey."* Per-origin scoping made enrolment impossible on any site the
+    /// vault had never seen, which is every site you have not already enrolled
+    /// on — Google included. The answer is a deliberate per-site arm, not a
+    /// wider default.
+    #[test]
+    fn a_site_with_no_passkey_can_be_armed_for_enrolment() {
+        let host = "arm-test.example";
+        assert!(!passkey_enrol_armed().contains(host), "starts unarmed");
+
+        // The pane offers the door when the shim does not already cover the host.
+        let offer = passkey_enrol_widgets(
+            Some(host),
+            &PasskeyShimState::ScopedTo(vec!["other.example".into()]),
+        );
+        assert!(
+            offer.iter().any(|w| w["action"] == "passkey-arm"),
+            "no way to arm enrolment on a site the vault has never seen"
+        );
+
+        assert!(passkey_enrol_arm(host), "arming a good host must take");
+        assert!(!passkey_enrol_arm(host), "arming twice must not re-report");
+        assert!(passkey_enrol_armed().contains(host));
+
+        // ...and an armed host must actually reach the shim's match patterns,
+        // which is the whole point: the widget without the pattern is theatre.
+        let patterns: Vec<String> = passkey_enrol_armed()
+            .iter()
+            .flat_map(|h| rp_id_match_patterns(h))
+            .collect();
+        assert!(patterns.contains(&format!("*://{host}/*")));
+        let production = include_str!("sidebar.rs");
+        let builder = production
+            .split("fn passkey_shim_scripts(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n}").next())
+            .expect("passkey_shim_scripts is present");
+        assert!(
+            builder.contains("passkey_enrol_armed()"),
+            "the armed hosts never reach the shim, so arming does nothing"
+        );
+
+        // A host that cannot become a safe pattern is refused at the door.
+        assert!(!passkey_enrol_arm("*"), "a wildcard would widen the scope to everything");
+        assert!(!passkey_enrol_arm(""), "empty is not a host");
+
+        passkey_enrol_disarm(host);
+        assert!(!passkey_enrol_armed().contains(host), "disarm must actually clear it");
+    }
+
+    /// ⛔ THE 2026-08-02 REPORT, IN ONE ASSERTION. The user could not finish a
+    /// Google login: the pane found no field to fill, said "Filled …" anyway,
+    /// and left no way to read the code. A one-time code that reaches nobody is
+    /// worth exactly as much as no code, and the toast made it look like a
+    /// success — so the script must carry a fallback for the case where the
+    /// page has no field WE recognise, and the toast must be true on every rung.
+    #[test]
+    fn a_code_the_page_will_not_take_still_reaches_the_user() {
+        let script = totp_script("123456");
+        assert!(
+            script.contains("clipboard"),
+            "no clipboard rung: a page with no recognised field leaves the user stranded"
+        );
+        assert!(
+            script.contains("__ychrome_totp"),
+            "no visible rung: the clipboard can be refused, and then nothing shows the code"
+        );
+        assert!(
+            script.contains("contentDocument"),
+            "same-origin frames are not searched, and a 2FA input usually lives in one"
+        );
+        // The old shape: one query, then give up with a value nobody read.
+        assert!(
+            !script.contains("return 'no-otp-field'"),
+            "the script still bails without delivering the code"
+        );
+
+        // And the sentence the user actually sees may not overclaim. The old one
+        // was an unconditional "Filled {name}'s authenticator code."
+        let production = include_str!("sidebar.rs");
+        let totp_arm = production
+            .split(r#""totp" => {"#)
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n        }").next())
+            .expect("the totp action arm is present");
+        assert!(
+            !totp_arm.contains(r#"format!("Filled {name}"#),
+            "the toast claims a fill it cannot know happened"
+        );
+    }
+
+    fn fill_actions(row: &Value) -> Vec<&str> {
+        row["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|action| action["action"].as_str())
+            .filter(|action| *action != "edit-open")
+            .collect()
+    }
+
+    // ⛔ THE 2026-08-01 FAILURE, IN ONE ASSERTION. A vault that has not synced
+    // since the morning serves its copy with exactly the confidence of a fresh
+    // one. The pane must say the age, and must say it as a WARNING once the copy
+    // is old enough for another client to have changed something.
+    #[test]
+    fn a_stale_vault_says_so_where_the_filling_happens() {
+        let now = 1_800_000_000;
+        let stale = json!({"last_sync_unix": now - 4 * 3600});
+        let freshness = Freshness::of(&stale, now);
+        assert_eq!(freshness, Freshness::Stale(4 * 3600));
+
+        let widgets = freshness_widgets(&freshness, None);
+        let text = serde_json::to_string(&widgets).unwrap();
+        assert!(
+            text.contains("4 hours ago"),
+            "the AGE must be on screen: {text}"
+        );
+        assert!(
+            text.contains("another client may have changed"),
+            "the age needs its meaning, or it is just a timestamp: {text}"
+        );
+        // A warning drawn muted is a warning nobody reads.
+        let warning = widgets
+            .iter()
+            .find(|widget| {
+                widget["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("4 hours"))
+            })
+            .expect("the age line");
+        assert!(
+            warning["muted"].as_bool() != Some(true),
+            "a stale-vault warning must not be muted: {warning}"
+        );
+        assert!(
+            widgets.iter().any(|widget| widget["action"] == "sync"),
+            "the remedy must be right there: {text}"
+        );
+    }
+
+    // …and a fresh one is quiet, but still says WHEN. The user asked for a way
+    // to see it; a pane that only speaks up when it is unhappy cannot answer
+    // "is this current?" on demand.
+    #[test]
+    fn a_fresh_vault_still_reports_its_age_quietly() {
+        let now = 1_800_000_000;
+        let widgets = freshness_widgets(
+            &Freshness::of(&json!({"last_sync_unix": now - 90}), now),
+            None,
+        );
+        let text = serde_json::to_string(&widgets).unwrap();
+        assert!(text.contains("Synced 1 minute ago"), "{text}");
+        assert!(
+            widgets.iter().any(|widget| widget["action"] == "sync"),
+            "sync must be reachable without waiting for it to go stale: {text}"
+        );
+    }
+
+    // An agent too old to report the fact must not be drawn as fresh — that is
+    // the same "looks healthy, is not" shape as the passkey `agent_stale` trap.
+    #[test]
+    fn an_agent_that_cannot_report_its_sync_time_is_not_reported_as_fresh() {
+        assert_eq!(Freshness::of(&json!({}), 1_800_000_000), Freshness::Unknown);
+        let text = serde_json::to_string(&freshness_widgets(&Freshness::Unknown, None)).unwrap();
+        assert!(text.contains("does not report"), "{text}");
+        assert!(
+            !text.contains("Synced "),
+            "unknown must never read as synced: {text}"
+        );
+    }
+
+    // ⛔ A FAILED SYNC MAY NOT BE A TOAST. It has to stay on screen, and it has
+    // to say what the user is looking at instead — stale entries, not an empty
+    // list.
+    #[test]
+    fn a_failed_sync_stays_on_screen_and_says_what_is_being_served() {
+        let widgets = freshness_widgets(&Freshness::Fresh(10), Some("connection refused"));
+        let text = serde_json::to_string(&widgets).unwrap();
+        assert!(text.contains("connection refused"), "the reason: {text}");
+        assert!(text.contains("FAILED"), "{text}");
+        assert!(
+            text.contains("whatever was already here"),
+            "the user must know the list below is the OLD one: {text}"
+        );
+    }
+
+    // A clock that jumped backwards must not turn into a vault synced in the
+    // future or, through an underflow, one 500 years old.
+    #[test]
+    fn a_stamp_from_the_future_reads_as_just_now() {
+        let now = 1_800_000_000;
+        assert_eq!(
+            Freshness::of(&json!({"last_sync_unix": now + 600}), now),
+            Freshness::Fresh(0)
+        );
+    }
+
+    #[test]
+    fn ages_read_the_way_a_person_says_them() {
+        for (secs, expected) in [
+            (0, "just now"),
+            (44, "just now"),
+            (60, "1 minute ago"),
+            (3600, "1 hour ago"),
+            (4 * 3600, "4 hours ago"),
+            (2 * 86_400, "2 days ago"),
+        ] {
+            assert_eq!(humanise_age(secs), expected, "{secs}s");
+        }
+    }
+
+    // ⛔ THE EDIT FORM MAY NOT CARRY A STORED SECRET. Everything else about this
+    // form is negotiable; this is not. The boxes for a password, an
+    // authenticator secret, the notes and a field value are declared EMPTY, and
+    // what the form pre-fills is only what a secret-free listing already knows.
+    #[test]
+    fn the_edit_form_declares_every_secret_box_empty() {
+        let draft = EditDraft {
+            target_name: "github.com".into(),
+            target_user: "octocat".into(),
+            current: EditFields {
+                name: "github.com".into(),
+                user: "octocat".into(),
+                uris: "https://github.com".into(),
+                folder: "Work".into(),
+            },
+            field_names: vec!["API Key".into(), "Recovery Code".into()],
+            ..EditDraft::default()
+        };
+        let widgets = edit_tab_widgets(&draft);
+        for id in [
+            "edit_password",
+            "edit_totp",
+            "edit_notes",
+            "edit_field_value",
+        ] {
+            let widget = widgets
+                .iter()
+                .find(|widget| widget["id"] == id)
+                .unwrap_or_else(|| panic!("{id} is on the form"));
+            assert_eq!(
+                widget["value"], "",
+                "{id} must be declared empty — a stored secret may not ride a schema"
+            );
+        }
+        // The names of custom fields DO travel (the card audit line settles
+        // that); their values do not, and there is no widget that could carry one.
+        let text = serde_json::to_string(&widgets).unwrap();
+        assert!(text.contains("API Key"), "field names are shown: {text}");
+        // The non-secret half IS pre-filled, or the form would be useless.
+        assert!(text.contains("https://github.com"));
+        assert!(text.contains("Work"));
+    }
+
+    // Leaving a box empty and asking for a value to be deleted are DIFFERENT
+    // requests. A form that conflated them would wipe the notes every time
+    // somebody corrected a username — which is exactly the edit this user
+    // needed to make.
+    #[test]
+    fn an_empty_box_keeps_the_value_and_removal_is_its_own_request() {
+        let draft = EditDraft {
+            target_name: "github.com".into(),
+            current: EditFields {
+                name: "github.com".into(),
+                user: "new@example.com".into(),
+                ..EditFields::default()
+            },
+            original: EditFields {
+                name: "github.com".into(),
+                user: "old@example.com".into(),
+                ..EditFields::default()
+            },
+            ..EditDraft::default()
+        };
+        // Every secret box empty: the username changes, and NOTHING else is on
+        // the wire — no notes, no password, no clear.
+        let request = build_edit_request(&draft, &json!({})).expect("the username changed");
+        assert_eq!(request["set_user"], "new@example.com");
+        for absent in ["notes", "password", "totp", "clear", "fields", "rename"] {
+            assert!(
+                request.get(absent).is_none(),
+                "{absent} must not be sent when the user did not ask: {request}"
+            );
+        }
+
+        // Removal is only ever explicit.
+        let clearing = EditDraft {
+            clear_notes: true,
+            ..draft.clone()
+        };
+        let request = build_edit_request(&clearing, &json!({})).unwrap();
+        assert_eq!(request["clear"], json!(["notes"]));
+    }
+
+    // An unchanged form is a no-op. Saving it anyway would move `revisionDate`
+    // and make every other client's copy stale for nothing — the very problem
+    // this lane is about.
+    #[test]
+    fn saving_an_untouched_form_sends_nothing() {
+        let fields = EditFields {
+            name: "github.com".into(),
+            user: "octocat".into(),
+            uris: "https://github.com".into(),
+            folder: "Work".into(),
+        };
+        let draft = EditDraft {
+            target_name: "github.com".into(),
+            original: fields.clone(),
+            current: fields,
+            ..EditDraft::default()
+        };
+        assert!(build_edit_request(&draft, &json!({})).is_none());
+    }
+
+    // The typed secrets reach the request and nothing else does — including the
+    // hidden-field spelling, which is what keeps a secret out of the clear.
+    #[test]
+    fn typed_secrets_reach_the_request_under_the_right_action() {
+        let draft = EditDraft {
+            target_name: "github.com".into(),
+            field_name: "API Key".into(),
+            field_hidden: true,
+            ..EditDraft::default()
+        };
+        let request = build_edit_request(
+            &draft,
+            &json!({"edit_password": "new-pw", "edit_field_value": "sk-live"}),
+        )
+        .expect("a password and a field were typed");
+        assert_eq!(request["password"], "new-pw");
+        assert_eq!(request["fields"][0]["action"], "set-hidden");
+        assert_eq!(request["fields"][0]["name"], "API Key");
+    }
+
+    // ⛔ AN AGENT OLDER THAN THIS BROWSER SILENTLY DROPS WHAT IT DOES NOT KNOW.
+    // Without this the pane would report a save that changed nothing, which is
+    // the lie-of-success shape the CLI already refuses.
+    #[test]
+    fn a_save_with_no_receipt_is_a_failure_not_a_success() {
+        let error = require_verified(json!({"id": "c1", "name": "x"})).unwrap_err();
+        assert!(
+            error.to_string().contains("older than the browser"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("Hand it over"), "{error}");
+
+        let verified =
+            require_verified(json!({"verified": ["set_user", "field:API Key"]})).unwrap();
+        assert_eq!(verified, ["set_user", "field:API Key"]);
+    }
+
+    #[test]
+    fn uri_lines_drop_blanks_rather_than_sending_an_empty_uri() {
+        assert_eq!(
+            uri_lines("https://a.example\n\n  https://b.example  \n"),
+            ["https://a.example", "https://b.example"]
+        );
+        assert!(uri_lines("\n  \n").is_empty());
+    }
+
+    /// Render the REAL vault pane against a real unlocked vault and print it.
+    ///
+    /// ⛔ NEVER THE OPERATOR'S VAULT. It runs only when `HOME` has been pointed
+    /// at a throwaway one (`crates/ychrome-vault/tests/live_edit.rs` has the
+    /// fixture that builds it), and it refuses to run against the default home
+    /// rather than trusting the caller to have remembered.
+    ///
+    /// This is the content proof for the pane: the exact JSON yggterm draws,
+    /// produced by the same code path a click goes through, with a live agent
+    /// on the other end. A screenshot proves it was PAINTED; this proves what
+    /// was in it.
+    #[test]
+    #[ignore = "live: point HOME at a scratch vault first"]
+    fn render_the_vault_pane_against_a_scratch_vault() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert!(
+            home.starts_with("/tmp/"),
+            "refusing to render against {home} — point HOME at a scratch vault"
+        );
+        let mut state = PaneState::new("default");
+        for tab in ["fill", "tools"] {
+            state.tab = tab.to_string();
+            let schema = vault_schema(&mut state, Some("git.example.org"));
+            println!(
+                "=== {tab} ===\n{}",
+                serde_json::to_string_pretty(&schema).unwrap()
+            );
+        }
+        // And the edit form, loaded the way the ✎ affordance loads it.
+        let draft = load_edit_draft("git.example.org", "avik").expect("the fixture item");
+        state.edit = draft;
+        state.tab = "edit".to_string();
+        let schema = vault_schema(&mut state, Some("git.example.org"));
+        let text = serde_json::to_string_pretty(&schema).unwrap();
+        println!("=== edit ===\n{text}");
+        // The fixture's secrets must not be anywhere in what the GUI receives.
+        for secret in ["JBSWY3DPEHPK3PXP", "t-0001", "the personal forge"] {
+            assert!(!text.contains(secret), "{secret} reached the pane schema");
+        }
     }
 
     // The secret is embedded in the eval script (that is the design), but it
@@ -3866,7 +5192,15 @@ mod tests {
             .iter()
             .map(|action| action["action"].as_str().unwrap())
             .collect();
-        assert_eq!(actions, ["card-fill"], "a card cannot use the login fill");
+        assert_eq!(
+            fill_actions(&card),
+            ["card-fill"],
+            "a card cannot use the login fill"
+        );
+        assert!(
+            actions.contains(&"edit-open"),
+            "a card is editable too — name, notes, folder and custom fields"
+        );
         let wire = card.to_string();
         assert!(!wire.contains("4111111111114242"), "PAN leaked: {wire}");
         assert!(!wire.contains("737"), "CVV leaked: {wire}");
@@ -3881,7 +5215,8 @@ mod tests {
             .iter()
             .map(|action| action["action"].as_str().unwrap())
             .collect();
-        assert_eq!(actions, ["fill", "totp"]);
+        assert_eq!(fill_actions(&login), ["fill", "totp"]);
+        let _ = actions;
     }
 
     // The PAN rides the eval script (that is the design — the app computes, the

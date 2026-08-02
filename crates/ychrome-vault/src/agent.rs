@@ -729,12 +729,29 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
                 vault.items()
             };
             if let Some(query) = &query {
+                // CHEAP FIRST, then the decrypting pass. Name, username and uris
+                // are already decrypted in `VaultItem`, so the overwhelming
+                // majority of matches never touch the raw record; only an item
+                // that fails all three pays for its notes and field names to be
+                // decrypted.
+                //
+                // Searching name and username ALONE was the old behaviour, and
+                // it is far narrower than any other client: an entry whose notes
+                // say which of four accounts it is, or whose custom field is
+                // named "Recovery Code", was unfindable by the words the user
+                // remembered. See `Vault::deep_search_match` for what is
+                // deliberately still not searched.
                 items.retain(|item| {
                     item.name.to_lowercase().contains(query)
                         || item
                             .username
                             .as_deref()
                             .is_some_and(|user| user.to_lowercase().contains(query))
+                        || item
+                            .uris
+                            .iter()
+                            .any(|uri| uri.to_lowercase().contains(query))
+                        || vault.deep_search_match(&item.id, query)
                 });
             }
             items.sort_by(|a, b| {
@@ -1778,6 +1795,14 @@ pub fn status_json(manager: &VaultManager) -> Value {
     status["auto_lock"] = json!(lock_timeout_secs != 0);
     status["version"] = json!(env!("CARGO_PKG_VERSION"));
     status["exe_stamp"] = json!(exe_stamp());
+    // WHEN the ciphers were last pulled. Reported as an epoch second and not as
+    // "3 hours ago": the age is a presentation of this fact, and a client that
+    // renders it must not be able to disagree with the vault about what the
+    // fact IS. `null` when locked — a locked vault holds nothing to be stale.
+    status["last_sync_unix"] = match manager.last_sync_unix() {
+        Some(at) => json!(at),
+        None => Value::Null,
+    };
     status
 }
 
@@ -2459,6 +2484,68 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("unknown custom-field action"), "{error}");
+    }
+
+    // Search reached name and username ONLY, which is far narrower than any
+    // other Bitwarden client: an entry findable by its uri, by a word in its
+    // notes, or by the name of a custom field was simply unfindable here.
+    #[test]
+    fn search_reaches_uris_notes_and_custom_field_names() {
+        let state = synthetic_state();
+        let names = |query: &str| -> Vec<String> {
+            dispatch(&json!({"op": "list", "query": query}), &state).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // The fixture's GitHub login carries a uri, notes and a custom field.
+        assert_eq!(names("github"), ["GitHub"], "name still matches");
+        assert!(!names("github.com").is_empty(), "a uri must match");
+    }
+
+    // ⛔ A SEARCH BOX MUST NOT BECOME AN ORACLE. Matching on a hidden custom
+    // field's VALUE would let anyone at the socket confirm a guess one query at
+    // a time — type it, and the result list answers. Field NAMES identify;
+    // values reveal, and only names are searched.
+    #[test]
+    fn search_never_matches_a_custom_field_value() {
+        let key_bytes = [0x33u8; 64];
+        let seal_str = |text: &str| crate::model::seal(&key_bytes, text.as_bytes()).to_string();
+        let mut raw = serde_json::json!({
+            "id": "s1",
+            "type": 1,
+            "name": seal_str("Bank"),
+            "fields": [{
+                "name": seal_str("Recovery Code"),
+                "value": seal_str("swordfish"),
+                "type": 1,
+            }],
+            "login": {},
+        });
+        raw["notes"] = json!(seal_str("the note mentions pelican"));
+        let vault = crate::model::Vault::new(
+            crate::crypto::SymmetricKey::from_bytes(&key_bytes).unwrap(),
+            Default::default(),
+            vec![crate::model::RawCipher {
+                raw,
+                id: "s1".into(),
+                item_type: 1,
+                name: Some(crate::model::seal(&key_bytes, b"Bank")),
+                ..Default::default()
+            }],
+            vec![],
+            Default::default(),
+        );
+        // A field NAME and a word in the NOTES are both findable…
+        assert!(vault.deep_search_match("s1", "recovery"));
+        assert!(vault.deep_search_match("s1", "pelican"));
+        // …and the hidden field's value is not, however exactly it is typed.
+        assert!(
+            !vault.deep_search_match("s1", "swordfish"),
+            "a hidden field's value must never be searchable"
+        );
     }
 
     // `lock` must make the cached vault unreachable immediately.

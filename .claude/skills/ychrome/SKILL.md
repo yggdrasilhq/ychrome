@@ -126,6 +126,43 @@ record) and `Vault::edit_body` patches **that**:
   drop an empty value, so `--notes ""` arrived as "no fields named". `edit_value`
   preserves it so `edit_body` refuses it. Found by the live round trip.
 
+### ⛔ A VAULT IS ONLY AS GOOD AS ITS LAST SYNC, AND IT USED TO NEVER SAY
+
+**2026-08-01.** A password corrected in the official Bitwarden extension was
+filled from our copy — the OLD value — into a sign-in form. Nothing was broken:
+an unlocked agent holds its ciphers until something asks it to re-pull, and with
+`lock_timeout_secs: 0` (this fleet's default) it can sit unlocked for days.
+Nothing on screen said the copy was hours old, and the user's own words were
+*"I cannot ask the vault in GUI in any way to resync."*
+
+- `VaultManager::last_sync` is the fact, written in ONE place (`mark_synced`)
+  reached by `unlock`, `resync` and therefore every write. `lock` clears it —
+  a locked vault has no freshness. `status` reports `last_sync_unix`.
+- `sidebar::Freshness` is the reading of it, shared by the Fill tab and Tools so
+  they cannot tell different stories. **Over 30 minutes reads as a warning, not
+  a timestamp**, and it is deliberately not muted.
+- Opening the pane RE-SYNCS once the copy is over 30 minutes old. The button
+  alone was never enough — one existed, in Tools, and this still happened,
+  because nobody clicks a button for a problem they cannot see.
+- A failed sync **stays on screen** until one succeeds and says the list below is
+  the old one. A toast is not a report.
+
+### Editing from the pane, not just the CLI
+
+The row's ✎ opens an Edit form covering what the CLI covers. Two rules shape it:
+
+- **Every secret box is declared EMPTY and means "leave this alone".** A schema
+  travels app → OSC → GUI and may carry names, usernames and booleans — never a
+  value. So the form pre-fills only what a listing already knows (name, username,
+  uris, folder) and shows custom-field NAMES without their values.
+- **Removal is its own request** (`--clear`, the "Remove a value" toggles). An
+  empty box keeps the old value; conflating the two would wipe the notes every
+  time somebody fixed a username.
+
+`sidebar::require_verified` refuses a save whose reply carries no `verified`
+list — that is an agent older than the browser, which silently drops arguments
+it does not know and would otherwise report a save that changed nothing.
+
 ### Two unlocked agents WILL go stale against each other
 
 Each host's agent caches the vault at its own `unlock`/`sync`. A write from a
@@ -208,6 +245,7 @@ ychrome-vault edit NAME --set-field "API Key=v"      # custom fields, at last
 ychrome-vault edit NAME --set-hidden-field NAME      # value from STDIN, like a password
 ychrome-vault edit NAME --remove-field NAME
 ychrome-vault edit NAME --clear notes --clear totp   # remove, not blank
+ychrome-vault status                                # carries last_sync_unix
 ychrome-vault rm NAME [USER]           # -> TRASH.  --permanent destroys it.
 ychrome-vault generate 24              # local dice, no vault touched
 ychrome-vault sync | lock | stop-agent | ping | status | diagnose | check
