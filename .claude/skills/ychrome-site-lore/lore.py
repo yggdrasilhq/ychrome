@@ -175,10 +175,17 @@ def cmd_get(args: argparse.Namespace) -> int:
 #: full of the real names. A word-boundary substitution cannot match across the
 #: seam, so the guard survives the next scrub. Same lesson as a leak-scanner
 #: that must skip its own source: the detector is inside the search space.
-_HOSTS = "|".join(("jo" "jo", "man" "in"))
+_HOSTS = "|".join(("jo" "jo", "man" "in", "chi" "cago", "po" "po"))
+#: Private infrastructure domains. Same split-string reason as the hosts above.
+#: Deliberately NOT including the bare public apex — a public site's own domain
+#: belongs in lore — only the sub-hosts that are internal services.
+_PRIVATE_DOMAINS = "|".join(("g." "gour.top", "i." "gour.top", "llm." "gour.top",
+                             "drive." "gour.top", "mail." "gour.top"))
 
 PRIVATE_SHAPES = (
     (rf"\b(?:{_HOSTS})\b", "a fleet hostname — say 'the GUI host' / 'a headless host'", re.I),
+    (rf"\b(?:{_PRIVATE_DOMAINS})\b",
+     "a private infrastructure host — say 'the private forge' / 'the vault'", re.I),
     (r"[A-Za-z0-9._%+-]+@(?!example\.(?:com|org)\b)[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
      "an e-mail address — name the VAULT ENTRY, or 'the site's published helpdesk'", re.I),
     (r"\b(?:\+?91[-\s]?)?[6-9]\d{9}\b", "a phone number — write 'the registered number'", 0),
@@ -263,14 +270,27 @@ def cmd_log(args: argparse.Namespace) -> int:
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
-    """Audit every committed lore file. Exit 1 on any hit, so CI can gate on it.
+    """Audit every Markdown file in the lore directory. Exit 1 on any hit.
 
     The write-time gate in `log` only sees entries written THROUGH it; a file
     hand-edited in an editor bypasses it entirely. This is the sweep that
     catches that, and it is the one to run before a push.
+
+    ⚠ This scans `LORE_DIR/*.md` and **glob("*.md") is the whole of its reach**.
+    It does not read SKILL.md, this file, or anything else in the repository, so
+    a clean result here is not a clean repository — say so, rather than printing
+    a bare "clean" that a reader will hear as broader than it is. A checker that
+    overstates its own scope is how a leak survives an audit that "passed".
+
+    ⚠ It also scans `_`-prefixed files, which `_all_sites()` deliberately hides
+    from *reading* commands because they are templates rather than sites. Hiding
+    a file from the reader is fine; hiding it from the leak scanner is not, and
+    for a while `_TEMPLATE.md` and anything named like it were invisible here —
+    a silent hole that reported "clean" with a straight face.
     """
+    paths = sorted(LORE_DIR.glob("*.md")) if LORE_DIR.exists() else []
     total = 0
-    for path in _all_sites():
+    for path in paths:
         bad = scrub_violations(path.read_text(encoding="utf-8"))
         if bad:
             total += len(bad)
@@ -281,7 +301,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
         print(f"\n{total} private-data hit(s). The lore repo is PUBLIC — rewrite, "
               f"do not publish.", file=sys.stderr)
         return 1
-    print(f"clean — {len(_all_sites())} site file(s), no private data")
+    print(f"no private data in {len(paths)} lore file(s) under {LORE_DIR.name}/ "
+          f"— this checks the lore directory ONLY, not the rest of the repo")
     return 0
 
 
