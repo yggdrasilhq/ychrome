@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        YouTube Ad Defense
-// @version     1.1.0
+// @version     1.2.0
 // @match       https://*.youtube.com/*
 // @match       https://youtube.com/*
 // @world       main
@@ -15,15 +15,41 @@
 // schedule alongside the video. Delete those fields before the page reads them
 // and the player has nothing to schedule.
 //
-// Two layers, deliberately:
-//   1. NETWORK PRUNE (the real one). `window.fetch` and `XMLHttpRequest` are
-//      patched at document-start — before the player script exists — so every
-//      player response is pruned on the way in. The same prune runs over the
-//      inline `ytInitialPlayerResponse` the first page load ships in its HTML.
-//   2. DOM FALLBACK (the belt). If the response shape shifts and an ad reaches
+// ⚠ THE TRANSPORT IS NOT ONLY `fetch`, AND ASSUMING IT WAS IS WHY ADS CAME BACK.
+// Measured on www.youtube.com/watch in the ychrome engine on 2026-07-31, one
+// cold load, with every entry point instrumented:
+//
+//   window.fetch → /youtubei/v1/player .... 1 call, and NOT the video's player
+//                                           response (a 328-byte field probe)
+//   JSON.parse(<60-260 KB string>) ........ 9 calls, EVERY ONE still carrying
+//                                           adPlacements, adSlots, playerAds
+//                                           and adBreakHeartbeatParams
+//   Response.prototype.json() ............. 3 calls carrying the same fields,
+//                                           on Responses whose `.url` is EMPTY
+//                                           — i.e. built in JS by the page,
+//                                           never seen by a fetch hook
+//
+// So the player reads its answer through `JSON.parse` and through
+// JS-constructed `Response` objects, and a blocker that only wraps `fetch`,
+// `XMLHttpRequest` and the inline `ytInitialPlayerResponse` prunes three copies
+// while the player quietly parses a fourth. Hooking the two PARSE points is
+// what closes it — they are the narrowest place every route has to pass
+// through, whatever carried the bytes.
+//
+// Three layers, deliberately:
+//   1. NETWORK PRUNE. `window.fetch` and `XMLHttpRequest` are patched at
+//      document-start — before the player script exists — so every player
+//      response is pruned on the way in. The same prune runs over the inline
+//      `ytInitialPlayerResponse` the first page load ships in its HTML.
+//   2. PARSE PRUNE (the one that actually covers the modern player).
+//      `JSON.parse` and `Response.prototype.json` are the two funnels a player
+//      response cannot avoid: whether the bytes came from fetch, XHR, a cache
+//      replay, a prefetch or an inline script, an object only reaches the
+//      player by passing through one of them.
+//   3. DOM FALLBACK (the belt). If the response shape shifts and an ad reaches
 //      the screen anyway, click the skip button, or seek past an unskippable
 //      one. It also WARNS on the console the first time it fires, because an ad
-//      on screen means layer 1 did not cover it, and that is the thing worth
+//      on screen means the prune did not cover it, and that is the thing worth
 //      knowing. It deliberately does NOT force playbackRate any more: WebKit
 //      clamps a forced rate to about 2x, so the user watched every ad anyway,
 //      faster and weirder, while the dead primary path stayed invisible.
@@ -66,8 +92,33 @@
     ];
     // --------------------------------------------------------------------------
 
-    var state = { pruned: 0, skipped: 0, forwarded: 0 };
+    // ⚠ THE NATIVE PARSER, CAPTURED BEFORE WE HOOK IT. Layer 2 replaces
+    // `JSON.parse`, and `pruneText` below parses a body in order to decide
+    // whether to REWRITE it. If `pruneText` used the hooked parser, the hook
+    // would prune the object first, `pruneAds` would then find nothing left to
+    // remove, and `pruneText` would hand back the ORIGINAL TEXT — ad fields and
+    // all — to a caller that reads the body as text rather than as JSON. The
+    // two layers would cancel each other out and the failure would be silent.
+    var nativeParse = JSON.parse;
+    var nativeStringify = JSON.stringify;
+
+    // `pruned` is the headline count a maintainer reads first; `hooks` says
+    // WHICH funnel bit, which is the difference between "YouTube renamed a
+    // field" and "YouTube moved the response to a route we do not watch".
+    var state = {
+        pruned: 0,
+        skipped: 0,
+        forwarded: 0,
+        hooks: { fetch: 0, xhr: 0, inline: 0, json_parse: 0, response_json: 0 },
+    };
     window.__yga_state = state;
+
+    function pruneVia(hook, root) {
+        var before = state.pruned;
+        var removed = pruneAds(root);
+        if (state.pruned !== before) state.hooks[hook] += 1;
+        return removed;
+    }
 
     function isAdBearingUrl(url) {
         if (!url) return false;
@@ -116,20 +167,61 @@
     // Prune a JSON body given as text. Returns the ORIGINAL string untouched
     // when there was nothing to remove (or it was not JSON at all), so a
     // non-player response is never rewritten.
-    function pruneText(text) {
+    function pruneText(hook, text) {
         if (typeof text !== 'string' || !text) return text;
         var data;
         try {
-            data = JSON.parse(text);
+            // nativeParse, NOT JSON.parse — see the note where it is captured.
+            data = nativeParse(text);
         } catch (e) {
             return text;
         }
-        if (!pruneAds(data)) return text;
+        if (!pruneVia(hook, data)) return text;
         try {
-            return JSON.stringify(data);
+            return nativeStringify(data);
         } catch (e) {
             return text;
         }
+    }
+
+    // A cheap pre-filter for the parse hooks: does this text even MENTION an ad
+    // field? `JSON.parse` is on YouTube's hot path, so the hook must cost
+    // nothing on the strings that are not player responses. Scanning is O(n)
+    // and the parse the caller already asked for is more expensive than that,
+    // so the ceiling on this is a small constant factor — and it is only paid
+    // by strings that survive the length test.
+    var AD_NEEDLES = [];
+    // The shortest text that could contain the shortest needle at all: the
+    // needle, plus the `{`, `:`, one character of value and `}` around it.
+    // DERIVED from AD_FIELDS rather than chosen, so it cannot drift out of step
+    // with the field list, and so it can never skip a body that had something
+    // to remove.
+    var MIN_PARSE_SCAN = 0;
+    for (var needleAt = 0; needleAt < AD_FIELDS.length; needleAt++) {
+        var needle = '"' + AD_FIELDS[needleAt] + '"';
+        AD_NEEDLES.push(needle);
+        if (MIN_PARSE_SCAN === 0 || needle.length + 4 < MIN_PARSE_SCAN) {
+            MIN_PARSE_SCAN = needle.length + 4;
+        }
+    }
+    function mentionsAnAdField(text) {
+        for (var i = 0; i < AD_NEEDLES.length; i++) {
+            if (text.indexOf(AD_NEEDLES[i]) !== -1) return true;
+        }
+        return false;
+    }
+
+    // Is this parsed object a player response, or something carrying one? Used
+    // by the `Response.prototype.json` hook to decide whether to walk. The
+    // measured shapes are all three of these: ad fields at the top level, a
+    // `playerResponse` wrapper, and a bare player response identified by
+    // `streamingData`/`videoDetails`.
+    function carriesAPlayerResponse(data) {
+        if (!data || typeof data !== 'object') return false;
+        for (var i = 0; i < AD_FIELDS.length; i++) {
+            if (Object.prototype.hasOwnProperty.call(data, AD_FIELDS[i])) return true;
+        }
+        return !!(data.playerResponse || data.streamingData || data.videoDetails);
     }
 
     // ---- Layer 1a: fetch -----------------------------------------------------
@@ -151,7 +243,7 @@
                 // and leave the caller a Response it can no longer read.
                 if (resp.status === 204 || resp.status === 205) return resp;
                 return resp.text().then(function (text) {
-                    var out = pruneText(text);
+                    var out = pruneText('fetch', text);
                     // Nothing removed: hand back a Response with the identical
                     // body rather than the consumed original.
                     return new Response(out, {
@@ -184,7 +276,7 @@
             var prunedOnce = function (raw) {
                 if (raw === cacheIn) return cacheOut;
                 cacheIn = raw;
-                cacheOut = pruneText(raw);
+                cacheOut = pruneText('xhr', raw);
                 return cacheOut;
             };
             if (textDesc && textDesc.get) {
@@ -205,7 +297,7 @@
                         // (blob, arraybuffer) is not a player response.
                         if (typeof raw === 'string') return prunedOnce(raw);
                         if (raw && typeof raw === 'object') {
-                            pruneAds(raw);
+                            pruneVia('xhr', raw);
                             return raw;
                         }
                         return raw;
@@ -234,7 +326,7 @@
     // on window catches that assignment (a top-level `var` assigns through an
     // existing accessor), and the eager prune covers a page that already ran.
     var inlinePlayerResponse = window.ytInitialPlayerResponse;
-    if (inlinePlayerResponse) pruneAds(inlinePlayerResponse);
+    if (inlinePlayerResponse) pruneVia('inline', inlinePlayerResponse);
     try {
         Object.defineProperty(window, 'ytInitialPlayerResponse', {
             configurable: true,
@@ -242,7 +334,7 @@
                 return inlinePlayerResponse;
             },
             set: function (value) {
-                if (value && typeof value === 'object') pruneAds(value);
+                if (value && typeof value === 'object') pruneVia('inline', value);
                 inlinePlayerResponse = value;
             },
         });
@@ -250,7 +342,60 @@
         // Already non-configurable: the eager prune above is all we get.
     }
 
-    // ---- Layer 2: the DOM fallback -------------------------------------------
+    // ---- Layer 2a: JSON.parse ------------------------------------------------
+    // THE FUNNEL. Layer 1 wraps three ways bytes can ARRIVE; this wraps the one
+    // way they become an object the player can read. Measured on a single cold
+    // watch-page load: nine `JSON.parse` calls on 60-260 KB strings, every one
+    // of them still carrying all four ad fields, every one from YouTube's own
+    // `kevlar_base_module` — none of which passed through the fetch hook. That
+    // gap is the whole of "the userscript runs, the fields are gone from
+    // `ytInitialPlayerResponse`, and the user still sees ads".
+    //
+    // The object is edited IN PLACE and handed straight back, so a caller's
+    // reference, prototype and property order are the parser's, not ours. No
+    // re-serialisation: a player response round-tripped through
+    // stringify/parse would be a different object graph for no reason.
+    var origParse = JSON.parse;
+    JSON.parse = function (text) {
+        var out = origParse.apply(this, arguments);
+        try {
+            if (typeof text === 'string' && text.length >= MIN_PARSE_SCAN
+                && mentionsAnAdField(text)) {
+                pruneVia('json_parse', out);
+            }
+        } catch (e) { /* a prune must never break the page's own parse */ }
+        return out;
+    };
+
+    // ---- Layer 2b: Response.prototype.json -----------------------------------
+    // The player replays payloads it already holds by BUILDING a `Response` in
+    // JavaScript and reading it back — measured: three such calls per cold
+    // load, each carrying the four ad fields, each on a Response whose `.url`
+    // is the empty string because nothing ever fetched it. A URL-matching hook
+    // is structurally unable to see those, which is why the empty URL is
+    // treated as a reason TO prune rather than a reason to skip.
+    var responseProto = typeof Response !== 'undefined' && Response.prototype;
+    if (responseProto && typeof responseProto.json === 'function') {
+        var origJson = responseProto.json;
+        responseProto.json = function () {
+            var url = '';
+            try {
+                url = this.url || '';
+            } catch (e) { /* an exotic Response: treat it as urlless */ }
+            var pending = origJson.apply(this, arguments);
+            if (!pending || typeof pending.then !== 'function') return pending;
+            return pending.then(function (data) {
+                try {
+                    if (url === '' || isAdBearingUrl(url) || carriesAPlayerResponse(data)) {
+                        pruneVia('response_json', data);
+                    }
+                } catch (e) { /* ignore */ }
+                return data;
+            });
+        };
+    }
+
+    // ---- Layer 3: the DOM fallback -------------------------------------------
     // `ad-showing` is the class YouTube puts on the player container while an ad
     // is on screen — the one bit that says "right now". Watching just that
     // attribute keeps this observer off the hot path of YouTube's DOM churn.
@@ -264,30 +409,36 @@
     var adPoll = null;
     var warnedUnpruned = false;
 
-    // AN AD ON SCREEN MEANS LAYER 1 DID NOT FIRE. Layer 2 exists to soften
+    // AN AD ON SCREEN MEANS THE PRUNE DID NOT FIRE. Layer 3 exists to soften
     // that, never to hide it — this warning is the difference between a user
     // who knows the blocker needs attention and one who just thinks it is
-    // broken in a weird way. `state.pruned` separates the two failures a
-    // maintainer would chase:
-    //   pruned === 0  -> the hooks never bit. Either AD_FIELDS has been renamed
-    //                    by YouTube, or the script is running in the ISOLATED
-    //                    world, where its window.fetch patch is invisible to
-    //                    the page (see crate::provision for how that happened).
-    //   pruned  >  0  -> the prune works and this particular break arrived by a
-    //                    route AD_BEARING_PATHS does not cover.
+    // broken in a weird way. The counters separate the failures a maintainer
+    // would chase, and `state.hooks` is the one that matters most now:
+    //   pruned === 0        -> nothing bit at all. Either AD_FIELDS has been
+    //                          renamed by YouTube, or the script is running in
+    //                          the ISOLATED world, where its patches are
+    //                          invisible to the page (see crate::provision for
+    //                          how exactly that happened once).
+    //   hooks.json_parse and hooks.response_json both 0, others non-zero
+    //                       -> the funnels never saw a player response. That is
+    //                          the shape of a NEW transport, and the thing to
+    //                          measure is which call the player parses through.
+    //   pruned > 0          -> the prune works and this break arrived carrying
+    //                          a field AD_FIELDS does not name.
     function warnLayerOneMissed() {
         if (warnedUnpruned) return;
         warnedUnpruned = true;
         try {
             console.warn(
-                '[ychrome youtube-adblock] an ad reached the player, so the network prune ' +
+                '[ychrome youtube-adblock] an ad reached the player, so the prune ' +
                 'did not cover it. Pruned fields so far: ' + state.pruned + '. ' +
+                'Per hook: ' + nativeStringify(state.hooks) + '. ' +
                 (state.pruned === 0
                     ? 'NOTHING has been pruned this session — check that this script runs in ' +
                       'the MAIN world (@world main) and that AD_FIELDS still matches a live ' +
                       '/youtubei/v1/player response.'
-                    : 'The prune is working, so this break arrived on a path ' +
-                      'AD_BEARING_PATHS does not list.')
+                    : 'The prune is working, so this break arrived carrying a field ' +
+                      'AD_FIELDS does not name.')
             );
         } catch (e) { /* no console: the counters still carry it */ }
     }

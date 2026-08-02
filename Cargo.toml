@@ -27,7 +27,10 @@ base64 = "0.22"
 # the same lockfile entries — so the engine adds a module, not a toolchain.
 cairo-rs = { version = "0.18", features = ["png"] }
 clap = { version = "4", features = ["derive"] }
-ctrlc = "3"
+# `termination` so SIGTERM reaches the daemon's handler too: a deploy or a
+# `kill` is exactly when an unreaped Xvfb gets left behind, and plain SIGINT
+# (the default feature set) never fires for either.
+ctrlc = { version = "3", features = ["termination"] }
 dirs = "5"
 # Pure-Rust (miniz_oxide) inflate for the bundled adblock ruleset, which is
 # 19 MB of JSON and 1.9 MB gzipped. No C toolchain, no TLS, nothing that

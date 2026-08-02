@@ -28,12 +28,20 @@ use anyhow::{Result, bail};
 use glib::translate::{IntoGlib, ToGlibPtr, from_glib_full};
 use serde_json::json;
 use webkit2gtk::{
-    NetworkProxyMode, NetworkProxySettings, UserContentInjectedFrames, UserContentManager,
-    UserContentManagerExt, UserScript, UserScriptInjectionTime, WebContext, WebsiteDataManager,
-    WebsiteDataManagerExt,
+    CookieManagerExt, CookiePersistentStorage, NetworkProxyMode, NetworkProxySettings,
+    UserContentInjectedFrames, UserContentManager, UserContentManagerExt, UserScript,
+    UserScriptInjectionTime, WebContext, WebsiteDataManager, WebsiteDataManagerExt,
 };
 
 use crate::userscript::ScriptWorld;
+
+/// The cookie jar's filename inside a profile directory.
+///
+/// It is `cookies` because that is what wry writes for the visible surface and
+/// the standalone window. The engine and the surface must be ONE browser to a
+/// website (this module's whole premise), and two files would make them two.
+/// If wry ever renames it, this is the line that has to move with it.
+pub const COOKIE_JAR_FILE: &str = "cookies";
 
 /// The name of the isolated world engine userscripts run in.
 ///
@@ -83,10 +91,66 @@ fn build(profile: &str) -> Result<ProfileIdentity> {
     // copy, not an engine-specific sibling: the point of Phase C is that these
     // are one identity.
     let dir = crate::profile_dir(profile)?;
+    // ⭐ BOTH base directories are the profile jar, because wry passes the SAME
+    // path for both (`webkitgtk/web_context.rs`: `base_cache_directory` and
+    // `base_data_directory` are each `data_directory`). A cache directory of our
+    // own would be exactly the "engine-specific sibling" the paragraph above
+    // says this is not.
+    //
+    // It was `dir.join("cache")` until 2026-08-01, and the consequence is the
+    // cookie bug's twin: WebKit's HTTP disk cache lives under
+    // `<base_cache_directory>/WebKitCache`, so the engine filled
+    // `<profile>/cache/WebKitCache` while the visible browser filled
+    // `<profile>/WebKitCache` and NEITHER could read the other's records.
+    // Measured on dev and the GUI host before the fix: three profiles on each host
+    // carried BOTH trees, one written by the engine and one by the surface.
+    // Every engine page therefore refetched assets the user's own browser had
+    // on disk a second earlier, and vice versa — "one browser" was true for
+    // cookies and false for every byte of cacheable content.
+    //
+    // `hsts-storage.sqlite` and `CacheStorage` (the service-worker Cache API)
+    // live under the same root and were forked the same way, so an HSTS upgrade
+    // the surface learned was unknown to the engine.
+    //
+    // Concurrency is not a new question here: `base_data_directory` was ALREADY
+    // shared, so the daemon's network process and the GUI's have always
+    // co-written this profile's cookies, localstorage and IndexedDB. WebKit's
+    // NetworkCache is written as per-record files published by rename and
+    // checksum-verified on read, so the worst a racing writer costs is a miss.
     let manager = WebsiteDataManager::builder()
         .base_data_directory(dir.to_string_lossy().as_ref())
-        .base_cache_directory(dir.join("cache").to_string_lossy().as_ref())
+        .base_cache_directory(dir.to_string_lossy().as_ref())
         .build();
+    // ⭐ COOKIES DO NOT PERSIST JUST BECAUSE THE JAR HAS A DIRECTORY.
+    //
+    // A `WebsiteDataManager` with base directories still gets a MEMORY-ONLY
+    // cookie store: WebKitGTK persists cookies only when someone calls
+    // `set_persistent_storage`. wry does that for the visible surface and the
+    // standalone window (`webkitgtk/web_context.rs`), so those wrote
+    // `<profile>/cookies`; the engine built its manager by hand and never did,
+    // so EVERY engine page started with an empty jar and wrote nothing back.
+    //
+    // Measured on dev, 2026-07-31: after a full page load under a fresh
+    // profile, that profile's directory held `cache/`, `storage/` and
+    // `mediakeys/` and NO `cookies` file, while a profile the visible browser
+    // had used held one. So the module's claim above — "a page logged in under
+    // profile X in the visible surface is logged in here" — was false, and
+    // `parity.rs`'s cookie test passed only because both its pages live in one
+    // process sharing one in-memory store.
+    //
+    // The failure this causes is worse than "logged out": a bot-check clearance
+    // cookie (`cf_clearance`) can never be kept, so a site that issues one
+    // re-challenges on every single navigation and the challenge LOOPS with
+    // nothing on screen to explain why.
+    //
+    // Same path and same format as wry, deliberately — `<profile>/cookies`,
+    // Netscape text — because the whole point is that this is not a second jar.
+    if let Some(cookies) = manager.cookie_manager() {
+        cookies.set_persistent_storage(
+            dir.join(COOKIE_JAR_FILE).to_string_lossy().as_ref(),
+            CookiePersistentStorage::Text,
+        );
+    }
     let context = WebContext::with_website_data_manager(&manager);
 
     // THE policy — one call, one owner. The engine does not decide whether ad
@@ -122,6 +186,10 @@ fn build(profile: &str) -> Result<ProfileIdentity> {
         applied: json!({
             "profile": profile,
             "jar": dir.display().to_string(),
+            // The cookie FILE, not just the directory. Reported because "the jar
+            // directory exists" was never evidence that cookies survive, and a
+            // reader of this journal line deserves the path they can stat.
+            "cookie_jar": dir.join(COOKIE_JAR_FILE).display().to_string(),
             "user_agent": policy.user_agent,
             "userscripts": scripts_attached,
             "userscript_detail": script_detail,
@@ -430,6 +498,93 @@ mod tests {
         assert!(
             !source.contains("web-profiles"),
             "the jar path belongs to crate::profile_dir, not to this module"
+        );
+    }
+
+    /// ⭐ THE COOKIE JAR MUST BE ASKED TO PERSIST.
+    ///
+    /// A `WebsiteDataManager` with base directories still stores cookies in
+    /// MEMORY ONLY. For three months the engine built one that way and every
+    /// page it opened started logged out and threw its cookies away on exit —
+    /// invisibly, because the profile directory filled up with cache and
+    /// storage and looked alive. A clearance cookie from a bot check
+    /// (`cf_clearance`) could never be kept, so a challenged site re-challenged
+    /// forever.
+    ///
+    /// Source-level, like the test above, and for the same reason: the failure
+    /// is architectural and SILENT. There is no assertion about a live page
+    /// that would have caught it — `parity.rs` set a cookie and read it back in
+    /// the same process, and passed.
+    #[test]
+    fn the_profiles_cookie_jar_is_made_persistent_at_the_wrys_own_path() {
+        let source = include_str!("identity.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the module body precedes its tests");
+        assert!(
+            source.contains("set_persistent_storage("),
+            "without this call the engine's cookies are memory-only and every \
+             page starts logged out"
+        );
+        assert!(
+            source.contains("CookiePersistentStorage::Text"),
+            "the format has to match wry's, or the engine and the visible \
+             surface keep two jars that cannot read each other"
+        );
+        // wry writes `<profile>/cookies`. One browser, one file.
+        assert_eq!(super::COOKIE_JAR_FILE, "cookies");
+    }
+
+    /// ⭐ THE HTTP DISK CACHE MUST LAND WHERE THE VISIBLE SURFACE'S DOES.
+    ///
+    /// The cookie test above has a twin, and it went unnoticed for as long.
+    /// `WebsiteDataManager` takes TWO base directories and wry passes the
+    /// profile jar for both; the engine passed the jar for data and
+    /// `<jar>/cache` for cache. WebKit puts its HTTP disk cache at
+    /// `<base_cache_directory>/WebKitCache`, so the two halves of "one browser"
+    /// kept two caches and neither could read the other's records — an engine
+    /// page refetched what the user's browser had just stored, silently, while
+    /// both directories looked healthy.
+    ///
+    /// Source-level for the cookie test's exact reason: a forked cache is
+    /// invisible at runtime. Both managers work, both fill a directory, and the
+    /// only symptom is bytes on the wire that did not need to be there.
+    #[test]
+    fn the_profiles_http_cache_lands_in_the_same_jar_the_surface_uses() {
+        // CODE only. The module documents the bug it fixes, naming the old path
+        // in prose, and a scan that read the commentary would fail on the very
+        // war story that stops the next person reintroducing it. This test
+        // caught exactly that on the commit that added it.
+        let source: String = include_str!("identity.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the module body precedes its tests")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = source.as_str();
+        let arg_of = |call: &str| -> String {
+            let start = source
+                .find(call)
+                .unwrap_or_else(|| panic!("{call} must be called on the builder"))
+                + call.len();
+            let rest = &source[start..];
+            let end = rest.find(')').expect("the call has to close");
+            rest[..end].trim().to_string()
+        };
+        assert_eq!(
+            arg_of(".base_cache_directory("),
+            arg_of(".base_data_directory("),
+            "both base directories must be the profile jar itself — a cache \
+             directory of the engine's own splits the HTTP cache, the HSTS \
+             store and CacheStorage away from the visible surface's"
+        );
+        // The specific regression: a `cache` subdirectory under the jar.
+        assert!(
+            !source.contains("join(\"cache\")"),
+            "`<jar>/cache` is the forked cache directory this test exists to \
+             keep out"
         );
     }
 }

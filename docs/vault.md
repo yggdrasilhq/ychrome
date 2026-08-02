@@ -16,7 +16,8 @@ State: `~/.yggterm/vault/` — `config.json` (secret-free), `agent.sock`, and
 | `crypto` | KDF → master key → stretched key → user key; EncString type-2 (AES-256-CBC + HMAC-SHA256), MAC checked in constant time before decrypt; type-3/4 (RSA-OAEP) for organization keys |
 | `api` | `prelogin`, the identity token endpoint, `sync`. Responses navigated case-insensitively (Vaultwarden drifts PascalCase↔camelCase) |
 | `model` | The unlocked `Vault`: user key + still-encrypted ciphers. Metadata is secret-free; passwords and TOTP secrets decrypt on demand |
-| `totp` | RFC 6238, `otpauth://` URIs |
+| `totp` | RFC 6238, `otpauth://` URIs. A wall-clock mint goes through `clock` first |
+| `clock` | Is this host's clock fit to mint a one-time code? Reads the KERNEL's NTP state (`adjtimex`), never a time daemon's opinion of itself |
 | `matching` | Page-host → item rules (below) |
 | `generator` | Local password generation (no server, no `rbw generate` subprocess) |
 | `watchtower` | Reused + weak password analysis. Groups by SHA-256 digest, so no plaintext password ever sits in a collection; only entry labels leave the module |
@@ -46,7 +47,7 @@ Requests and responses are one JSON object per line:
 
 Ops: `ping`, `status`, `unlock`, `lock`, `stop`, `handover`, `sync`, `list` (`trashed:true`
 for the trash), `get`, `notes`, `fields`, `card`, `card-secret`, `totp`,
-`totp-secret`, `passkeys`, `match`, `suggest`, `add`, `edit`,
+`totp-secret`, `passkeys`, `passkey-hosts`, `match`, `suggest`, `add`, `edit`,
 `rm`, `restore`, `generate`. The agent auto-starts on `unlock` (and on
 `ping`) and detaches into its own process group, so the shell that first needed
 it can go away. A socket left behind by a SIGKILLed agent is detected (nobody
@@ -215,7 +216,8 @@ taking the first — deterministic.
 ychrome-vault configure --server https://vault.example.com --email you@example.com
 read -rs PW; echo "$PW" | ychrome-vault unlock   # once
 ychrome-vault get github.com                     # password on stdout
-ychrome-vault totp github.com                    # 6-digit code
+ychrome-vault totp github.com                    # 6-digit code (refuses on a bad clock)
+ychrome-vault clock                              # what the kernel says about this host's clock
 ychrome-vault passkeys github.com                # rpId<TAB>user<TAB>credId<TAB>created
 ychrome-vault card "HDFC Regalia"                # brand<TAB>holder<TAB>month<TAB>year<TAB>last4
 ychrome-vault list                               # name<TAB>user<TAB>folder
@@ -223,6 +225,12 @@ ychrome-vault match chat.example.com                  # what an auto-fill may us
 ychrome-vault generate 24                        # local dice, no vault touched
 ychrome-vault add example.com alice --generate --uri https://example.com
 ychrome-vault edit example.com alice --generate   # rotate the password
+ychrome-vault edit example.com --rename "Example (work)" --set-user new@example.com
+ychrome-vault edit example.com --uri https://example.com --uri https://login.example.com
+ychrome-vault edit example.com --set-field "API Key=sk-123"   # custom field
+ychrome-vault edit example.com --set-hidden-field "Recovery"  # value from stdin
+ychrome-vault edit example.com --remove-field "Old Token"
+ychrome-vault edit example.com --clear notes --clear totp     # remove, not blank
 ychrome-vault rm example.com alice                # to the trash, restorable
 ychrome-vault list --trashed                      # show the trash
 ychrome-vault restore example.com alice           # bring it back from the trash
@@ -269,7 +277,8 @@ but undocumented.
 | --- | --- |
 | `rbw list --fields name,user,folder` | `ychrome-vault list` (same TSV) |
 | `rbw get NAME [USER]` | `ychrome-vault get NAME [USER]` |
-| `rbw code NAME [USER]` | `ychrome-vault totp NAME [USER]` |
+| `rbw code NAME [USER]` | `ychrome-vault totp NAME [USER]` (refuses on an undisciplined clock; `--ignore-clock` waives) |
+| _(none — rbw guesses)_ | `ychrome-vault clock` |
 | `rbw unlock` | `read -rs PW; echo "$PW" \| ychrome-vault unlock` |
 | `rbw lock` | `ychrome-vault lock` |
 | `rbw add NAME [USER]` | `ychrome-vault add NAME [USER]` |
@@ -448,8 +457,72 @@ patches *that*:
   this cipher is out of date") instead of clobbering another client's edit.
 - Replacing a password prepends the OLD ciphertext to `passwordHistory`, reusing
   it verbatim rather than re-encrypting.
-- Clearing a field is **not** expressible: `--notes ""` is rejected rather than
-  quietly encrypting an empty string. That needs its own verb.
+- Clearing a field is a SEPARATE request, `--clear <field>`
+  (`notes|totp|username|uri|folder`, repeatable). Setting one to `""` is still
+  rejected rather than quietly encrypting an empty string: a stored empty string
+  and an absent value are different facts, and an edit must not guess which one
+  was meant. `--clear-totp` is the same request as `--clear totp`, kept because
+  it shipped first; `ClearField` is the one owner of the spelling. There is
+  deliberately **no** `--clear password`: that destroys a secret with nothing to
+  recover it from (password history records a *replacement*), and removing an
+  item is what `rm` is for, which trashes.
+
+  ⚠ **Absent is not empty on the WRITE side either, and it had no twin.** The
+  agent's argument decoder dropped an empty value, so `--notes ""` arrived as
+  "you named no fields" and the documented refusal above was unreachable from
+  the CLI — the user was told to name a field they had named. `edit_value` now
+  preserves the empty string across the wire so `edit_body` is the one thing
+  that answers for it. Found by the live round trip, not by review.
+
+### Custom fields are editable, not just readable
+
+`--set-field NAME=VALUE` replaces a field's value and appends the field if it is
+absent. `--set-hidden-field NAME` does the same for a hidden one and reads the
+value from **stdin**, exactly as a password does — one per edit, because stdin
+carries one value. `--remove-field NAME` deletes it.
+
+The rules that are not obvious, each one locked by a test:
+
+- **The entry is MUTATED, never rebuilt.** A custom field is an object carrying
+  more than name/value/type (`linkedId`, and whatever Bitwarden adds next), so
+  rebuilding it from what this client models would be the same data loss as
+  rebuilding a cipher, one level down.
+- **Setting a value on a HIDDEN field keeps it hidden.** `--set-field` means
+  "do not change the visibility"; a secret that silently became a plain text
+  field on its next edit would be rendered in the clear by every Bitwarden
+  client. `--set-hidden-field` is the only thing that changes the type, and it
+  only ever hides.
+- **A LINKED field is refused.** It points at the item's own username or
+  password and stores no value; writing one would break what it links to.
+- **A duplicated name is refused, not guessed.** Bitwarden permits two fields
+  with one name; picking one could overwrite the wrong secret, and there is no
+  undo.
+- **Removing a field that is not there is an error.** "There was nothing to
+  remove" and "removed it" are different facts.
+
+### Uris are a list, and an unchanged one keeps what it carries
+
+`--uri` is repeatable and replaces the whole list, in the order given. A uri the
+item ALREADY stores is carried over as its stored object rather than re-minted,
+because a uri is not a string: it carries the per-uri `match` type the user
+chose in another client, `uriChecksum` on newer servers, and anything added
+later. Re-minting `{uri, match: null}` would discard all of it.
+
+### An edit is re-read before it is reported
+
+⛔ **A 200 from `PUT` is not proof.** It says the server accepted a body; whether
+the item now holds what the user asked for is a different question. `edit_item`
+therefore re-syncs and runs `Vault::verify_edit`, which decrypts the fresh
+cipher and checks each named change. The reply carries a `verified` list of
+field LABELS (`name`, `password`, `field:API Key`, `clear:notes`) and never a
+value; a change the re-read cannot find makes the whole edit a failure, however
+cleanly the write returned.
+
+That receipt doubles as the stale-agent guard. **An agent outlives its binary
+and silently ignores arguments it does not know** — a newer CLI's `uris`,
+`clear` and `fields` would have gone into a void and reported success. An old
+agent cannot fake `verified`, so its absence is the tell, and the CLI refuses
+with the `handover` remedy rather than lying.
 
 ### `rm` trashes by default
 
@@ -480,6 +553,18 @@ never bring back or touch a live entry that happens to share a name. A
 
 ## What is proven, and what is not
 
+- **The TOTP clock gate** — the kernel read is proven live on **dev**:
+  `ychrome-vault clock` answers `{"sync":"synchronized","source":"adjtimex",
+  "max_error_secs":0.03}` and agrees with `timedatectl`'s
+  `System clock synchronized: yes`, which is the only line that told the truth
+  during the 72-second incident. The **refusal** branch is proven by unit test
+  and by mutation (seven production call sites, each made RED and restored) and
+  is **NOT live-reproducible**: every host in this fleet now has a disciplined
+  clock, and breaking one to watch the refusal fire would break the operator's.
+  ⚠ A full mint-through-the-gate against the REAL vault has not been run either:
+  it needs the operator's unlocked agent handed over to this binary, and an
+  unlock is his to type.
+
 - **Read path** — proven end to end against the real vault at `vault.example.com`
   (1107 ciphers, 35 with TOTP, 936 with URIs), and in `cargo test` against a
   synthetic vault sealed with the real primitives, so
@@ -495,6 +580,19 @@ never bring back or touch a live entry that happens to share a name. A
 - **`add` against a real server** — proven on `vault.example.com`: an item was created,
   `cipher_count` went 1107 → 1108, `get` round-tripped the exact generated
   password, and `match` resolved it by its stored URI.
+- **The full edit surface against a real server** — proven on a SCRATCH
+  vaultwarden (`2026.6.0`, gitHash `2629bcbe`) in
+  `crates/ychrome-vault/tests/live_edit.rs`, which registers its own throwaway
+  account and creates its own items, so it can never touch a real vault. It
+  drives the actual `ychrome-vault` binary the way a user types it: title,
+  username, notes, password-from-stdin (with the old one landing in
+  `passwordHistory`), two uris at once, the authenticator secret, custom fields
+  created / updated / hidden-from-stdin / removed, and `--clear`. Every change
+  is read back through the CLI. It also asserts that `favorite` and `reprompt`
+  — written by a different client and modelled nowhere here — are still on the
+  cipher afterwards, which is the property raw-patching exists to protect,
+  measured rather than argued. Run it with
+  `YCHROME_VAULT_TEST_SERVER=… cargo test -p ychrome-vault --test live_edit -- --ignored`.
 - **`edit` against a real server** — proven on `vault.example.com`. Notes were written to
   an item on one host; a **password-only** edit was then issued from a *different*
   host's client; the notes read back intact, alongside name, username and URI.
@@ -546,8 +644,20 @@ never bring back or touch a live entry that happens to share a name. A
     `granted()`, which the GUI's presence dialog calls; a headless agent has no
     path to a signature. There is deliberately **no agent/CLI op** for it yet —
     exposing one over the socket would be an auto-consent path.
-  - **Not yet built** (the browser slice): the `navigator.credentials` userscript
-    shim (WebKitGTK has no WebAuthn), the loopback signer bridge, the
-    user-presence dialog that mints `UserPresence`, credential *creation*
-    (`create()`), and signCount increment. `keyValue` decoding + real-RP
-    acceptance are validated there.
+  - **The browser slice IS built** (this paragraph said otherwise until
+    2026-08-01, and a doc that lies is worse than no doc): the
+    `navigator.credentials` userscript shim, the token-gated `/fido2/*` signer
+    routes, the GUI presence dialog that mints `UserPresence`, and credential
+    *creation* — `/fido2/create` → the signer → the agent's `fido2-create` op →
+    `VaultManager::add_passkey_login`, which seals a fresh P-256 key under the
+    user key. What is still owed is **acceptance by a real relying party** and
+    signCount increment.
+  - ⛔ **THE SHIM IS INSTALLED ONLY WHERE A PASSKEY ALREADY EXISTS, WHICH MAKES
+    ENROLMENT IMPOSSIBLE.** `passkey_shim_scripts` builds its match patterns
+    from the rpIds the vault already holds credentials for, so a site you have
+    no passkey for sees a pristine `navigator` — correct for the
+    fingerprinting bug it fixes, and it also means `create()` can never be
+    called there. Every credential in this vault was therefore enrolled in some
+    OTHER browser. Closing it needs an explicit per-site opt-in (the user asking
+    to enrol on the site they are looking at), not a return to installing
+    everywhere. Filed in `docs/pending-bugs.md`.
