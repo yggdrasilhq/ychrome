@@ -7,15 +7,17 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
-## ★★ THE VAULT PANE'S REVEAL AND COPY ARE BUILT BUT NOT PIXEL-PROVEN, AND SYNC IS STILL A BUTTON
+## ★ THE VAULT PANE STILL WAITS FOR YOU TO PRESS SYNC, AND THE USER'S OWN DAEMONS HAVE NOT SEEN THE PANE YET
 
-**Status:** OPEN — parts 1 and 2 are FIXED IN CODE and proven against a scratch
-vault; what is owed is the live pane on the GUI host, and the schedule.
+**Status:** OPEN — reveal, copy and the last-synced FACT are SHIPPED and
+live-proven in the GUI (pixels below). What is left of this entry is (c), the
+sync SCHEDULE, plus one deploy note: the daemons the user's own sessions are
+attached to still run the old binary, and retiring them is his call.
 
 User-tested the sidebar against the real Bitwarden extension side by side,
-2026-08-02, with screenshots. Three gaps; two are built, one remains.
+2026-08-02, with screenshots. Three gaps; two are closed, one remains.
 
-### 1. Edit could not SHOW a stored value — ✅ BUILT 2026-08-02, live proof owed
+### 1. Edit could not SHOW a stored value — ✅ CLOSED 2026-08-02, live-proven
 
 The user's words: *"I cannot edit the existing fields or see them to manually
 copy paste."* The pane was a REPLACE form, not an EDIT form, so you could not
@@ -36,7 +38,7 @@ the form that actually matters: **a secret is never in a schema AT REST or in a
 LISTING.** Locked by `the_schema_route_cannot_carry_a_revealed_value` and
 `a_revealed_value_lives_in_exactly_one_render`.
 
-### 2. No copy actions on a row — ✅ BUILT 2026-08-02, live proof owed
+### 2. No copy actions on a row — ✅ CLOSED 2026-08-02, live-proven
 
 Bitwarden's row overflow offers **Copy username · Copy password · Copy
 verification code**. Ours offered fill ⧉, totp ⏱ and edit ✎ — every affordance
@@ -50,15 +52,19 @@ value is handed to the GUI as an `eval` calling `navigator.clipboard.writeText`
 takes. There is no OSC 52 spelling: that would put the secret in the scrollback
 ring.
 
-⚠ **Two honest limits, neither yet observed on a real page.**
-- `navigator.clipboard` exists only in a **secure context**, so on a plain http
-  page there is nothing to write with. The page notice names that and points at
-  the eye. A hidden-textarea `execCommand('copy')` fallback was refused on
-  purpose: it puts the secret in the page's own DOM, where the page can read it,
-  and a user copying a password on some unrelated site did not consent to that.
-- Whether WebKitGTK grants `writeText` to a GUI-injected eval at all (user
-  gesture / focus) is **not measured yet**. If it refuses, the notice says so and
-  the eye is the route; but the "Copied" path has not been seen to fire.
+✅ **THE CLIPBOARD RUNG IS MEASURED, NOT ASSUMED.** The open question was whether
+WebKitGTK grants `writeText` to a GUI-injected eval at all (user gesture, focus).
+It does: on a live surface at `https://example.com/`, "Copy password" from a
+row's menu left the page saying *"Copied the password to the clipboard."* and
+`navigator.clipboard.readText()` read back **20 characters** — the scratch item's
+generated password, by length, never printed. Same for the notes (**18**).
+
+⚠ **One honest limit remains.** `navigator.clipboard` exists only in a **secure
+context**, so on a plain http page there is nothing to write with; the page
+notice names that and points at the eye. That branch has not been exercised on a
+real http page. A hidden-textarea `execCommand('copy')` fallback was refused on
+purpose: it puts the secret in the page's own DOM, where the page can read it,
+and a user copying a password on some unrelated site did not consent to that.
 
 ⛔ A card still has neither verb. Number and CVV reach a page only through
 `card-fill` — a PAN in a transcript is durable and cannot be rotated (settled
@@ -100,8 +106,8 @@ detail, which does not hold if an installer overwrites in place and keeps the
 inode.
 ✅ **The agent-side half of (b) is also cleared**: the post-handover agent
 reports `last_sync_unix` (measured `1785682003`).
-✅ **(b) PANE HALF DONE 2026-08-02**: a current copy reads **"Last synced 3
-minutes ago"** as a muted fact with the Sync now button under it, and carries no
+✅ **(b) PANE HALF DONE 2026-08-02**: a current copy reads **"Last synced 1
+minute ago"** as a muted fact with the Sync now button under it, and carries no
 `⚠` at all. The warning survives for the two cases that earn one — a copy over 30
 minutes old, and an agent that cannot report the fact — and the second now offers
 the one-click **"Hand the agent over (keeps it unlocked)"** button instead of
@@ -111,20 +117,40 @@ user press it. Today the only automatic pull is on pane OPEN, once the copy is
 over 30 minutes old (`refresh_if_stale`), so a pane left open goes stale in
 silence.
 
-⚠ **WHAT IS OWED FOR 1 AND 2: THE PIXEL.** The data path is proven live — the
-scratch-vault fixture (`provision_a_scratch_vault_for_a_live_proof`) plus
-`render_the_vault_pane_against_a_scratch_vault` drives a REAL unlocked agent
-through `run_action`: `edit-reveal` on notes, the authenticator key and a custom
-field returns the stored value, the very next `GET /pane/vault` carries none of
-it, `edit-copy` returns an eval holding the value and a toast that does not, and
-a copy of a field the item lacks refuses by name. What has NOT been seen is the
-pane painted with an eye in it, because the pane is served by the ychrome DAEMON
-and both this fleet's daemons were holding live surfaces (dev: 5, including the
-linked WhatsApp Web session; the GUI host: 3). Retiring one is the operator's
-call, not an agent's. **The observation that closes this: open the vault pane on
-a session whose ychrome daemon is running a binary from 2026-08-02 or later,
-press ✎ on an entry, and see the "Stored values" rows — then press 👁 and watch
-one value appear and be gone on the next redraw.**
+✅ **PIXEL-PROVEN 2026-08-02, ON THE LIVE GUI HOST, WITHOUT TOUCHING ANYTHING
+OF HIS.** The proof rig is the one this repo already had for exactly this:
+`provision_a_scratch_vault_for_a_live_proof` against a throwaway vaultwarden in
+docker, a scratch `HOME` (its own ychrome daemon, its own vault agent, adblock
+off so the GUI never recompiles a ruleset), a probe row created with
+`--no-activate`, and a SHADOW client. Observed, in that order:
+
+1. the pane paints **"Last synced 1 minute ago"** as a muted fact with `Sync now`
+   under it and no `⚠` anywhere — part 3, on screen;
+2. `✎` opens the Edit tab with a **Stored values** section: Password ·
+   Verification code · Authenticator key · Notes, plus the custom field below;
+3. `👁` on Notes paints the stored value with *"Shown once. The pane keeps
+   nothing"* under it;
+4. a plain `GET /pane/vault` refetch immediately after shows the row **bare
+   again** — the one-render invariant, in pixels rather than in an assertion;
+5. right-clicking a row opens **Copy username · Copy password · Copy verification
+   code · Edit, and read what is stored**;
+6. clicking Copy password toasts *"Copying git.example.org's password — the page
+   confirms the clipboard, or names the refusal."* and the clipboard really holds
+   it (see above).
+
+⚠ **WHAT IS STILL OWED: THE USER'S OWN DAEMONS.** The pane is served by the
+ychrome DAEMON, and both of this fleet's daemons were holding live surfaces
+(dev: 5, including the linked WhatsApp Web session; the GUI host: 3, two of them
+the trademark filing). Retiring one is the operator's call, not an agent's, so
+the binary is installed on both hosts and **the running daemons still serve the
+old pane**. One `ychrome daemon restart` per host adopts it; every session on
+that host re-registers in ~4s and its page reloads.
+
+⚠ **And on dev the vault AGENT still predates `last_sync_unix`**, so the pane
+there will show the warning branch until it is handed over. That is now a
+one-click button in the pane itself ("Hand the agent over (keeps it unlocked)"),
+which is deliberately where it was left: a handover that fails costs a master
+password, and it is his to spend.
 
 ⚠ Same family as three other findings today: a version-gated hot-restart that
 cannot swap a same-version binary, `ctl --help` exiting 0 on a build without the
