@@ -304,6 +304,36 @@ was INCONCLUSIVE — the second `ychrome` invocation did not mint a new surface
 (the href never changed), so "a fresh surface gets its scripts" is expected but
 **not yet demonstrated**. Demonstrate it before closing this entry.
 
+### The mechanism, traced 2026-08-02 (the expensive half is done)
+
+Read on the yggterm side, `crates/yggterm-shell/src/shell.rs`:
+
+- A contribution holds `policy`, `policy_attempts` and `declared_control_url`.
+- `sidebar_contribution_matches_declare` ALREADY handles a moved endpoint: a
+  declare carrying a different control url returns false, and the caller tears
+  the contribution down so the declare re-creates it. **So re-resolution exists
+  for a fresh declare** — which is why a session whose ychrome CLI is cycled
+  recovers, and why cycling the clients is the working remedy today.
+- What has no owner is the REPAIR. `fail_sidebar_policy` counts to
+  `MAX_POLICY_FETCH_ATTEMPTS` (3) and `web_surface_policy_gate` then answers
+  `Abandoned`, so the reconciler builds the surface with no userscripts and no
+  ruleset. When the policy later becomes reachable, `apply_sidebar_policy` fills
+  `contribution.policy` — and **nothing rebuilds the webview**, which still
+  holds the empty `init_script` set it was created with. That is the "for its
+  whole life" clause, and it is a missing edge rather than a wrong decision.
+
+**Shape of the fix:** when `apply_sidebar_policy` lands a policy for a session
+whose surface was created under `Abandoned`, reclaim that session's tabs so the
+reconciler recreates them with the scripts attached —
+`selecting_a_reclaimed_tab_recreates_its_webview_with_the_saved_url` is the
+existing proof that a reclaimed tab comes back at its saved url, so the
+machinery is already there and only the trigger is missing.
+
+⚠ A rebuild is visible (the page reloads), and that is unavoidable:
+`init_script` binds at webview creation, so there is no silent repair. Prefer
+rebuilding a BACKGROUND tab immediately and an active one at the next
+opportunity, rather than yanking the page the user is reading.
+
 ### The fix
 
 On a policy-fetch connection failure the GUI must **re-resolve the endpoint**

@@ -3746,6 +3746,38 @@ function ychromeSet(el, value) {
 }
 "#;
 
+/// Build the autofill script for a vault item, for callers outside the pane.
+///
+/// The engine plane needs exactly what the sidebar's `"fill"` action does, and
+/// for exactly the same reason: a credential must reach the page without ever
+/// becoming a string the caller handles. `docs/agent-engine.md` §4 has always
+/// documented `POST /fill`, but nothing implemented it, so an agent driving a
+/// login on the engine had two choices and both were bad — put the password in
+/// `ctl input events=…`, where it lands in `/proc/<pid>/cmdline` for every
+/// same-uid process on the host, or hand-roll the payload into a 0600 file and
+/// POST it to the socket. The second is merely awkward; the first is a leak,
+/// and on a fleet where several agents share a uid it is a leak to them.
+///
+/// So the secret follows the same path it does for the pane: off the host's
+/// agent, into the script, dropped. It is never returned, logged, or put in a
+/// reply — the caller learns only WHICH fields were filled.
+///
+/// `user` disambiguates when one item name has several logins; when it is
+/// `None` the item's own username is used.
+pub(crate) fn vault_fill_script(name: &str, user: Option<&str>) -> Result<String> {
+    let reply = vault_op(json!({
+        "op": "get",
+        "name": name,
+        "user": user.map_or(Value::Null, |u| Value::String(u.to_string())),
+    }))?;
+    let entry = &reply["entry"];
+    let password = entry["password"].as_str().unwrap_or_default();
+    let username = user
+        .or_else(|| entry["username"].as_str())
+        .unwrap_or_default();
+    Ok(fill_script(username, password))
+}
+
 fn fill_script(username: &str, password: &str) -> String {
     format!(
         r#"(function() {{
