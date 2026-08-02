@@ -475,6 +475,16 @@ struct EditDraft {
     current: EditFields,
     /// The item's custom-field names, for the remove list. Names only.
     field_names: Vec<String>,
+    /// WHAT THE ENTRY STORES — booleans, never values. A listing may carry these
+    /// (`has_password` and `has_totp` are the agent's own secret-free metadata),
+    /// and they are what lets the form say "there is a password here" and offer
+    /// an eye for it without the password itself going anywhere near a schema.
+    has_password: bool,
+    has_totp: bool,
+    /// Notes are not in a listing (they live only in the raw record), so this
+    /// one costs a probe at load time — the `notes` op, whose value is dropped
+    /// and only its success kept.
+    has_notes: bool,
     /// A custom field to set, name here and value on the action only.
     field_name: String,
     field_hidden: bool,
@@ -1490,6 +1500,205 @@ fn split_row_id(value: &str) -> (String, String) {
     }
 }
 
+/// One stored value the user may ask to SEE or to COPY, and the agent op that
+/// reads it.
+///
+/// ⛔ ONE OWNER. Two surfaces ask for the same values — the row menu on the Fill
+/// tab ("give me the password") and the stored-value rows on the Edit tab ("show
+/// me what is in there") — and before this they would have been two independent
+/// spellings of "password", two op choices, two labels. A field is parsed,
+/// labelled and READ here, so the two cannot drift.
+///
+/// ⛔ THERE IS NO CARD ARM, AND THAT IS DELIBERATE. A card's number and CVV
+/// reach a page only through the `card-fill` INJECTOR, because a PAN in a
+/// transcript is durable and, unlike a password, cannot be rotated. Revealing
+/// one into the rail or the clipboard would be exactly the transcript path
+/// `ychrome-vault` refuses to grow a CLI verb for. Cards keep ▤ and nothing
+/// else. Settled 2026-07-26; do not add one here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StoredField {
+    /// Not a secret, and offered anyway: a username is what the OTHER half of a
+    /// hand-typed login needs, and the row already shows it.
+    Username,
+    Password,
+    /// The six digits, minted now. Bitwarden calls this the verification code.
+    TotpCode,
+    /// The authenticator KEY. Bitwarden's Edit Login shows it behind an eye and
+    /// this is the same affordance: it is what you re-enrol another device from.
+    TotpSecret,
+    Notes,
+    /// A custom field, by name. Hidden or not — the vault decides whether it can
+    /// be read, and says why when it cannot.
+    Custom(String),
+}
+
+/// The wire spelling of a custom field, so `field:API Key` cannot collide with
+/// the fixed names above.
+const CUSTOM_FIELD_PREFIX: &str = "field:";
+
+impl StoredField {
+    /// The token that travels in an action id or a row id. Round-trips through
+    /// [`StoredField::parse`].
+    pub(crate) fn spec(&self) -> String {
+        match self {
+            StoredField::Username => "username".to_string(),
+            StoredField::Password => "password".to_string(),
+            StoredField::TotpCode => "totp".to_string(),
+            StoredField::TotpSecret => "totp-secret".to_string(),
+            StoredField::Notes => "notes".to_string(),
+            StoredField::Custom(name) => format!("{CUSTOM_FIELD_PREFIX}{name}"),
+        }
+    }
+
+    pub(crate) fn parse(spec: &str) -> Option<StoredField> {
+        Some(match spec {
+            "username" => StoredField::Username,
+            "password" => StoredField::Password,
+            "totp" => StoredField::TotpCode,
+            "totp-secret" => StoredField::TotpSecret,
+            "notes" => StoredField::Notes,
+            // A custom field's name may itself contain a colon, so this splits
+            // ONCE on the prefix and takes the whole remainder.
+            other => match other.strip_prefix(CUSTOM_FIELD_PREFIX) {
+                Some(name) if !name.is_empty() => StoredField::Custom(name.to_string()),
+                _ => return None,
+            },
+        })
+    }
+
+    /// What the user is told they are copying or reading. Never a value.
+    pub(crate) fn label(&self) -> String {
+        match self {
+            StoredField::Username => "username".to_string(),
+            StoredField::Password => "password".to_string(),
+            StoredField::TotpCode => "verification code".to_string(),
+            StoredField::TotpSecret => "authenticator key".to_string(),
+            StoredField::Notes => "notes".to_string(),
+            StoredField::Custom(name) => format!("field “{name}”"),
+        }
+    }
+
+    /// The row title in the Edit tab's stored-value list. Sentence case, because
+    /// it is a heading rather than a phrase inside one — except a custom field,
+    /// which is titled by the name the user gave it and nothing else.
+    fn row_title(&self) -> String {
+        if let StoredField::Custom(name) = self {
+            return name.clone();
+        }
+        let label = self.label();
+        let mut chars = label.chars();
+        match chars.next() {
+            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            None => label,
+        }
+    }
+}
+
+/// Read exactly ONE stored value out of this host's vault agent.
+///
+/// ⛔ THE ONLY PLACE A SECRET LEAVES THE VAULT FOR THE PANE, and it is always an
+/// explicit per-field ask for one field of one item. Nothing here is cached,
+/// batched, or folded into a listing: the pane's invariant is that a secret is
+/// never in a schema AT REST and never in a LISTING, which is a property of WHEN
+/// a value is fetched, not of whether it can be shown at all.
+///
+/// A field the item does not carry is a REFUSAL that names the reason, never an
+/// empty string — the "absent is not empty" rule the CLI runs on. `fields`
+/// distinguishes a LINKED field (stores no value of its own) from an UNREADABLE
+/// one (a value this vault could not decrypt), and the two send the reader to
+/// different places, so the message says which.
+fn read_stored(name: &str, user: &str, field: &StoredField) -> Result<String> {
+    let target = json!({ "name": name, "user": opt_field(user) });
+    let with = |op: &str| {
+        let mut request = target.clone();
+        request["op"] = json!(op);
+        request
+    };
+    match field {
+        StoredField::Username => {
+            let reply = vault_op(with("get"))?;
+            match reply["entry"]["username"].as_str() {
+                Some(user) if !user.is_empty() => Ok(user.to_string()),
+                _ => bail!("{name} has no username"),
+            }
+        }
+        StoredField::Password => {
+            let reply = vault_op(with("get"))?;
+            match reply["entry"]["password"].as_str() {
+                Some(password) if !password.is_empty() => Ok(password.to_string()),
+                _ => bail!("{name} has no password"),
+            }
+        }
+        StoredField::TotpCode => {
+            let reply = vault_op(with("totp"))?;
+            match reply["code"].as_str() {
+                Some(code) if !code.is_empty() => Ok(code.to_string()),
+                _ => bail!("{name} has no authenticator secret"),
+            }
+        }
+        StoredField::TotpSecret => {
+            let reply = vault_op(with("totp-secret"))?;
+            match reply["totp_secret"].as_str() {
+                Some(secret) if !secret.is_empty() => Ok(secret.to_string()),
+                _ => bail!("{name} has no authenticator secret"),
+            }
+        }
+        StoredField::Notes => {
+            let reply = vault_op(with("notes"))?;
+            match reply["notes"].as_str() {
+                Some(notes) if !notes.is_empty() => Ok(notes.to_string()),
+                _ => bail!("{name} has no notes"),
+            }
+        }
+        StoredField::Custom(field_name) => {
+            let reply = vault_op(with("fields"))?;
+            let found = reply["fields"]
+                .as_array()
+                .and_then(|fields| {
+                    fields
+                        .iter()
+                        .find(|field| field["name"].as_str() == Some(field_name.as_str()))
+                })
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("{name} has no field “{field_name}”"))?;
+            match (found["value"].as_str(), found["absent"].as_str()) {
+                (Some(value), _) if !value.is_empty() => Ok(value.to_string()),
+                (_, Some("linked")) => bail!(
+                    "“{field_name}” is a LINKED field: it stores no value of its own, it points at another field of this item"
+                ),
+                (_, Some("unreadable")) => bail!(
+                    "“{field_name}” holds a value this vault could not decrypt — it is sealed under a key this account does not have"
+                ),
+                _ => bail!("“{field_name}” is empty"),
+            }
+        }
+    }
+}
+
+/// A value fetched for EXACTLY ONE render of the pane.
+///
+/// ⛔ IT IS A PARAMETER, NEVER A FIELD OF [`PaneState`], and that is the whole
+/// mechanism. A schema is re-fetched by the GUI whenever the pane is opened and
+/// re-sent on every action, so a secret kept in the pane's state would be
+/// broadcast for as long as it lived there. This one is threaded from the action
+/// that fetched it into the schema that action returns, and there is nowhere for
+/// it to be held afterwards — the very next schema is built with `None`.
+///
+/// That is the invariant the user's Bitwarden comparison actually needs: a
+/// secret is never in a schema AT REST and never in a LISTING. It may be on
+/// screen when a human pressed the eye for it.
+pub(crate) struct Reveal {
+    field: StoredField,
+    value: String,
+}
+
+/// Copy actions on a ROW: the target is the row id in `values.value` and the
+/// field is the suffix. The Edit tab's twin (`edit-copy`) takes its target from
+/// the loaded draft instead and carries the field in `values.value` — two
+/// spellings because the two surfaces genuinely have different targets, both
+/// resolving to the same [`read_stored`] + [`copy_script`] underneath.
+const COPY_ROW_ACTION_PREFIX: &str = "copy-row:";
+
 fn item_row(item: &Value) -> Value {
     let name = item["name"].as_str().unwrap_or_default();
     let user = item["username"].as_str().unwrap_or_default();
@@ -1536,12 +1745,53 @@ fn item_row(item: &Value) -> Value {
         "label": "✎",
         "title": "Edit this entry",
     }));
+
+    // ⛔ EVERY BUTTON ABOVE PUTS A VALUE IN THE PAGE; NONE OF THEM GIVES IT TO
+    // THE USER. That was the whole of the 2026-08-02 report: a user who needs a
+    // credential anywhere else — another app, a terminal, a form we mis-detect —
+    // had no route at all, where every other client offers Copy username / Copy
+    // password / Copy verification code on the row.
+    //
+    // They live in the row's right-click MENU rather than as more glyph buttons:
+    // a menu item can say "Copy password" in words, and a 300px rail cannot hold
+    // five guessable glyphs. `menu` is yggterm's own row vocabulary (the same one
+    // yedit's Rename uses), so the GUI draws and dismisses it and ychrome only
+    // says what is in it.
+    //
+    // What is offered is what the LISTING knows exists — `has_password` is the
+    // metadata boolean, so a card (which has none) never offers to copy one, and
+    // an item with no authenticator secret never offers a code.
+    let mut menu = Vec::new();
+    if !user.is_empty() {
+        menu.push(json!({
+            "action": format!("{COPY_ROW_ACTION_PREFIX}{}", StoredField::Username.spec()),
+            "label": "Copy username",
+        }));
+    }
+    if item["has_password"].as_bool().unwrap_or(false) {
+        menu.push(json!({
+            "action": format!("{COPY_ROW_ACTION_PREFIX}{}", StoredField::Password.spec()),
+            "label": "Copy password",
+        }));
+    }
+    if item["has_totp"].as_bool().unwrap_or(false) {
+        menu.push(json!({
+            "action": format!("{COPY_ROW_ACTION_PREFIX}{}", StoredField::TotpCode.spec()),
+            "label": "Copy verification code",
+        }));
+    }
+    menu.push(json!({
+        "action": "edit-open",
+        "label": "Edit, and read what is stored",
+    }));
+
     json!({
         "kind": "list-row",
         "id": row_id(name, user),
         "title": name,
         "subtitle": subtitle,
         "actions": actions,
+        "menu": menu,
     })
 }
 
@@ -1698,9 +1948,14 @@ fn now_unix() -> u64 {
 pub(crate) fn freshness_widgets(freshness: &Freshness, last_error: Option<&str>) -> Vec<Value> {
     let mut widgets = Vec::new();
     match freshness {
+        // A FACT, in the words a person would use, with the button under it.
+        // The user's report, 2026-08-02: *"our sync now option should have last
+        // synced time and then sync now button … A warning text is
+        // non-confidence inspiring."* A healthy vault says when it last pulled;
+        // only a vault that cannot be trusted raises its voice.
         Freshness::Fresh(age) => widgets.push(json!({
             "kind": "label", "muted": true,
-            "text": format!("Synced {}", humanise_age(*age)),
+            "text": format!("Last synced {}", humanise_age(*age)),
         })),
         // NOT muted: this is the line that would have saved a wrong password
         // being filled into a sign-in form, and it has to read as a warning
@@ -1712,10 +1967,22 @@ pub(crate) fn freshness_widgets(freshness: &Freshness, last_error: Option<&str>)
                 humanise_age(*age),
             ),
         })),
-        Freshness::Unknown => widgets.push(json!({
-            "kind": "label",
-            "text": "⚠ This host's vault agent does not report when it last synced,                      so nothing here can tell you whether it is current. Install the                      current ychrome-vault and hand the agent over.",
-        })),
+        // The GENUINE failure case, and the only one that still warns. The
+        // remedy used to be a sentence telling the user to run two commands,
+        // and one of them — `handover` — refused on the very agent that needed
+        // it (it compared the binary PATH, which an in-place install leaves
+        // identical). Both halves are fixed, so the pane offers the BUTTON the
+        // passkey notice already offers, on the same one-owner action.
+        Freshness::Unknown => {
+            widgets.push(json!({
+                "kind": "label",
+                "text": "⚠ This host's vault agent predates the field that says when it last                          synced, so nothing here can tell you whether this copy is current.                          Handing the agent over to the installed ychrome-vault fixes it, and                          keeps the vault unlocked.",
+            }));
+            widgets.push(json!({
+                "kind": "button", "id": "hand_over_agent", "action": "hand_over_agent",
+                "label": "Hand the agent over (keeps it unlocked)",
+            }));
+        }
     }
     if let Some(error) = last_error {
         widgets.push(json!({
@@ -1780,6 +2047,22 @@ fn run_sync(state: &mut PaneState) -> Value {
 /// The I/O lives here so [`unlocked_schema`] stays pure and testable without an
 /// agent — a test must never touch the user's real vault.
 fn vault_schema(state: &mut PaneState, host: Option<&str>) -> Value {
+    vault_schema_revealing(state, host, None)
+}
+
+/// The pane, plus at most ONE value the user just asked to see.
+///
+/// ⛔ THE `None` CALLER IS THE POINT. `GET /pane/vault` — the route the GUI
+/// re-fetches whenever the panel opens, and the one a schema is "at rest" in —
+/// can only reach [`vault_schema`], which passes `None`. A revealed value exists
+/// solely in the reply to the action that fetched it; the next render, from any
+/// caller, is built without it. There is no state to forget and nothing to
+/// expire.
+fn vault_schema_revealing(
+    state: &mut PaneState,
+    host: Option<&str>,
+    reveal: Option<&Reveal>,
+) -> Value {
     // ONE `status` call per schema. It is the SSOT for lock state AND agent
     // staleness, so both branches read the same answer — the Tools tab used to
     // fetch it a second time and could disagree with the gate above it.
@@ -1791,7 +2074,7 @@ fn vault_schema(state: &mut PaneState, host: Option<&str>) -> Value {
                 Some(_) => vault_status().unwrap_or(status),
                 None => status,
             };
-            unlocked_schema(state, host, &status)
+            unlocked_schema(state, host, &status, reveal)
         }
         Ok(status) => locked_schema(&status),
         Err(error) => json!({
@@ -1808,7 +2091,12 @@ fn vault_schema(state: &mut PaneState, host: Option<&str>) -> Value {
 /// usernames and the booleans saying a password or TOTP secret exists. The Add
 /// tab's password field is declared EMPTY every time: it carries what the user
 /// types up to this process on an action, and nothing ever comes back down.
-fn unlocked_schema(state: &PaneState, host: Option<&str>, status: &Value) -> Value {
+fn unlocked_schema(
+    state: &PaneState,
+    host: Option<&str>,
+    status: &Value,
+    reveal: Option<&Reveal>,
+) -> Value {
     let mut widgets = vec![json!({
         "kind": "tabs",
         "id": "tab",
@@ -1863,7 +2151,7 @@ fn unlocked_schema(state: &PaneState, host: Option<&str>, status: &Value) -> Val
                 "label": "Save to vault",
             }));
         }
-        "edit" => widgets.extend(edit_tab_widgets(&state.edit)),
+        "edit" => widgets.extend(edit_tab_widgets(&state.edit, reveal)),
         "tools" => {
             widgets.push(json!({"kind": "section", "text": "Vault"}));
             let state_label = status["state"].as_str().unwrap_or("unknown");
@@ -1913,6 +2201,12 @@ fn unlocked_schema(state: &PaneState, host: Option<&str>, status: &Value) -> Val
             widgets.push(json!({
                 "kind": "search-box", "id": "query", "action": "search",
                 "placeholder": "Search vault…", "value": state.query,
+            }));
+            // A menu nobody knows about is a menu nobody uses, and the copy
+            // verbs are the ones a user reaches for when our autofill misses.
+            widgets.push(json!({
+                "kind": "label", "muted": true,
+                "text": "Right-click an entry to copy its username, password or verification code.                          ✎ opens it, where any one stored value can be read.",
             }));
             let query = state.query.trim();
             if query.is_empty()
@@ -1966,20 +2260,76 @@ fn unlocked_schema(state: &PaneState, host: Option<&str>, status: &Value) -> Val
     json!({ "title": "Vault", "widgets": widgets })
 }
 
+/// One stored value, as a row with an eye and a copy button — plus the value
+/// itself when THIS is the row the user just pressed the eye on.
+///
+/// The reveal is rendered directly under the row it belongs to, so a pane
+/// holding several revealable values can never show one under another's title.
+fn stored_value_row(field: &StoredField, reveal: Option<&Reveal>, removable: bool) -> Vec<Value> {
+    let mut actions = vec![
+        json!({
+            "action": "edit-reveal",
+            "label": "👁",
+            "title": format!("Show the stored {} here, once", field.label()),
+        }),
+        json!({
+            "action": "edit-copy",
+            "label": "⧉",
+            "title": format!("Copy the stored {} to the clipboard", field.label()),
+        }),
+    ];
+    if removable {
+        actions.push(json!({
+            "action": "edit-remove-field",
+            "label": "🗑",
+            "title": "Remove this custom field",
+        }));
+    }
+    let mut widgets = vec![json!({
+        "kind": "list-row",
+        // The row id IS the field spec, which is what the two actions above
+        // read: one encoding of "which field", shared by the reveal, the copy
+        // and the remove.
+        "id": field.spec(),
+        "title": field.row_title(),
+        "actions": actions,
+    })];
+    if let Some(reveal) = reveal.filter(|reveal| &reveal.field == field) {
+        widgets.push(json!({ "kind": "label", "text": reveal.value }));
+        widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": "Shown once. The pane keeps nothing — press 👁 again to read it again.",
+        }));
+    }
+    widgets
+}
+
 /// The Edit form.
 ///
-/// ⛔ EVERY SECRET BOX IS EMPTY AND MEANS "LEAVE THIS ALONE". A schema goes
-/// app -> OSC -> GUI, and this pane's standing rule is that it carries names,
-/// usernames and booleans — never a value. So this form cannot work the way a
-/// desktop password manager's does (show the current password, let the user
-/// retype it); it works the way the CLI does, where an unnamed field is
-/// preserved and removal is its own request.
+/// ⛔ EVERY SECRET BOX IS STILL EMPTY AND STILL MEANS "LEAVE THIS ALONE". What
+/// changed on 2026-08-02 is that emptiness is no longer the whole story.
 ///
-/// That is not a workaround, it is the same "absent is not empty" rule the rest
-/// of the vault runs on: leaving a box blank and asking for a value to be
-/// deleted are different intentions, and a form that conflated them would
-/// destroy notes every time somebody fixed a username.
-fn edit_tab_widgets(draft: &EditDraft) -> Vec<Value> {
+/// The rule a schema obeys is that it carries names, usernames and booleans and
+/// never a value — because a schema is re-fetched whenever the pane opens and
+/// re-sent on every action, so anything placed in it is broadcast for as long as
+/// it stays there. A form PRE-FILLED with the stored password would break that
+/// on every render, which is why it is not, and why it must never become one.
+///
+/// But the user's complaint was not about the form's boxes: *"I cannot edit the
+/// existing fields or see them to manually copy paste."* Every other client can
+/// show you what is stored, and that is the fallback when autofill misses. So
+/// the form now says WHAT the entry holds (booleans, which a listing may carry)
+/// and offers, per field, an eye that fetches that ONE value for ONE render and
+/// a copy that puts it on the clipboard without it ever entering a schema.
+///
+/// The invariant is unchanged in substance and sharper in words: a secret is
+/// never in a schema AT REST and never in a LISTING.
+///
+/// Removal stays its own request (`--clear`, the "Remove a value" toggles),
+/// because leaving a box blank and asking for a value to be deleted are
+/// different intentions and a form that conflated them would destroy notes every
+/// time somebody fixed a username.
+fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
     if draft.target_name.is_empty() {
         return vec![
             json!({"kind": "section", "text": "Edit an entry"}),
@@ -2009,10 +2359,41 @@ fn edit_tab_widgets(draft: &EditDraft) -> Vec<Value> {
             "value": draft.current.folder,
             "placeholder": "Leave empty to keep it where it is",
         }),
+    ];
+
+    // WHAT THIS ENTRY HOLDS, and a way to read each of it. Only the booleans
+    // travel in the schema; the values arrive one at a time, on a press.
+    widgets.push(json!({"kind": "section", "text": "Stored values"}));
+    let stored: Vec<StoredField> = [
+        (draft.has_password, StoredField::Password),
+        (draft.has_totp, StoredField::TotpCode),
+        (draft.has_totp, StoredField::TotpSecret),
+        (draft.has_notes, StoredField::Notes),
+    ]
+    .into_iter()
+    .filter(|(present, _)| *present)
+    .map(|(_, field)| field)
+    .collect();
+    if stored.is_empty() {
+        widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": "This entry stores no password, authenticator secret or notes.",
+        }));
+    } else {
+        widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": "👁 fetches one value and shows it here for this one render; ⧉ puts it on                      the clipboard. Neither is kept, and neither rides the schema that draws                      this pane.",
+        }));
+        for field in &stored {
+            widgets.extend(stored_value_row(field, reveal, false));
+        }
+    }
+
+    widgets.extend([
         json!({"kind": "section", "text": "Replace a secret"}),
         json!({
             "kind": "label", "muted": true,
-            "text": "These boxes are empty because this pane never carries a stored secret.                      Leave one empty and that value is left exactly as it is.",
+            "text": "These boxes are empty because an empty box means “leave this alone”.                      Use 👁 above to read what is stored; type here only to REPLACE it.",
         }),
         json!({
             "kind": "text-input", "id": "edit_password", "label": "New password",
@@ -2033,7 +2414,7 @@ fn edit_tab_widgets(draft: &EditDraft) -> Vec<Value> {
             "multiline": true, "rows": 6, "value": "",
             "placeholder": "Leave empty to keep the current notes",
         }),
-    ];
+    ]);
 
     widgets.push(json!({"kind": "section", "text": "Custom fields"}));
     if draft.field_names.is_empty() {
@@ -2041,20 +2422,17 @@ fn edit_tab_widgets(draft: &EditDraft) -> Vec<Value> {
             "kind": "label", "muted": true, "text": "This entry carries none.",
         }));
     } else {
-        // NAMES ONLY. A custom field's value is a secret as often as not (a
-        // hidden field always is), and the card audit line already settled that
-        // a field NAME may travel where its value may not.
+        // THE SCHEMA STILL CARRIES NAMES ONLY. A custom field's value is a
+        // secret as often as not (a hidden field always is), and the card audit
+        // line already settled that a field NAME may travel where its value may
+        // not — so the value arrives only when the eye is pressed, through the
+        // same one-render path every other stored value takes.
         for name in &draft.field_names {
-            widgets.push(json!({
-                "kind": "list-row",
-                "id": name,
-                "title": name,
-                "actions": [{
-                    "action": "edit-remove-field",
-                    "label": "🗑",
-                    "title": "Remove this custom field",
-                }],
-            }));
+            widgets.extend(stored_value_row(
+                &StoredField::Custom(name.clone()),
+                reveal,
+                true,
+            ));
         }
     }
     widgets.push(json!({
@@ -2274,12 +2652,21 @@ fn load_edit_draft(name: &str, user: &str) -> Result<EditDraft> {
         })
         .unwrap_or_default();
 
+    // WHAT IS STORED, as booleans. The first two are the agent's own secret-free
+    // listing metadata; the third has no listing to come from, so it is a probe
+    // whose VALUE is dropped on the spot and whose success is all that is kept.
+    // A refusal here ("has no notes") is the answer, not an error.
+    let has_notes = vault_op(json!({"op": "notes", "name": name, "user": opt_field(user)})).is_ok();
+
     Ok(EditDraft {
         target_name: name.to_string(),
         target_user: user.to_string(),
         original: fields.clone(),
         current: fields,
         field_names,
+        has_password: item["has_password"].as_bool().unwrap_or(false),
+        has_totp: item["has_totp"].as_bool().unwrap_or(false),
+        has_notes,
         ..EditDraft::default()
     })
 }
@@ -2490,6 +2877,49 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
             }
             reschema(state, host.as_deref())
         }
+        // Show ONE stored value, for ONE render.
+        //
+        // ⛔ THE VALUE IS NEVER STORED. It is read here, threaded into the schema
+        // this action returns, and dropped when this function ends — the pane has
+        // no field to keep it in, so the next render of the same pane (a refetch,
+        // another click, reopening the panel) is built without it. That is what
+        // makes "a secret is never in a schema AT REST" true even though a secret
+        // may be on screen: it is in exactly one reply, to exactly one press.
+        //
+        // The target is the LOADED DRAFT, not a row id: you are on the Edit tab,
+        // editing one entry, and the field to read is the row's own id.
+        "edit-reveal" | "edit-copy" => {
+            let (target_name, target_user) = {
+                let state = state.lock().unwrap();
+                (
+                    state.edit.target_name.clone(),
+                    state.edit.target_user.clone(),
+                )
+            };
+            if target_name.is_empty() {
+                return json!({ "toast": "Open an entry on the Fill tab first." });
+            }
+            let Some(field) = StoredField::parse(&value) else {
+                return json!({ "toast": format!("{value:?} is not a field this pane can read.") });
+            };
+            match read_stored(&target_name, &target_user, &field) {
+                Ok(secret) => {
+                    if action == "edit-copy" {
+                        copy_reply(&target_name, &field, &secret)
+                    } else {
+                        reschema_revealing(
+                            state,
+                            host.as_deref(),
+                            Some(&Reveal {
+                                field,
+                                value: secret,
+                            }),
+                        )
+                    }
+                }
+                Err(error) => json!({ "toast": error.to_string() }),
+            }
+        }
         // Removing a custom field is its own request, not a blank box.
         "edit-remove-field" => {
             let (target_name, target_user) = {
@@ -2498,6 +2928,12 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                     state.edit.target_name.clone(),
                     state.edit.target_user.clone(),
                 )
+            };
+            // The row id is the FIELD SPEC — the same one the eye and the copy
+            // button read, so the three verbs on a custom-field row cannot
+            // disagree about which field they act on.
+            let Some(StoredField::Custom(value)) = StoredField::parse(&value) else {
+                return json!({ "toast": format!("{value:?} is not a custom field.") });
             };
             let request = json!({
                 "op": "edit", "name": target_name, "user": opt_field(&target_user),
@@ -2782,13 +3218,55 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 Err(error) => json!({ "toast": error.to_string() }),
             }
         }
+        // COPY, FROM A ROW. Every other affordance on a row puts a value INTO
+        // the page; this is the one that gives it to the user, for the form we
+        // mis-detect, the app that is not a browser, the terminal. The row id
+        // names the entry and the action's suffix names the field, both resolved
+        // through the same [`StoredField`] the Edit tab uses.
+        action if action.starts_with(COPY_ROW_ACTION_PREFIX) => {
+            let spec = &action[COPY_ROW_ACTION_PREFIX.len()..];
+            let Some(field) = StoredField::parse(spec) else {
+                return json!({ "toast": format!("{spec:?} is not a field this pane can copy.") });
+            };
+            let (name, user) = split_row_id(&value);
+            match read_stored(&name, &user, &field) {
+                Ok(secret) => copy_reply(&name, &field, &secret),
+                Err(error) => json!({ "toast": error.to_string() }),
+            }
+        }
         _ => json!({ "toast": format!("unknown action {action:?}") }),
     }
 }
 
+/// The reply that puts one value on the clipboard.
+///
+/// ⛔ THE TOAST MAY ONLY CLAIM WHAT IS TRUE ON EVERY RUNG. The GUI runs the eval
+/// and does not report its outcome back here, so this cannot say "Copied": the
+/// page is what knows whether the clipboard took it, and the page is what says
+/// so. Claiming a copy that silently failed is the same lie `totp_script`'s
+/// "Filled …" was, on the same kind of flow.
+fn copy_reply(name: &str, field: &StoredField, secret: &str) -> Value {
+    let label = field.label();
+    json!({
+        "eval": copy_script(&label, secret),
+        "toast": format!(
+            "Copying {name}'s {label} — the page confirms the clipboard, or names the refusal.",
+        ),
+    })
+}
+
 fn reschema(state: &Mutex<PaneState>, host: Option<&str>) -> Value {
+    reschema_revealing(state, host, None)
+}
+
+/// Redraw the pane, carrying at most one value the user just asked to see.
+fn reschema_revealing(
+    state: &Mutex<PaneState>,
+    host: Option<&str>,
+    reveal: Option<&Reveal>,
+) -> Value {
     let mut state = state.lock().unwrap();
-    json!({ "schema": vault_schema(&mut state, host) })
+    json!({ "schema": vault_schema_revealing(&mut state, host, reveal) })
 }
 
 // ---------------------------------------------------------------------------
@@ -3853,6 +4331,75 @@ fn card_fill_script(
         exp_month = js_string(exp_month),
         exp_year = js_string(exp_year),
         cardholder = js_string(cardholder),
+    )
+}
+
+/// Put ONE stored value on the system clipboard, through the page.
+///
+/// The clipboard belongs to the machine the GUI runs on, which over ssh is not
+/// the machine this app runs on — so the value takes the same road a filled
+/// password takes: the app computes it, the GUI injects it, and the page's own
+/// clipboard API is what reaches the desktop. There is no OSC spelling of this
+/// on purpose: an OSC 52 would put the secret in the terminal byte stream and
+/// therefore in the scrollback ring, which is exactly the durable copy this
+/// codebase refuses to make.
+///
+/// ⛔ THE VALUE IS NEVER PAINTED INTO THE PAGE, and this is where it differs
+/// from [`totp_script`], deliberately. That one shows its code when the
+/// clipboard refuses, which is right for six digits that expire in half a minute
+/// and are useless twice. A stored password is neither: a page can read anything
+/// in its own DOM, and a user copying a password on a news site did not consent
+/// to giving it to that site. So the failure rung tells the user WHERE to read it
+/// instead — the pane's own eye, which lives in yggterm's chrome where no page
+/// can reach — and the page learns only the field's NAME.
+///
+/// ⚠ `navigator.clipboard` exists only in a SECURE CONTEXT, so on a plain http
+/// page there is nothing to write with. The alternative would be a hidden
+/// textarea and `document.execCommand('copy')`, which means putting the secret
+/// in the page's DOM for a moment; that is the leak above with a shorter
+/// lifetime, and it is refused rather than smuggled in. The notice names the
+/// reason so it does not read as a bug.
+fn copy_script(label: &str, value: &str) -> String {
+    format!(
+        r#"(function() {{
+  const label = {label};
+  function notice(text) {{
+    const old = document.getElementById('__ychrome_copy');
+    if (old) old.remove();
+    const box = document.createElement('div');
+    box.id = '__ychrome_copy';
+    box.setAttribute('style', [
+      'position:fixed', 'z-index:2147483647', 'top:16px', 'right:16px',
+      'max-width:340px', 'padding:10px 12px', 'border-radius:10px',
+      'background:#262a33', 'color:#e5e5e5',
+      'font:400 12px/1.5 system-ui,sans-serif',
+      'box-shadow:0 6px 24px rgba(0,0,0,.45)', 'border:1px solid #3b414f',
+      'user-select:none',
+    ].join(';'));
+    box.textContent = text;
+    document.body.appendChild(box);
+    setTimeout(function() {{
+      const b = document.getElementById('__ychrome_copy');
+      if (b) b.remove();
+    }}, 6000);
+  }}
+  try {{
+    if (navigator.clipboard && navigator.clipboard.writeText) {{
+      navigator.clipboard.writeText({value}).then(
+        function() {{ notice('Copied the ' + label + ' to the clipboard.'); }},
+        function(error) {{
+          notice('The clipboard refused this page (' + ((error && error.name) || 'error') +
+            '). Press 👁 beside the ' + label + ' in the vault pane to read it.');
+        }});
+      return 'copying';
+    }}
+  }} catch (error) {{ /* fall through to the honest refusal */ }}
+  notice('This page cannot reach the clipboard (it is not a secure context). ' +
+    'Press 👁 beside the ' + label + ' in the vault pane to read it.');
+  return 'no-clipboard';
+}})()"#,
+        label = js_string(label),
+        value = js_string(value),
     )
 }
 
@@ -4949,7 +5496,11 @@ mod tests {
             None,
         );
         let text = serde_json::to_string(&widgets).unwrap();
-        assert!(text.contains("Synced 1 minute ago"), "{text}");
+        // ⛔ A FACT, NOT A WARNING. The user, 2026-08-02: *"our sync now option
+        // should have last synced time and then sync now button … A warning
+        // text is non-confidence inspiring."*
+        assert!(text.contains("Last synced 1 minute ago"), "{text}");
+        assert!(!text.contains('\u{26a0}'), "a current vault must not warn: {text}");
         assert!(
             widgets.iter().any(|widget| widget["action"] == "sync"),
             "sync must be reachable without waiting for it to go stale: {text}"
@@ -4961,11 +5512,21 @@ mod tests {
     #[test]
     fn an_agent_that_cannot_report_its_sync_time_is_not_reported_as_fresh() {
         assert_eq!(Freshness::of(&json!({}), 1_800_000_000), Freshness::Unknown);
-        let text = serde_json::to_string(&freshness_widgets(&Freshness::Unknown, None)).unwrap();
-        assert!(text.contains("does not report"), "{text}");
+        let widgets = freshness_widgets(&Freshness::Unknown, None);
+        let text = serde_json::to_string(&widgets).unwrap();
+        assert!(text.contains("predates the field"), "{text}");
         assert!(
-            !text.contains("Synced "),
+            !text.contains("Last synced "),
             "unknown must never read as synced: {text}"
+        );
+        // ⛔ AND THE REMEDY IS A BUTTON. It used to be a sentence telling the
+        // user to install a binary and run `handover` — and `handover` refused
+        // on the very agent that needed it, so the advice sent them in a circle.
+        // The refusal is fixed (ce0a7ec) and the pane offers the one-click path
+        // the passkey notice already offers, on the same action.
+        assert!(
+            widgets.iter().any(|widget| widget["action"] == "hand_over_agent"),
+            "no remedy offered for an agent that cannot report its sync: {text}"
         );
     }
 
@@ -5027,7 +5588,7 @@ mod tests {
             field_names: vec!["API Key".into(), "Recovery Code".into()],
             ..EditDraft::default()
         };
-        let widgets = edit_tab_widgets(&draft);
+        let widgets = edit_tab_widgets(&draft, None);
         for id in [
             "edit_password",
             "edit_totp",
@@ -5050,6 +5611,264 @@ mod tests {
         // The non-secret half IS pre-filled, or the form would be useless.
         assert!(text.contains("https://github.com"));
         assert!(text.contains("Work"));
+    }
+
+    /// A draft of an entry that stores one of everything, for the reveal tests.
+    fn stored_everything_draft() -> EditDraft {
+        EditDraft {
+            target_name: "github.com".into(),
+            target_user: "octocat".into(),
+            current: EditFields {
+                name: "github.com".into(),
+                user: "octocat".into(),
+                ..EditFields::default()
+            },
+            field_names: vec!["API Key".into()],
+            has_password: true,
+            has_totp: true,
+            has_notes: true,
+            ..EditDraft::default()
+        }
+    }
+
+    /// Every row id in a schema, in draw order.
+    fn row_ids(widgets: &[Value]) -> Vec<String> {
+        widgets
+            .iter()
+            .filter(|widget| widget["kind"] == "list-row")
+            .filter_map(|widget| widget["id"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    // ⛔ THE 2026-08-02 REPORT, FIRST HALF: *"I cannot edit the existing fields
+    // or see them to manually copy paste."* The form used to be a REPLACE form —
+    // empty boxes and a sentence explaining that emptiness — so a user could not
+    // check what was stored, which is the fallback every other client gives when
+    // autofill misses.
+    //
+    // The answer is not a pre-filled form (that would put a secret in every
+    // render); it is the form SAYING what is there, from booleans a listing may
+    // carry, with a per-field eye and copy.
+    #[test]
+    fn the_edit_form_says_what_is_stored_and_offers_a_way_to_read_each_one() {
+        let widgets = edit_tab_widgets(&stored_everything_draft(), None);
+        let ids = row_ids(&widgets);
+        for expected in ["password", "totp", "totp-secret", "notes", "field:API Key"] {
+            assert!(ids.contains(&expected.to_string()), "no row for {expected}: {ids:?}");
+        }
+        // Every one of them offers BOTH verbs, and a custom field also offers
+        // the removal it always had.
+        for id in ids {
+            let row = widgets
+                .iter()
+                .find(|widget| widget["id"] == id)
+                .expect("the row we just listed");
+            let actions: Vec<&str> = row["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|action| action["action"].as_str().unwrap())
+                .collect();
+            assert!(actions.contains(&"edit-reveal"), "{id} has no eye");
+            assert!(actions.contains(&"edit-copy"), "{id} cannot be copied");
+            assert_eq!(
+                actions.contains(&"edit-remove-field"),
+                id.starts_with(CUSTOM_FIELD_PREFIX),
+                "only a custom field may be removed: {id}",
+            );
+        }
+
+        // An entry that stores none of them says so rather than offering eyes
+        // for values that are not there.
+        let bare = EditDraft {
+            target_name: "a note".into(),
+            ..EditDraft::default()
+        };
+        let widgets = edit_tab_widgets(&bare, None);
+        assert!(row_ids(&widgets).is_empty(), "offered a reveal for nothing");
+        assert!(
+            serde_json::to_string(&widgets)
+                .unwrap()
+                .contains("stores no password"),
+            "silence is not an answer",
+        );
+    }
+
+    // ⛔ THE INVARIANT, AS AN ASSERTION: a secret is never in a schema AT REST
+    // and never in a LISTING. A revealed value exists in the ONE render that
+    // fetched it and in no other, because it is a parameter and the pane has
+    // nowhere to keep it.
+    #[test]
+    fn a_revealed_value_lives_in_exactly_one_render() {
+        let draft = stored_everything_draft();
+        let secret = "hunter2-correct-horse";
+
+        let revealed = edit_tab_widgets(
+            &draft,
+            Some(&Reveal {
+                field: StoredField::Password,
+                value: secret.into(),
+            }),
+        );
+        let wire = serde_json::to_string(&revealed).unwrap();
+        assert!(wire.contains(secret), "the eye showed nothing");
+        // ...directly under ITS OWN row, never under another value's title.
+        let at = revealed
+            .iter()
+            .position(|widget| widget["text"] == secret)
+            .expect("the revealed label");
+        assert_eq!(
+            revealed[at - 1]["id"], "password",
+            "a revealed value landed under the wrong row",
+        );
+
+        // The very next render — any caller, any reason — is built without it.
+        let again = serde_json::to_string(&edit_tab_widgets(&draft, None)).unwrap();
+        assert!(!again.contains(secret), "the reveal survived into a later schema");
+
+        // And revealing one field does not reveal another.
+        let other = serde_json::to_string(&edit_tab_widgets(
+            &draft,
+            Some(&Reveal {
+                field: StoredField::Notes,
+                value: "the notes".into(),
+            }),
+        ))
+        .unwrap();
+        assert!(!other.contains(secret));
+    }
+
+    // The structural half of the same invariant: the route the GUI re-fetches
+    // whenever the panel opens CANNOT carry a reveal, because the only schema
+    // builder it can reach passes `None`, and there is no field in `PaneState`
+    // for one to be parked in.
+    #[test]
+    fn the_schema_route_cannot_carry_a_revealed_value() {
+        let production = include_str!("sidebar.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source before the test module");
+        let route = production
+            .split("(\"GET\", p) if p == format!(\"/pane/{VAULT_PANE}\")")
+            .nth(1)
+            .and_then(|suffix| suffix.split("(\"GET\", p) if p ==").next())
+            .expect("the vault pane route");
+        assert!(
+            route.contains("vault_schema(&mut pane, host.as_deref())"),
+            "the pane GET must build through the no-reveal owner: {route}",
+        );
+        assert!(
+            !route.contains("reveal"),
+            "the pane GET grew a way to carry a secret: {route}",
+        );
+        let state = production
+            .split("pub(crate) struct PaneState {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n}").next())
+            .expect("PaneState is present");
+        assert!(
+            !state.contains("Reveal"),
+            "a revealed value must have nowhere to live between renders: {state}",
+        );
+    }
+
+    // ⛔ THE 2026-08-02 REPORT, SECOND HALF: every affordance on a row put a
+    // value INTO the page and none gave it to the user. What is offered is what
+    // the LISTING says exists — so a card, which has no password, never offers
+    // to copy one, and the number stays injector-only.
+    #[test]
+    fn a_row_offers_the_copy_verbs_every_other_client_has() {
+        let menu = |item: Value| -> Vec<String> {
+            item_row(&item)["menu"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["action"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let login = menu(json!({
+            "name": "github.com", "username": "octocat",
+            "has_password": true, "has_totp": true,
+        }));
+        assert_eq!(
+            login,
+            [
+                "copy-row:username",
+                "copy-row:password",
+                "copy-row:totp",
+                "edit-open",
+            ],
+        );
+
+        // No username, no password, no authenticator secret: no verb claiming
+        // to copy one.
+        let bare = menu(json!({"name": "a note", "username": "", "has_password": false}));
+        assert_eq!(bare, ["edit-open"]);
+
+        // A card: the PAN and the CVV have no copy path at all, by the
+        // 2026-07-26 ruling. Only the injector.
+        let card = menu(json!({
+            "name": "a card", "username": "", "item_type": 3,
+            "has_password": false, "has_totp": false,
+        }));
+        assert!(
+            !card.iter().any(|action| action.starts_with(COPY_ROW_ACTION_PREFIX)),
+            "a card grew a copy verb: {card:?}",
+        );
+    }
+
+    // One encoding of "which field", shared by the row menu, the eye, the copy
+    // and the remove — including a field whose NAME contains the separator.
+    #[test]
+    fn a_field_spec_round_trips_including_an_awkward_name() {
+        for field in [
+            StoredField::Username,
+            StoredField::Password,
+            StoredField::TotpCode,
+            StoredField::TotpSecret,
+            StoredField::Notes,
+            StoredField::Custom("API Key".into()),
+            StoredField::Custom("odd:name: with colons".into()),
+        ] {
+            assert_eq!(StoredField::parse(&field.spec()), Some(field.clone()), "{field:?}");
+            assert!(!field.label().is_empty());
+        }
+        assert_eq!(StoredField::parse("card-number"), None, "cards have no reveal");
+        assert_eq!(StoredField::parse("field:"), None, "an unnamed field is not a field");
+        assert_eq!(StoredField::parse(""), None);
+    }
+
+    // ⛔ THE COPY SCRIPT HANDS THE PAGE A VALUE AND TELLS IT NOTHING ELSE. The
+    // value appears exactly once, in the clipboard call; every message the page
+    // can read names the FIELD and never the value — because a page can read
+    // anything in its own DOM, and a user copying a password on some site did
+    // not consent to giving it to that site.
+    #[test]
+    fn the_copy_script_never_paints_the_secret_into_the_page() {
+        let secret = "correct-horse-battery-staple";
+        let script = copy_script("password", secret);
+        assert_eq!(
+            script.matches(secret).count(),
+            1,
+            "the value must appear only in the clipboard call: {script}",
+        );
+        let notices: Vec<&str> = script.match_indices("notice(").map(|(at, _)| &script[at..]).collect();
+        assert!(!notices.is_empty(), "no notice at all");
+        for call in notices {
+            let line = call.split(");").next().unwrap_or(call);
+            assert!(!line.contains(secret), "a notice carried the value: {line}");
+        }
+        assert!(
+            !script.contains("execCommand"),
+            "the execCommand fallback puts the secret in the page's DOM",
+        );
+        assert!(
+            script.contains("navigator.clipboard.writeText"),
+            "no clipboard write at all",
+        );
+        // A hostile value cannot break out of the literal.
+        let hostile = copy_script("password", "\"; alert(1); //");
+        assert!(hostile.contains(r#""\"; alert(1); //""#), "{hostile}");
     }
 
     // Leaving a box empty and asking for a value to be deleted are DIFFERENT
@@ -5197,6 +6016,85 @@ mod tests {
         for secret in ["JBSWY3DPEHPK3PXP", "t-0001", "the personal forge"] {
             assert!(!text.contains(secret), "{secret} reached the pane schema");
         }
+
+        // ⛔ AND NOW THE OTHER HALF, LIVE: an explicit per-field REVEAL shows one
+        // value for one render, and the render after it does not. Unit tests can
+        // prove the rendering; only a real agent proves the READ — that
+        // `read_stored` asks the right op per field and gets the stored value
+        // back out of a real vault.
+        let pane = Mutex::new(std::mem::take(&mut state));
+        let action = |name: &str, value: &str| {
+            run_action(
+                &pane,
+                &json!({"pane": VAULT_PANE, "action": name, "values": {"value": value}}),
+            )
+        };
+        for (spec, expected) in [
+            ("notes", "the personal forge"),
+            ("totp-secret", "JBSWY3DPEHPK3PXP"),
+            ("field:Deploy Token", "t-0001"),
+        ] {
+            let revealed = action("edit-reveal", spec).to_string();
+            assert!(
+                revealed.contains(expected),
+                "the eye on {spec} showed nothing: {revealed}",
+            );
+            // The NEXT render, from the route the GUI re-fetches, carries none
+            // of it — which is the whole invariant, measured rather than argued.
+            let again = {
+                let mut pane = pane.lock().unwrap();
+                vault_schema(&mut pane, Some("git.example.org")).to_string()
+            };
+            assert!(
+                !again.contains(expected),
+                "{spec} survived into the next schema: {again}",
+            );
+        }
+
+        // COPY hands the value to the GUI as an eval and says so in words that
+        // carry no value.
+        let copied = action("edit-copy", "notes");
+        assert!(
+            copied["eval"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("the personal forge"),
+            "the copy script carried no value: {copied}",
+        );
+        assert!(
+            !copied["toast"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("the personal forge"),
+            "the toast carried the value: {copied}",
+        );
+        assert!(copied["schema"].is_null(), "a copy must not redraw: {copied}");
+
+        // The row menu's copy, resolved from a row id rather than the draft.
+        let from_row = action(
+            &format!("{COPY_ROW_ACTION_PREFIX}password"),
+            &row_id("git.example.org", "avik"),
+        );
+        let script = from_row["eval"].as_str().expect("a copy script");
+        assert!(
+            script.contains("navigator.clipboard.writeText"),
+            "{script}",
+        );
+        // A field the item does not have REFUSES by name rather than copying an
+        // empty string.
+        let refused = action(
+            &format!("{COPY_ROW_ACTION_PREFIX}totp"),
+            &row_id("bank.example", "10029384"),
+        );
+        assert!(
+            refused["eval"].is_null()
+                && refused["toast"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("no authenticator secret"),
+            "{refused}",
+        );
+        println!("reveal + copy against a live agent: OK");
     }
 
     // The secret is embedded in the eval script (that is the design), but it
@@ -5310,7 +6208,7 @@ mod tests {
         state.seed_add_draft(Some("github.com"));
         // `unlocked_schema`, not `vault_schema`: the latter shells out to
         // `ychrome-vault status`, which a test must never do.
-        let schema = unlocked_schema(&state, Some("github.com"), &json!({"state": "unlocked"}));
+        let schema = unlocked_schema(&state, Some("github.com"), &json!({"state": "unlocked"}), None);
         let widgets = schema["widgets"].as_array().unwrap();
 
         let password = widgets
@@ -5410,6 +6308,7 @@ mod tests {
             },
             None,
             &json!({"state": "unlocked"}),
+            None,
         );
         let notes = schema["widgets"]
             .as_array()
@@ -5454,7 +6353,7 @@ mod tests {
             ..PaneState::default()
         };
         let unlocked_stale = json!({"state": "unlocked", "item_count": 1107, "agent_stale": true});
-        let wire = unlocked_schema(&tools, None, &unlocked_stale).to_string();
+        let wire = unlocked_schema(&tools, None, &unlocked_stale, None).to_string();
         assert!(wire.contains("restart_agent"));
         assert!(wire.contains("1107 items"));
     }
