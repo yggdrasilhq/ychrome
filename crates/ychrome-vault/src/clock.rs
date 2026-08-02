@@ -1,7 +1,7 @@
 //! Is this host's clock fit to mint a one-time code?
 //!
 //! ⛔ **The failure this module exists to end.** On 2026-07-31 manin's clock was
-//! **72 seconds slow**, and dev and oc are LXCs that share its `CLOCK_REALTIME`.
+//! **72 seconds slow**, and dev and a headless host are LXCs that share its `CLOCK_REALTIME`.
 //! A TOTP window is 30 s and servers accept at most ±1 window, so
 //! `ychrome-vault totp` on those hosts emitted a code that was **always wrong**
 //! while looking perfectly well formed: six digits, stable within its window,
