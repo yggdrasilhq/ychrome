@@ -7,6 +7,45 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ★★ A CLIENT-SIDE VIEW SWAP STALLS: the URL changes, the screen does not
+
+**Status:** OPEN
+
+Found 2026-08-02 driving the Google sign-in end to end. After each step Google
+navigates its own URL (`/v3/signin/challenge/pwd`, then the 2SV screens) and the
+**visible view never swaps**: the body still renders the PREVIOUS screen with
+Google's own "Loading" prefix, while the next screen's inputs are present in the
+DOM at **`0x0` with `offsetParent: null`**.
+
+**This is layout, not paint** — the measurements come from `web eval`, so the
+element genuinely has no box; a stale-pixel explanation is falsified. Google's
+client-side swap did not complete.
+
+`web wait --until load:finished` answers `met: true, elapsed_ms: 1`, which is
+correct and unhelpful: the document load DID finish. Waiting does not help
+(measured: still `0x0` after 60 s of polling).
+
+**`location.reload()` renders the real screen every time**, so the flow is
+drivable — at the cost of one reload per step, which is why it reads as "the
+Google auth flow cannot be completed" to anyone who does not know the trick.
+
+⚠ Downstream, this makes an HONEST refusal look like a selector bug:
+`fill-vault` answers `no_hittable_match (… matched 1 element(s) and NONE could
+receive a click)`. That is the tool correctly refusing to dispatch into a 0x0
+target — do not "fix" it by loosening hittability.
+
+**Worth knowing before diagnosing:** the passkey shim is NOT the cause. It was
+the first hypothesis (Google's identifier field carries
+`autocomplete="username webauthn"`, so a conditional-mediation call into a shim
+that ignores `options.mediation` would block on the ceremony timeout) and it is
+FALSIFIED: `performance.getEntriesByType("resource")` shows **zero** `/fido2/*`
+and zero control-endpoint requests on the stalled page. The shim was never
+called. ⚠ The `mediation` gap is real anyway —
+`isConditionalMediationAvailable()` answers `false` while `shim.get()` ignores
+`options.mediation` entirely, so a site that asks regardless would hang on a
+ceremony no agent surface can approve. Worth closing on its own merits.
+
+
 ## ★★★ THE PASSKEY SHIM PATCHES `navigator.credentials` ON EVERY PAGE, INCLUDING A CHALLENGE PAGE
 
 **Found 2026-07-31 while investigating why a Cloudflare challenge on a
