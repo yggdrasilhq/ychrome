@@ -121,7 +121,7 @@ pub(crate) enum PasskeyShimState {
     /// unlocked and simply does not know the op this browser needs, so passkeys
     /// are off on EVERY site while `status` reports a perfectly good vault.
     ///
-    /// Measured on guihost 2026-08-01: `status` answered `state: unlocked`,
+    /// Measured on the GUI host 2026-08-01: `status` answered `state: unlocked`,
     /// `agent_stale: false`, 1116 items — and the same socket answered
     /// `unknown op "passkey-hosts"`. `agent_stale` compares the agent against
     /// the INSTALLED `ychrome-vault`, and both were the same six-day-old
@@ -4979,7 +4979,7 @@ mod tests {
     }
 
     // ⛔ THE POLICY STAMP WAS BLIND TO THE SHIM, WHICH MADE THE FAILURE
-    // PERMANENT. Measured on guihost: `sidebar_contribution/policy` recorded
+    // PERMANENT. Measured on the GUI host: `sidebar_contribution/policy` recorded
     // `userscripts: 6` then `userscripts: 5` under ONE unchanged
     // `policy_version` (`ebc219f7d40ddc53`), and the GUI refetches only when
     // that stamp moves — so no surface could ever recover the shim.
