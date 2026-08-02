@@ -472,6 +472,111 @@ fn serve_connection(stream: UnixStream, state: &Arc<Mutex<AgentState>>) {
     }
 }
 
+/// A value argument to `edit`, WITH THE EMPTY STRING PRESERVED.
+///
+/// ⛔ ABSENT IS NOT EMPTY, ON THE WRITE SIDE TOO. `dispatch`'s `string()` helper
+/// drops an empty value, which quietly turned `--notes ""` into "no change
+/// requested": the documented refusal ("refusing to set a field to the empty
+/// string") was unreachable from the CLI, and the user got "edit needs at least
+/// one field to change" — a sentence about a different problem, for a request
+/// that named a field perfectly clearly. The empty string has to survive the
+/// wire so that [`crate::model::Vault::edit_body`] is the one thing that
+/// answers for it. This is the same absent-vs-empty rule `required_field`
+/// enforces on the read side; it simply had no twin here.
+fn edit_value(request: &Value, key: &str) -> Option<String> {
+    request.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+/// A repeated string argument. Absent or null is an empty list; empty strings
+/// are dropped so a client sending `[""]` gets the same refusal as `--uri ""`
+/// rather than a silently shorter list.
+fn string_list(request: &Value, key: &str) -> Vec<String> {
+    request
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Decode `clear: ["notes", …]`.
+///
+/// ⛔ AN UNRECOGNISED NAME IS AN ERROR, NEVER A SKIP. Silently dropping a clear
+/// this build does not know would report a successful edit that did not remove
+/// what the caller asked to remove — and the caller here can be a NEWER CLI
+/// talking to an older agent, which is the exact direction the stale-agent trap
+/// runs in.
+fn clear_fields(request: &Value) -> Result<std::collections::BTreeSet<crate::model::ClearField>> {
+    let mut clear = std::collections::BTreeSet::new();
+    for name in string_list(request, "clear") {
+        let field = crate::model::ClearField::parse(&name).ok_or_else(|| {
+            anyhow!(
+                "this vault agent does not know how to clear {name:?} — \
+                 run `ychrome-vault handover` if your CLI is newer than it"
+            )
+        })?;
+        clear.insert(field);
+    }
+    Ok(clear)
+}
+
+/// Decode the custom-field changes: `fields: [{name, action, value?}]`.
+///
+/// `value` is a SECRET for a hidden field, so it is never echoed back, never
+/// logged, and never appears in an error — the refusals below name the field
+/// and the action only.
+fn field_edits(request: &Value) -> Result<Vec<crate::model::FieldEdit>> {
+    use crate::model::{FieldEdit, FieldKind};
+
+    let mut edits = Vec::new();
+    for change in request
+        .get("fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let name = change
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("a custom-field change needs a name"))?
+            .to_string();
+        let action = change
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("set");
+        let value = || -> Result<String> {
+            change
+                .get("value")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("setting custom field {name:?} needs a value"))
+        };
+        edits.push(match action {
+            "set" => FieldEdit::Set {
+                value: value()?,
+                name,
+                kind: FieldKind::Text,
+            },
+            "set-hidden" => FieldEdit::Set {
+                value: value()?,
+                name,
+                kind: FieldKind::Hidden,
+            },
+            "remove" => FieldEdit::Remove { name },
+            other => bail!(
+                "unknown custom-field action {other:?} (set | set-hidden | remove) — \
+                 run `ychrome-vault handover` if your CLI is newer than this agent"
+            ),
+        });
+    }
+    Ok(edits)
+}
+
 fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
     let op = request
         .get("op")
@@ -821,17 +926,44 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
                 "exp_year": card.exp_year,
             }))
         }
+        // What the KERNEL says about this host's clock. Read-only, needs no
+        // unlock: an operator asking "can this host mint a code at all" must be
+        // able to find out before paying for an unlock.
+        "clock" => Ok(crate::clock::state().to_json()),
         "totp" => {
             let name = string("name").ok_or_else(|| anyhow!("totp needs a name"))?;
+            // The waiver travels in the REQUEST, not in an environment
+            // variable: the mint happens inside this long-lived agent, whose
+            // environment was frozen at launch and is not the caller's.
+            let ignore_clock = request
+                .get("ignore_clock")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let vault = unlocked(&state)?;
             let items = vault.items();
             let item = resolve(&items, &name, string("user").as_deref())?;
-            let (code, remaining) = vault
-                .totp_code(&item.id)
-                .ok_or_else(|| anyhow!("{} has no authenticator secret", item.name))?;
+            let no_secret = || anyhow!("{} has no authenticator secret", item.name);
+            let (code, remaining) = if ignore_clock {
+                vault
+                    .totp_code_ignoring_clock(&item.id)
+                    .ok_or_else(no_secret)?
+            } else {
+                vault
+                    .totp_code(&item.id)
+                    .ok_or_else(no_secret)?
+                    .map_err(|untrusted| anyhow!("{untrusted}"))?
+            };
             let name = item.name.clone();
             state.touch();
-            Ok(json!({ "code": code, "remaining_secs": remaining, "name": name }))
+            Ok(json!({
+                "code": code,
+                "remaining_secs": remaining,
+                "name": name,
+                // Reported on SUCCESS too, so a caller can see what the code was
+                // minted against rather than only hearing about it on refusal.
+                "clock": crate::clock::state().to_json(),
+                "clock_ignored": ignore_clock,
+            }))
         }
         // The item's stored passkeys, metadata only. No private key crosses this
         // socket — that is reserved for a future ceremony op with explicit
@@ -844,6 +976,23 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             let passkeys = vault.passkeys(&item.id);
             state.touch();
             Ok(json!({ "name": item.name, "passkeys": passkeys }))
+        }
+        // Which hosts this vault holds a passkey for — nothing else.
+        //
+        // ⛔ SECRET-FREE BY CONSTRUCTION, and it must stay that way. The browser
+        // calls this to decide WHERE to install its WebAuthn shim, so the answer
+        // travels to a process that then hands match patterns to a webview. An
+        // rpId is a public hostname; a credentialId is not, and does not belong
+        // in this reply however convenient it would be for a future caller.
+        //
+        // A LOCKED vault errors here, and that is CORRECT rather than a
+        // regression: the browser then installs no shim at all, which is the
+        // honest state — a passkey ceremony needs an unlocked agent anyway.
+        "passkey-hosts" => {
+            let vault = unlocked(&state)?;
+            let rp_ids = vault.passkey_rp_ids();
+            state.touch();
+            Ok(json!({ "rp_ids": rp_ids }))
         }
         // The strict host rule: what an auto-fill is allowed to use. Returns
         // the credential outright, because every caller wants it next.
@@ -963,7 +1112,10 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             } else {
                 string("password")
             };
-            let folder_id = match string("folder") {
+            // `edit_value`, not `string`: an empty value must reach `edit_body`
+            // to be REFUSED there, rather than vanishing into "you named no
+            // fields". See `edit_value`.
+            let folder_id = match edit_value(request, "folder") {
                 Some(folder) => Some(
                     unlocked(&state)?
                         .folder_id(&folder)
@@ -972,17 +1124,15 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
                 None => None,
             };
             let edit = crate::model::CipherEdit {
-                name: string("rename"),
-                username: string("set_user"),
+                name: edit_value(request, "rename"),
+                username: edit_value(request, "set_user"),
                 password: password.clone(),
-                totp: string("totp"),
-                clear_totp: request
-                    .get("clear_totp")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                uri: string("uri"),
-                notes: string("notes"),
+                totp: edit_value(request, "totp"),
+                uris: string_list(request, "uris"),
+                notes: edit_value(request, "notes"),
                 folder_id,
+                fields: field_edits(request)?,
+                clear: clear_fields(request)?,
             };
             if edit.is_empty() {
                 bail!("edit needs at least one field to change");
@@ -991,7 +1141,7 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             let items = vault.items();
             let item = resolve(&items, &name, string("user").as_deref())?;
             let (id, name) = (item.id.clone(), item.name.clone());
-            state
+            let verification = state
                 .manager
                 .edit_item(&id, &edit)
                 .map_err(|error| anyhow!(error.to_string()))?;
@@ -1000,6 +1150,11 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
                 "id": id,
                 "name": name,
                 "generated_password": generate.then_some(password).flatten(),
+                // The RECEIPT: which changes a re-read of the freshly synced
+                // item actually found. Field labels only, never values. A client
+                // that gets no `verified` key is talking to an agent too old to
+                // check, which is a different and worse answer than an empty list.
+                "verified": verification.landed,
             }))
         }
         // Delete an item. Soft by default: it lands in the vault's trash and any
@@ -1817,9 +1972,43 @@ mod tests {
         assert_eq!(got["entry"]["password"], "s3cret!");
         assert_eq!(got["entry"]["username"], "octocat");
 
+        // The mint goes through the clock gate, and says what it minted
+        // against. Counting the question is the only way to see it: on a
+        // healthy host the digits are identical either way.
+        let asked = crate::clock::judgements();
         let totp = dispatch(&json!({"op": "totp", "name": "GitHub"}), &state).unwrap();
         assert_eq!(totp["code"].as_str().unwrap().len(), 6);
+        assert_eq!(
+            crate::clock::judgements(),
+            asked + 1,
+            "the totp op minted without asking whether this host's clock is fit"
+        );
+        assert_eq!(totp["clock"]["source"], "adjtimex");
+        assert_eq!(totp["clock_ignored"], false);
+
+        // `--ignore-clock` really skips the question and SAYS it did — a waiver
+        // that looked like the ordinary answer would be its own lie.
+        let asked = crate::clock::judgements();
+        let waived = dispatch(
+            &json!({"op": "totp", "name": "GitHub", "ignore_clock": true}),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(waived["code"].as_str().unwrap().len(), 6);
+        assert_eq!(
+            crate::clock::judgements(),
+            asked,
+            "the waiver must skip the gate, not ask and discard the answer"
+        );
+        assert_eq!(waived["clock_ignored"], true);
+
         assert!(dispatch(&json!({"op": "totp", "name": "ygg.example"}), &state).is_err());
+
+        // The clock op answers without an unlock and from the same owner as the
+        // field the mint reports.
+        let clock = dispatch(&json!({"op": "clock"}), &state).unwrap();
+        assert_eq!(clock["source"], totp["clock"]["source"]);
+        assert!(clock["sync"].is_string());
 
         // Strict rule: the github URI auto-matches its own host...
         let matched = dispatch(&json!({"op": "match", "host": "github.com"}), &state).unwrap();
@@ -2204,6 +2393,72 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("no vault entry named"), "{error}");
+    }
+
+    // ⛔ ABSENT IS NOT EMPTY, AND THE WRITE SIDE HAD NO TWIN FOR THAT RULE.
+    // `dispatch`'s `string()` drops an empty value, so `--notes ""` arrived as
+    // "no fields named" and the user was told to name a field they HAD named.
+    // Found by the live round trip against a scratch vaultwarden, 2026-08-01.
+    // The refusal must be about the empty string, and it must still happen
+    // before any network.
+    #[test]
+    fn an_empty_value_is_refused_as_empty_not_as_no_change() {
+        let state = synthetic_state();
+        for (field, request) in [
+            (
+                "notes",
+                json!({"op": "edit", "name": "github", "notes": ""}),
+            ),
+            (
+                "rename",
+                json!({"op": "edit", "name": "github", "rename": ""}),
+            ),
+            (
+                "set_user",
+                json!({"op": "edit", "name": "github", "set_user": ""}),
+            ),
+            ("totp", json!({"op": "edit", "name": "github", "totp": ""})),
+            (
+                "uris",
+                json!({"op": "edit", "name": "github", "uris": [""]}),
+            ),
+        ] {
+            let error = dispatch(&request, &state).unwrap_err().to_string();
+            assert!(
+                error.contains("empty string"),
+                "an empty {field} must be refused as empty, said: {error}"
+            );
+        }
+    }
+
+    // A clear this build does not know must be REFUSED, never skipped: a newer
+    // CLI talking to an older agent is the direction the stale-agent trap runs
+    // in, and a silently dropped clear reports a successful edit that removed
+    // nothing.
+    #[test]
+    fn an_unknown_clear_target_is_refused_rather_than_ignored() {
+        let state = synthetic_state();
+        let error = dispatch(
+            &json!({"op": "edit", "name": "github", "clear": ["something-new"]}),
+            &state,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("does not know how to clear"), "{error}");
+        assert!(
+            error.contains("handover"),
+            "the remedy must be named: {error}"
+        );
+
+        // Same rule for a custom-field action.
+        let error = dispatch(
+            &json!({"op": "edit", "name": "github",
+                    "fields": [{"name": "X", "action": "invert"}]}),
+            &state,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unknown custom-field action"), "{error}");
     }
 
     // `lock` must make the cached vault unreachable immediately.

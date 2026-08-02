@@ -258,6 +258,34 @@ pub fn stop(dir: &Path) -> Result<bool> {
     }
 }
 
+/// Hand the running agent's unlocked session to the installed binary — the
+/// remedy for "the agent predates this build" that does NOT cost a master
+/// password. Returns the post-exec `status`, with `handed_over` on it.
+///
+/// **The reply is not the proof.** The agent answers BEFORE it execs, so
+/// "accepted" only means it agreed to try. The proof is a SECOND round trip on
+/// the same socket asking who is answering now: a connection that lands mid-exec
+/// is queued on the inherited listener rather than refused, which is the whole
+/// reason that fd crosses the boundary.
+///
+/// This lives in the wire crate because BOTH ends need it and neither may
+/// re-derive it: the `ychrome-vault` CLI's `handover` verb, and the vault
+/// sidebar's button — which exists because an operator who ships a browser
+/// ahead of its agent will otherwise meet the failure at a login prompt.
+pub fn handover(dir: &Path) -> Result<Value> {
+    let accepted = request(dir, &json!({"op": "handover"}))?;
+    let mut after = request(dir, &json!({"op": "status"}))?;
+    let now = after
+        .get("exe_stamp")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let handed_over = !now.is_empty() && Some(now) == accepted["successor_stamp"].as_str();
+    after["handed_over"] = json!(handed_over);
+    after["successor"] = accepted["successor"].clone();
+    after["pid"] = accepted["pid"].clone();
+    Ok(after)
+}
+
 /// SIGTERM, then SIGKILL if it will not go. An agent holds decrypted keys, so
 /// "still running" is never an acceptable outcome of `stop`.
 fn terminate(pid: i32, dir: &Path) -> Result<()> {

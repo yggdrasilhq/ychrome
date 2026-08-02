@@ -35,6 +35,24 @@ pub const DEFAULT_PER_PAGE_RSS_MB: u64 = 1500;
 /// How often the governor tick measures and acts (§5).
 pub const GOVERNOR_TICK: Duration = Duration::from_secs(2);
 
+/// The ONE wording for "that page is not here", and the one place that names
+/// which daemon generation is saying so.
+///
+/// `no page "pg_000001"` alone cannot distinguish *never opened*, *closed*, and
+/// *opened on a daemon that is no longer the one answering you* — and the third
+/// was the one that broke every recipe under `assets/engine-recipes/`, since
+/// each is a sequence of `ctl` calls against a single `page_id`. An agent had no
+/// way to see that two calls had reached two different daemons. Naming the
+/// generation is what makes that visible in the message itself.
+pub fn no_such_page(id: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "no page {id:?} on the daemon that answered ({}). A page belongs to the \
+         daemon generation that opened it: if the open landed on an earlier \
+         daemon, this is what that looks like",
+        crate::daemon::generation_label()
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageState {
     Live,
@@ -427,7 +445,7 @@ pub fn park(engine: &Engine, id: &str) -> Result<LogicalPage> {
 /// The body of [`park`]. The caller MUST already hold the admission lock.
 fn park_locked(engine: &Engine, id: &str) -> Result<LogicalPage> {
     let Some(mut page) = pool().get(id) else {
-        bail!("no page {id:?}")
+        return Err(no_such_page(id));
     };
     if page.state != PageState::Live {
         return Ok(page);
@@ -473,7 +491,7 @@ fn park_locked(engine: &Engine, id: &str) -> Result<LogicalPage> {
 /// Recreate the view and restore the place.
 pub fn resume(engine: &Engine, id: &str) -> Result<LogicalPage> {
     let Some(mut page) = pool().get(id) else {
-        bail!("no page {id:?}")
+        return Err(no_such_page(id));
     };
     if page.state == PageState::Live {
         return Ok(page);

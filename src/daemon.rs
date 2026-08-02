@@ -101,6 +101,30 @@ fn exe_stamp() -> String {
     format!("{}@{mtime}", path.display())
 }
 
+/// When THIS daemon started, so a refusal can name which generation refused.
+static STARTED_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Which daemon answered — `pid 923108, up 42s`.
+///
+/// A page belongs to the daemon generation that opened it, so "no page" is
+/// ambiguous on its own between *you never opened it*, *it was closed*, and
+/// *you opened it on a daemon that is no longer the one answering you*. The
+/// third used to be common enough to break every `assets/engine-recipes/`
+/// script, which is a sequence of `ctl` calls against one `page_id`, and it was
+/// invisible: the agent had no way to tell that two calls hit two daemons. The
+/// singleton makes it rare; naming the generation makes it diagnosable when it
+/// happens anyway.
+pub fn generation_label() -> String {
+    let pid = std::process::id();
+    match STARTED_AT_MS.load(Ordering::SeqCst) {
+        0 => format!("pid {pid}"),
+        started => {
+            let up = now_millis().saturating_sub(u128::from(started)) / 1000;
+            format!("pid {pid}, up {up}s")
+        }
+    }
+}
+
 fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -241,6 +265,11 @@ struct SessionMeta {
     /// Registration order; the routing tie-break ("most recently registered
     /// wins") picks the highest.
     registered_seq: u64,
+    /// Did this session's client claim, in its `register`, that it declares the
+    /// control token? See [`crate::sidebar::TokenCourier`]. Asserted by the
+    /// client rather than inferred, and re-asserted on every ~4s heartbeat, so
+    /// it can never describe a client that is no longer the one attached.
+    declares_control_token: bool,
 }
 
 /// One anchored session: its control state (pane + signer), its dedicated control
@@ -312,7 +341,18 @@ impl Daemon {
     /// and spawn its accept loop; existing ⇒ refresh profile/pid/heartbeat and
     /// hand back the same control url (idempotent, so the client's ~4s heartbeat
     /// costs nothing and re-registration after a daemon respawn just works).
-    fn register(self: &Arc<Self>, env_id: &str, profile: &str, pid: i32) -> Result<Value> {
+    ///
+    /// `declares_control_token` is the client saying it will carry the token we
+    /// are about to hand it. Recorded on BOTH arms: a pre-gate client that keeps
+    /// heartbeating must not be able to look capable just because it registered
+    /// once against a generous default.
+    fn register(
+        self: &Arc<Self>,
+        env_id: &str,
+        profile: &str,
+        pid: i32,
+        declares_control_token: bool,
+    ) -> Result<Value> {
         {
             let sessions = self.sessions.lock().unwrap();
             if let Some(entry) = sessions.get(env_id) {
@@ -320,6 +360,7 @@ impl Daemon {
                 meta.profile = profile.to_string();
                 meta.pid = pid;
                 meta.last_heartbeat = Instant::now();
+                meta.declares_control_token = declares_control_token;
                 return Ok(json!({
                     "ok": true,
                     "control_url": entry.control_url,
@@ -359,6 +400,7 @@ impl Daemon {
                 last_heartbeat: Instant::now(),
                 last_session_ping: None,
                 registered_seq,
+                declares_control_token,
             }),
             queue: Mutex::new(Queue::default()),
             stop: Arc::new(AtomicBool::new(false)),
@@ -369,7 +411,19 @@ impl Daemon {
             .insert(env_id.to_string(), Arc::clone(&entry));
         let control_token = entry.control.control_token.clone();
         self.spawn_session_accept_loop(Arc::clone(&entry), listener);
-        journal("register", json!({ "env_id": env_id, "profile": profile, "pid": pid, "port": port }));
+        journal(
+            "register",
+            json!({
+                "env_id": env_id,
+                "profile": profile,
+                "pid": pid,
+                "port": port,
+                // A session whose client cannot carry the token is diagnosable
+                // from the journal alone, at the moment it attaches, rather than
+                // only from the 403s it will produce later.
+                "declares_control_token": declares_control_token,
+            }),
+        );
         Ok(json!({
             "ok": true,
             "control_url": control_url,
@@ -463,6 +517,11 @@ impl Daemon {
                     "last_heartbeat_ms_ago": meta.last_heartbeat.elapsed().as_millis(),
                     "policy_version": crate::webpolicy::policy_version(&profile),
                     "zoom_version": crate::webzoom::zoom_version(),
+                    // False ⇒ this session's vault and settings panes CANNOT
+                    // open, no matter what the GUI or the daemon do, because its
+                    // CLI predates the control-token gate and never declares
+                    // one. The one place to see it without reading 403s.
+                    "control_token_declared": meta.declares_control_token,
                 })
             })
             .collect();
@@ -612,7 +671,20 @@ fn handle_control_conn(daemon: &Daemon, entry: &SessionEntry, stream: TcpStream)
         sidebar::respond_json(stream, 200, &reply, &request.path);
         return;
     }
-    let (status, body) = sidebar::dispatch(&entry.control, &request);
+    // The session's registration fact, read HERE because only the daemon holds
+    // it: a refusal that cannot say "this session's CLI can never deliver the
+    // token" is the bare 403 the user could do nothing with.
+    let courier = {
+        let meta = entry.meta.lock().unwrap();
+        if meta.declares_control_token {
+            sidebar::TokenCourier::Live
+        } else {
+            sidebar::TokenCourier::Absent {
+                client_pid: meta.pid,
+            }
+        }
+    };
+    let (status, body) = sidebar::dispatch(&entry.control, &request, courier);
     sidebar::respond_json(stream, status, &body, &request.path);
 }
 
@@ -663,9 +735,13 @@ fn serve_engine_http(mut reader: BufReader<UnixStream>, stream: UnixStream) {
         crate::engine::api::Reply::Json(status, body) => {
             sidebar::respond_json(stream, status, &body, &request.path)
         }
-        crate::engine::api::Reply::Png(png) => {
-            sidebar::respond_bytes(stream, 200, "image/png", &png)
-        }
+        crate::engine::api::Reply::Png { png, meta } => sidebar::respond_bytes(
+            stream,
+            200,
+            "image/png",
+            &crate::engine::api::shot_meta_header(&meta),
+            &png,
+        ),
         crate::engine::api::Reply::Ndjson(write_body) => {
             let mut stream = stream;
             sidebar::respond_ndjson_head(&mut stream);
@@ -674,14 +750,34 @@ fn serve_engine_http(mut reader: BufReader<UnixStream>, stream: UnixStream) {
     }
 }
 
+/// How long the accept loop will wait for a connected client's FIRST byte.
+///
+/// ⛔ WITHOUT THIS THE WHOLE DAEMON IS ONE SILENT CLIENT AWAY FROM WEDGED.
+/// `fill_buf` below blocks until a byte arrives, and it runs ON the accept
+/// loop, so a client that connects and then says nothing — a CLI killed between
+/// `connect` and `write`, an ssh pipe that froze — stops the daemon answering
+/// anything at all. That wedge is what used to get a live daemon misread as
+/// dead and its socket stolen (see `DaemonLock`). The lock now makes that
+/// misdiagnosis harmless, but a wedged daemon still serves nobody, so the wedge
+/// itself is closed here rather than only survived.
+const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn handle_unix_conn(daemon: &Arc<Daemon>, stream: UnixStream) -> bool {
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(clone) => clone,
         Err(_) => return false,
     });
+    // `try_clone` dups the descriptor, so both refer to the same socket and
+    // SO_RCVTIMEO set here also bounds the `fill_buf` on `reader`.
+    let _ = stream.set_read_timeout(Some(FIRST_BYTE_TIMEOUT));
     match socket_protocol(reader.fill_buf().ok().and_then(<[u8]>::first).copied()) {
         SocketProtocol::Empty => return false,
         SocketProtocol::Http => {
+            // The first byte is in, so the accept loop is no longer at risk from
+            // this connection: hand the socket back its blocking reads before
+            // the engine thread takes over. An engine verb legitimately takes
+            // far longer than FIRST_BYTE_TIMEOUT.
+            let _ = stream.set_read_timeout(None);
             // ON ITS OWN THREAD, unlike the legacy ops below. Those are handled
             // inline because they are genuinely non-blocking and because `stop`
             // has to return `should_exit` from here. An engine verb is the
@@ -707,11 +803,18 @@ fn handle_unix_conn(daemon: &Arc<Daemon>, stream: UnixStream) -> bool {
             let env_id = request.get("env_id").and_then(Value::as_str).unwrap_or("");
             let profile = request.get("profile").and_then(Value::as_str).unwrap_or("default");
             let pid = request.get("pid").and_then(Value::as_i64).unwrap_or(0) as i32;
+            // Absent ⇒ false, and that is the load-bearing default: a client too
+            // old to know the field is exactly the client that cannot carry the
+            // token, so silence means "no courier" rather than "assume the best".
+            let declares_control_token = request
+                .get("declares_control_token")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             if env_id.is_empty() {
                 json!({ "ok": false, "error": "register needs env_id" })
             } else {
                 daemon
-                    .register(env_id, profile, pid)
+                    .register(env_id, profile, pid, declares_control_token)
                     .unwrap_or_else(|error| json!({ "ok": false, "error": error.to_string() }))
             }
         }
@@ -778,6 +881,11 @@ fn handle_unix_conn(daemon: &Arc<Daemon>, stream: UnixStream) -> bool {
         if let Ok(sock) = sock_path() {
             let _ = std::fs::remove_file(&sock);
         }
+        // …and hand on the singleton in the same breath, for the same reason:
+        // the successor must be able to START while this process is still
+        // shutting its engine down. Freeing the path but keeping the lock would
+        // make every handover wait out a full engine teardown.
+        DaemonLock::release();
         journal(
             "retire",
             json!({ "pid": std::process::id(), "op": op, "stale": daemon.is_stale() }),
@@ -822,25 +930,148 @@ fn vault_agent_reachable() -> bool {
 // Daemon entry point (`ychrome --daemon`)
 // ---------------------------------------------------------------------------
 
-/// Run the daemon. The unix-socket BIND is the singleton: only one process holds
-/// a given path. If the bind fails because another daemon owns it we exit; if it
-/// fails on a stale socket (a crashed daemon), we unlink and retry once.
+/// The daemon singleton, held for the process's whole life.
+///
+/// ⛔⛔ THE PING WAS THE BUG, AND THE SOCKET WAS NEVER THE SINGLETON.
+/// `run()` used to answer "is another daemon alive?" by connecting to
+/// `daemon.sock` and waiting 2 s for a `ping`. Legacy ops are served INLINE on
+/// the accept loop, so one slow op — or one client that connects and then says
+/// nothing — wedges every accept. A daemon that was alive but merely BUSY
+/// therefore read as *stale*, and the challenger then `remove_file`d the socket
+/// out from under it and bound its own. The incumbent kept running forever on
+/// an unlinked inode, still holding its engine, its Xvfb and its pages, and
+/// invisible to every client that came after — which is why an agent could
+/// `ctl open` a page and be told `no page "pg_000001"` one call later.
+///
+/// Measured on dev, 2026-07-31, in `~/.yggterm/ychrome/journal.jsonl`:
+/// **21 `daemon_start` against 13 `daemon_stop`**, including a burst of SIX
+/// starts with no stop between them (pids 2797950, 2801025, 2809309, 2814008,
+/// 2818486, 2883525 — the first two are the pair the bug was filed from), and
+/// **15 `Xvfb` processes reparented to init** on displays `:90`–`:104`.
+///
+/// `flock` cannot make that mistake. It answers from the kernel, with no
+/// timeout and no guess, and the kernel releases it when the holder dies —
+/// including on SIGKILL — so there is no stale-lock case to reclaim and no
+/// window in which two processes both believe they won.
+///
+/// ⛔ The lock file is NEVER unlinked. Unlinking it is precisely how a
+/// lock-by-file loses its mutual exclusion: a challenger that creates a fresh
+/// inode at the same path locks a *different* file and both sides proceed.
+struct DaemonLock {
+    /// Held only for its `Drop`/process-exit side effect — closing the fd is
+    /// what releases the advisory lock.
+    _file: std::fs::File,
+}
+
+/// The lock this process holds while it is THE serving daemon.
+///
+/// ⛔ IT MEANS "I AM SERVING", NOT "MY PROCESS EXISTS", and the difference is a
+/// measured regression. A retiring daemon unlinks its socket BEFORE answering
+/// (see `handle_unix_conn`) precisely so its successor can bind and start
+/// serving while this one is still winding its engine down — that overlap is
+/// the design. Holding the lock until process exit removed it: every handover
+/// then had to wait for a full engine shutdown, which made
+/// `tests/daemon_staleness.rs` flaky and roughly doubled its runtime.
+/// `release()` is called at the same instant the socket is unlinked.
+static SINGLETON: Mutex<Option<DaemonLock>> = Mutex::new(None);
+
+impl DaemonLock {
+    /// `Ok(None)` when another daemon provably holds it and we must step aside.
+    fn acquire() -> Result<Option<DaemonLock>> {
+        Self::acquire_at(&daemon_dir()?.join("daemon.lock"))
+    }
+
+    /// Hand the singleton to whoever comes next. Idempotent.
+    fn release() {
+        if let Ok(mut held) = SINGLETON.lock() {
+            held.take();
+        }
+    }
+
+    /// The path is a parameter ONLY so the lock's exclusion can be proven on a
+    /// temp file. A test must never reach for the real `daemon.lock`: taking it
+    /// would stop the host's actual daemon from starting.
+    fn acquire_at(path: &std::path::Path) -> Result<Option<DaemonLock>> {
+        use std::os::fd::AsRawFd;
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        // SAFETY: `file` owns a valid fd for the duration of the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(DaemonLock { _file: file }));
+        }
+        let error = std::io::Error::last_os_error();
+        // EWOULDBLOCK == EAGAIN on Linux; both mean "someone else holds it",
+        // which is the ONE outcome that is not an error.
+        match error.raw_os_error() {
+            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => Ok(None),
+            _ => Err(error).context("flock on daemon.lock"),
+        }
+    }
+}
+
+/// Run the daemon. The advisory lock on `daemon.lock` is the singleton — see
+/// `DaemonLock` for why the socket bind could never be one. Holding it proves
+/// no other daemon is alive, which is what makes reclaiming a leftover socket
+/// safe: it can only be a corpse's.
 pub fn run() -> Result<()> {
+    // Decided before anything is bound, spawned, or started, so a losing daemon
+    // costs nothing and — the load-bearing half — touches nothing.
+    let Some(singleton) = DaemonLock::acquire()? else {
+        // The kernel says another daemon is alive. That is the fact the 2 s ping
+        // could not establish. Step aside WITHOUT unlinking its socket.
+        return Ok(());
+    };
+    // Parked where the retire path can hand it on the moment we stop serving,
+    // rather than at process exit. See `SINGLETON`.
+    if let Ok(mut held) = SINGLETON.lock() {
+        *held = Some(singleton);
+    }
+
+    // Safe HERE and only here: holding the singleton, before anything of ours is
+    // running, an orphaned engine display can only be a dead daemon's. See
+    // `reap_orphaned_displays` for why a live daemon's — including one under
+    // another HOME — can never be selected.
+    let reaped = crate::engine::substrate::reap_orphaned_displays();
+    if !reaped.is_empty() {
+        journal("engine.display.reaped", json!({ "displays": reaped }));
+    }
+
     let sock = sock_path()?;
     let listener = match UnixListener::bind(&sock) {
         Ok(listener) => listener,
         Err(_) => {
-            // Someone holds the path. Alive ⇒ step aside; stale ⇒ reclaim it.
-            if socket_answers_ping(&sock) {
-                return Ok(());
-            }
+            // We hold the singleton, so whoever left this socket behind is gone.
+            // No ping, no timeout, no guess: reclaiming it cannot strand a live
+            // owner, because a live owner would still hold the lock.
             let _ = std::fs::remove_file(&sock);
             UnixListener::bind(&sock).context("binding daemon.sock after reclaiming a stale one")?
         }
     };
+
+    // ⛔ WITHOUT THIS, EVERY NON-GRACEFUL EXIT LEAKS AN X SERVER. `run()` reaps
+    // the engine on its way out of the accept loop, but a `kill` never reaches
+    // that line — which is how 15 Xvfb came to be parented to init on dev.
+    // `ctrlc` runs this on its own thread rather than in signal context, so
+    // taking the engine's mutex and writing the journal here is sound.
+    if let Err(error) = ctrlc::set_handler(|| {
+        crate::engine::api::shutdown();
+        journal("daemon_stop", json!({ "pid": std::process::id(), "cause": "signal" }));
+        std::process::exit(0);
+    }) {
+        // Not fatal: a daemon that cannot install the handler still serves, it
+        // just leaks its display if it is signalled. Saying so beats pretending.
+        eprintln!("ychrome: could not install the daemon's signal handler ({error}); a signal will leak its X display");
+    }
     std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
         .context("locking down daemon.sock")?;
 
+    STARTED_AT_MS.store(now_millis() as u64, Ordering::SeqCst);
     let daemon = Arc::new(Daemon::new());
     write_daemon_json(&daemon)?;
     journal("daemon_start", json!({ "version": VERSION, "pid": std::process::id() }));
@@ -1004,17 +1235,13 @@ fn note_daemon_reply(reply: &Value) {
     warn_outdated_daemon(reply.get("pid").and_then(Value::as_u64).unwrap_or(0), &why);
 }
 
-fn socket_answers_ping(sock: &std::path::Path) -> bool {
-    let Ok(mut stream) = UnixStream::connect(sock) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    if writeln!(stream, "{}", json!({ "op": "ping" })).is_err() {
-        return false;
-    }
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).is_ok() && line.contains("\"ok\":true")
-}
+// `socket_answers_ping` lived here and is deliberately GONE. It was a second
+// answer to "is a daemon alive?", and it was the wrong one: a 2 s read timeout
+// against a socket whose accept loop can legitimately be busy. Liveness now has
+// exactly one owner, `DaemonLock`, and the kernel answers it. Do not
+// reintroduce a timeout-based liveness probe — a daemon that fails it is
+// usually working, not dead, and the cost of the mistake is a permanently
+// orphaned daemon holding a display nobody can reach.
 
 /// Ensure a daemon running THIS binary's code is serving, and return nothing but
 /// the guarantee that a daemon is up. Four outcomes, and the middle two are the
@@ -1188,6 +1415,12 @@ fn register_reply(env_id: &str, profile: &str) -> Result<Value> {
         "env_id": env_id,
         "profile": profile,
         "pid": std::process::id(),
+        // We are the token's only courier, so we say so in the same round trip
+        // that mints it. A binary older than the gate cannot send this field,
+        // which is precisely what makes its absence trustworthy: the daemon then
+        // knows the session's panes can never open and can say so instead of
+        // answering 403 forever with no explanation.
+        "declares_control_token": true,
     }))
     .context("registering with the ychrome daemon")?;
     if reply.get("ok").and_then(Value::as_bool) != Some(true) {
@@ -1451,6 +1684,7 @@ mod tests {
                 last_heartbeat,
                 last_session_ping: None,
                 registered_seq: 0,
+                declares_control_token: true,
             }),
             queue: Mutex::new(Queue::default()),
             stop: Arc::new(AtomicBool::new(false)),
@@ -1713,7 +1947,7 @@ mod tests {
         // an endpoint it cannot drive.
         let source = include_str!("daemon.rs");
         let body = source
-            .split("fn register(self: &Arc<Self>, env_id: &str, profile: &str, pid: i32)")
+            .split("    fn register(\n")
             .nth(1)
             .and_then(|rest| rest.split("\n    fn deregister").next())
             .expect("register body present");
@@ -1721,6 +1955,56 @@ mod tests {
             body.matches("\"control_token\":").count(),
             2,
             "both the heartbeat reply and the fresh-session reply must carry the token"
+        );
+        // And both arms must record the COURIER fact. The heartbeat arm is the
+        // one that matters: a pre-gate client re-registers every ~4s, and an
+        // arm that only set the flag on first bind would let one lucky
+        // registration make a session look drivable for the rest of its life.
+        assert!(
+            body.contains("meta.declares_control_token = declares_control_token;"),
+            "the HEARTBEAT arm must re-record the courier fact, or a session keeps \
+             whatever its first registration said forever"
+        );
+        assert!(
+            body.contains(
+                "                registered_seq,\n                declares_control_token,\n"
+            ),
+            "the fresh-session arm must record the courier fact on the entry it builds"
+        );
+        assert!(
+            body.contains("\"declares_control_token\": declares_control_token,"),
+            "the journal's register line must carry it, so a session that can never \
+             open its panes is diagnosable at the moment it attaches"
+        );
+    }
+
+    /// The client asserts its own capability, in the same round trip that mints
+    /// the token it would have to carry. Nothing infers a binary's vintage.
+    #[test]
+    fn the_client_claims_the_courier_and_silence_means_it_cannot() {
+        let source = include_str!("daemon.rs");
+        let body = source
+            .split("fn register_reply(env_id: &str, profile: &str)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n/// What a client needs").next())
+            .expect("register_reply body present");
+        assert!(
+            body.contains("\"declares_control_token\": true"),
+            "this binary declares the token, so its register must say so — without \
+             the claim the daemon would report every session of ours as un-drivable"
+        );
+
+        // The DEFAULT is the load-bearing half: a client too old to send the
+        // field must read as "no courier", never as "assume the best".
+        let arm = source
+            .split("        \"register\" => {")
+            .nth(1)
+            .and_then(|rest| rest.split("        \"deregister\"").next())
+            .expect("the register op arm");
+        assert!(
+            arm.contains(".and_then(Value::as_bool)\n                .unwrap_or(false)"),
+            "an absent `declares_control_token` must default to FALSE: the clients \
+             that cannot send it are exactly the ones that cannot carry the token"
         );
     }
 
@@ -1761,6 +2045,179 @@ mod tests {
         assert!(
             body.contains("sidebar::respond_json(stream, status, &body, &request.path)"),
             "a response's CORS headers must be chosen by the route that produced it"
+        );
+    }
+
+    // ── THE SINGLETON ───────────────────────────────────────────────────────
+    // Measured cost of not having it, on dev 2026-07-31: 21 `daemon_start`
+    // against 13 `daemon_stop`, six starts in a row with no stop, and 15 Xvfb
+    // reparented to init. An agent's `ctl open` landed on a daemon that no
+    // longer owned the socket, so the very next `ctl eval` said `no page`.
+
+    // The exclusion itself, against the real kernel primitive. Two SEPARATE
+    // `open`s conflict even inside one process, because an flock belongs to the
+    // open file description rather than to the process — which is exactly the
+    // property that makes it a cross-process singleton.
+    #[test]
+    fn only_one_daemon_can_hold_the_lock_at_a_time() {
+        let path = std::env::temp_dir().join(format!(
+            "ychrome-daemon-lock-test-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let first = DaemonLock::acquire_at(&path)
+            .expect("first acquire must not error")
+            .expect("the first daemon takes the lock");
+
+        let second = DaemonLock::acquire_at(&path).expect("a held lock is not an error");
+        assert!(
+            second.is_none(),
+            "a second daemon MUST be refused while the first holds the lock — \
+             this refusal is the whole singleton"
+        );
+
+        // Releasing hands it to the next daemon, so a clean handover still works.
+        drop(first);
+        let third = DaemonLock::acquire_at(&path).expect("acquire after release");
+        assert!(
+            third.is_some(),
+            "once the holder is gone the lock MUST be available, or a daemon \
+             restart could never bring one back"
+        );
+        drop(third);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ⛔ ORDER IS THE FIX. Acquiring the lock BEFORE touching the socket is what
+    // makes reclaiming a leftover socket safe; doing it after would leave the
+    // same window that stranded six daemons.
+    #[test]
+    fn run_takes_the_singleton_before_it_touches_the_socket() {
+        let source = include_str!("daemon.rs");
+        let body = source
+            .split("pub fn run() -> Result<()> {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n}").next())
+            .expect("run body present");
+        let lock_at = body
+            .find("DaemonLock::acquire()")
+            .expect("run() must take the daemon singleton");
+        let bind_at = body
+            .find("UnixListener::bind")
+            .expect("run() must bind the socket");
+        assert!(
+            lock_at < bind_at,
+            "run() must acquire the singleton BEFORE binding: the lock is what \
+             proves a leftover socket belongs to a corpse rather than to a live \
+             daemon that was merely busy"
+        );
+    }
+
+    // The predicate that caused the damage must not come back in any form. A
+    // timeout-based liveness probe answers "busy" as "dead", and the price of
+    // that mistake is a daemon orphaned for the rest of its life.
+    #[test]
+    fn liveness_is_never_decided_by_a_ping_timeout_again() {
+        let source = include_str!("daemon.rs");
+        // Assembled at runtime so this test's OWN text is not a match for it.
+        let banned_fn = format!("fn {}_answers_ping", "socket");
+        let run_body = source
+            .split("pub fn run() -> Result<()> {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n}").next())
+            .expect("run body present");
+        assert!(
+            !run_body.contains(&banned_fn[3..]),
+            "run() must not decide liveness by pinging the socket — a busy \
+             daemon fails that probe while working perfectly"
+        );
+        assert!(
+            !source.contains(&banned_fn),
+            "the ping-based liveness predicate must stay deleted: a second \
+             answer to 'is a daemon alive?' is how the first one got trusted"
+        );
+    }
+
+    // ⛔ THE SINGLETON IS RELEASED WHERE THE SOCKET IS, NOT AT PROCESS EXIT.
+    // A retiring daemon frees the path before answering so its successor can
+    // start serving while it winds its engine down. Holding the lock past that
+    // point removed the overlap: measured, it made tests/daemon_staleness.rs
+    // flaky and roughly doubled its runtime (~12s green -> ~18-21s intermittent).
+    #[test]
+    fn retiring_hands_on_the_singleton_in_the_same_breath_as_the_socket() {
+        let source = include_str!("daemon.rs");
+        let body = source
+            .split("fn handle_unix_conn(daemon: &Arc<Daemon>, stream: UnixStream) -> bool {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n}").next())
+            .expect("handle_unix_conn body present");
+        let unlink_at = body
+            .find("remove_file(&sock)")
+            .expect("the retire path unlinks the socket");
+        let release_at = body
+            .find("DaemonLock::release()")
+            .expect(
+                "the retire path must release the singleton too — freeing the \
+                 socket while keeping the lock makes every handover wait out a \
+                 full engine teardown",
+            );
+        assert!(
+            release_at > unlink_at,
+            "release belongs with the unlink, on the retire path"
+        );
+    }
+
+    // Unlinking the lock file would silently destroy the exclusion: the next
+    // daemon creates a fresh inode and locks something nobody else holds.
+    #[test]
+    fn the_lock_file_is_never_unlinked() {
+        // PRODUCTION CODE ONLY: the daemon is what must never unlink it, and
+        // scanning this module too would only ever match the assertion below.
+        let production = include_str!("daemon.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source before the test module");
+        // Assembled at runtime for the same reason.
+        let (unlink, lockish) = (format!("remove_{}", "file"), "lock".to_string());
+        for line in production.lines() {
+            let line = line.trim();
+            if line.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !(line.contains(&unlink) && line.contains(&lockish)),
+                "a line removes a lock file, which destroys the mutual \
+                 exclusion it exists to provide: {line}"
+            );
+        }
+    }
+
+    // A connected-but-silent client used to wedge the accept loop forever,
+    // because `fill_buf` runs inline on it with no timeout. That wedge is what
+    // made a live daemon look dead.
+    #[test]
+    fn the_accept_loop_bounds_the_wait_for_a_clients_first_byte() {
+        let source = include_str!("daemon.rs");
+        let body = source
+            .split("fn handle_unix_conn(daemon: &Arc<Daemon>, stream: UnixStream) -> bool {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n}").next())
+            .expect("handle_unix_conn body present");
+        let timeout_at = body
+            .find("set_read_timeout(Some(FIRST_BYTE_TIMEOUT))")
+            .expect("the first-byte wait must be bounded");
+        let fill_at = body.find("fill_buf()").expect("fill_buf present");
+        assert!(
+            timeout_at < fill_at,
+            "the read timeout must be set BEFORE fill_buf blocks on it, or one \
+             silent client stops the daemon answering anything"
+        );
+        // …and released once the byte is in, so an engine verb that legitimately
+        // runs for 45s is not cut off at 5s.
+        assert!(
+            body.contains("set_read_timeout(None)"),
+            "the HTTP branch must clear the first-byte timeout before the engine \
+             thread takes the stream — engine verbs outlast it by design"
         );
     }
 
