@@ -838,6 +838,69 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             state.touch();
             Ok(json!({ "entry": entry }))
         }
+        // EVERYTHING A DETAIL PAGE NEEDS, IN ONE READ, AND NOT ONE SECRET.
+        //
+        // The sidebar's View pane was assembled from `list` + `fields` +
+        // `passkeys` + three date questions before this existed, which is four
+        // round-trips that can each describe a different moment — the way a page
+        // ends up showing one item's dates beside another's fields. Dates are
+        // plaintext in the sync record; the booleans say a value EXISTS. A value
+        // itself still arrives only through the one-render reveal ops below.
+        "view" => {
+            let name = string("name").ok_or_else(|| anyhow!("view needs a name"))?;
+            let vault = unlocked(&state)?;
+            let items = vault.items();
+            let item = resolve(&items, &name, string("user").as_deref())?;
+            let detail = vault
+                .detail(&item.id)
+                .ok_or_else(|| anyhow!("{} could not be read", item.name))?;
+            state.touch();
+            Ok(serde_json::to_value(detail)?)
+        }
+        // ONE past password, by index. Never the list — see `Vault::past_password`
+        // for why a page gets dates and a press gets a value.
+        "password-history" => {
+            let name =
+                string("name").ok_or_else(|| anyhow!("password-history needs a name"))?;
+            let index = request
+                .get("index")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow!("password-history needs an index"))?
+                as usize;
+            let vault = unlocked(&state)?;
+            let items = vault.items();
+            let item = resolve(&items, &name, string("user").as_deref())?;
+            let password = vault.past_password(&item.id, index).ok_or_else(|| {
+                anyhow!(
+                    "{} has no readable password at history position {index}",
+                    item.name
+                )
+            })?;
+            let name = item.name.clone();
+            state.touch();
+            Ok(json!({ "password": password, "name": name, "index": index }))
+        }
+        // Put an item away without destroying it — Bitwarden's third bucket.
+        // `archived: false` brings it back. Not the trash: `rm` is that, and the
+        // two are deliberately different verbs because one is on a path to
+        // destruction and the other is not.
+        "archive" => {
+            let name = string("name").ok_or_else(|| anyhow!("archive needs a name"))?;
+            let archived = request
+                .get("archived")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let vault = unlocked(&state)?;
+            let items = vault.items();
+            let item = resolve(&items, &name, string("user").as_deref())?;
+            let (id, name) = (item.id.clone(), item.name.clone());
+            state
+                .manager
+                .archive_item(&id, archived)
+                .map_err(|error| anyhow!(error.to_string()))?;
+            state.touch();
+            Ok(json!({ "id": id, "name": name, "archived": archived }))
+        }
         // Notes live only in the raw record, so this is also the read that
         // proves an edit preserved them.
         "notes" => {

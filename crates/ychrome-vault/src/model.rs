@@ -39,6 +39,10 @@ pub struct RawCipher {
     /// key (`key_value`) is only ever touched by a WebAuthn ceremony, never by
     /// the metadata listing.
     pub fido2: Vec<RawFido2Credential>,
+    /// `archivedDate` — plaintext, server-owned, `None` for an ordinary item.
+    /// Bitwarden's archive is a third bucket beside live and trashed, and the
+    /// server keeps archived ciphers in the LIVE list with this set.
+    pub archived_date: Option<String>,
 }
 
 /// One stored passkey as it arrives from `sync`, every string field still an
@@ -351,6 +355,53 @@ pub struct VaultItem {
     /// be asked: 130 of this user's 1113 items are not logins, so `get` refuses
     /// them ("has no password") with nothing in the listing to explain why.
     pub item_type: u8,
+    /// The item is ARCHIVED: put away without being destroyed.
+    ///
+    /// Bitwarden's own third bucket, distinct from the trash — the server keeps
+    /// archived ciphers in the LIVE list with an `archivedDate` set, so unlike
+    /// [`Vault::trashed_items`] this cannot be a separate collection without
+    /// inventing a split the wire does not have. It is a flag on the item and
+    /// the callers filter.
+    pub archived: bool,
+}
+
+/// Everything a DETAIL VIEW needs and nothing it must not have.
+///
+/// ⛔ SECRET-FREE BY CONSTRUCTION, exactly like [`VaultItem`]. It carries the
+/// booleans saying a password/notes/authenticator EXIST and the plaintext dates
+/// the server stores in the clear; it never carries a value. The one reader is
+/// the sidebar's View pane, which is re-fetched on every render — so anything
+/// placed here is broadcast for as long as the pane is open, which is precisely
+/// why the eye and the copy stay one-render reads through their own ops.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ItemDetail {
+    /// The listing's own record, so a detail page and the row that opened it can
+    /// never disagree about a name, a username or a type.
+    #[serde(flatten)]
+    pub item: VaultItem,
+    pub has_notes: bool,
+    /// Custom-field NAMES in stored order. A name identifies; it does not
+    /// reveal — the same line the card audit and the edit receipt draw.
+    pub field_names: Vec<String>,
+    pub passkeys: Vec<PasskeyInfo>,
+    /// `creationDate` — plaintext in the sync record.
+    pub created: Option<String>,
+    /// `revisionDate` — when the server last saw a change.
+    pub revised: Option<String>,
+    /// `login.passwordRevisionDate` — when the PASSWORD last changed, which is
+    /// a different question from when the item did.
+    pub password_revised: Option<String>,
+    pub archived_date: Option<String>,
+    /// One entry per REPLACED password, newest first — dates only. The values
+    /// are read one at a time through [`Vault::past_password`].
+    pub password_history: Vec<PastPassword>,
+}
+
+/// A past password's metadata. The value is deliberately absent: a history list
+/// is a LISTING, and a listing never carries a secret.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PastPassword {
+    pub last_used_date: Option<String>,
 }
 
 /// Secret-free metadata for a card cipher: what a human needs to tell two cards
@@ -636,6 +687,7 @@ impl Vault {
                     has_totp: cipher.totp.is_some(),
                     has_passkey: !cipher.fido2.is_empty(),
                     item_type: cipher.item_type,
+                    archived: cipher.archived_date.is_some(),
                 })
             })
             .collect()
@@ -1289,6 +1341,93 @@ impl Vault {
         key.decrypt_to_string(enc).ok()
     }
 
+    /// Everything a detail view needs about one item, and nothing secret.
+    ///
+    /// ONE read for a whole page. The alternative — the pane asking `list`,
+    /// `fields`, `passkeys` and three date questions separately — is four
+    /// round-trips that can each describe a different moment, which is how a
+    /// page ends up showing one item's dates beside another's fields.
+    ///
+    /// `None` only when the id is unknown; an item whose raw record is missing
+    /// a date simply reports `None` for it, because "the server did not say" and
+    /// "there is no such item" are different answers and the caller acts on them
+    /// differently.
+    pub fn detail(&self, id: &str) -> Option<ItemDetail> {
+        let cipher = self.find(id)?;
+        let item = self.items_from(std::slice::from_ref(cipher)).pop()?;
+        let raw = cipher.raw.as_object();
+        let plain = |key: &str| {
+            raw.and_then(|raw| get_ci(raw, key))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        // `passwordRevisionDate` lives INSIDE the login object, unlike the two
+        // dates the server keeps at the top level.
+        let password_revised = raw
+            .and_then(|raw| get_ci(raw, "login"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|login| get_ci(login, "passwordRevisionDate"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        Some(ItemDetail {
+            has_notes: self.notes(id).is_some(),
+            field_names: self
+                .fields(id)
+                .into_iter()
+                .map(|(name, _)| name)
+                .filter(|name| !name.is_empty())
+                .collect(),
+            passkeys: self.passkeys(id),
+            created: plain("creationDate"),
+            revised: plain("revisionDate"),
+            password_revised,
+            archived_date: cipher.archived_date.clone(),
+            password_history: self
+                .password_history_entries(cipher)
+                .iter()
+                .map(|entry| PastPassword {
+                    last_used_date: entry
+                        .as_object()
+                        .and_then(|entry| get_ci(entry, "lastUsedDate"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                })
+                .collect(),
+            item,
+        })
+    }
+
+    /// The raw `passwordHistory` array, newest first, as the server stored it.
+    /// Each entry's `password` is still ciphertext here — see
+    /// [`Vault::past_password`] for the one read that decrypts one.
+    fn password_history_entries(&self, cipher: &RawCipher) -> Vec<serde_json::Value> {
+        cipher
+            .raw
+            .as_object()
+            .and_then(|raw| get_ci(raw, "passwordHistory"))
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// ONE past password, by its index in [`ItemDetail::password_history`],
+    /// decrypted on demand.
+    ///
+    /// Deliberately indexed rather than returned with the history: a list of
+    /// every password an item ever had is the single most dangerous payload this
+    /// vault can produce, and a detail page re-fetches its schema constantly. So
+    /// the page gets DATES, and a value arrives only for the entry whose eye was
+    /// pressed, for exactly one render — the same contract the current
+    /// password's reveal has had since 2026-08-02.
+    pub fn past_password(&self, id: &str, index: usize) -> Option<String> {
+        let cipher = self.find(id)?;
+        let entry = self.password_history_entries(cipher).into_iter().nth(index)?;
+        let encrypted = get_ci(entry.as_object()?, "password")?.as_str()?.to_string();
+        let key = self.cipher_key(cipher).ok()?;
+        key.decrypt_to_string(&EncString::parse(&encrypted).ok()?)
+            .ok()
+    }
+
     /// A specific item's notes, decrypted on demand.
     ///
     /// Read straight off the RAW record, because `sync` does not parse notes
@@ -1782,6 +1921,7 @@ mod tests {
             organization_id: None,
             raw: serde_json::Value::Null,
             fido2: vec![],
+            archived_date: None,
         };
         let vault = Vault::new(user_key, HashMap::new(), vec![cipher], vec![], folders);
 
