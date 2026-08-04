@@ -496,6 +496,27 @@ struct EditDraft {
     generate_password: bool,
 }
 
+/// The entry the View pane is showing.
+///
+/// ⛔ `detail` IS THE AGENT'S OWN SECRET-FREE RECORD, held verbatim. The pane
+/// does not re-model it: `ItemDetail` is the single source of truth for what an
+/// item IS, and a second Rust struct here would be a copy that drifts the first
+/// time the agent learns a new date. What it holds is names, booleans and
+/// plaintext dates — the same class of thing a listing carries — and never a
+/// value.
+#[derive(Default)]
+struct ViewDraft {
+    /// How `list` identifies the item. Empty = nothing open.
+    target_name: String,
+    target_user: String,
+    /// The `view` op's reply.
+    detail: Value,
+    /// The delete button has been pressed ONCE. A trash press is one click away
+    /// from moving somebody's credential out of every fill path, so it asks;
+    /// but it asks IN THE BUTTON, not in a modal a rail cannot draw.
+    confirm_delete: bool,
+}
+
 /// The pre-fillable half of an edit: exactly the fields a secret-free listing
 /// already carries.
 #[derive(Default, Clone, PartialEq, Eq)]
@@ -539,6 +560,7 @@ pub(crate) struct PaneState {
     /// password (see `ychrome_vault::watchtower`).
     watchtower: Option<Value>,
     edit: EditDraft,
+    view: ViewDraft,
     /// Why the last sync failed, held until one SUCCEEDS.
     ///
     /// ⛔ A TOAST IS NOT A REPORT. A sync that failed and said so for three
@@ -562,6 +584,7 @@ impl Default for PaneState {
             generate_no_symbols: false,
             watchtower: None,
             edit: EditDraft::default(),
+            view: ViewDraft::default(),
             last_sync_error: None,
             last_sync_attempt: None,
         }
@@ -1533,11 +1556,23 @@ pub(crate) enum StoredField {
     /// A custom field, by name. Hidden or not — the vault decides whether it can
     /// be read, and says why when it cannot.
     Custom(String),
+    /// A REPLACED password, by its position in the item's history (0 = the most
+    /// recently replaced). Bitwarden's "Password history", which the user asked
+    /// to have open by default rather than behind a link.
+    ///
+    /// Indexed rather than named because history entries have no names — only an
+    /// order and a date — and reading one is the same one-render ask every other
+    /// arm here makes.
+    PastPassword(usize),
 }
 
 /// The wire spelling of a custom field, so `field:API Key` cannot collide with
 /// the fixed names above.
 const CUSTOM_FIELD_PREFIX: &str = "field:";
+
+/// The wire spelling of a past password. Parsed BEFORE the custom-field prefix
+/// so a field somebody named `past:3` cannot shadow history position 3.
+const PAST_PASSWORD_PREFIX: &str = "past:";
 
 impl StoredField {
     /// The token that travels in an action id or a row id. Round-trips through
@@ -1550,6 +1585,7 @@ impl StoredField {
             StoredField::TotpSecret => "totp-secret".to_string(),
             StoredField::Notes => "notes".to_string(),
             StoredField::Custom(name) => format!("{CUSTOM_FIELD_PREFIX}{name}"),
+            StoredField::PastPassword(index) => format!("{PAST_PASSWORD_PREFIX}{index}"),
         }
     }
 
@@ -1560,12 +1596,18 @@ impl StoredField {
             "totp" => StoredField::TotpCode,
             "totp-secret" => StoredField::TotpSecret,
             "notes" => StoredField::Notes,
-            // A custom field's name may itself contain a colon, so this splits
-            // ONCE on the prefix and takes the whole remainder.
-            other => match other.strip_prefix(CUSTOM_FIELD_PREFIX) {
-                Some(name) if !name.is_empty() => StoredField::Custom(name.to_string()),
-                _ => return None,
-            },
+            other => {
+                if let Some(index) = other.strip_prefix(PAST_PASSWORD_PREFIX) {
+                    StoredField::PastPassword(index.parse().ok()?)
+                } else {
+                    // A custom field's name may itself contain a colon, so this
+                    // splits ONCE on the prefix and takes the whole remainder.
+                    match other.strip_prefix(CUSTOM_FIELD_PREFIX) {
+                        Some(name) if !name.is_empty() => StoredField::Custom(name.to_string()),
+                        _ => return None,
+                    }
+                }
+            }
         })
     }
 
@@ -1578,6 +1620,7 @@ impl StoredField {
             StoredField::TotpSecret => "authenticator key".to_string(),
             StoredField::Notes => "notes".to_string(),
             StoredField::Custom(name) => format!("field “{name}”"),
+            StoredField::PastPassword(index) => format!("past password #{}", index + 1),
         }
     }
 
@@ -1653,6 +1696,15 @@ fn read_stored(name: &str, user: &str, field: &StoredField) -> Result<String> {
                 _ => bail!("{name} has no notes"),
             }
         }
+        StoredField::PastPassword(index) => {
+            let mut request = with("password-history");
+            request["index"] = json!(index);
+            let reply = vault_op(request)?;
+            match reply["password"].as_str() {
+                Some(password) if !password.is_empty() => Ok(password.to_string()),
+                _ => bail!("{name} has no readable password at history position {index}"),
+            }
+        }
         StoredField::Custom(field_name) => {
             let reply = vault_op(with("fields"))?;
             let found = reply["fields"]
@@ -1721,13 +1773,13 @@ fn item_row(item: &Value) -> Value {
     let mut actions = vec![if is_card {
         json!({
             "action": "card-fill",
-            "label": "▤",
+            "label": "icon:card",
             "title": "Fill this card into the page",
         })
     } else {
         json!({
             "action": "fill",
-            "label": "⧉",
+            "label": "icon:fill",
             "title": "Fill this login into the page",
         })
     }];
@@ -1736,18 +1788,17 @@ fn item_row(item: &Value) -> Value {
     if item["has_totp"].as_bool().unwrap_or(false) {
         actions.push(json!({
             "action": "totp",
-            "label": "⏱",
+            "label": "icon:clock",
             "title": "Fill the authenticator code into the page",
         }));
     }
-    // Editing was CLI-only until 2026-08-01: the pane could create an entry and
-    // fill one, and the user watched it serve a value they had already fixed in
-    // another client with no way to correct it here.
-    actions.push(json!({
-        "action": "edit-open",
-        "label": "✎",
-        "title": "Edit this entry",
-    }));
+
+    // ⛔ THERE IS NO ✎ ON THE ROW ANY MORE, and dropping it was the point.
+    // Editing arrived as a third glyph in 2026-08-01 because the row had no
+    // other way in; the row now OPENS the entry, exactly as every list in this
+    // product opens what you click, and edit is a button on the page that opens.
+    // The user's words, 2026-08-04: *"the edit pencil icon can be dropped
+    // entirely in lieu of clicking the actual item."*
 
     // ⛔ EVERY BUTTON ABOVE PUTS A VALUE IN THE PAGE; NONE OF THEM GIVES IT TO
     // THE USER. That was the whole of the 2026-08-02 report: a user who needs a
@@ -1784,6 +1835,10 @@ fn item_row(item: &Value) -> Value {
         }));
     }
     menu.push(json!({
+        "action": "view-open",
+        "label": "Open this entry",
+    }));
+    menu.push(json!({
         "action": "edit-open",
         "label": "Edit, and read what is stored",
     }));
@@ -1793,6 +1848,10 @@ fn item_row(item: &Value) -> Value {
         "id": row_id(name, user),
         "title": name,
         "subtitle": subtitle,
+        // THE ROW BODY OPENS THE ENTRY. Everything else on the row puts a value
+        // in the PAGE; this is the one affordance that gives the user the item.
+        "row_action": "view-open",
+        "icon": if is_card { "icon:card" } else { "icon:globe" },
         "actions": actions,
         "menu": menu,
     })
@@ -2157,6 +2216,10 @@ fn unlocked_schema(
                 "label": "Save to vault",
             }));
         }
+        "view" => {
+            widgets.extend(view_tab_widgets(&state.view, reveal));
+            footer = view_footer_widgets(&state.view);
+        }
         "edit" => {
             widgets.extend(edit_tab_widgets(&state.edit, reveal));
             footer = edit_footer_widgets(&state.edit);
@@ -2215,7 +2278,7 @@ fn unlocked_schema(
             // verbs are the ones a user reaches for when our autofill misses.
             widgets.push(json!({
                 "kind": "label", "muted": true,
-                "text": "Right-click an entry to copy its username, password or verification code.                          ✎ opens it, where any one stored value can be read.",
+                "text": "Click an entry to see everything it stores. Right-click to copy its username, password or verification code without leaving the list.",
             }));
             let query = state.query.trim();
             if query.is_empty()
@@ -2283,6 +2346,12 @@ fn field_action(verb: &str, field: &StoredField, label: &str, title: String) -> 
         "title": title,
     })
 }
+
+/// A URI verb on the View pane. The address rides the ACTION, exactly as a
+/// field spec does — a row's press carries the ROW's id, and a row that holds
+/// one of several websites has no way to say which one from that alone.
+pub(crate) const VIEW_OPEN_URI_VERB: &str = "view-open-uri:";
+pub(crate) const VIEW_COPY_URI_VERB: &str = "view-copy-uri:";
 
 pub(crate) const EDIT_REVEAL_VERB: &str = "edit-reveal";
 pub(crate) const EDIT_COPY_VERB: &str = "edit-copy";
@@ -2393,6 +2462,368 @@ fn stored_value_row(field: &StoredField, reveal: Option<&Reveal>, removable: boo
     widgets
 }
 
+/// A stored value, as the VIEW pane draws it: the field's name, what it holds,
+/// and the verbs that act on it.
+///
+/// One `list-row` per value, so the detail page inherits the product's row
+/// engine — hover tint, trailing verbs revealed on hover, one set of metrics —
+/// instead of growing a fourth row style (DESIGN.md ▸ Session-style rows: "New
+/// list surfaces MUST consume the engine").
+///
+/// `secret` decides what the row shows AT REST: mask dots for a password, the
+/// value itself for a username. A revealed value replaces either — for exactly
+/// one render, because [`Reveal`] is a parameter and there is nowhere to keep
+/// it.
+fn view_value_row(
+    field: StoredField,
+    title: &str,
+    resting: &str,
+    secret: bool,
+    reveal: Option<&Reveal>,
+    extra_actions: Vec<Value>,
+) -> Value {
+    let revealed = reveal.filter(|reveal| reveal.field == field);
+    let mut actions = Vec::new();
+    if secret {
+        actions.push(field_action(
+            VIEW_REVEAL_VERB,
+            &field,
+            if revealed.is_some() {
+                "icon:eye-off"
+            } else {
+                "icon:eye"
+            },
+            format!("Show the stored {} here, once", field.label()),
+        ));
+    }
+    actions.extend(extra_actions);
+    actions.push(field_action(
+        VIEW_COPY_VERB,
+        &field,
+        "icon:copy",
+        format!("Copy the {} to the clipboard", field.label()),
+    ));
+    json!({
+        "kind": "list-row",
+        // The row id IS the field spec, so a row and its verbs cannot disagree
+        // about what they act on.
+        "id": field.spec(),
+        "title": title,
+        "subtitle": match revealed {
+            Some(reveal) => reveal.value.clone(),
+            None => resting.to_string(),
+        },
+        "actions": actions,
+    })
+}
+
+/// What a masked value looks like at rest. A COUNT-FREE run of dots: a mask
+/// whose length matched the secret would leak the secret's length to anyone
+/// looking over a shoulder, and every other client draws a fixed run too.
+const MASK_DOTS: &str = "••••••••••••";
+
+pub(crate) const VIEW_REVEAL_VERB: &str = "view-reveal";
+pub(crate) const VIEW_COPY_VERB: &str = "view-copy";
+
+/// `2026-08-01T20:03:55.123Z` → `1 Aug 2026, 20:03 UTC`.
+///
+/// UTC is NAMED rather than silently converted. This process has no timezone
+/// database and the vault stores UTC; printing `8:03 PM` with no zone would be
+/// a small lie on a fleet whose hosts are +05:30, and "when did this password
+/// change" is exactly the question where an unlabelled six-hour error matters.
+/// Anything unparseable is returned verbatim — a date we cannot read is still
+/// data the user might recognise.
+fn human_date(iso: &str) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (date, rest) = match iso.split_once('T') {
+        Some(parts) => parts,
+        None => return iso.to_string(),
+    };
+    let mut parts = date.split('-');
+    let (Some(year), Some(month), Some(day)) = (parts.next(), parts.next(), parts.next()) else {
+        return iso.to_string();
+    };
+    let Ok(month_index) = month.parse::<usize>() else {
+        return iso.to_string();
+    };
+    let Some(name) = MONTHS.get(month_index.wrapping_sub(1)) else {
+        return iso.to_string();
+    };
+    let day = day.trim_start_matches('0');
+    let time: String = rest.chars().take(5).collect();
+    format!("{day} {name} {year}, {time} UTC")
+}
+
+/// THE VIEW PANE — Bitwarden's View Login, in our rail.
+///
+/// ⛔ IT IS A PAGE, NOT A TOOLTIP. Clicking a row used to do nothing at all: the
+/// row's three glyphs put values into the PAGE and none of them gave the user
+/// the item. The user asked for this shape explicitly, with a screenshot of
+/// Bitwarden's own view (2026-08-04) — credential card, autofill card, notes
+/// card, item history with **password history already expanded**, and an action
+/// bar whose first element is a big Edit button beside an archive and a delete.
+///
+/// ⛔ AND IT CARRIES NO SECRET. Every value here is either metadata the agent's
+/// `view` op already answers with (names, dates, booleans) or mask dots. A real
+/// value arrives only in the reply to the press of an eye, for one render —
+/// [`Reveal`] is a parameter, not state, and `GET /pane/vault` cannot reach the
+/// revealing builder at all.
+fn view_tab_widgets(draft: &ViewDraft, reveal: Option<&Reveal>) -> Vec<Value> {
+    if draft.target_name.is_empty() {
+        return vec![
+            json!({"kind": "section", "text": "No entry open", "card": true}),
+            json!({
+                "kind": "label", "muted": true,
+                "text": "Pick an entry on the Fill tab to see everything it stores.",
+            }),
+        ];
+    }
+    let detail = &draft.detail;
+    let flag = |key: &str| detail[key].as_bool().unwrap_or(false);
+    let text = |key: &str| detail[key].as_str().unwrap_or_default().to_string();
+    let is_card = detail["item_type"].as_u64() == Some(u64::from(CIPHER_TYPE_CARD));
+
+    // WHAT THE ENTRY IS. Bitwarden's header card.
+    let mut widgets = vec![
+        json!({"kind": "section", "text": draft.target_name, "card": true}),
+        json!({
+            "kind": "label", "muted": true,
+            "text": match detail["folder"].as_str() {
+                Some(folder) if !folder.is_empty() => format!("Folder: {folder}"),
+                _ => "No folder".to_string(),
+            },
+        }),
+    ];
+    if detail["archived"].as_bool().unwrap_or(false) {
+        widgets.push(json!({
+            "kind": "label",
+            "text": "Archived — kept, but out of the way. Press the archive button to bring it back.",
+        }));
+    }
+
+    // LOGIN CREDENTIALS.
+    widgets.push(json!({"kind": "section", "text": "Login credentials", "card": true}));
+    let user = text("username");
+    if user.is_empty() && !flag("has_password") && !flag("has_totp") && !flag("has_passkey") {
+        widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": if is_card {
+                "This is a card. Its number and CVV reach a page only through the card fill button — they are never shown here."
+            } else {
+                "This entry stores no credentials."
+            },
+        }));
+    }
+    if !user.is_empty() {
+        widgets.push(view_value_row(
+            StoredField::Username,
+            "Username",
+            &user,
+            false,
+            reveal,
+            Vec::new(),
+        ));
+    }
+    if flag("has_password") {
+        widgets.push(view_value_row(
+            StoredField::Password,
+            "Password",
+            MASK_DOTS,
+            true,
+            reveal,
+            Vec::new(),
+        ));
+    }
+    for passkey in detail["passkeys"].as_array().into_iter().flatten() {
+        widgets.push(json!({
+            "kind": "list-row",
+            "id": format!("passkey:{}", passkey["rp_id"].as_str().unwrap_or_default()),
+            "icon": "icon:key",
+            "title": "Passkey",
+            "subtitle": match passkey["creation_date"].as_str() {
+                Some(created) => format!("Created {}", human_date(created)),
+                None => passkey["rp_id"].as_str().unwrap_or_default().to_string(),
+            },
+        }));
+    }
+    if flag("has_totp") {
+        // TWO different values live behind one authenticator secret, and
+        // conflating them is how a user pastes a base32 key into a six-digit
+        // box. The CODE is what you type into a form; the KEY is what you
+        // re-enrol another device from.
+        widgets.push(view_value_row(
+            StoredField::TotpCode,
+            "Verification code",
+            MASK_DOTS,
+            true,
+            reveal,
+            Vec::new(),
+        ));
+        widgets.push(view_value_row(
+            StoredField::TotpSecret,
+            "Authenticator key",
+            MASK_DOTS,
+            true,
+            reveal,
+            Vec::new(),
+        ));
+    }
+
+    // AUTOFILL OPTIONS — where this entry matches.
+    let uris: Vec<&str> = detail["uris"]
+        .as_array()
+        .map(|uris| uris.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    widgets.push(json!({"kind": "section", "text": "Autofill options", "card": true}));
+    if uris.is_empty() {
+        widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": "No website is stored, so this entry is only reachable by search.",
+        }));
+    }
+    for (index, uri) in uris.iter().enumerate() {
+        widgets.push(json!({
+            "kind": "list-row",
+            "id": format!("uri:{index}"),
+            "icon": "icon:globe",
+            "title": "Website",
+            "subtitle": uri,
+            "actions": [
+                {
+                    "action": format!("{VIEW_OPEN_URI_VERB}{uri}"),
+                    "label": "icon:external",
+                    "title": "Open this address in a new web surface",
+                },
+                {
+                    "action": format!("{VIEW_COPY_URI_VERB}{uri}"),
+                    "label": "icon:copy",
+                    "title": "Copy this address to the clipboard",
+                },
+            ],
+        }));
+    }
+
+    // ADDITIONAL OPTIONS — notes and custom fields.
+    widgets.push(json!({"kind": "section", "text": "Additional options", "card": true}));
+    if flag("has_notes") {
+        widgets.push(view_value_row(
+            StoredField::Notes,
+            "Note",
+            MASK_DOTS,
+            true,
+            reveal,
+            Vec::new(),
+        ));
+    }
+    let field_names: Vec<&str> = detail["field_names"]
+        .as_array()
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for name in &field_names {
+        widgets.push(view_value_row(
+            StoredField::Custom((*name).to_string()),
+            name,
+            MASK_DOTS,
+            true,
+            reveal,
+            Vec::new(),
+        ));
+    }
+    if !flag("has_notes") && field_names.is_empty() {
+        widgets.push(json!({
+            "kind": "label", "muted": true, "text": "No note and no custom fields.",
+        }));
+    }
+
+    // ITEM HISTORY.
+    widgets.push(json!({"kind": "section", "text": "Item history", "card": true}));
+    for (label, key) in [
+        ("Last edited", "revised"),
+        ("Created", "created"),
+        ("Password updated", "password_revised"),
+    ] {
+        if let Some(date) = detail[key].as_str().filter(|date| !date.is_empty()) {
+            widgets.push(json!({
+                "kind": "label", "muted": true,
+                "text": format!("{label}: {}", human_date(date)),
+            }));
+        }
+    }
+    let history = detail["password_history"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if history.is_empty() {
+        widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": "No password has been replaced on this entry, so there is no history.",
+        }));
+    } else {
+        // ⛔ EXPANDED, NOT BEHIND A LINK. Bitwarden hides this list behind a
+        // "Password history" link; the user asked for it open (2026-08-04:
+        // *"password history should auto expand the list"*). It costs nothing to
+        // show, because it is DATES — every value still needs its own eye.
+        widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": format!("Password history ({} replaced)", history.len()),
+        }));
+        for (index, entry) in history.iter().enumerate() {
+            widgets.push(view_value_row(
+                StoredField::PastPassword(index),
+                &match entry["last_used_date"].as_str() {
+                    Some(date) => format!("Replaced {}", human_date(date)),
+                    None => format!("Past password #{}", index + 1),
+                },
+                MASK_DOTS,
+                true,
+                reveal,
+                Vec::new(),
+            ));
+        }
+    }
+    widgets
+}
+
+/// The View pane's action bar.
+///
+/// ⛔ EDIT IS FIRST AND IT IS A BUTTON WITH A WORD ON IT. The user's ask, in
+/// their words: *"the edit button should be the first element in this page with
+/// big button, archive icon and the delete icon"* — which is Bitwarden's own
+/// bar, and the reason the two icons are icon-only is that yggterm floats the
+/// trailing cluster from exactly that fact (`app_pane_first_icon_button`).
+///
+/// The delete asks. A trashed credential vanishes from every fill path at once,
+/// and a rail cannot draw a modal — so the button itself becomes the question,
+/// which is the affordance a footer can actually hold.
+fn view_footer_widgets(draft: &ViewDraft) -> Vec<Value> {
+    if draft.target_name.is_empty() {
+        return Vec::new();
+    }
+    let archived = draft.detail["archived"].as_bool().unwrap_or(false);
+    vec![
+        json!({
+            "kind": "button", "id": "view-edit", "action": "view-edit", "primary": true,
+            "label": "Edit", "title": "Edit this entry",
+        }),
+        json!({
+            "kind": "button", "id": "view-archive", "action": "view-archive",
+            "label": "icon:archive",
+            "title": if archived {
+                "Bring this entry back out of the archive"
+            } else {
+                "Archive this entry — kept, but out of the way"
+            },
+        }),
+        json!({
+            "kind": "button", "id": "view-delete", "action": "view-delete", "danger": true,
+            "label": if draft.confirm_delete { "Really delete?" } else { "icon:trash" },
+            "title": "Move this entry to the trash — it can be restored from any client",
+        }),
+    ]
+}
+
 /// The Edit form — Bitwarden's Edit Login, in our rail.
 ///
 /// ⛔ EVERY SECRET BOX IS STILL EMPTY AND STILL MEANS "LEAVE THIS ALONE". What
@@ -2426,7 +2857,7 @@ fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
             json!({"kind": "section", "text": "Edit an entry", "card": true}),
             json!({
                 "kind": "label", "muted": true,
-                "text": "Pick an entry on the Fill tab and press ✎ to edit it.",
+                "text": "Pick an entry on the Fill tab, then press Edit on the page it opens.",
             }),
         ];
     }
@@ -2750,6 +3181,27 @@ fn absorb_draft(state: &mut PaneState, values: &Value) {
 /// rule is that neither ever happens. `list` already carries everything here
 /// (it is the same secret-free metadata the rows are drawn from) except the
 /// field names, which come from `fields` — from which only the names are taken.
+/// Load the View pane from ONE agent read.
+///
+/// ⛔ `view` IS THE ONE CALL, and that is the design, not an optimisation. The
+/// page shows dates, field names, passkeys and existence booleans; assembling it
+/// from `list` + `fields` + `passkeys` + three date questions would let four
+/// replies describe four different moments, which is how a page ends up showing
+/// one item's dates beside another's fields.
+///
+/// An agent too old to know the verb answers an error, and the caller shows it
+/// — which is the correct outcome. A pane that fell back to a partial page here
+/// would be a detail view that quietly omits detail.
+fn load_view_draft(name: &str, user: &str) -> Result<ViewDraft> {
+    let detail = vault_op(json!({"op": "view", "name": name, "user": opt_field(user)}))?;
+    Ok(ViewDraft {
+        target_name: name.to_string(),
+        target_user: user.to_string(),
+        detail,
+        confirm_delete: false,
+    })
+}
+
 fn load_edit_draft(name: &str, user: &str) -> Result<EditDraft> {
     let listed = vault_op(json!({
         "op": "list", "query": Value::String(name.to_string()), "trashed": false,
@@ -2992,6 +3444,141 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
             };
             merge(reschema(state, host.as_deref()), json!({ "toast": toast }))
         }
+        // OPEN AN ENTRY. The row body's action, and now the pane's front door:
+        // every other row verb puts a value into the PAGE, this one gives the
+        // user the item.
+        //
+        // ONE agent read builds the whole page (`view`), so the dates, the
+        // fields and the booleans on screen all describe the same moment.
+        "view-open" => {
+            let (name, user) = split_row_id(&value);
+            match load_view_draft(&name, &user) {
+                Ok(draft) => {
+                    {
+                        let mut state = state.lock().unwrap();
+                        state.view = draft;
+                        state.tab = "view".to_string();
+                    }
+                    reschema(state, host.as_deref())
+                }
+                Err(error) => json!({ "toast": error.to_string() }),
+            }
+        }
+        // The View pane's Edit button: the SAME loader the row menu uses, so the
+        // two doors into the form cannot load an entry differently.
+        "view-edit" => {
+            let (name, user) = {
+                let state = state.lock().unwrap();
+                (
+                    state.view.target_name.clone(),
+                    state.view.target_user.clone(),
+                )
+            };
+            if name.is_empty() {
+                return json!({ "toast": "No entry is open." });
+            }
+            match load_edit_draft(&name, &user) {
+                Ok(draft) => {
+                    {
+                        let mut state = state.lock().unwrap();
+                        state.edit = draft;
+                        state.tab = "edit".to_string();
+                    }
+                    reschema(state, host.as_deref())
+                }
+                Err(error) => json!({ "toast": error.to_string() }),
+            }
+        }
+        // Archive, or bring back — the button reads the CURRENT state and asks
+        // for its inverse, so one action serves both directions and there is no
+        // second flag to disagree with the item.
+        "view-archive" => {
+            let (name, user, archived) = {
+                let state = state.lock().unwrap();
+                (
+                    state.view.target_name.clone(),
+                    state.view.target_user.clone(),
+                    state.view.detail["archived"].as_bool().unwrap_or(false),
+                )
+            };
+            if name.is_empty() {
+                return json!({ "toast": "No entry is open." });
+            }
+            let wanted = !archived;
+            match vault_op(json!({
+                "op": "archive", "name": name, "user": opt_field(&user), "archived": wanted,
+            })) {
+                // RE-READ, never patch the held copy: the agent re-synced as
+                // part of the write, and a locally flipped boolean would be a
+                // second source of truth for which bucket the item is in.
+                Ok(_) => {
+                    if let Ok(draft) = load_view_draft(&name, &user) {
+                        state.lock().unwrap().view = draft;
+                    }
+                    merge(
+                        reschema(state, host.as_deref()),
+                        json!({
+                            "toast": if wanted {
+                                format!("{name} is archived.")
+                            } else {
+                                format!("{name} is back out of the archive.")
+                            },
+                        }),
+                    )
+                }
+                Err(error) => json!({ "toast": error.to_string() }),
+            }
+        }
+        // TRASH, and it asks first. The first press turns the button into the
+        // question; the second answers it. A rail cannot draw a modal, so the
+        // button IS the confirmation — and it is a SOFT delete, restorable from
+        // any client, which is what makes one extra click enough.
+        "view-delete" => {
+            let (name, user, confirmed) = {
+                let mut state = state.lock().unwrap();
+                let confirmed = state.view.confirm_delete;
+                if !confirmed {
+                    state.view.confirm_delete = true;
+                }
+                (
+                    state.view.target_name.clone(),
+                    state.view.target_user.clone(),
+                    confirmed,
+                )
+            };
+            if name.is_empty() {
+                return json!({ "toast": "No entry is open." });
+            }
+            if !confirmed {
+                return merge(
+                    reschema(state, host.as_deref()),
+                    json!({
+                        "toast": format!(
+                            "Press again to move {name} to the trash. It can be restored from any client.",
+                        ),
+                    }),
+                );
+            }
+            match vault_op(json!({
+                "op": "rm", "name": name, "user": opt_field(&user), "permanent": false,
+            })) {
+                Ok(_) => {
+                    {
+                        let mut state = state.lock().unwrap();
+                        state.view = ViewDraft::default();
+                        state.tab = "fill".to_string();
+                    }
+                    merge(
+                        reschema(state, host.as_deref()),
+                        json!({ "toast": format!("{name} is in the trash.") }),
+                    )
+                }
+                Err(error) => {
+                    state.lock().unwrap().view.confirm_delete = false;
+                    json!({ "toast": error.to_string() })
+                }
+            }
+        }
         // Load an entry into the Edit form. Only what a LISTING already
         // carries is read here — name, username, folder, uris, and the custom
         // field NAMES. No password, no authenticator secret, no notes, no field
@@ -3010,11 +3597,18 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 Err(error) => json!({ "toast": error.to_string() }),
             }
         }
+        // BACK TO WHERE YOU CAME FROM. Cancelling an edit that was opened from
+        // an entry's page lands back on that page, not at the top of a 1100-row
+        // list — a Cancel that loses your place is a Cancel you learn not to
+        // press.
         "edit-cancel" => {
             {
                 let mut state = state.lock().unwrap();
+                let open = state.edit.target_name == state.view.target_name
+                    && state.edit.target_user == state.view.target_user
+                    && !state.view.target_name.is_empty();
                 state.edit = EditDraft::default();
-                state.tab = "fill".to_string();
+                state.tab = if open { "view" } else { "fill" }.to_string();
             }
             reschema(state, host.as_deref())
         }
@@ -3060,15 +3654,30 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
         // field specs), so the target rides the action exactly as `copy-row:`
         // does — one encoding, two surfaces.
         _ if action.starts_with(&format!("{EDIT_REVEAL_VERB}:"))
-            || action.starts_with(&format!("{EDIT_COPY_VERB}:")) =>
+            || action.starts_with(&format!("{EDIT_COPY_VERB}:"))
+            || action.starts_with(&format!("{VIEW_REVEAL_VERB}:"))
+            || action.starts_with(&format!("{VIEW_COPY_VERB}:")) =>
         {
             let (verb, spec) = action.split_once(':').expect("the guard matched a prefix");
+            // WHICH ENTRY, asked ONCE. The View pane and the Edit form each hold
+            // their own loaded target, and the verb says which one is on screen
+            // — a single `open_entry` that guessed from `tab` would answer wrong
+            // the moment an action arrives from a schema the pane has since
+            // moved on from.
+            let from_view = verb == VIEW_REVEAL_VERB || verb == VIEW_COPY_VERB;
             let (target_name, target_user) = {
                 let state = state.lock().unwrap();
-                (
-                    state.edit.target_name.clone(),
-                    state.edit.target_user.clone(),
-                )
+                if from_view {
+                    (
+                        state.view.target_name.clone(),
+                        state.view.target_user.clone(),
+                    )
+                } else {
+                    (
+                        state.edit.target_name.clone(),
+                        state.edit.target_user.clone(),
+                    )
+                }
             };
             if target_name.is_empty() {
                 return json!({ "toast": "Open an entry on the Fill tab first." });
@@ -3078,7 +3687,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
             };
             match read_stored(&target_name, &target_user, &field) {
                 Ok(secret) => {
-                    if verb == EDIT_COPY_VERB {
+                    if verb == EDIT_COPY_VERB || verb == VIEW_COPY_VERB {
                         copy_reply(&target_name, &field, &secret)
                     } else {
                         reschema_revealing(
@@ -3093,6 +3702,28 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 }
                 Err(error) => json!({ "toast": error.to_string() }),
             }
+        }
+        // A website row's two verbs. The address is not a secret and does not
+        // come from the vault agent at all — it is already in the schema the
+        // user is looking at, so these need no read.
+        // Opening a website takes the SAME road a page's own link takes —
+        // `window.open`, which this browser already answers with a new surface.
+        // There is deliberately no new "navigate" field on the pane reply: an
+        // app asking the shell to open a URL is a page asking to open a URL, and
+        // a second mechanism for it would be a second thing to keep safe.
+        _ if action.starts_with(VIEW_OPEN_URI_VERB) => {
+            let uri = &action[VIEW_OPEN_URI_VERB.len()..];
+            json!({
+                "eval": format!("window.open({}, '_blank', 'noopener')", js_string(uri)),
+                "toast": format!("Opening {uri}"),
+            })
+        }
+        _ if action.starts_with(VIEW_COPY_URI_VERB) => {
+            let uri = &action[VIEW_COPY_URI_VERB.len()..];
+            json!({
+                "eval": copy_script("website", uri),
+                "toast": format!("Copying {uri}"),
+            })
         }
         // Removing a custom field is its own request, not a blank box.
         _ if action.starts_with(&format!("{EDIT_REMOVE_FIELD_VERB}:")) => {
@@ -5503,12 +6134,16 @@ mod tests {
             .map(|action| action["action"].as_str().unwrap())
             .collect();
         // The FILL half is what varies by item: ⏱ appears only where a secret
-        // actually exists (`rbw list` could not say). ✎ is on every row, so the
-        // list is asserted for the fill actions rather than pinned whole — a
-        // pinned list is how adding a row affordance breaks a test about
-        // secrets.
+        // actually exists (`rbw list` could not say).
         assert_eq!(fill_actions(&row), ["fill", "totp"]);
-        assert!(actions.contains(&"edit-open"), "every row is editable");
+        // ⛔ EVERY ROW OPENS, and NO row wears an edit glyph. The pencil was a
+        // third button on a 300px rail that existed only because the row body
+        // did nothing; the body is the affordance now (user, 2026-08-04).
+        assert_eq!(row["row_action"], "view-open", "the row body opens the entry");
+        assert!(
+            !actions.contains(&"edit-open"),
+            "the pencil is gone from the row: {actions:?}"
+        );
 
         let plain = item_row(&json!({"name": "n", "username": "", "has_totp": false}));
         assert_eq!(
@@ -5756,6 +6391,171 @@ mod tests {
             (2 * 86_400, "2 days ago"),
         ] {
             assert_eq!(humanise_age(secs), expected, "{secs}s");
+        }
+    }
+
+    // ⛔ THE EDIT FORM MAY NOT CARRY A STORED SECRET. Everything else about this
+    // form is negotiable; this is not. The boxes for a password, an
+    // authenticator secret, the notes and a field value are declared EMPTY, and
+    // what the form pre-fills is only what a secret-free listing already knows.
+    /// A ViewDraft over a detail record that carries every kind of value the
+    /// pane can draw, plus decoys the schema must never echo.
+    fn view_fixture() -> ViewDraft {
+        ViewDraft {
+            target_name: "github.com".into(),
+            target_user: "octocat".into(),
+            detail: json!({
+                "id": "c1",
+                "name": "github.com",
+                "username": "octocat",
+                "folder": "Work",
+                "uris": ["https://github.com", "https://gist.github.com"],
+                "has_password": true,
+                "has_totp": true,
+                "has_passkey": true,
+                "has_notes": true,
+                "item_type": 1,
+                "archived": false,
+                "field_names": ["API Key", "Recovery Code"],
+                "passkeys": [{"rp_id": "github.com", "creation_date": "2026-06-12T10:53:00.000Z"}],
+                "created": "2023-11-05T01:48:23.000Z",
+                "revised": "2026-08-01T20:03:55.000Z",
+                "password_revised": "2026-08-01T20:02:53.000Z",
+                "password_history": [
+                    {"last_used_date": "2026-08-01T20:02:53.000Z"},
+                    {"last_used_date": "2024-02-02T02:02:02.000Z"},
+                ],
+            }),
+            confirm_delete: false,
+        }
+    }
+
+    /// ★ THE VIEW PANE IS A LISTING, AND A LISTING CARRIES NO SECRET.
+    ///
+    /// This is the same invariant the Edit form has (a schema is re-fetched
+    /// whenever the pane opens and re-sent on every action, so anything in it is
+    /// broadcast for as long as it is there) — restated for a surface that shows
+    /// FOUR kinds of secret at once: a password, an authenticator key, a note
+    /// and a past password. Every one of them is mask dots until an eye is
+    /// pressed.
+    #[test]
+    fn the_view_pane_shows_what_is_stored_and_never_a_value() {
+        let widgets = view_tab_widgets(&view_fixture(), None);
+        let wire = json!(widgets).to_string();
+        // Everything a value row can hold at rest is either the mask or
+        // metadata. The one place a real string appears is the username, which
+        // the row that opened this page was already showing.
+        for row in ["password", "totp", "totp-secret", "notes", "past:0", "past:1"] {
+            let widget = widgets
+                .iter()
+                .find(|widget| widget["id"] == row)
+                .unwrap_or_else(|| panic!("{row} is on the page"));
+            assert_eq!(
+                widget["subtitle"], MASK_DOTS,
+                "{row} must be masked at rest: {widget}"
+            );
+        }
+        // The custom fields travel by NAME — the card-audit line settles that a
+        // name identifies where a value would reveal.
+        assert!(wire.contains("API Key"), "a field name is metadata: {wire}");
+        // PASSWORD HISTORY IS OPEN, not behind a link, and it is dates only.
+        assert!(
+            wire.contains("Password history (2 replaced)"),
+            "the history list is expanded: {wire}"
+        );
+        assert!(
+            wire.contains("Replaced 1 Aug 2026"),
+            "a history row is titled by WHEN, since it has no other name: {wire}"
+        );
+    }
+
+    /// A pressed eye paints ONE value, in ONE render, on ONE row.
+    #[test]
+    fn a_revealed_value_lands_on_its_own_row_and_nowhere_else() {
+        let reveal = Reveal {
+            field: StoredField::PastPassword(1),
+            value: "an-old-password".into(),
+        };
+        let widgets = view_tab_widgets(&view_fixture(), Some(&reveal));
+        let row = widgets
+            .iter()
+            .find(|widget| widget["id"] == "past:1")
+            .expect("the history row is there");
+        assert_eq!(row["subtitle"], "an-old-password");
+        // …and every other secret on the page is still masked. A reveal that
+        // leaked sideways would be worse than one that never worked.
+        for other in ["password", "totp-secret", "notes", "past:0"] {
+            let widget = widgets
+                .iter()
+                .find(|widget| widget["id"] == other)
+                .unwrap_or_else(|| panic!("{other} is on the page"));
+            assert_eq!(widget["subtitle"], MASK_DOTS, "{other} leaked: {widget}");
+        }
+        // The rest-state schema — the one `GET /pane/vault` can reach — cannot
+        // carry it at all.
+        let at_rest = json!(view_tab_widgets(&view_fixture(), None)).to_string();
+        assert!(!at_rest.contains("an-old-password"), "{at_rest}");
+    }
+
+    /// ★ THE ACTION BAR IS BITWARDEN'S: a worded Edit first, then the icons.
+    ///
+    /// yggterm floats the trailing cluster from the fact that a button's label
+    /// IS an icon token, so "Edit is first and the icons are last" is expressed
+    /// by the labels themselves — there is no second alignment field that could
+    /// disagree with them.
+    #[test]
+    fn the_view_action_bar_leads_with_edit_and_ends_with_the_two_icons() {
+        let footer = view_footer_widgets(&view_fixture());
+        let labels: Vec<&str> = footer
+            .iter()
+            .map(|widget| widget["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(labels, ["Edit", "icon:archive", "icon:trash"]);
+        assert_eq!(footer[0]["primary"], true, "Edit is the bar's own act");
+        assert_eq!(footer[2]["danger"], true, "delete wears the product's red");
+        // …and the delete ASKS. A rail cannot draw a modal, so the button is
+        // the question.
+        let armed = view_footer_widgets(&ViewDraft {
+            confirm_delete: true,
+            ..view_fixture()
+        });
+        assert_eq!(armed[2]["label"], "Really delete?");
+        // Nothing is offered at all when no entry is open.
+        assert!(view_footer_widgets(&ViewDraft::default()).is_empty());
+    }
+
+    /// ⛔ NO EMOJI IN A ROW'S VERBS. DESIGN.md ▸ Icons: marks are stroked SVG
+    /// from a named set, "never emoji" — full colour and a different metric on
+    /// every platform, which is exactly what "the icons look illegible" was.
+    /// The app names a mark; yggterm draws it.
+    #[test]
+    fn every_row_verb_names_a_mark_rather_than_pasting_a_character() {
+        let mut labels: Vec<String> = Vec::new();
+        let row = item_row(&json!({
+            "name": "github.com", "username": "octocat",
+            "has_password": true, "has_totp": true,
+        }));
+        let mut collect = |widget: &Value| {
+            for action in widget["actions"].as_array().into_iter().flatten() {
+                labels.push(action["label"].as_str().unwrap_or_default().to_string());
+            }
+        };
+        collect(&row);
+        for widget in view_tab_widgets(&view_fixture(), None) {
+            collect(&widget);
+        }
+        for widget in view_footer_widgets(&view_fixture()) {
+            labels.push(widget["label"].as_str().unwrap_or_default().to_string());
+        }
+        assert!(!labels.is_empty(), "the surfaces draw verbs at all");
+        for label in labels {
+            // A worded button (Edit, Really delete?) is fine; a lone glyph is
+            // not. The test that matters is that no label is a non-ASCII
+            // pictograph.
+            assert!(
+                label.is_ascii(),
+                "{label:?} is a pasted glyph — name a mark with `icon:` instead"
+            );
         }
     }
 
@@ -6114,6 +6914,9 @@ mod tests {
                 "copy-row:username",
                 "copy-row:password",
                 "copy-row:totp",
+                // The two doors the row body's click also opens, spelled in
+                // words — a menu can say what a glyph could not.
+                "view-open",
                 "edit-open",
             ],
         );
@@ -6121,7 +6924,7 @@ mod tests {
         // No username, no password, no authenticator secret: no verb claiming
         // to copy one.
         let bare = menu(json!({"name": "a note", "username": "", "has_password": false}));
-        assert_eq!(bare, ["edit-open"]);
+        assert_eq!(bare, ["view-open", "edit-open"]);
 
         // A card: the PAN and the CVV have no copy path at all, by the
         // 2026-07-26 ruling. Only the injector.
@@ -6473,9 +7276,13 @@ mod tests {
             ["card-fill"],
             "a card cannot use the login fill"
         );
+        assert_eq!(
+            card["row_action"], "view-open",
+            "a card opens like anything else — name, notes, folder and fields"
+        );
         assert!(
-            actions.contains(&"edit-open"),
-            "a card is editable too — name, notes, folder and custom fields"
+            !actions.contains(&"edit-open"),
+            "no row wears the pencil any more: {actions:?}"
         );
         let wire = card.to_string();
         assert!(!wire.contains("4111111111114242"), "PAN leaked: {wire}");
