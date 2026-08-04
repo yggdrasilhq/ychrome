@@ -764,3 +764,73 @@ registration numbers, reconciled.** Recipe held end to end. New traps:
    SAME unconsumed OTP code to the new session.
 7. Surface note: the payment surface died once ("web surface not live");
    `web ensure` rebuilt it (generation bump), cookies re-imported, run continued.
+
+## invalid-details-is-not-a-captcha-error · PARTIAL
+task: 
+model: claude-opus-5
+date: 2026-08-04
+tags: 
+
+Fifth run (2026-08-04). **T5 (UGC) FILED end to end unattended — UGCOM/R/E/26/05932,
+Rs 10 by card, 3DS passed.** T6 (DARPG) blocked portal-side with nothing staged and no
+money moved. Two corrections to earlier entries, one of them important.
+
+## ⛔⛔ CORRECTION: "Invalid Details.!!" IS NOT A CAPTCHA ERROR
+
+No earlier entry separates these two messages, and conflating them costs a session.
+Today one POST came back with the captcha **accepted** (no `Security code does not
+match` element anywhere in the response) and the answer `Invalid Details.!!` — using
+the identical applicant block that had filed T5 successfully thirty minutes earlier.
+
+| Page says | Meaning | Cost |
+|---|---|---|
+| `Security code does not match` (form re-renders, all fields retained) | ordinary captcha miss | cheap, retry |
+| `Invalid Details.!!` (form NOT re-rendered) | **the portal will not issue an OTP for this identity right now** | run is over until it clears |
+
+⇒ The reading that fits: **an OTP is bound to the e-mail+mobile, not to the session**
+(the portal's own banner says *"OTPs do not expire until they are used"*), and while one
+is outstanding and unconsumed the portal refuses to start another request. Today's
+sequence: T5 consumed OTP #1; T6 reached the OTP page and was issued OTP #2; two captcha
+misses at the OTP hop meant #2 was never consumed; every later attempt answered
+`Invalid Details.!!` with a good captcha. A per-identity issuance throttle fits equally.
+
+**Do not respond to `Invalid Details.!!` by re-reading the captcha, restarting the
+session, or touching the applicant block.** All three were tried; all three are wasted.
+
+## The one-shot captcha poison is NOT limited to the request-form POST
+
+The previous entry documents session poisoning at the staging hop. It happens at the
+**earlier hops too**: two clean reads were rejected in a row at the OTP hop, and a
+genuinely fresh session (jar deleted, new PHPSESSID) then rejected its first read at
+the e-mail/mobile hop. Treat *any* captcha rejection as session-fatal.
+
+## Glyph discriminators added today
+
+- A bare slanted stem **with a foot serif but no top-left flag** is **`L`**, not `1`
+  and not `I`. (`XBCZLE` passed the staging hop first time on this call.)
+- **`9` vs `g`**: `9` has a straight descender; `g` curls back left under the bowl.
+  Both appeared today.
+- A **chevron `∧`** is a rotated `V`, same as the `>` / `<` forms already recorded.
+- ⚠ **Segmentation invents letters.** A 32 px ink run split at 17 px produced a
+  confident-looking `A`+`N` that was rejected. **Read the WHOLE strip first** at ~18x
+  to get the glyph count from spacing, and use per-glyph crops only as a tie-breaker
+  on a specific confusable pair.
+
+## Working notes for the payment leg (unchanged where not stated)
+
+- `web fill-card` filled all four fields but reported **`matched: false` on every one**
+  while every value landed. Its own field is an assumption; verify page-side.
+- ⚠ **The CVV landed 2 of 3 characters on the first fill** and needed a clear-and-refill.
+  `fill-card` had already reported `chars: 3`. **Assert the CVV length page-side before
+  clicking Pay** — a short CVV burns a staged application, which is unrecoverable.
+- `#cr_no` has `maxlength=23`, not 16, so stored separators fit; normalise anyway.
+- Timings: bank debit SMS **~90 s** after the 3DS submit; registration e-mail ~90 s
+  after that. Faster than the previous run's ~114 s + 3 min.
+- Portal OTP SMS sender seen as **`BZ-RTISMS-S`** and `BV-RTISMS-S` today; the known
+  set was BV/BH/BT. **Match on the body string `Submit Request OTP`, never on a sender
+  prefix list.** Bank 3DS came from `VD-EXBANK-T` (the `-T` suffix distinguishes it from
+  same-day `-S` promotional traffic).
+- The registration e-mail landed in **gmail** today; the previous run said outlook.
+  Search both.
+- ✅ The portal's `doubleverification.php` → generic-page ending still tells you
+  nothing. Debit SMS then registration e-mail remain the only success test.
