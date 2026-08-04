@@ -7,12 +7,25 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
-## ★ THE VAULT PANE STILL WAITS FOR YOU TO PRESS SYNC, AND THE USER'S OWN DAEMONS HAVE NOT SEEN THE PANE YET
+## ★ THE VAULT PANE STILL WAITS FOR YOU TO PRESS SYNC
 
-**Status:** OPEN — reveal, copy and the last-synced FACT are SHIPPED and
-live-proven in the GUI (pixels below). What is left of this entry is (c), the
-sync SCHEDULE, plus one deploy note: the daemons the user's own sessions are
-attached to still run the old binary, and retiring them is his call.
+**Status:** OPEN — only (c), the sync SCHEDULE, survives. Everything else in
+this entry shipped and is live-proven on the GUI host.
+
+✅ **2026-08-04 — the DEPLOY half is closed.** Both binaries are installed on the
+GUI host, the vault agent was handed over (unlock preserved, 1122 items, fresh
+`last_sync_unix`) and the ychrome daemon restarted, so the pane the user is
+looking at is the current one. The row's `✎` is gone: a row OPENS the entry now,
+into a Bitwarden-shaped View Login (masked secrets throughout, password history
+expanded, `Edit` leading an action bar with archive and delete). Archive was
+exercised against the live server and reversed, leaving the vault as found.
+
+✅ **2026-08-04 — and the reason it could not be exercised before is fixed too.**
+A contributed pane could be OPENED from the control plane and not PRESSED; the
+new `server app pane <pane-id> <action> [value]` verb (yggterm 3.0.24) routes
+through the same owner a click uses. Without it this pane's affordances are
+pointer-only, on a desktop where absolute pointer injection does not map to
+screen pixels.
 
 User-tested the sidebar against the real Bitwarden extension side by side,
 2026-08-02, with screenshots. Three gaps; two are closed, one remains.
