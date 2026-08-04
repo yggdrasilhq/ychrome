@@ -519,6 +519,25 @@ impl VaultManager {
         Ok(())
     }
 
+    /// Archive an item, or bring it back out of the archive, and re-sync so the
+    /// local copy agrees with the server about which bucket it is in.
+    ///
+    /// Same shape as [`remove_item`] and [`restore_item`] deliberately: every
+    /// mutation on this manager is "ask the server, then re-read", because a
+    /// local edit that is not re-read is a second source of truth for what the
+    /// vault contains.
+    ///
+    /// [`remove_item`]: VaultManager::remove_item
+    /// [`restore_item`]: VaultManager::restore_item
+    pub fn archive_item(&mut self, id: &str, archived: bool) -> Result<(), VaultError> {
+        if self.vault.is_none() {
+            return Err(VaultError::Locked);
+        }
+        self.authenticated(|client, token| client.archive_cipher(token, id, archived))?;
+        self.resync()?;
+        Ok(())
+    }
+
     /// Re-pull the ciphers with the session's bearer token, keeping the same
     /// user key. The master password is NOT needed — that is the whole point
     /// of holding the token: an agent can refresh a long-lived unlock.

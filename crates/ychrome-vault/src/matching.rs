@@ -170,6 +170,7 @@ mod tests {
             has_totp: false,
             has_passkey: false,
             item_type: ychrome_vault_proto::CIPHER_TYPE_LOGIN,
+            archived: false,
         }
     }
 
