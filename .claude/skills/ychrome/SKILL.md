@@ -1043,6 +1043,41 @@ ychrome engine bench 10 # concurrency + shot latency
 Each journals to `~/.yggterm/ychrome/journal.jsonl` and exits non-zero on
 failure. Run them under a private `HOME` and they touch nothing of the user's.
 
+## ★★★ THE SHADOW SURFACE IS A WEBAPP DEVELOPMENT LOOP, not only a scraper
+
+**User-stated intent, 2026-08-04:**
+
+> *"ychrome's shadow can be used similarly for developing webapps and agents can iterate by
+> actually going through the human UX in a human-like fashion to iterate on fixes."*
+
+The agent engine is usually reached for to **get something out of a site** — a status, a table, a
+login-walled record. That is the extraction use. The other use, deliberately built and
+under-exercised, is **development**: change a webapp, then *walk its human UX yourself* — click
+what a user clicks, at the tab widths a user has, hitting the modals a user hits — and iterate to
+a fix without asking the human to reproduce anything.
+
+**What this catches that a unit test cannot:** a control that is present in the DOM, correctly
+wired, passing every assertion, **and not reachable by a human**. Two on record from one session:
+the create-key button that matched `--target-text` but returned `no_hittable_match` because
+`elementFromPoint` landed on `HTML`, and a Truecaller submit that stayed disabled because the
+framework never saw a programmatic value-set. Both would pass a DOM test. Both are broken for a
+person. **Only walking the surface finds them.**
+
+★ **The bug is often in the walking tool, not the page.** When a verb refuses, ask first whether a
+human could do it: if yes, the verb has a gap — fix `web do`, don't hand-write a `location.href`
+around it. This is how the fill/click/hit-testing verbs earned their current shape.
+
+⛔ **Never test a webapp change by reading the code and declaring it correct.** The whole reason
+this surface exists is that a page's correctness is a property of *using* it.
+
+★ **DREAM AND IMPLEMENT AS YOU GO (standing user directive).** While working any task here,
+propose and build the verb you wished existed rather than routing around it. `web do`,
+`--selector-set`, `web ensure` healing, and the faithful `web screenshot` all arrived mid-task
+that way. Record what you learn in `ychrome-site-lore` — ⚠ **naming the file for the HOST the
+surface reports (`www.truecaller.com.md`), never the brand** — a misnamed lore file is
+indistinguishable from no lore, and on 2026-08-04 that cost a live probe re-deriving an
+11-day-old finding.
+
 ## Anti-patterns
 
 - Rebuilding a cipher from parsed fields for a PUT. → patch `RawCipher::raw`.
