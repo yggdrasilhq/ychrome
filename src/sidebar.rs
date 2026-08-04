@@ -2385,13 +2385,13 @@ fn secret_field(
         actions.push(field_action(
             EDIT_REVEAL_VERB,
             &field,
-            "👁",
+            "icon:eye",
             format!("Show the stored {} here, once", field.label()),
         ));
         actions.push(field_action(
             EDIT_COPY_VERB,
             &field,
-            "⧉",
+            "icon:copy",
             format!("Copy the stored {} to the clipboard", field.label()),
         ));
     }
@@ -2426,13 +2426,13 @@ fn stored_value_row(field: &StoredField, reveal: Option<&Reveal>, removable: boo
         field_action(
             EDIT_REVEAL_VERB,
             field,
-            "👁",
+            "icon:eye",
             format!("Show the stored {} here, once", field.label()),
         ),
         field_action(
             EDIT_COPY_VERB,
             field,
-            "⧉",
+            "icon:copy",
             format!("Copy the stored {} to the clipboard", field.label()),
         ),
     ];
@@ -2440,7 +2440,7 @@ fn stored_value_row(field: &StoredField, reveal: Option<&Reveal>, removable: boo
         actions.push(field_action(
             EDIT_REMOVE_FIELD_VERB,
             field,
-            "🗑",
+            "icon:trash",
             "Remove this custom field".to_string(),
         ));
     }
@@ -2456,7 +2456,7 @@ fn stored_value_row(field: &StoredField, reveal: Option<&Reveal>, removable: boo
         widgets.push(json!({ "kind": "label", "text": reveal.value }));
         widgets.push(json!({
             "kind": "label", "muted": true,
-            "text": "Shown once. Press 👁 again to read it again.",
+            "text": "Shown once. Press the eye again to read it again.",
         }));
     }
     widgets
@@ -2887,7 +2887,7 @@ fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
             vec![field_action(
                 EDIT_COPY_VERB,
                 &StoredField::Username,
-                "⧉",
+                "icon:copy",
                 "Copy the username to the clipboard".to_string(),
             )]
         },
@@ -2907,7 +2907,7 @@ fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
         0,
         vec![json!({
             "action": "edit-generate",
-            "label": if draft.generate_password { "⟲" } else { "⟳" },
+            "label": if draft.generate_password { "icon:reload" } else { "icon:dice" },
             "title": if draft.generate_password {
                 "Cancel the roll — keep the stored password"
             } else {
@@ -2918,7 +2918,7 @@ fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
     if draft.generate_password {
         widgets.push(json!({
             "kind": "label", "muted": true,
-            "text": "A new password will be rolled on this host when you save. Press ⟲ to cancel.",
+            "text": "A new password will be rolled on this host when you save. Press the roll button again to cancel.",
         }));
     }
     widgets.push(secret_field(
@@ -2939,7 +2939,7 @@ fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
             vec![field_action(
                 EDIT_COPY_VERB,
                 &StoredField::TotpCode,
-                "⏱",
+                "icon:clock",
                 "Copy the current verification code".to_string(),
             )]
         } else {
@@ -2970,7 +2970,7 @@ fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
         // Notes are prose, not a secret: mask dots over a six-row box would be
         // theatre, so this one names its own placeholder and gets no mask.
         if draft.has_notes {
-            "Stored — press 👁 to read, or type to replace"
+            "Stored — press the eye to read it, or type to replace it"
         } else {
             "Anything to remember"
         },
@@ -5198,13 +5198,13 @@ fn copy_script(label: &str, value: &str) -> String {
         function() {{ notice('Copied the ' + label + ' to the clipboard.'); }},
         function(error) {{
           notice('The clipboard refused this page (' + ((error && error.name) || 'error') +
-            '). Press 👁 beside the ' + label + ' in the vault pane to read it.');
+            '). Press the eye beside the ' + label + ' in the vault pane to read it.');
         }});
       return 'copying';
     }}
   }} catch (error) {{ /* fall through to the honest refusal */ }}
   notice('This page cannot reach the clipboard (it is not a secure context). ' +
-    'Press 👁 beside the ' + label + ' in the vault pane to read it.');
+    'Press the eye beside the ' + label + ' in the vault pane to read it.');
   return 'no-clipboard';
 }})()"#,
         label = js_string(label),
@@ -6544,6 +6544,21 @@ mod tests {
         for widget in view_tab_widgets(&view_fixture(), None) {
             collect(&widget);
         }
+        // The EDIT form's inline verbs too — the eye, the copy, the roll and the
+        // remove all sit on a field the same way, and an emoji among them would
+        // read as a different product one card down.
+        let editing = EditDraft {
+            target_name: "github.com".into(),
+            target_user: "octocat".into(),
+            field_names: vec!["API Key".into()],
+            has_password: true,
+            has_totp: true,
+            has_notes: true,
+            ..EditDraft::default()
+        };
+        for widget in edit_tab_widgets(&editing, None) {
+            collect(&widget);
+        }
         for widget in view_footer_widgets(&view_fixture()) {
             labels.push(widget["label"].as_str().unwrap_or_default().to_string());
         }
@@ -6731,7 +6746,10 @@ mod tests {
         assert!(
             notes["placeholder"]
                 .as_str()
-                .is_some_and(|hint| hint.contains("👁")),
+                // NAMES the affordance rather than pasting its glyph: the eye
+                // is a stroked mark now, and a sentence quoting an emoji at it
+                // would describe a button that no longer looks like that.
+                .is_some_and(|hint| hint.contains("press the eye")),
             "the notes box says nothing about what is in it",
         );
         // The username is not a secret and never was: no eye, but the copy every
