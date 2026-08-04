@@ -338,6 +338,36 @@ impl Client {
             .map_err(|error| ApiError::Network(error.to_string()))?;
         ok_or_err(resp)
     }
+
+    /// Archive a cipher, or bring it back: `PUT /api/ciphers/{id}/archive` and
+    /// `…/unarchive`.
+    ///
+    /// ARCHIVE IS NOT THE TRASH, and the difference is the whole reason it
+    /// exists: a trashed item is on its way to being destroyed (and is hidden
+    /// from fill), while an archived one is kept deliberately and merely gets
+    /// out of the way. Bitwarden shipped it as `pm-19148-innovation-archive`;
+    /// the deployed vaultwarden advertises that flag as `true` in
+    /// `GET /api/config` and answers both routes, which is how this client knows
+    /// the verb is available rather than assuming it.
+    ///
+    /// A server WITHOUT the feature answers 404, which surfaces here as an
+    /// `ApiError::Http` naming the route — an honest refusal, not a silent
+    /// no-op.
+    pub fn archive_cipher(
+        &self,
+        access_token: &str,
+        id: &str,
+        archived: bool,
+    ) -> Result<(), ApiError> {
+        let verb = if archived { "archive" } else { "unarchive" };
+        let resp = self
+            .http
+            .put(format!("{}/api/ciphers/{id}/{verb}", self.base))
+            .bearer_auth(access_token)
+            .send()
+            .map_err(|error| ApiError::Network(error.to_string()))?;
+        ok_or_err(resp)
+    }
 }
 
 /// Parse a `GET /api/sync` document into a [`SyncResponse`]. Pure (no network),
@@ -430,6 +460,11 @@ fn parse_raw_cipher(cipher: &serde_json::Value) -> RawCipher {
             })
             .unwrap_or_default(),
         fido2: login.map(parse_fido2).unwrap_or_default(),
+        // Plaintext and server-owned, like `deletedDate`. Absent on every item
+        // this vault has ever held, which is exactly why it is read as an
+        // Option rather than defaulted: "the server did not send one" and "this
+        // server has no archive at all" both read as not-archived, correctly.
+        archived_date: get_str(cipher, "archivedDate").map(str::to_string),
     }
 }
 
