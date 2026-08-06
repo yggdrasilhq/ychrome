@@ -981,3 +981,43 @@ routes to UPI. The rule is only correctly applied by someone who looked.
 ⛔ Unchanged: **never a card number by any route an agent can read.** `fill-card` answers
 `{item, field, chars, matched}` — a length, never a value — and audits `op: card-secret`. Verify by
 digit count, never by printing. Normalise the stored separators in place before submit.
+
+## ⭐ CORRECTION (2026-08-06 22:00) — the card rail was never missing. I was on the wrong plane.
+
+An earlier entry today said *"check `server app clients` first — zero clients means no card rail in
+this session"*. **That is WRONG and is retracted.** What it actually means:
+
+1. ⛔ **ychrome's engine has NO card verb.** Probed live: `ctl fill-card` / `fillcard` / `card` /
+   `fill_card` → `unknown engine verb`. **`ctl fill` does credentials ONLY.** ⇒ **a ychrome-`ctl`-
+   driven RTI run can never pay by card** and silently falls to netbanking. The card verb is a
+   **yggterm web** verb. Driving the whole flow on `ctl` was the root error.
+2. **`clients: 0` on dev means the daemon there is `yggterm-headless`**, which registers no GUI
+   client — not that no rail exists. **guihost had a live GUI client AND an unlocked vault the whole
+   time** (verified 22:00: active client on `:1`, 1122 ciphers).
+3. ✅ **`web ensure` refusing "no web-surface declare … (a plain shell)" is CORRECT, not a bug.**
+   Per `data-fabric` §Web co-browse plane step 5, **a surface is declared by launching `ychrome`
+   INSIDE the session** — the app emits an OSC on the PTY the daemon reads. A `terminal new` bash
+   shell declares nothing. A surface also registers only once the session is ACTIVATED.
+
+**⇒ THE PAYMENT RUN, on the plane it was designed for:**
+```
+guihost: terminal new --no-activate → sleep 3 → send `ychrome --profile agent-<n> <payment-url>`
+    → web ensure --session <s>
+    → web cookies --import /tmp/rti-jar-clean.txt      # carry the curl-staged session
+    → web do click / web read                          # the two-radio sequence, then MOPS
+    → paySubmitForCard('CreditCard')                   # ⭐ card first, per the thumb rule
+    → web fill-card --item "IDFC WOW AVIKALPA" --field number|expiry|code <target>
+```
+⚠ **The card item is `IDFC WOW AVIKALPA`** — there is a separate `IDFC Credit Card WOW bon` in
+bon's name. Confirm the item before any charge.
+⚠ Normalise the stored separators in `#cr_no` in place before submit (`maxlength` truncates), and
+assert a DIGIT COUNT rather than printing.
+
+**Two ychrome gaps I logged earlier are also just wrong-plane artefacts** — the yggterm web plane
+already has both: **`web read --frame <url-substring>` reaches INTO cross-origin frames** (so the
+`target=_self` workaround is unnecessary) and **`web screenshot --session` writes a file**.
+
+⇒ **STANDING LESSON: when a proven pathway "does not work", the first hypothesis is that you are
+not on the pathway** — wrong plane, wrong host, wrong verb — not that the pathway is broken.
+**Load the `data-fabric` skill before driving any co-browse surface; a "NO research" preamble does
+not forbid it.**
