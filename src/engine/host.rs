@@ -23,7 +23,7 @@
 //! whenever the answer actually arrives. `goto` returning means the load
 //! finished; it does not mean a request was posted.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Sender};
@@ -36,7 +36,10 @@ use glib::translate::{ToGlibPtr, ToGlibPtrMut};
 use gtk::prelude::*;
 use javascriptcore::ValueExt;
 use serde_json::{Value, json};
-use webkit2gtk::{LoadEvent, SettingsExt, SnapshotOptions, SnapshotRegion, WebView, WebViewExt};
+use webkit2gtk::{
+    CookieManagerExt, LoadEvent, SettingsExt, SnapshotOptions, SnapshotRegion, WebView, WebViewExt,
+    WebsiteDataManagerExt,
+};
 
 use super::substrate::{self, HeadlessDisplay, Probe, Substrate};
 
@@ -105,6 +108,19 @@ fn with_page<T>(id: &str, responder: Responder<T>, f: impl FnOnce(&Page, Respond
         Some(page) => f(&page, responder),
         None => responder.fail(super::pool::no_such_page(id).to_string()),
     }
+}
+
+/// One cookie to place into a profile's live store, already parsed and
+/// domain-filtered by the router. Values never appear in any reply.
+pub struct CookieSpec {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    pub secure: bool,
+    pub http_only: bool,
+    /// Seconds until expiry, or -1 for a session cookie.
+    pub max_age: i32,
 }
 
 /// Which region of the page a snapshot covers.
@@ -539,6 +555,111 @@ impl Engine {
             with_page(&id, responder, move |page, responder| {
                 arm_load_wait(&page.view, responder);
                 page.view.load_uri(&url);
+            })
+        })
+    }
+
+    /// Put cookies into a page's PROFILE store and answer with the store's own
+    /// readback for `origin` — the observation, never the adds' success flags.
+    ///
+    /// This is the missing half of the jar being shared Netscape text on disk:
+    /// the network process reads the jar once at startup, so handing a session
+    /// from curl to the engine needs a LIVE-store write, not a file edit
+    /// (probed 2026-08-06: an appended jar line was invisible to a fresh page,
+    /// which stopped an otherwise-staged government filing).
+    pub fn cookie_import(
+        &self,
+        id: &str,
+        cookies_in: Vec<CookieSpec>,
+        origin: String,
+    ) -> Result<Value> {
+        let id = id.to_string();
+        on_engine(Duration::from_secs(30), move |responder| {
+            with_page(&id, responder, move |page, responder| {
+                let identity = match super::identity::for_profile(&page.profile) {
+                    Ok(identity) => identity,
+                    Err(error) => return responder.fail(error.to_string()),
+                };
+                let Some(manager) = identity.data.cookie_manager() else {
+                    return responder.fail("profile has no cookie manager");
+                };
+                let total = cookies_in.len();
+                let pending = Rc::new(Cell::new(total));
+                let add_failures: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+                let slot: Shared<Value> = Rc::new(RefCell::new(Some(responder)));
+                // The finish step runs ONCE, after the last add lands: read the
+                // store back for the origin and answer with what a request
+                // would actually carry. Same law as every injector on this
+                // plane — the verb's own success field is an assumption.
+                let finish: Rc<dyn Fn()> = {
+                    let manager = manager.clone();
+                    let origin = origin.clone();
+                    let add_failures = add_failures.clone();
+                    let slot = slot.clone();
+                    Rc::new(move || {
+                        let add_failures = add_failures.clone();
+                        let slot = slot.clone();
+                        let total = total;
+                        manager.cookies(
+                            &origin,
+                            None::<&gio::Cancellable>,
+                            move |result: std::result::Result<Vec<soup::Cookie>, glib::Error>| {
+                            let Some(responder) = slot.borrow_mut().take() else {
+                                return;
+                            };
+                            match result {
+                                Ok(list) => {
+                                    let visible: Vec<String> = list
+                                        .into_iter()
+                                        .map(|mut cookie| {
+                                            cookie
+                                                .name()
+                                                .map(|name| name.to_string())
+                                                .unwrap_or_default()
+                                        })
+                                        .collect();
+                                    responder.ok(json!({
+                                        "ok": true,
+                                        "imported": total,
+                                        "add_failures": add_failures.borrow().clone(),
+                                        "visible_for_origin": visible,
+                                    }));
+                                }
+                                Err(error) => {
+                                    responder.fail(format!("cookie readback failed: {error}"))
+                                }
+                            }
+                        });
+                    })
+                };
+                if total == 0 {
+                    finish();
+                    return;
+                }
+                for spec in cookies_in {
+                    let mut cookie = soup::Cookie::new(
+                        &spec.name,
+                        &spec.value,
+                        &spec.domain,
+                        &spec.path,
+                        spec.max_age,
+                    );
+                    cookie.set_secure(spec.secure);
+                    cookie.set_http_only(spec.http_only);
+                    let pending = pending.clone();
+                    let add_failures = add_failures.clone();
+                    let finish = finish.clone();
+                    let name = spec.name.clone();
+                    manager.add_cookie(&mut cookie, None::<&gio::Cancellable>, move |result| {
+                        if let Err(error) = result {
+                            add_failures.borrow_mut().push(format!("{name}: {error}"));
+                        }
+                        pending.set(pending.get() - 1);
+                        if pending.get() == 0 {
+                            finish();
+                        }
+                    });
+                }
             })
         })
     }
