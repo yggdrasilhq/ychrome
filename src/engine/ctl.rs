@@ -34,7 +34,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let Some(verb) = args.first() else {
         bail!(
             "usage: ychrome ctl <verb> [key=value ...] [--out FILE]\n\
-             verbs: open close pages goto nav wait eval dom shot input\n\
+             verbs: open close pages goto nav wait eval dom shot input console\n\
              \x20      cookie-import park resume pool metrics budget batch egress identity status\n\
              \n\
              shot regions (all four write PNG bytes; --out catches them):\n\
