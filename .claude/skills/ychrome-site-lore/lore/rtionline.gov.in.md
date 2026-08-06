@@ -942,3 +942,42 @@ whole output — the second JSON object is the next captcha, not an error.
 - A **bare vertical with no serif and no top-left flag is `I`**, not `1`. (`9UFI8R` passed.)
 - A stroke that **hooks left at the bottom is `J`**, not `7`; `7` has no bottom hook. (`7KBJDC`
   passed the one-shot staging hop.)
+
+---
+
+## ⭐⭐ PAYMENT INSTRUMENT ORDER — OWNER THUMB RULE (2026-08-06). Read this BEFORE picking a MOPS tile.
+
+**His words:** *"we pay by wow avikalpa credit card NOT netbanking unless all option fails or they
+carry extra charge and netbanking or UPI doesn't. Even in those cases we use UPI first and
+Netbaking last."*
+
+1. ⭐ **CARD FIRST** — the WOW Avikalpa card → `paySubmitForCard('CreditCard')`.
+2. **UPI SECOND** → `paySubmitUPI('UPI')`.
+3. **NETBANKING LAST** → `paySubmit('OTHERINB')`.
+
+Fall back ONLY if the card leg fails, or if the card carries a surcharge the others do not.
+**Cost moves you down the list; convenience never does.**
+
+⛔ **THE "`paySubmitForCard(...)` ⛔ NEVER" LINE IN THE EARLIER ENTRIES IS SUPERSEDED AND WRONG.**
+It was a **capability limit recorded as a prohibition** — an early headless session could not reach
+the vault card op, concluded "the card is a human instrument", and the note outlived the limitation
+(the `web fill-card` WORKS entry above already corrected the mechanism, but the ⛔ was never pulled
+out of the recipe). **On 2026-08-06 that stale line sent a full run down the netbanking rail to
+`auth.examplebank.test`, where it died on a stale password — a blocker the card would have walked
+straight past.**
+⇒ **Standing lesson: a capability limit written down as a prohibition will outlive the limit.**
+When lore forbids a route, ask whether it is forbidden or merely was once impossible.
+
+⚠ **The card leg lives on a yggterm WEB SURFACE, not a ychrome page.** `ctl fill` (ychrome) does
+credentials; `yggterm server app web fill-card --session <s>` does cards. **Check
+`yggterm server app clients` first — zero clients means no card rail in this session** (that was
+the state at 19:40 on 2026-08-06).
+
+⚠ **Trigger (b) is live on THIS gateway.** The BillDesk SDK payload carries
+**`showConvenienceFeeDetails=true`**, i.e. per-instrument fees are displayed. **Read the fee shown
+against each instrument before choosing** — if the card is surcharged and UPI is not, the rule
+routes to UPI. The rule is only correctly applied by someone who looked.
+
+⛔ Unchanged: **never a card number by any route an agent can read.** `fill-card` answers
+`{item, field, chars, matched}` — a length, never a value — and audits `op: card-secret`. Verify by
+digit count, never by printing. Normalise the stored separators in place before submit.
