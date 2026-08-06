@@ -101,3 +101,81 @@ OTHER FACTS WORTH HAVING:
   - ctl input nth indexes the HITTABLE pool, not querySelectorAll order, so a
     DOM index counted from an eval will click the wrong control. Address by a
     unique selector or by coordinates read off a screenshot.
+
+## session-timeout-modal-and-code-race · WORKS
+task: read balances and open orders on a profile whose session had expired
+model: claude-opus-5
+date: 2026-08-06
+tags: session, shadow-dom, mfa, totp, otp, modal, orders, trap, screenshot
+
+A LOGGED-IN PROFILE CAN STILL BE LOCKED OUT, AND THE DOM WILL NOT TELL YOU.
+
+Reading an account page on a profile whose session had gone stale, the text rung
+lied in the most expensive way available: document.title was correct
+("Spot - Wallet - Binance"), body.innerText rendered the full table HEADERS
+("Asset / Amount / Available / Action") and ZERO rows. That reads exactly like
+"the account is empty" and it is not — it is "the data never loaded".
+
+THE SCREENSHOT IS THE INSTRUMENT. One `ctl shot` showed a centred modal:
+"Verification Needed — Your login session has timed out. Please complete security
+verification to stay logged in." with [Verify Myself] / [Log Out], and the rows
+behind it were loading SKELETONS, not empty cells.
+
+⛔ THE MODAL IS IN A SHADOW ROOT. It is invisible to the obvious probes:
+  document.querySelector("button")            -> does not find it
+  body.innerHTML.includes("verify myself")    -> FALSE
+Walk for it instead, and click the live rect rather than a guessed coordinate:
+
+  const host=[...document.querySelectorAll("*")].find(e=>e.shadowRoot)
+  const el=[...host.shadowRoot.querySelectorAll("*")]
+            .find(e=>/verify myself/i.test(e.textContent)&&!e.children.length)
+  const r=el.getBoundingClientRect()   // -> click x=r.x+r.width/2, y=r.y+r.height/2
+
+A coordinate read off a full-document screenshot did NOT match the live rect here
+(y differed by ~165px because `region=full` is a taller surface than the viewport).
+Take the rect from the DOM, take the confirmation from the pixels.
+
+RE-VERIFICATION IS THE SAME 0/2 CHECKLIST AS FIRST LOGIN (Authenticator App +
+Email), so the flow already logged for login applies. Two refinements:
+
+1. THE AUTHENTICATOR FIELD AUTO-SUBMITS ON THE 6th DIGIT. A wait predicate of the
+   shape "input.value.length === 6" therefore TIMES OUT even on total success —
+   the dialog has already advanced and the input is gone. The counter going 0/2 ->
+   1/2 is the real signal. Do not read that timeout as a failed factor.
+
+2. THE EMAIL FACTOR MUST BE RACED, and the failure is silent. Stamp T0 BEFORE
+   clicking the factor and accept only a message newer than T0. Concretely: a
+   high-recall mail search for "Binance verification code" returned 2024-era codes
+   from a DIFFERENT account first, all of them correct-looking 6-digit strings.
+   Match on subject "[Binance] Verification Code - <UTC timestamp>" and compare
+   that timestamp to T0.
+
+⚠ AND EXTRACT THE CODE FROM THE DECODED BODY, NOT THE RAW MESSAGE. Regexing
+\b\d{6}\b over the raw source yielded SIX candidates (ids, dates, style values).
+After stripping tags from the decoded text/html part there was exactly ONE, and
+its context is unambiguous: "Your verification code:&nbsp; <CODE> The verification
+code will be valid for NN minutes." Anchor on that phrase.
+
+⚠ A FULL-TEXT MAIL CLIENT CAN BE TOO SLOW FOR A LIVE CODE. A `read --message-id`
+against a ~9 GiB store exceeded a 120 s timeout while the code was expiring.
+Reading the tail of the mbox file directly and parsing with python's `email`
+module returned instantly. When a secret is on a clock, go to the file.
+
+ORDER-BOOK COVERAGE — THREE BOOKS, NOT ONE. "No open orders" from the spot screen
+is NOT the answer to "is anything resting". Check all three; they are separate:
+  Orders > Spot Order > Open Orders     (set Pair/Direction/Filter all to All)
+  Orders > Convert > Open Orders > Limit Order
+  Orders > Convert > Open Orders > TP/SL
+A Convert limit order never appears in the spot book. Same lesson as
+"registry uninstall keys are not an inventory": name the instrument you used.
+
+HISTORY WINDOWS ARE SHORT AND THE SHORTCUTS ARE FIDDLY. Spot Trade History states
+it covers 6 months only and defaults to 7 days; Convert History and crypto Deposit
+History default to 30 days. The "Past 6 months" shortcut in the date popover did
+not apply on one attempt (the popover closed and the range reverted, silently).
+For anything older, use the page's own Export function rather than grinding the
+picker.
+
+ALSO SEEN: a persistent site-wide banner asking for additional KYC details and
+warning of "limited access" if ignored. It is informational, it does not block
+reads, and it is the operator's to clear.
