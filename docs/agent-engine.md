@@ -175,6 +175,10 @@ exactly the divergence the single-source-of-truth rule forbids.
 POST /open      {url?, profile, tags?, viewport?: {w,h,scale}}      → {page}
 POST /close     {page_id}                                           → {closed}
 GET  /pages     [?tag=…&profile=…&state=live|parked]                → {pages:[…]}
+                 ⚠ `url` is read from the LIVE VIEW, not from what a caller
+                 last asked for — it was the latter until 2026-08-06, which
+                 made the one verb an agent can poll during a navigation
+                 unable to observe one.
 POST /goto      {page_id, url}                                      → {page}
 POST /nav       {page_id, action: back|forward|reload|stop}         → {page}
 ```
@@ -381,6 +385,53 @@ detaches itself mid-resolve. Mutation-proven: restoring `hit.contains(el)` turns
 the ancestor-hit step red, removing the liveness filter turns two steps red, and
 both together (the historical resolver) turn the reported case red with
 `dispatched:3` and an unchanged `document.title`.
+
+### What the PAGE asks for: new windows and script dialogs
+
+Two things a page does on its own account, neither of them a verb, and both of
+which the engine silently dropped until 2026-08-06. Proven by
+**`ychrome engine gateway`** — seven steps against two real loopback origins,
+mutation-proven (removing the two handlers turns exactly four of them red).
+
+**A new window becomes a PAGE.** `window.open`, a `target="_blank"` link, and a
+form whose target is a new window all reach WebKit's `create` signal. With no
+handler, `window.open` answers `null` and the navigation is discarded: measured
+on a two-origin fixture, **not one byte left the host**, while `/engine/input`
+answered `{"dispatched":3,"ok":true}` and the page sat where it was. That is the
+shape a bank-payment gateway takes — the merchant's `frmPayment` targets a popup
+— so an agent driving a real government payment saw a successful click and a
+page that never moved.
+
+The handler mints a real child view (built with `related_view`, which WebKit
+requires, and with the profile's own content manager so the popup keeps the
+ruleset and userscripts), registers it as a logical page tagged
+`opened-by-page`, and journals `engine.window.create`. Collapsing the popup into
+its opener instead would be a second lie: the page asked for two documents and
+would get one. ⚠ A popup is LISTED at its provisional url the moment the
+navigation commits, before the document is parsed — `/engine/wait` is what tells
+you it is a document. Its load answers no responder, so
+`engine.window.load` / `engine.window.load_failed` in the journal is the only
+record of how it went.
+
+⛔ **A popup must not be shown before `create` returns.** Realising the view runs
+WebKit's page-proxy setup, and doing that while WebKit is still inside
+`createNewPage` loses the navigation it is handing over: the view comes back
+listed at the right url with `location.href === "about:blank"` and a load that
+never finishes.
+
+**A script dialog is answered, never raised.** `alert` is dismissed, `confirm`
+and the beforeunload confirm are accepted, `prompt` answers with the page's own
+default text, and each is journaled as `engine.script.dialog` with the answer
+given. Unanswered, WebKitGTK's default puts up a modal on a display with no
+viewer, the page's script stays parked inside `alert()`, the navigation it was
+about to make never happens, and **every later verb on that page times out** —
+measured as `engine call did not answer within 30s`, which is character for
+character what a live run against a government payment page recorded before the
+cause was known. The wedge is page-local; the rest of the pool keeps answering.
+
+There is no operator on this display, so "let the human decide" is not the
+alternative to answering — a page that hangs until the daemon dies is. The
+journal is what makes the decision attributable.
 
 ### Fleet + governance
 
