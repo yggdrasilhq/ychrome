@@ -233,6 +233,9 @@ POST /dom  {page_id, mode: "html"|"text"|"snapshot"}
   → snapshot = the structured interactable tree: [{role,text,selector,rect,value?}…]
     built by an injected extractor script (v1: buttons, links, inputs, selects,
     textareas, [role], [contenteditable]) — the agent's "what can I act on"
+POST /console {page_id, clear?: bool = true}
+  → {installed, entries: [{kind, level, text, at, source?, line?, col?, stack?}…]}
+    kind: "console" | "error" | "rejection" | "resource"
 POST /eval {page_id, js, await_promise: bool, timeout_ms}
   → {value} | {error}
     await_promise=true wraps in the callback shim (store to a token global,
@@ -385,6 +388,64 @@ detaches itself mid-resolve. Mutation-proven: restoring `hit.contains(el)` turns
 the ancestor-hit step red, removing the liveness filter turns two steps red, and
 both together (the historical resolver) turn the reported case red with
 `dispatched:3` and an unchanged `document.title`.
+
+### `/console` — why a page that "does nothing" is doing something
+
+⛔ **An SDK that throws looks exactly like an SDK that is inert, and until
+2026-08-06 the engine could not tell you which.** A payment SDK builds its
+`<iframe>` and navigates it a few statements later; if anything in between
+raises, the element is in the document, visible, sized, and its `src` is empty
+forever. Every DOM probe an agent can run reports "constructed, never
+navigated" — a symptom, not a cause. A live investigation into a government
+payment gateway stopped at exactly that wall, because the reason was in a
+console message nobody could read.
+
+The page instrument is injected at `LoadEvent::Committed` — the earliest this
+engine can reach, with the document created and its own scripts not yet run — and
+`/engine/console` drains what it saw. Reading CLEARS by default: a buffer nobody
+drains fills with the same error a hundred times and buries the next one. Every
+read is journaled as `engine.page.console`, so an agent who never asks still
+leaves the page's errors in the daemon's record.
+
+**Errors and rejections cost the page nothing.** They are captured with
+`addEventListener` on `error` (capturing, so a failed subresource is caught too)
+and `unhandledrejection` — additive, so no handler the page owns is replaced and
+`window.onerror` is left for the page to set. A rejection reports its MESSAGE
+with the stack beside it; WebKit's `Error.stack` is bare frames with no message
+line, so preferring the stack reported `@sdk.js:79:32` for a rejection whose
+whole value was its sentence.
+
+⚠ **`console` is the one patched thing, and the cost is stated rather than
+hidden.** There is no additive listener for it, so the five methods are wrapped;
+each calls the original and reports the native source from `toString`, which
+defeats the cheap sniff but not a determined fingerprint. It is not put in the
+profile's content manager on purpose: that manager is the identity `/policy`
+declares, and a debugging aid living there would make the engine a different
+browser from the visible surface for every site, forever.
+
+### The mechanisms an embedded SDK uses — `ychrome engine embed`
+
+A separate proof, and it REPORTS rather than gates: which mechanisms a substrate
+supports is a measurement, and a run that went red on a mechanism nobody uses
+would teach an agent to ignore it.
+
+Thirteen cases, one real ES module defining one real custom element, building a
+dynamic iframe against a second origin. **All eleven population mechanisms work
+on webkitgtk-headless** — `src` before and after append, `srcdoc`,
+`document.write` into the initial `about:blank` child, `contentWindow.location`
+assign and replace, a form whose `target` NAMES the frame, a `postMessage`
+handshake, an iframe inside a shadow root, and a module that builds at top level
+instead of in a ready handler. So "the SDK constructs its iframe and never
+navigates it" is **not** a substrate gap, and the remaining two cases show what
+it is instead: a bootstrap that builds the frame and then throws, and one whose
+async bootstrap rejects. Both reproduce the live symptom exactly — frame
+present, `src` empty — and both pass only when `/engine/console` names the
+reason.
+
+⚠ One case is an EXPECTED refusal and is the control that says so: a form whose
+`target` names no existing frame asks for a new window, and WebKit blocks a
+window nobody clicked for. **An `id` is not a `name`**, and an SDK that confuses
+them gets silence.
 
 ### What the PAGE asks for: new windows and script dialogs
 
