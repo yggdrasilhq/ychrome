@@ -20,6 +20,7 @@ pub mod api;
 pub mod ctl;
 pub mod embedsdk;
 pub mod flow;
+pub mod frames;
 pub mod gate;
 pub mod gateway;
 pub mod hit;
@@ -337,15 +338,47 @@ pub fn run_verb(sub: Option<&str>, as_json: bool) -> Result<()> {
             // Reports, never gates — see the module doc.
             Ok(())
         }
+        Some("frames") => {
+            let report = frames::run()?;
+            if as_json {
+                println!("{report}");
+            } else {
+                println!(
+                    "cross-origin frame reach — {} ({} steps)",
+                    report["mechanism"].as_str().unwrap_or(""),
+                    report["steps"].as_array().map(Vec::len).unwrap_or(0),
+                );
+                for step in report["steps"].as_array().into_iter().flatten() {
+                    println!(
+                        "  {} {}",
+                        if step["pass"].as_bool() == Some(true) {
+                            "PASS"
+                        } else {
+                            "FAIL"
+                        },
+                        step["step"].as_str().unwrap_or(""),
+                    );
+                }
+                println!(
+                    "  a web-process extension is required: {}",
+                    report["web_process_extension_required"],
+                );
+            }
+            if report["pass"].as_bool() != Some(true) {
+                bail!("cross-origin frame reach FAILED — see the journal and the report above");
+            }
+            Ok(())
+        }
         Some(other) => {
             bail!(
                 "unknown engine verb {other:?} \
-                 (known: probe, gate, flow, hit, gateway, embed, bench, govern, parity)"
+                 (known: probe, gate, flow, hit, gateway, embed, frames, bench, govern, parity)"
             )
         }
         None => {
             bail!(
-                "usage: ychrome engine <probe|gate|flow|hit|gateway|embed|bench|govern|parity> [--json]"
+                "usage: ychrome engine \
+                 <probe|gate|flow|hit|gateway|embed|frames|bench|govern|parity> [--json]"
             )
         }
     }
