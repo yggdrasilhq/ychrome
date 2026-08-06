@@ -53,6 +53,9 @@ ychrome-vault-proto = { path = "crates/ychrome-vault-proto" }
 # asks the vault agent to sign. The signing crypto itself lives in ychrome-vault.
 sha2 = "0.10"
 tao = "0.35"
+# The same soup3 webkit2gtk itself builds against — `CookieManagerExt::add_cookie`
+# takes a `soup::Cookie`, and webkit2gtk does not re-export the crate.
+soup = { package = "soup3", version = "0.5" }
 url = "2"
 # `v2_40` is what `webkit_web_view_evaluate_javascript` needs; wry already
 # turns on v2_38, so this is one additive step on a shared dependency.
