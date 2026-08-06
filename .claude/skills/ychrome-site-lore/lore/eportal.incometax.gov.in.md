@@ -183,3 +183,66 @@ VERIFICATION: "E-Verify Now" -> "OTP on mobile number registered with Aadhaar" -
 tick consent -> Generate Aadhaar OTP -> six separate #otp_<i>_<suffix> boxes, which
 need real input (web do type) one digit at a time; eval cannot drive them. Stamp the
 since-timestamp BEFORE clicking Generate so a stale code cannot win.
+
+## cpc-itr-grievance-filing · WORKS
+task: 
+model: claude-opus-5
+date: 2026-08-06
+tags: 
+
+Filing a CPC-ITR grievance end to end, unattended, from a `--keep` session
+(proven 2026-08-06, acknowledgement 26390914, AY 2025-26 refund chase).
+
+## Route
+Top-nav **Grievances -> Submit Grievance -> CPC-ITR** -> Category / Applicable Act /
+Sub-Category -> **Continue** -> AY, Grievance Description, attachments -> **Submit Grievance**.
+
+- `Continue` EXPANDS the same route (`#/fo-greivance/submit/fillDetails`); it does not navigate.
+  Do not wait for a hash change or you will conclude the click failed.
+- Menu items: click the element's `closest("a")`, and take the LAST element whose exact text
+  matches -- the label text appears on several nested nodes and the outer one is inert.
+- The department is a plain div tile, not a radio.
+- Dropdowns are `mat-select` (`#mat-select-N`), options are `mat-option` in a CDK overlay.
+  Sub-Category stays EMPTY until Applicable Act is chosen -- an empty option list here means
+  "a prerequisite field is unset", not "the control is broken".
+- Close a stray overlay with `.cdk-overlay-backdrop`.
+
+## ⛔ The description field silently rejects `>`
+No error text, no hint: the control just stays `ng-invalid` and Submit stays disabled forever.
+Probed one character at a time: `"` `/` `:` `,` and newlines ALL PASS; only `>` fails.
+So a menu path like `e-File > View Filed Returns` must be written with commas.
+There is no `pattern` attribute -- the validator is in code, so the DOM tells you nothing.
+
+## ⚠⚠ Never read `ng-invalid` synchronously after setting a value
+Angular updates the class in a LATER tick. A same-tick read reports INVALID for a field that is
+perfectly fine, and it does so for every candidate you probe -- which reads as "the value never
+reached Angular" and sends you hunting a wiring bug that does not exist. This cost ~15 minutes
+and three wrong diagnoses here. Use `web await` and sleep ~500ms before reading the class.
+
+## Setting the value
+- `document.execCommand("insertText", ...)` on the focused textarea is EXACT and reaches Angular.
+- The native-setter injection also reaches Angular (control goes `ng-dirty ng-touched`).
+- `web do type` reaches Angular too but DUPLICATES THE FINAL CHARACTER (typed "test grievance",
+  got "test grievancee") -- same stray-char class as `#panAdhaarUserId` on the login page.
+
+## Form shape
+- There is **no subject field** -- fold the subject into the first line of the description.
+- Description cap is 3000 chars; the "Remaining Characters" counter tracks the DOM value and can
+  read correct while the control is still invalid, so it is not a validity signal.
+- Applicable Act: AY 2025-26 is FY 2024-25 => **Income Tax Act 1961**, not the 2025 Act also
+  offered (that starts FY 2026-27).
+
+## ⛔ Attachments cannot be filed by an agent today
+The form offers Form 16/16A, Challan Copy, Order Copy from department, Other documents
+(pdf/jpeg/zip, 10MB total). There is **no file-upload verb on the web surface** -- `web do` is
+click/type only -- and a multi-MB DataTransfer injection through an eval is not viable.
+Workaround that made the filing worth sending anyway: quote the JOIN KEYS in the body (order DIN,
+rectification ARN, challan CIN + BSR + serial, DRN) -- those are what CPC matches on -- and keep
+the PDF staged for when they ask.
+
+## Confirming
+The success toast prints `Grievance submitted sucessfully!` (the department's own typo) with the
+acknowledgement number, then clears. **Screenshot immediately or you lose it** -- a capture taken
+~60s later shows only the reset form. Confirm INDEPENDENTLY under **Grievances -> View Grievance
+Status**, which lists ack no / department / category / sub-category / date logged / status, and
+screenshot that instead: it is the durable artefact.
