@@ -918,10 +918,18 @@ returns `user-only` on step 1 and `filled` once the password field exists.
 1. **No cross-origin frame reach.** `ctl eval` is page-scoped, so the in-frame payment UI is
    unreadable. A frame-targeted eval (or exposing subframes in `ctl pages`) would remove the need
    to re-POST top-level.
-2. **`ctl shot` cannot write a file on this build.** It streams binary to stdout and the CLI then
-   refuses it — `ychrome: stream did not contain valid UTF-8` — so the image is lost. `path=`,
-   `out=`, `file=`, `dest=` are all unrecognised keys. With no screenshot and no frame reach,
-   driving a payment page by blind coordinates was the only alternative, and was refused.
+   ✅ **2026-08-06 — the substrate question is answered and the answer is cheap.** `ychrome engine
+   frames` (8/8, mutation-proven) shows a cross-origin child IS reachable with no WebKit
+   web-process extension: an `@all-frames` userscript runs inside a bank frame, and a rect
+   measured in the child plus the iframe's own rect gives a coordinate a real `GdkEvent` click
+   lands on (`isTrusted: true`), with typed text reading back from inside the child. ⚠ The
+   `frame=` verb is not built yet, so **`_self` is still the working method today** — but the
+   next lane here should check `docs/pending-bugs.md` before re-POSTing, not assume.
+2. ✅ **`ctl shot` writes a file now** (`f03b0c2`): `--out FILE` always worked and `out=FILE` now
+   does too; `path=`/`file=`/`dest=`/`output=` are refused **by name** instead of being ignored.
+   The old note below is why blind-coordinate driving looked like the only alternative — and it
+   was still correctly refused. ⛔ A driving surface with neither frame reach nor a screenshot
+   must not be used to spend money; that rule stands whatever the tooling does.
 
 ### Portal-driver lore (`rti_portal.py`)
 
