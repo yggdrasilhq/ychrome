@@ -28,14 +28,71 @@ payment page, because `ctl shot` was also unavailable to them at that moment
 (see the entry below, now fixed). A driving surface with neither frame reach nor
 a screenshot is one an agent must not use to spend money.
 
-**Shape of the fix**, so it is not re-derived: WebKitGTK can evaluate in a named
-frame (`webkit_web_view_evaluate_javascript` takes a `world_name`, and
-`WebKitFrame` exists in the web-process extension API only). A `frame=` selector
-on `/engine/eval` and `/engine/input` is the verb that is missing. Whether it can
-be done without a web-process extension is UNPROVEN — establish that first.
+**Shape of the fix**, so it is not re-derived: `webkit_web_view_evaluate_javascript`
+takes a `world_name`, not a frame, and `WebKitFrame` exists in the web-process
+extension API only. A `frame=` selector on `/engine/eval` and `/engine/input` is
+the verb that is missing.
+
+### ✅ THE COST QUESTION IS SETTLED: NO WEB-PROCESS EXTENSION IS NEEDED
+
+**Measured 2026-08-06, `ychrome engine frames`, 8/8 on dev.** The entry used to
+end "whether it can be done without a web-process extension is UNPROVEN —
+establish that first". It is now established, by measurement, and the answer is
+the cheap one: **two UI-process APIs the engine already links are enough.**
+
+1. **`UserContentInjectedFrames::AllFrames`** — `identity::attach_script`
+   already honours a userscript's `@all-frames`, and WebKit really does inject
+   it into a cross-origin child. That is the load-bearing half: a bank's
+   document will never cooperate, so the only question was whether our own code
+   can run inside it. It can.
+2. **`postMessage`** — cross-origin by design. The copy of the bridge in the
+   child talks to the copy in the top frame, and ordinary `eval` (which reaches
+   the top frame) reads the result off a global.
+
+The fixture is two real loopback origins with an **inert** child page — no
+script, no listener, no beacon — because a child that helped us would prove
+nothing about a real gateway. Measured, in this order: the child is genuinely
+cross-origin (`THREW:SecurityError`); the bridge runs inside it; ⭐ **the
+mutation control** — the same script in the same world with the same `@match`
+and no `@all-frames` is `undefined` in the child and a `number` in the top; the
+child's DOM reads back; a listener installs inside the child; an element
+measures inside the child.
+
+⭐ **And it drives, not just reads.** `/engine/input` was never the missing
+piece — WebKit already hit-tests a real `GdkEvent` through the frame tree. What
+was missing is the **coordinate**, because selector resolution runs in the top
+document and cannot see into the child. A rect measured inside the child plus
+the iframe's own rect is that coordinate. Proven: a click at the translated
+point lands on the child's own `#otp` with `isTrusted: true`, focuses it, and
+`424242` typed after it reads back **from inside the child**. A `#decoy` band
+occupies exactly where an untranslated point would land, so this cannot pass by
+arithmetic accident.
+
+**Mutation-proven**: deleting `@all-frames` from the bridge turns exactly the
+seven dependent steps red and leaves the cross-origin control green.
+
+**What is still OPEN**, and why this entry stays: the verb itself. `frame=` on
+`/engine/eval` and `/engine/input` is not built. The probe's bridge is an
+instrument, not the design — it is installed for the run, removed on every exit
+path including a panic, and gated on a per-run token so a leftover copy is inert
+to any page. ⛔ **Do not lift that script into `src/`**: it accepts `eval` off
+the page's own message channel, which a shipped verb must not.
 
 ⚠ Do NOT "fix" this by loosening origin checks. The frames are cross-origin
-because banks intend them to be.
+because banks intend them to be — and nothing above does: the child reads its
+OWN document, in its own frame, and reports a value.
+
+### ⛔ `rustfmt <file>` IS NOT FILE-SCOPED, AND THAT IS THE FORMATTER TRAP IN A NEW SHAPE
+
+The skill says to use `rustfmt <file>` rather than `cargo fmt` (which reformats
+the whole workspace and buried a 385-line change on 2026-08-06). That advice is
+incomplete and cost a revert the same day: **`rustfmt` follows `mod`
+declarations.** `rustfmt src/engine/mod.rs` reformatted `api.rs`, `host.rs`,
+`js.rs` and `substrate.rs` — four files that change had never touched.
+
+**Use `rustfmt --skip-children <file>`**, and audit `git diff --stat` after
+formatting, every time. A formatter that silently widens its own blast radius
+looks exactly like a clean run until someone reads the diff.
 
 ---
 
