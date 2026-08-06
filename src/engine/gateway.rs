@@ -54,21 +54,25 @@ impl Step {
 // ---------------------------------------------------------------------------
 
 /// What one origin answers: `(method, path) -> (status, extra headers, body)`.
-type Route = Arc<dyn Fn(&str, &str) -> (u16, Vec<String>, String) + Send + Sync>;
+///
+/// Shared with [`super::embedsdk`], which needs the same two-origin rig for a
+/// different question. One fixture server, not two: a second copy would drift,
+/// and the two traps below are exactly the kind of thing a drifting copy loses.
+pub(super) type Route = Arc<dyn Fn(&str, &str) -> (u16, Vec<String>, String) + Send + Sync>;
 
 /// Every request an origin actually received, as `METHOD path`.
 ///
 /// The browser's own url is not evidence that a request was made — a view can
 /// be LISTED at a url it never fetched, which is precisely how the bug under
 /// proof presented. The server's log is the only thing that knows.
-type Hits = Arc<Mutex<Vec<String>>>;
+pub(super) type Hits = Arc<Mutex<Vec<String>>>;
 
 /// Serve `reply` on an ephemeral loopback port, forever, on its own thread.
 ///
 /// Deliberately the smallest thing that can hold a POST: a proof server that
 /// grew features would start having bugs of its own, and then a red step would
 /// mean two things.
-fn spawn_origin(listener: TcpListener, reply: Route) -> Result<(u16, Hits)> {
+pub(super) fn spawn_origin(listener: TcpListener, reply: Route) -> Result<(u16, Hits)> {
     let port = listener.local_addr()?.port();
     let hits: Hits = Arc::new(Mutex::new(Vec::new()));
     let log = hits.clone();
@@ -161,7 +165,7 @@ fn serve_one(mut stream: TcpStream, reply: &Route, hits: &Hits) -> std::io::Resu
     stream.flush()
 }
 
-fn document(title: &str, body: &str) -> String {
+pub(super) fn document(title: &str, body: &str) -> String {
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head>\
          <body style=\"font:16px sans-serif\">{body}</body></html>"

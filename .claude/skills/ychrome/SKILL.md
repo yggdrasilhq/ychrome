@@ -820,6 +820,7 @@ ychrome ctl open url=https://example.com/ [profile=work]   # -> {page_id, ...}
 ychrome ctl goto  page_id=pg_000001 url=…
 ychrome ctl eval  page_id=pg_000001 js=document.title
 ychrome ctl dom   page_id=pg_000001 mode=snapshot           # the structured read
+ychrome ctl console page_id=pg_000001 [clear=false]        # WHY the page did nothing
 ychrome ctl shot  page_id=pg_000001 --out shot.png          # image/png bytes (see below)
 ychrome ctl input page_id=pg_000001 events='[{"type":"click","selector":"#go"}]'
 ychrome ctl wait  page_id=pg_000001 until='{"js":"…"}' timeout_ms=8000
@@ -963,6 +964,55 @@ Input is **real**: `GdkEvent`s through `gtk_main_do_event`, so `isTrusted` is
 true, `:hover` applies and default actions fire. A `dispatchEvent` cannot do any
 of that, and the difference is the whole point.
 
+### ⭐ `ctl console` — REACH FOR THIS THE MOMENT A PAGE "DOES NOTHING"
+
+**Added 2026-08-06, and it is the verb whose absence cost the most.** An SDK that
+throws looks exactly like an SDK that is inert. A payment SDK builds its
+`<iframe>` and navigates it a few statements later; if anything in between
+raises, the element is there, visible, sized, and its `src` is empty forever.
+Every DOM probe says "constructed, never navigated" — a symptom, not a cause. A
+live investigation into a government payment gateway stopped at that wall for two
+sessions because the reason was in a console message the engine did not capture.
+
+```sh
+ychrome ctl console page_id=$p              # drains and CLEARS
+ychrome ctl console page_id=$p clear=false  # peek without draining
+# -> {"entries":[{"kind":"error","text":"TypeError: …","source":"…/sdk.js","line":75,…}]}
+```
+
+`kind` is `console` | `error` | `rejection` | `resource` (a subresource that
+404'd — an SDK whose module fails to load dies exactly there and says nothing
+else). Every read is journaled as `engine.page.console`.
+
+- **Errors and rejections cost the page nothing**: additive `addEventListener`,
+  so `window.onerror` stays the page's to set.
+- ⚠ **`console` is the one PATCHED thing** — no additive listener exists. The
+  wrappers call through and report the native `toString`, which beats the cheap
+  sniff and not a determined fingerprint. It is deliberately NOT in the profile's
+  content manager: that is the identity `/policy` declares, and a debugging aid
+  living there would make the engine a different browser from the visible surface
+  for every site, forever.
+
+### ⛔ "THE SDK BUILDS ITS IFRAME AND NEVER NAVIGATES IT" IS NOT A SUBSTRATE GAP
+
+Measured 2026-08-06 by `ychrome engine embed` — one real ES module, one real
+custom element, a dynamic iframe against a second origin. **All eleven ways of
+populating it WORK on webkitgtk-headless**: `src` set before and after append,
+`srcdoc`, `document.write` into the initial `about:blank` child,
+`contentWindow.location` assign and replace, a form whose `target` NAMES the
+frame, a `postMessage` handshake, an iframe inside a shadow root, and a module
+that builds at top level rather than in a ready handler.
+
+⇒ **Do not go looking for a broken iframe mechanism. Read `ctl console`.** The
+two remaining cases reproduce the live symptom exactly — frame present, `src`
+empty — and they are a bootstrap that throws and one whose async bootstrap
+rejects.
+
+⚠ **An `id` is not a `name`.** A form whose `target` names no existing frame asks
+for a new WINDOW, and WebKit blocks a window nobody clicked for, so a
+script-initiated submit to a mis-spelled target is silent. That case is in the
+proof as an expected refusal.
+
 ### ⛔ A NEW WINDOW AND A SCRIPT DIALOG ARE THINGS THE PAGE ASKS FOR, and both were dropped
 
 **Fixed 2026-08-06, after a staged government payment died on it.** Proof:
@@ -1067,6 +1117,7 @@ ychrome engine gate     # Phase A: display, load, pixels, eval, isTrusted differ
 ychrome engine flow     # Phase B: nav/wait/dom and all five input events
 ychrome engine hit      # selector clicks: hittability, the refusals, nth/require_unique
 ychrome engine gateway  # the page's OWN asks: a new-window hand-off, a script dialog
+ychrome engine embed    # 13 ways an embedded SDK fills a dynamic iframe (REPORTS, does not gate)
 ychrome engine parity   # Phase C: jar, adblock differential, userscript world
 ychrome engine govern   # Phase D: 300 pages under budget, park/resume
 ychrome engine bench 10 # concurrency + shot latency

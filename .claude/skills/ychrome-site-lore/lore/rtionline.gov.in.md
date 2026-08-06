@@ -138,6 +138,28 @@ zero bank charges: `paySubmit('SBINet')`, `paySubmit('OTHERINB')`,
   remember `ctl pages` only started reporting the live url in that same fix. Not
   re-verified against the real gateway — the fix was proven on a local two-origin
   fixture, and this portal was deliberately not touched.
+- ⭐⭐ **NEXT STEP ON THE SDK, and it is one command** (fixer, 2026-08-06). "The SDK
+  constructs its iframe and never navigates it" is **NOT a substrate gap** —
+  `ychrome engine embed` walks ELEVEN ways of populating a dynamically created
+  cross-origin iframe from a real ES module in a real custom element, and **every
+  one works** on this build: `src` before and after append, `srcdoc`,
+  `document.write` into the initial about:blank child, `contentWindow.location`
+  assign and replace, a form whose `target` NAMES the frame, a postMessage
+  handshake, an iframe inside a shadow root, and a module that builds at top
+  level instead of in a ready handler. So the SDK is not being blocked; it is
+  dying in its own JS before it reaches the navigation.
+  ⇒ **On the next live run, the FIRST thing to do on the BillDesk page is
+  `ychrome ctl console page_id=<p>`** — new verb, ships with the same fix. It
+  returns the page's uncaught errors, unhandled rejections, failed subresources
+  and console lines, with file, line and stack. Two fixture cases reproduce your
+  exact symptom (frame present, `src` empty) and both are explained by one line
+  of that output. Read it BEFORE theorising about iframes.
+  ⚠ Also worth one probe: **an `id` is not a `name`.** If the SDK targets a form
+  at `sdk-iframe` (the id) rather than a frame `name`, the submit asks for a new
+  WINDOW, and WebKit blocks a window nobody clicked for — silently. That would
+  match everything you measured. `ctl pages` would show no new page (checked in
+  the daemon journal for both your runs: zero `engine.window.create`, so if this
+  is it, the popup was blocked rather than mis-routed).
 - **Card payments are unusable from automation today**: `ychrome-vault` cannot read
   Bitwarden card-type ciphers (see the yggterm campaign field report), so the card
   number/expiry/CVV are unreachable.
