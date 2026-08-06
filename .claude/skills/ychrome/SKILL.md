@@ -963,6 +963,37 @@ Input is **real**: `GdkEvent`s through `gtk_main_do_event`, so `isTrusted` is
 true, `:hover` applies and default actions fire. A `dispatchEvent` cannot do any
 of that, and the difference is the whole point.
 
+### ⛔ A NEW WINDOW AND A SCRIPT DIALOG ARE THINGS THE PAGE ASKS FOR, and both were dropped
+
+**Fixed 2026-08-06, after a staged government payment died on it.** Proof:
+`ychrome engine gateway` (7 steps, two real loopback origins, mutation-proven).
+
+- **`window.open` / `target="_blank"` / a form targeting a new window** reach
+  WebKit's `create`. With no handler the navigation is DISCARDED — **not one
+  byte leaves the host** — while `ctl input` answers
+  `{"dispatched":3,"ok":true}` and the page sits where it was. That is exactly
+  the shape a bank-payment gateway takes. Now the popup is a **page of its own**:
+  new `page_id`, listed by `ctl pages`, tagged `opened-by-page`, journaled as
+  `engine.window.create`, keeping its opener's profile, ruleset and userscripts.
+  ⚠ It is listed at its provisional url BEFORE the document is parsed —
+  `ctl wait until='{"load":"finished"}'` is what tells you it is a document.
+- **An unanswered `alert()` WEDGES that page for good.** WebKitGTK raises a modal
+  on a display nobody can see, the page's script stays parked inside it, the
+  submit never happens, and every later verb on that page answers
+  `engine call did not answer within 30s`. Now: alert dismissed, confirm and
+  beforeunload accepted, prompt answered with the page's own default, every one
+  journaled as `engine.script.dialog` with the answer given.
+- **`ctl pages` reports the LIVE view's url**, not the one a caller last asked
+  for. It was the latter for months, so the one verb an agent is told to poll
+  during a navigation (because `eval` blocks) could not observe a navigation.
+
+⚠ Two traps in writing any fixture for this, both of which imitate the bug
+exactly — a flat 10 s stall with an empty server log: WebKit opens a
+**speculative connection** ahead of a navigation and sends nothing on it (a
+serial accept loop never reaches the connection carrying the POST), and it sends
+**`Expect: 100-continue`** for a form POST with a body and waits for the interim
+reply.
+
 ### ⛔ The engine's cookie jar was MEMORY-ONLY until 2026-07-31
 
 A `WebsiteDataManager` with base directories still gets a non-persistent cookie
@@ -1035,6 +1066,7 @@ ychrome engine probe    # which substrate this host can run, and why
 ychrome engine gate     # Phase A: display, load, pixels, eval, isTrusted differential
 ychrome engine flow     # Phase B: nav/wait/dom and all five input events
 ychrome engine hit      # selector clicks: hittability, the refusals, nth/require_unique
+ychrome engine gateway  # the page's OWN asks: a new-window hand-off, a script dialog
 ychrome engine parity   # Phase C: jar, adblock differential, userscript world
 ychrome engine govern   # Phase D: 300 pages under budget, park/resume
 ychrome engine bench 10 # concurrency + shot latency
