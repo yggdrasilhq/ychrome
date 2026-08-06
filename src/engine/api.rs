@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
-use super::host::{Engine, InputEvent, NavAction, PixelRect, ShotRegion};
+use super::host::{CookieSpec, Engine, InputEvent, NavAction, PixelRect, ShotRegion};
 use super::js;
 use super::pool::{self, pool};
 use crate::sidebar::ParsedRequest;
@@ -337,6 +337,35 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
                 },
             }
         }
+        // Put cookies INTO a page's profile store — the missing half of the
+        // jar being shared text on disk (the network process reads the jar
+        // once at startup, so a file-level handoff from curl never lands).
+        // Accepts an inline `cookies` array or a Netscape-format `jar` path,
+        // filtered to the origin's host. The reply's `visible_for_origin` is
+        // the store's own readback, not the adds' success; values never
+        // appear in the reply.
+        "cookie-import" => {
+            let Some(id) = page_id else {
+                return Reply::bad(400, "cookie-import needs a page_id");
+            };
+            let Some(origin) = request.body.get("origin").and_then(Value::as_str) else {
+                return Reply::bad(400, "cookie-import needs an origin url for the readback");
+            };
+            let specs = match cookie_specs(&request.body, origin) {
+                Ok(specs) => specs,
+                Err(error) => return Reply::bad(400, error),
+            };
+            if specs.is_empty() {
+                // An empty import is a caller error worth naming: the jar had
+                // nothing for this origin, which otherwise surfaces three
+                // steps later as an unauthenticated page.
+                return Reply::bad(400, "no cookies matched the origin (empty jar or filtered)");
+            }
+            match engine.cookie_import(&id, specs, origin.to_string()) {
+                Ok(report) => Reply::Json(200, report),
+                Err(error) => Reply::bad(502, error.to_string()),
+            }
+        }
         "shot" => match page_id {
             None => Reply::bad(400, "shot needs a page_id"),
             Some(id) => match capture(&engine, &id, &request.body) {
@@ -553,9 +582,122 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
 /// `park` is deliberately absent: parking a page must not first resume it.
 /// `close` is absent for the same reason — forgetting a parked page should not
 /// cost a page load.
-const DRIVES_A_PAGE: [&str; 8] = [
-    "goto", "nav", "eval", "shot", "dom", "input", "wait", "fill",
+const DRIVES_A_PAGE: [&str; 9] = [
+    "goto", "nav", "eval", "shot", "dom", "input", "wait", "fill", "cookie-import",
 ];
+
+/// Parse the caller's cookies for `cookie-import` — an inline `cookies` array
+/// or a Netscape-format `jar` file — keeping only cookies whose domain covers
+/// the origin. A parse failure refuses the import rather than guessing: an
+/// empty import surfaces three steps later as an unauthenticated page.
+fn cookie_specs(body: &Value, origin: &str) -> Result<Vec<CookieSpec>, String> {
+    let Some(host) = origin_host(origin) else {
+        return Err(format!("origin {origin:?} has no parseable host"));
+    };
+    if let Some(list) = body.get("cookies").and_then(Value::as_array) {
+        let mut specs = Vec::new();
+        for item in list {
+            let Some(name) = item.get("name").and_then(Value::as_str) else {
+                return Err("inline cookie without a name".into());
+            };
+            let Some(value) = item.get("value").and_then(Value::as_str) else {
+                return Err(format!("inline cookie {name:?} without a value"));
+            };
+            let domain = item.get("domain").and_then(Value::as_str).unwrap_or(&host);
+            if !domain_matches(&host, domain) {
+                continue;
+            }
+            specs.push(CookieSpec {
+                name: name.to_string(),
+                value: value.to_string(),
+                domain: domain.to_string(),
+                path: item
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("/")
+                    .to_string(),
+                secure: item.get("secure").and_then(Value::as_bool).unwrap_or(false),
+                http_only: item
+                    .get("httponly")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                max_age: item.get("max_age").and_then(Value::as_i64).unwrap_or(-1) as i32,
+            });
+        }
+        return Ok(specs);
+    }
+    if let Some(jar) = body.get("jar").and_then(Value::as_str) {
+        let text =
+            std::fs::read_to_string(jar).map_err(|error| format!("jar {jar:?}: {error}"))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs() as i64)
+            .unwrap_or(0);
+        return Ok(parse_netscape_jar(&text, &host, now));
+    }
+    Err("cookie-import needs `cookies` (array) or `jar` (path)".into())
+}
+
+/// Netscape jar lines: 7 tab-separated fields, with `#HttpOnly_` prefixing an
+/// HttpOnly cookie's domain. curl writes this format and so does the engine's
+/// own persistent store. Expired rows are dropped rather than imported dead;
+/// a `0` expiry is a session cookie and imports as one.
+fn parse_netscape_jar(text: &str, host: &str, now: i64) -> Vec<CookieSpec> {
+    let mut specs = Vec::new();
+    for raw in text.lines() {
+        let (line, http_only) = match raw.strip_prefix("#HttpOnly_") {
+            Some(rest) => (rest, true),
+            None => (raw, false),
+        };
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != 7 {
+            continue;
+        }
+        let domain = fields[0];
+        if !domain_matches(host, domain) {
+            continue;
+        }
+        let expires: i64 = fields[4].parse().unwrap_or(0);
+        if expires != 0 && expires <= now {
+            continue;
+        }
+        let max_age = if expires == 0 {
+            -1
+        } else {
+            (expires - now).min(i32::MAX as i64) as i32
+        };
+        specs.push(CookieSpec {
+            name: fields[5].to_string(),
+            value: fields[6].to_string(),
+            domain: domain.to_string(),
+            path: fields[2].to_string(),
+            secure: fields[3].eq_ignore_ascii_case("TRUE"),
+            http_only,
+            max_age,
+        });
+    }
+    specs
+}
+
+/// The host of an origin url, lowercased. The `url` crate does the parsing so
+/// userinfo, ports and IPv6 literals cannot fool a hand-rolled split.
+fn origin_host(origin: &str) -> Option<String> {
+    url::Url::parse(origin)
+        .ok()?
+        .host_str()
+        .map(str::to_ascii_lowercase)
+}
+
+/// RFC-6265-style domain match: the exact host, or the host under the cookie's
+/// domain. A leading dot on the jar side means the same thing and is ignored.
+fn domain_matches(host: &str, cookie_domain: &str) -> bool {
+    let domain = cookie_domain.trim_start_matches('.').to_ascii_lowercase();
+    let host = host.to_ascii_lowercase();
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
 
 /// A reply's status and body, for callers that only need the pair.
 ///
@@ -2085,6 +2227,50 @@ mod tests {
             header.contains("X-Evil"),
             "the value is escaped, not dropped: {header}"
         );
+    }
+
+    // The jar parser is the payment lane's gatekeeper: it must keep the
+    // origin's cookies (HttpOnly included), drop other domains, drop expired
+    // rows, and keep a 0-expiry row as a session cookie.
+    #[test]
+    fn netscape_jar_rows_filter_by_domain_and_expiry() {
+        let jar = concat!(
+            "# Netscape HTTP Cookie File\n",
+            "#HttpOnly_rtionline.gov.in\tFALSE\t/\tTRUE\t0\tPHPSESSID\tabc123\n",
+            ".rtionline.gov.in\tTRUE\t/rti\tFALSE\t4102444800\tpref\tone\n",
+            "othersite.example\tFALSE\t/\tFALSE\t0\tstray\tno\n",
+            "rtionline.gov.in\tFALSE\t/\tFALSE\t1\texpired\tgone\n",
+        );
+        let specs = parse_netscape_jar(jar, "rtionline.gov.in", 1_000_000);
+        let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+        assert_eq!(names, ["PHPSESSID", "pref"]);
+        assert!(specs[0].http_only && specs[0].secure);
+        assert_eq!(specs[0].max_age, -1, "0 expiry = session cookie");
+        assert!(specs[1].max_age > 0);
+    }
+
+    // Domain matching accepts both spellings of the same jar fact and refuses
+    // the suffix trick a hand-rolled ends_with would fall for.
+    #[test]
+    fn cookie_domains_match_like_rfc6265() {
+        assert!(domain_matches("rtionline.gov.in", ".rtionline.gov.in"));
+        assert!(domain_matches("sub.rtionline.gov.in", "rtionline.gov.in"));
+        assert!(!domain_matches("rtionline.gov.in", "online.gov.in"));
+        assert!(!domain_matches("evilrtionline.gov.in", "rtionline.gov.in"));
+    }
+
+    // The origin's host comes from a real url parse, not a split.
+    #[test]
+    fn origin_hosts_parse_or_refuse() {
+        assert_eq!(
+            origin_host("https://RTIonline.gov.in/request").as_deref(),
+            Some("rtionline.gov.in")
+        );
+        assert_eq!(
+            origin_host("https://user@host.example:8443/x").as_deref(),
+            Some("host.example")
+        );
+        assert_eq!(origin_host("not a url"), None);
     }
 
     // Path ownership must be exact. `/engineering` is not ours, and a daemon

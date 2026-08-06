@@ -4165,6 +4165,7 @@ dependencies = [
  "libc",
  "serde_json",
  "sha2",
+ "soup3",
  "tao",
  "url",
  "webkit2gtk",
