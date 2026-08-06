@@ -866,3 +866,71 @@ the e-mail/mobile hop. Treat *any* captcha rejection as session-fatal.
   Search both.
 - ✅ The portal's `doubleverification.php` → generic-page ending still tells you
   nothing. Debit SMS then registration e-mail remain the only success test.
+
+---
+
+## ★★★ 2026-08-06 run 5 — the BillDesk Embedded SDK v2 blocker, SOLVED (atlasStore lobe)
+
+Measured against `190da86` (verified deployed: binary mtime 19:08:46, daemon pid 124242 started
+19:08:55 — daemon NEWER than binary).
+
+**`ctl console` on the BillDesk bootstrap page returned EMPTY** — no uncaught errors, no
+rejections, no failed subresources. That is the finding, not the absence of one: the SDK is not
+crashing. One `ctl dom` read then answered it:
+
+```
+iframe  id="sdk-iframe"  name="response-frame"
+form    action=https://pay.billdesk.com/web/v1_2/sdk  target="response-frame"  method=post
+```
+
+⇒ **The SDK builds the iframe AND a correctly-targeted form, and never calls `submit()`.**
+⛔ **The id-vs-name hypothesis is FALSIFIED for this page** — the form's `target` already equals
+the iframe's `name`. No popup was ever requested, matching the journal's zero `engine.window.create`.
+✅ The engine was never at fault. `ychrome engine embed`'s eleven passing cases were right.
+
+### ⚠ THE MEASUREMENT TRAP THAT COST THREE SESSIONS
+
+**`iframe.src` is NOT a navigation indicator.** A form POST into a *named* frame navigates it
+while leaving the `src` attribute empty forever. Three sessions polled `src`, saw `""`, and
+concluded "the SDK never navigates its iframe".
+
+**The honest test is document access:**
+```js
+try { window.frames[0].document; "same-origin, still about:blank" }
+catch (e) { "SecurityError => a real cross-origin document IS loaded" }
+```
+After a manual `f.submit()` this flipped to `SecurityError` immediately.
+
+### THE WORKAROUND THAT REACHES THE BANK LIST
+
+```js
+const f = [...document.querySelectorAll("form")].find(x => x.target === "response-frame");
+f.target = "_self";   // render the payment UI TOP-LEVEL
+f.submit();
+```
+The order token tolerates the second POST (the payload carries `retryCount`). Top-level renders
+the full Net Banking bank list, drivable with ordinary `ctl eval`; clicking `IDFC First Bank
+Limited` reaches `auth.idfcfirst.bank.in/opt-customer-login`. `ctl fill entry=idfcfirstbank.com`
+returns `user-only` on step 1 and `filled` once the password field exists.
+
+### ⚠ TWO ENGINE GAPS THIS EXPOSED (both are why `_self` was necessary)
+
+1. **No cross-origin frame reach.** `ctl eval` is page-scoped, so the in-frame payment UI is
+   unreadable. A frame-targeted eval (or exposing subframes in `ctl pages`) would remove the need
+   to re-POST top-level.
+2. **`ctl shot` cannot write a file on this build.** It streams binary to stdout and the CLI then
+   refuses it — `ychrome: stream did not contain valid UTF-8` — so the image is lost. `path=`,
+   `out=`, `file=`, `dest=` are all unrecognised keys. With no screenshot and no frame reach,
+   driving a payment page by blind coordinates was the only alternative, and was refused.
+
+### Portal-driver lore (`rti_portal.py`)
+
+⚠ **`identify` prints `ok:true` and THEN renders the next hop's captcha.** A truncated read of its
+output looks exactly like a failure. Re-running it burns a live session and a portal OTP. Read the
+whole output — the second JSON object is the next captcha, not an error.
+
+### Glyph discriminators (this run)
+
+- A **bare vertical with no serif and no top-left flag is `I`**, not `1`. (`9UFI8R` passed.)
+- A stroke that **hooks left at the bottom is `J`**, not `7`; `7` has no bottom hook. (`7KBJDC`
+  passed the one-shot staging hop.)
