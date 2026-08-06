@@ -84,3 +84,54 @@ booking removes the queue, it removes the single largest time cost in the postal
 which is the lane every WB state RTI must use because **no West Bengal online RTI portal
 exists** (`rtiwb.gov.in`, `wbrti.gov.in`, `rti.wb.gov.in` do not resolve; `wbic.gov.in`
 and `wb.gov.in` time out).
+
+## shipping-label-convention-and-no-autoprint · WORKS
+task: how to address a Speed Post cover India Post accepts, and when to print a label at all
+model: claude-fable-5
+date: 2026-08-07
+tags: 
+
+⛔⛔ **THE OWNER'S STANDING ORDER, 2026-08-07: NEVER AUTO-PRINT A SHIPPING LABEL.**
+> *"do not print the shipping label from now on. It wastes paper and you make mistakes …
+> We print only if we have a batch and we use one page CORRECTLY for the shipping labels."*
+
+**Print a label sheet ONLY when (a) there is a BATCH of articles, and (b) the sheet is laid out to
+FILL an A4.** A single label on its own page is refused: the RTI-A sheet on 2026-08-06 occupied
+about 10% of an A4 and the whole page went in the bin. For one article he addresses the envelope
+himself and it is faster than being handed a wrong label.
+
+## ✅ THE ACTUAL LAYOUT INDIA POST ACCEPTS — settled from the primary artefact
+
+Photographed 2026-08-07, the RTI-A cover as accepted (atlasStore
+`icccc-kolkata-police-complaint/evidence/rti-postal/ENV-RTI-A-AS-ADDRESSED-2026-08-07.pdf`,
+`ev-20260806-fce39b26`). A DL long white envelope, landscape:
+
+- **FROM — upper LEFT, on the FRONT.**
+- **TO — lower RIGHT, on the FRONT**, offset down and across from the sender block.
+
+⛔⛔ **THIS CORRECTS THE 2026-07-27 ENTRY IN `indiapost.gov.in` LORE, WHICH SAID "FROM GOES ON THE
+BACK, TO ON THE FRONT" AND THAT A FRONT-PRINTED SENDER BLOCK WAS REFUSED.** The delivered
+article carries BOTH blocks on the front and was accepted. Whatever happened at that 2026-07-27
+counter, it is not a general rule and must not be applied again. **The photograph is the
+authority here, not the earlier recollection.**
+
+## ⛔ THE THREE DEFECTS IN THE PRINTED LABEL — all corrected by hand at dispatch
+
+1. **NO RECIPIENT PHONE WAS PRINTED.** He had to handwrite the addressee's published
+   switchboard number beside the To block at dispatch time. **Both phones are mandatory** per the counter's posted orders,
+   and the template only ever carried the sender's. ⇒ **A label with one phone number on it is an
+   incomplete label.** Sender: the registered number. Recipient: the authority's own published
+   switchboard number - look it up before rendering, never leave the field out.
+2. ⛔ **HIS E-MAIL MUST NOT APPEAR ON THE OUTSIDE.** It serves no postal purpose whatsoever, and
+   the reply address already sits INSIDE the application where the authority actually needs it.
+   Printing it on the cover is a gratuitous identifier leak to every handler. **Remove it from
+   every template.**
+3. ⛔ **DO NOT MARK THE COVER "RTI APPLICATION".** It announces the contents to everyone who
+   touches the envelope — including staff of the very authority the request is aimed at — and it
+   buys nothing, because **the addressee line already reads "Report (RTI) Section"**, so routing
+   is done by the address itself. `BY SPEED POST` is likewise redundant once the article carries a
+   Speed Post barcode. Both were the owner's calls on 2026-08-07 and both are correct.
+
+⇒ **The label carries exactly: From block (name, address, PIN, phone) · To block (designation,
+office, address, PIN, phone). Nothing else.** No email, no contents marking, no internal codes
+(that last one was already law — tray codes and slugs never print).
