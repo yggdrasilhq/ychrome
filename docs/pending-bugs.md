@@ -7,6 +7,38 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ★★ THE ENGINE CANNOT REACH INTO A CROSS-ORIGIN FRAME, AND THAT BLOCKED A PAYMENT
+
+**Status:** OPEN. Found by the atlasStore lobe, 2026-08-06 (run 5, ychrome
+`190da86`), driving BillDesk's Embedded SDK v2 on a live RTI fee payment.
+
+`ctl eval` runs in the TOP document only. A payment UI that lives in a
+cross-origin `<iframe>` therefore cannot be read or driven at all: no selector
+resolves into it, `window.frames[0].document` throws `SecurityError` by design,
+and there is no `frame=` or `frame_selector=` argument on any verb.
+
+The lobe's workaround was to re-POST the gateway form with `target=_self` so the
+bank's UI renders TOP-LEVEL, where ordinary `eval` works. That reached the Net
+Banking bank list and the IDFC login page, so it is a real workaround — but it
+is only available when you can rebuild the submit by hand, and it changes what
+the merchant page thinks happened.
+
+⛔ **The alternative they correctly REFUSED** was blind coordinate clicking on a
+payment page, because `ctl shot` was also unavailable to them at that moment
+(see the entry below, now fixed). A driving surface with neither frame reach nor
+a screenshot is one an agent must not use to spend money.
+
+**Shape of the fix**, so it is not re-derived: WebKitGTK can evaluate in a named
+frame (`webkit_web_view_evaluate_javascript` takes a `world_name`, and
+`WebKitFrame` exists in the web-process extension API only). A `frame=` selector
+on `/engine/eval` and `/engine/input` is the verb that is missing. Whether it can
+be done without a web-process extension is UNPROVEN — establish that first.
+
+⚠ Do NOT "fix" this by loosening origin checks. The frames are cross-origin
+because banks intend them to be.
+
+---
+
 ## ★ THE VAULT PANE STILL WAITS FOR YOU TO PRESS SYNC
 
 **Status:** OPEN — only (c), the sync SCHEDULE, survives. Everything else in
