@@ -646,6 +646,64 @@ pub fn open(
     Ok(pool().get(id).expect("just inserted"))
 }
 
+/// Adopt a view the PAGE created — `window.open`, or a form whose target is a
+/// new window — as a logical page of its own.
+///
+/// ⛔ **Takes the `inner` lock and NEVER `admission`.** This runs on the engine
+/// thread, inside WebKit's `create` signal, and `admission` is held across
+/// `park`/`open`/`goto` calls that block waiting on that same thread. Making
+/// room here would deadlock the engine against itself. So a popup can put the
+/// pool one over `max_live` for up to one governor tick, and then the governor
+/// parks LRU exactly as it does for every other page — the same mechanism that
+/// enforces `max_rss_mb`, rather than a second one.
+///
+/// Not `pinned`: the page's first load is WebKit's to run, not a caller's to
+/// unpin, and a page nobody ever unpins would hold a live slot for the life of
+/// the daemon.
+pub fn adopt(id: &str, url: &str, profile: &str, viewport: (i32, i32)) {
+    let now = now_ms();
+    pool().insert(LogicalPage {
+        id: id.to_string(),
+        url: url.to_string(),
+        tags: vec!["opened-by-page".to_string()],
+        state: PageState::Live,
+        place: Place::default(),
+        viewport,
+        profile: profile.to_string(),
+        opened_at_ms: now,
+        last_used_ms: now,
+        error: None,
+        pinned: false,
+    });
+}
+
+/// Re-read every LIVE page's url and title from its view, which is the only
+/// thing that knows either.
+///
+/// ⛔ **`page.url` is written at `open`, `goto` and `park` and nowhere else**, so
+/// before this existed a listing reported the url the CALLER last asked for and
+/// could not see an in-page navigation at all. Measured: a form POST that really
+/// did cross to another origin and render there still listed the page it had
+/// left. That made `/engine/pages` — the verb an agent is told to poll during a
+/// navigation, because `eval` blocks — an instrument that cannot observe the
+/// thing it is polled for. It also sent `resume` back to the wrong url.
+pub fn sync_live_urls(engine: &Engine) {
+    let Ok(live) = engine.live_locations() else {
+        return;
+    };
+    let Ok(mut inner) = pool().inner.lock() else {
+        return;
+    };
+    for (id, (url, _title)) in live {
+        if let Some(page) = inner.pages.get_mut(&id)
+            && page.state == PageState::Live
+            && !url.is_empty()
+        {
+            page.url = url;
+        }
+    }
+}
+
 /// Make sure a page has a live view before a verb touches it.
 ///
 /// A parked page RESUMES rather than erroring. That is what makes the pool
@@ -711,4 +769,53 @@ pub fn start_governor(engine: Weak<Engine>) {
             }
         })
         .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A popup arrives on the engine thread, inside WebKit's own signal. Both
+    /// properties below are what let it be registered there at all, and both
+    /// are invisible at the call site — a future edit that "tidies" `adopt`
+    /// into `open` would deadlock the engine against itself and only say so on
+    /// a live page that takes a window of its own.
+    #[test]
+    fn a_page_the_page_opened_is_adopted_live_and_unpinned() {
+        let id = "pg_adopt_test";
+        adopt(id, "https://gateway.example/pay", "research", (800, 600));
+        let page = pool().get(id).expect("adopt registers the page");
+        assert_eq!(page.state, PageState::Live, "a popup has a view already");
+        assert!(
+            !page.pinned,
+            "nobody will ever unpin it — its first load is WebKit's, not a caller's, \
+             so a pinned popup would hold a live slot for the life of the daemon"
+        );
+        assert_eq!(page.url, "https://gateway.example/pay");
+        assert_eq!(
+            page.profile, "research",
+            "a popup keeps its opener's identity"
+        );
+        assert!(
+            page.tags.iter().any(|tag| tag == "opened-by-page"),
+            "a listing must be able to tell a page an agent asked for from one a site took"
+        );
+        pool().remove(id);
+    }
+
+    /// `adopt` must never reach for the admission lock: it runs on the engine
+    /// thread, which is the thread every admission-held call is blocked on.
+    /// Holding it here and calling `adopt` would hang if it ever did.
+    #[test]
+    fn adopt_does_not_take_the_admission_lock() {
+        let _admission = pool().admission.lock().expect("admission lock");
+        adopt(
+            "pg_adopt_nodeadlock",
+            "https://example.com/",
+            "default",
+            (10, 10),
+        );
+        assert!(pool().get("pg_adopt_nodeadlock").is_some());
+        pool().remove("pg_adopt_nodeadlock");
+    }
 }
