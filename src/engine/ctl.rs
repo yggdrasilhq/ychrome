@@ -33,11 +33,11 @@ const SHOT_META_HEADER: &str = "x-ychrome-shot";
 pub fn run(args: &[String]) -> Result<()> {
     let Some(verb) = args.first() else {
         bail!(
-            "usage: ychrome ctl <verb> [key=value ...] [--out FILE]\n\
+            "usage: ychrome ctl <verb> [key=value ...] [out=FILE | --out FILE]\n\
              verbs: open close pages goto nav wait eval dom shot input console\n\
              \x20      cookie-import park resume pool metrics budget batch egress identity status\n\
              \n\
-             shot regions (all four write PNG bytes; --out catches them):\n\
+             shot regions (all four write PNG bytes; out=FILE catches them):\n\
              \x20  region=viewport                       what is on screen (default)\n\
              \x20  region=full                           the whole scrollable document\n\
              \x20  region=element selector='#main'       one element, cropped from the full page\n\
@@ -60,6 +60,21 @@ pub fn run(args: &[String]) -> Result<()> {
             continue;
         }
         match arg.split_once('=') {
+            // ⚠ Every OTHER argument here is `key=value`, so `--out FILE` is the
+            // odd one out and callers reach for `out=` first. It used to fall
+            // through as an ordinary body key, the engine ignored it, and the
+            // PNG then died on the UTF-8 check below with "stream did not
+            // contain valid UTF-8" — a message about the wrong thing entirely.
+            // That cost a live payment session its screenshots. `out=` is now
+            // the same verb as `--out`, and its near misses are named.
+            Some(("out", raw)) => out_path = Some(raw.to_string()),
+            Some((key, _)) if matches!(key, "path" | "file" | "dest" | "output") => {
+                bail!(
+                    "{key}= is not how a capture names its file — use out=FILE \
+                     (or --out FILE). {verb} answers with PNG bytes, and without a \
+                     destination there is nothing to write them to"
+                )
+            }
             Some((key, raw)) => {
                 body.insert(key.to_string(), coerce(raw));
             }
@@ -101,6 +116,16 @@ pub fn run(args: &[String]) -> Result<()> {
         // reply instead of parsing a sentence.
         println!("{}", out_report(shot_meta.as_deref(), &path, bytes.len()));
         return exit_status(status);
+    }
+
+    // A binary body with nowhere to go. Reading it as text is how this used to
+    // end, and "stream did not contain valid UTF-8" reads as "the verb is
+    // broken" rather than "you did not say where to put it".
+    if content_type.starts_with("image/") {
+        bail!(
+            "{verb} answers with {content_type} bytes — say where to put them: \
+             ychrome ctl {verb} page_id=… out=FILE"
+        );
     }
 
     if content_type.contains("ndjson") || STREAMING.contains(&verb.as_str()) {
@@ -287,5 +312,38 @@ mod tests {
                 "{raw} should stay a string, got {parsed}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod destination_tests {
+    /// The four spellings a live session actually tried before concluding the
+    /// verb could not write a file at all. Three of them must be REFUSED BY
+    /// NAME, and the fourth must work — silence here cost a payment run its
+    /// screenshots and forced a blind-click workaround that was rightly refused.
+    #[test]
+    fn a_capture_names_its_destination_in_the_house_style() {
+        let source = include_str!("ctl.rs");
+        assert!(
+            source.contains(r#"Some(("out", raw)) => out_path = Some(raw.to_string())"#),
+            "out=FILE must be the same verb as --out FILE"
+        );
+        for near_miss in ["path", "file", "dest", "output"] {
+            assert!(
+                source.contains(&format!("\"{near_miss}\"")),
+                "{near_miss}= must be refused by name, not swallowed as a body key"
+            );
+        }
+    }
+
+    /// The failure that named the wrong thing. A PNG body read as text reported
+    /// an encoding problem, which reads as "the verb is broken".
+    #[test]
+    fn a_binary_reply_with_nowhere_to_go_says_so_instead_of_blaming_utf8() {
+        let source = include_str!("ctl.rs");
+        assert!(
+            source.contains(r#"content_type.starts_with("image/")"#),
+            "an image body must be recognised before anything tries to decode it"
+        );
     }
 }
