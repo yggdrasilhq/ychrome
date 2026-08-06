@@ -23,8 +23,8 @@ use crate::sidebar::ParsedRequest;
 
 /// Default page viewport. The spec's `page` shape carries a per-page viewport;
 /// v1 gives every page the engine's own size unless the caller says otherwise.
-const DEFAULT_W: i32 = 1280;
-const DEFAULT_H: i32 = 900;
+pub(super) const DEFAULT_W: i32 = 1280;
+pub(super) const DEFAULT_H: i32 = 900;
 
 /// How long a navigation may take before `/engine/goto` gives up.
 const GOTO_TIMEOUT: Duration = Duration::from_secs(45);
@@ -263,6 +263,11 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
             }
         },
         "pages" => {
+            // The live views first: a listing reports where a page IS, not
+            // where its caller last sent it. Without this, an in-page
+            // navigation — a form POST handing off to a payment gateway — is
+            // invisible to the one verb an agent can safely poll mid-flight.
+            pool::sync_live_urls(&engine);
             // LOGICAL pages, live and parked alike, filtered as §4 allows. A
             // listing that showed only live views would hide most of the pool.
             let want_state = crate::sidebar::query_value(&request.query, "state");
@@ -1777,8 +1782,12 @@ fn journal_main_frame(engine: &Engine, id: &str, event: &str) {
 /// state) belong to Phase D and are absent rather than faked — a zero would
 /// read as a measurement.
 fn page_status(engine: &Engine, id: &str) -> Value {
-    let url = engine.eval(id, "location.href").ok();
-    let title = engine.eval(id, "document.title").ok();
+    // From the VIEW, never from an `eval`. A page whose script is parked — in a
+    // dialog, in a long handler — would otherwise make its own status report
+    // time out, and a status is what you ask for precisely when a page is not
+    // behaving.
+    let live = engine.live_locations().unwrap_or_default();
+    let (url, title) = live.get(id).cloned().unwrap_or_default();
     json!({
         "ok": true,
         "page_id": id,
@@ -1790,7 +1799,9 @@ fn page_status(engine: &Engine, id: &str) -> Value {
     })
 }
 
-fn new_page_id() -> String {
+/// Mint a page id. `pub(super)` because the engine host mints one too, for a
+/// window the PAGE opened — one owner, so two generations of ids cannot collide.
+pub(super) fn new_page_id() -> String {
     // Monotonic and unique within a daemon's life. Not a ULID: the spec's
     // `pg_01hxyz…` shape is cosmetic and a counter cannot collide.
     use std::sync::atomic::{AtomicU64, Ordering};

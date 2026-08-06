@@ -128,6 +128,16 @@ zero bank charges: `paySubmit('SBINet')`, `paySubmit('OTHERINB')`,
   Selecting it → `auth.idfcfirst.bank.in` (mobile number, then password — **no OTP
   was required**) → `my.idfcfirst.bank.in/ecom/home` with a `Pay ₹10.00` button,
   account picker, and a 50-char `#payment-remarks`.
+- ⚠ **"Submitting `frmPayment` leaves the page at `about:blank`" was the ENGINE, not
+  the portal** (2026-08-06, opus-5). The hand-off takes a window of its own, and the
+  headless engine had no `create` handler, so the navigation was discarded without a
+  byte leaving the host while `ctl input` still answered `{"dispatched":3,"ok":true}`.
+  An `alert()` on the submit path wedged the page separately — every later verb
+  answered `engine call did not answer within 30s`. Both fixed; `ychrome engine
+  gateway` is the proof. **If you meet this again, check the engine build FIRST**, and
+  remember `ctl pages` only started reporting the live url in that same fix. Not
+  re-verified against the real gateway — the fix was proven on a local two-origin
+  fixture, and this portal was deliberately not touched.
 - **Card payments are unusable from automation today**: `ychrome-vault` cannot read
   Bitwarden card-type ciphers (see the yggterm campaign field report), so the card
   number/expiry/CVV are unreachable.

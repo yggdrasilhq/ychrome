@@ -37,8 +37,8 @@ use gtk::prelude::*;
 use javascriptcore::ValueExt;
 use serde_json::{Value, json};
 use webkit2gtk::{
-    CookieManagerExt, LoadEvent, SettingsExt, SnapshotOptions, SnapshotRegion, WebView, WebViewExt,
-    WebsiteDataManagerExt,
+    CookieManagerExt, LoadEvent, ScriptDialogType, SettingsExt, SnapshotOptions, SnapshotRegion,
+    URIRequestExt, WebView, WebViewExt, WebsiteDataManagerExt,
 };
 
 use super::substrate::{self, HeadlessDisplay, Probe, Substrate};
@@ -372,38 +372,41 @@ impl Engine {
                 responder.fail(format!("page {id:?} is already open"));
                 return;
             }
-            // The profile's identity — jar, adblock filter, userscripts, UA —
-            // from its owners, built once per profile and reused. This is what
-            // makes the engine and the visible surface the SAME browser.
-            let identity = match super::identity::for_profile(&profile) {
-                Ok(identity) => identity,
-                Err(error) => return responder.fail(error.to_string()),
-            };
-            let window = gtk::Window::new(gtk::WindowType::Toplevel);
-            window.set_default_size(width, height);
-            let view = WebView::builder()
-                .web_context(&identity.context)
-                .user_content_manager(&identity.content)
-                .build();
-            if let Some(agent) = &identity.user_agent {
-                let settings: webkit2gtk::Settings =
-                    WebViewExt::settings(&view).unwrap_or_default();
-                settings.set_user_agent(Some(agent.as_str()));
-                WebViewExt::set_settings(&view, &settings);
+            match build_page(width, height, &profile, None) {
+                Ok(page) => {
+                    PAGES.with(|pages| pages.borrow_mut().insert(id, page));
+                    responder.ok(())
+                }
+                Err(error) => responder.fail(error.to_string()),
             }
-            window.add(&view);
-            window.show_all();
-            PAGES.with(|pages| {
-                pages.borrow_mut().insert(
-                    id,
-                    Page {
-                        window,
-                        view,
-                        profile,
-                    },
-                );
+        })
+    }
+
+    /// Every open page's url and title, read from the VIEW rather than from
+    /// anything the caller once asked for.
+    ///
+    /// One round trip for the whole table: a listing verb must not cost a hop
+    /// per page. Never an `eval` — a page whose script is busy would make a
+    /// listing hang, and the listing is exactly what an agent reaches for when
+    /// a page is misbehaving.
+    pub fn live_locations(&self) -> Result<HashMap<String, (String, String)>> {
+        on_engine(Duration::from_secs(10), |responder| {
+            let map = PAGES.with(|pages| {
+                pages
+                    .borrow()
+                    .iter()
+                    .map(|(id, page)| {
+                        (
+                            id.clone(),
+                            (
+                                page.view.uri().map(Into::into).unwrap_or_default(),
+                                page.view.title().map(Into::into).unwrap_or_default(),
+                            ),
+                        )
+                    })
+                    .collect::<HashMap<String, (String, String)>>()
             });
-            responder.ok(())
+            responder.ok(map)
         })
     }
 
@@ -1073,6 +1076,222 @@ fn main_frame_trace(view: &WebView) -> Value {
                 || matches!(status, 403 | 503) && headers.get("cf-ray").is_some(),
         },
     })
+}
+
+/// The longest a dialog message may be in the journal. A page's own text, not a
+/// secret, but a journal line is for reading.
+const DIALOG_MESSAGE_MAX: usize = 200;
+
+/// Build one page's engine resources under a profile's identity, armed and
+/// mapped. The ONE place a `WebView` is born, so a view the PAGE asked for
+/// cannot come out a different browser than a view an agent asked for.
+///
+/// The window is mapped rather than offscreen because WebKit only paints a view
+/// that is realised and visible, and a snapshot of an unpainted view is the
+/// blank-canvas lie this engine exists to end. "Headless" here means the DISPLAY
+/// has no screen anyone can see, not that the view is unmapped.
+///
+/// `opener` is `Some` only for a window the page itself asked for. WebKit
+/// requires the child of a `create` to be built *with the related view* — that
+/// relation is what gives the popup its opener, its `window.name` and the same
+/// web process, and a view built without it cannot be returned from the signal.
+fn build_page(width: i32, height: i32, profile: &str, opener: Option<&WebView>) -> Result<Page> {
+    // The profile's identity — jar, adblock filter, userscripts, UA — from its
+    // owners, built once per profile and reused. This is what makes the engine
+    // and the visible surface the SAME browser.
+    let identity = super::identity::for_profile(profile)?;
+    let window = gtk::Window::new(gtk::WindowType::Toplevel);
+    window.set_default_size(width, height);
+    // `related-view` and `web-context` are mutually exclusive construct
+    // properties — WebKit takes the context FROM the related view and warns at
+    // CRITICAL level if both are passed. They would name the same context here
+    // (a popup keeps its opener's profile), so setting both would be a warning
+    // for no gain.
+    let view = match opener {
+        Some(opener) => WebView::builder()
+            .related_view(opener)
+            .user_content_manager(&identity.content)
+            .build(),
+        None => WebView::builder()
+            .web_context(&identity.context)
+            .user_content_manager(&identity.content)
+            .build(),
+    };
+    if let Some(agent) = &identity.user_agent {
+        let settings: webkit2gtk::Settings = WebViewExt::settings(&view).unwrap_or_default();
+        settings.set_user_agent(Some(agent.as_str()));
+        WebViewExt::set_settings(&view, &settings);
+    }
+    window.add(&view);
+    match opener {
+        None => window.show_all(),
+        // ⛔ A popup must NOT be shown before `create` returns. Realising the
+        // view runs WebKit's page-proxy setup, and doing that while WebKit is
+        // still inside `createNewPage` loses the navigation it was handing us:
+        // measured, the view came back listed at the gateway's url with
+        // `location.href === "about:blank"` and a load that never finished —
+        // the exact symptom this whole fix started from, reproduced one layer
+        // in. Showing it on the next main-loop turn is after `create` has
+        // returned, by construction, since we are inside a main-loop callback.
+        Some(_) => {
+            let window = window.clone();
+            glib::idle_add_local_once(move || window.show_all());
+        }
+    }
+    arm_new_window(&view, profile);
+    arm_script_dialogs(&view);
+    Ok(Page {
+        window,
+        view,
+        profile: profile.to_string(),
+    })
+}
+
+/// Answer WebKit when a PAGE asks for a new window, by making it a page.
+///
+/// ⛔ **Without this the hand-off is dropped and nothing says so.** A view with
+/// no `create` handler answers `window.open` with `null` and silently discards a
+/// `target="_blank"` submit: measured on a two-origin fixture, **not one byte
+/// left the host** while `/engine/input` reported `{"dispatched":3,"ok":true}`
+/// and the page sat where it was. That is the shape a bank-payment gateway
+/// takes — the merchant form targets a popup — so an agent driving a payment saw
+/// a successful click and a page that never moved.
+///
+/// A popup is therefore a PAGE, with its own id, listed by `/engine/pages` and
+/// drivable by every verb. Collapsing it into the opener instead would be a
+/// second lie: the page asked for two documents and would get one.
+fn arm_new_window(view: &WebView, profile: &str) {
+    let profile = profile.to_string();
+    view.connect_create(move |opener, action| {
+        let requested = action
+            .request()
+            .and_then(|request| request.uri())
+            .map(|uri| uri.to_string())
+            .unwrap_or_default();
+        let (width, height) = opener
+            .toplevel()
+            .map(|top| (top.allocated_width(), top.allocated_height()))
+            .filter(|(w, h)| *w > 0 && *h > 0)
+            .unwrap_or((super::api::DEFAULT_W, super::api::DEFAULT_H));
+        let id = super::api::new_page_id();
+        match build_page(width, height, &profile, Some(opener)) {
+            Ok(page) => {
+                let child = page.view.clone();
+                arm_load_trace(&child, &id);
+                PAGES.with(|pages| pages.borrow_mut().insert(id.clone(), page));
+                // The pool must learn about it too, or the listing would not
+                // show the very page the agent now has to drive.
+                super::pool::adopt(&id, &requested, &profile, (width, height));
+                crate::daemon::journal(
+                    "engine.window.create",
+                    json!({
+                        "page_id": id,
+                        "url": requested,
+                        "profile": profile,
+                        "opener_url": opener.uri().map(|uri| uri.to_string()),
+                    }),
+                );
+                Some(child.upcast::<gtk::Widget>())
+            }
+            Err(error) => {
+                // Say it rather than dropping it in silence — the silence is
+                // the bug this handler exists to end.
+                crate::daemon::journal(
+                    "engine.window.refused",
+                    json!({ "url": requested, "profile": profile, "error": error.to_string() }),
+                );
+                None
+            }
+        }
+    });
+}
+
+/// Journal a popup's own load, because nobody else can.
+///
+/// Every other navigation in this engine is somebody's `goto` and answers a
+/// responder. A popup's first load belongs to the PAGE: no verb was called, no
+/// caller is waiting, and if it fails there is no reply to carry the reason. The
+/// journal is the only place that can hold it.
+fn arm_load_trace(view: &WebView, id: &str) {
+    let page_id = id.to_string();
+    view.connect_load_changed({
+        let page_id = page_id.clone();
+        move |view, event| {
+            crate::daemon::journal(
+                "engine.window.load",
+                json!({
+                    "page_id": page_id,
+                    "event": format!("{event:?}").to_lowercase(),
+                    "url": view.uri().map(|uri| uri.to_string()),
+                }),
+            );
+        }
+    });
+    view.connect_load_failed(move |_view, _event, uri, error| {
+        crate::daemon::journal(
+            "engine.window.load_failed",
+            json!({ "page_id": page_id, "url": uri, "error": error.to_string() }),
+        );
+        false
+    });
+}
+
+/// Answer `alert` / `confirm` / `prompt` instead of raising a modal nobody can
+/// reach.
+///
+/// ⛔ **An unanswered script dialog wedges the page for good.** WebKitGTK's
+/// default handler puts up a modal on a display with no viewer; the page's own
+/// script stays parked inside `alert()`, so the navigation it was about to make
+/// never happens and every later verb on that page times out. Measured: one
+/// `alert()` on submit turned `ctl eval` into `engine call did not answer within
+/// 30s`, which is character-for-character what a live run against a government
+/// payment page recorded before the cause was known.
+///
+/// The answers are the ones that let a flow continue, because the alternative is
+/// not "the operator decides" — there is no operator on this display — it is a
+/// page that hangs until the daemon dies. Every dialog is journaled with the
+/// answer given, so what the engine decided on the agent's behalf is attributable
+/// rather than invisible.
+fn arm_script_dialogs(view: &WebView) {
+    view.connect_script_dialog(|view, dialog| {
+        let kind = dialog.dialog_type();
+        let answer = match kind {
+            ScriptDialogType::Confirm | ScriptDialogType::BeforeUnloadConfirm => {
+                dialog.confirm_set_confirmed(true);
+                "accepted"
+            }
+            ScriptDialogType::Prompt => {
+                // The page's own default, which is what a user who pressed OK
+                // without typing would send. Inventing text would be answering
+                // a question nobody asked us.
+                let default = dialog
+                    .prompt_get_default_text()
+                    .map(|text| text.to_string())
+                    .unwrap_or_default();
+                dialog.prompt_set_text(&default);
+                "default-text"
+            }
+            _ => "dismissed",
+        };
+        let mut message = dialog.message().map(|m| m.to_string()).unwrap_or_default();
+        let truncated = message.len() > DIALOG_MESSAGE_MAX;
+        if truncated {
+            message.truncate(DIALOG_MESSAGE_MAX);
+        }
+        crate::daemon::journal(
+            "engine.script.dialog",
+            json!({
+                "type": format!("{kind:?}").to_lowercase(),
+                "answer": answer,
+                "message": message,
+                "truncated": truncated,
+                "url": view.uri().map(|uri| uri.to_string()),
+            }),
+        );
+        // TRUE means handled here and now. Returning FALSE hands it back to
+        // WebKitGTK's modal, which is the wedge.
+        true
+    });
 }
 
 /// Arm a one-shot wait for the next load to settle, resolving to the committed
