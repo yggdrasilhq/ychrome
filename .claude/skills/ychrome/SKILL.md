@@ -1044,6 +1044,39 @@ serial accept loop never reaches the connection carrying the POST), and it sends
 **`Expect: 100-continue`** for a form POST with a body and waits for the interim
 reply.
 
+### ⭐ A CROSS-ORIGIN FRAME IS REACHABLE, AND IT NEEDS NO WEB-PROCESS EXTENSION
+
+**Measured 2026-08-06 by `ychrome engine frames`, 8/8 on dev.** `ctl eval` runs
+in the TOP document, so a payment UI inside a bank's iframe could not be read or
+driven, and the open question was whether reaching it meant a **WebKit
+web-process extension** — a second shared object, a second lifecycle, a second
+thing to deploy to five hosts. **It does not.** Two UI-process APIs the engine
+already links are enough:
+
+- **`UserContentInjectedFrames::AllFrames`** — `identity::attach_script` already
+  honours `@all-frames`, and WebKit really does inject into a cross-origin
+  child. This is the half that matters: a bank page will never cooperate, so the
+  only question was whether OUR code can run inside it.
+- **`postMessage`** — cross-origin by design; the child's copy of the bridge
+  talks to the top frame's copy, and ordinary `eval` reads the result.
+
+⭐ **`/engine/input` was never the missing piece.** WebKit already hit-tests a
+real `GdkEvent` through the frame tree. What was missing is the **coordinate** —
+selector resolution runs in the top document and cannot see into the child. A
+rect measured *inside* the child plus the iframe's own rect is that coordinate.
+Proven: a click there lands on the child's own `#otp` with `isTrusted: true`,
+and text typed after it reads back from inside the child.
+
+⚠ The `frame=` verb is still **not built** — see `docs/pending-bugs.md`. And ⛔
+**do not lift the probe's bridge script into `src/`**: it accepts `eval` off the
+page's own message channel, which is fine for an instrument that lives for one
+run behind a per-run token and is not fine for a product.
+
+⛔ **`rustfmt <file>` FOLLOWS `mod` DECLARATIONS.** "Use `rustfmt` not `cargo
+fmt`" is not enough: `rustfmt src/engine/mod.rs` reformatted four files the
+change had never touched. Use **`rustfmt --skip-children <file>`** and read
+`git diff --stat` afterwards.
+
 ### ⛔ The engine's cookie jar was MEMORY-ONLY until 2026-07-31
 
 A `WebsiteDataManager` with base directories still gets a non-persistent cookie
@@ -1118,6 +1151,7 @@ ychrome engine flow     # Phase B: nav/wait/dom and all five input events
 ychrome engine hit      # selector clicks: hittability, the refusals, nth/require_unique
 ychrome engine gateway  # the page's OWN asks: a new-window hand-off, a script dialog
 ychrome engine embed    # 13 ways an embedded SDK fills a dynamic iframe (REPORTS, does not gate)
+ychrome engine frames   # reach INTO a cross-origin frame: read, measure, click, type
 ychrome engine parity   # Phase C: jar, adblock differential, userscript world
 ychrome engine govern   # Phase D: 300 pages under budget, park/resume
 ychrome engine bench 10 # concurrency + shot latency
