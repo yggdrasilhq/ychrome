@@ -490,6 +490,41 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
                 Err(error) => Reply::bad(400, error.to_string()),
             }
         }
+        "console" => {
+            let Some(id) = page_id else {
+                return Reply::bad(400, "console needs a page_id");
+            };
+            // Reading is destructive by default. A buffer nobody drains fills
+            // with the same error a hundred times and buries the next one; a
+            // caller who wants to keep it says so.
+            let clear = request.body["clear"].as_bool().unwrap_or(true);
+            match engine.eval(&id, &format!("({})({clear})", js::CONSOLE_READ)) {
+                Ok(value) => {
+                    let entries = value["entries"].as_array().cloned().unwrap_or_default();
+                    // Journalled on READ rather than on capture: an agent that
+                    // never asks still leaves the page's errors in the daemon's
+                    // record for whoever reads it next, and journaling every
+                    // console line as it happened would need an eval per line.
+                    if !entries.is_empty() {
+                        crate::daemon::journal(
+                            "engine.page.console",
+                            json!({ "page_id": id, "count": entries.len(), "entries": entries }),
+                        );
+                    }
+                    Reply::Json(
+                        200,
+                        json!({
+                            "ok": true,
+                            "page_id": id,
+                            "installed": value["installed"],
+                            "cleared": clear,
+                            "entries": entries,
+                        }),
+                    )
+                }
+                Err(error) => Reply::bad(400, error.to_string()),
+            }
+        }
         "dom" => {
             let Some(id) = page_id else {
                 return Reply::bad(400, "dom needs a page_id");
@@ -587,8 +622,8 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
 /// `park` is deliberately absent: parking a page must not first resume it.
 /// `close` is absent for the same reason — forgetting a parked page should not
 /// cost a page load.
-const DRIVES_A_PAGE: [&str; 9] = [
-    "goto", "nav", "eval", "shot", "dom", "input", "wait", "fill", "cookie-import",
+const DRIVES_A_PAGE: [&str; 10] = [
+    "goto", "nav", "eval", "shot", "dom", "input", "wait", "fill", "cookie-import", "console",
 ];
 
 /// Parse the caller's cookies for `cookie-import` — an inline `cookies` array

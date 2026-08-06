@@ -464,3 +464,186 @@ pub const SHOT_SCROLL_TO: &str = r#"(y) => {
   window.scrollTo(0, y);
   return { scroll_y: Math.round(window.scrollY || 0) };
 }"#;
+
+/// Where the page instrument keeps what it saw. Non-enumerable, so a page that
+/// walks `window` does not trip over it.
+pub const CONSOLE_KEY: &str = "__ychromeConsole";
+
+/// The page instrument: uncaught errors, unhandled promise rejections, and
+/// console messages, from as early as the engine can inject.
+///
+/// ⛔ **This exists because an SDK that throws looks exactly like an SDK that
+/// does nothing.** A payment SDK builds its iframe and then navigates it a few
+/// statements later; if anything in between raises, the element is there, the
+/// frame is empty, and every DOM probe an agent can run says "constructed, never
+/// navigated" — which is a symptom, not a cause. The reason was always in a
+/// console message nobody could read, because the engine captured none. Days of
+/// live investigation on a government payment gateway ended at that wall.
+///
+/// **Errors and rejections are captured ADDITIVELY** — `addEventListener` on
+/// `error` and `unhandledrejection` — so nothing the page can observe changes:
+/// no handler is replaced, `window.onerror` is left alone for the page to own,
+/// and a listener is not enumerable from script.
+///
+/// ⚠ **`console` is different and the difference is stated rather than hidden.**
+/// There is no additive listener for it, so the methods ARE wrapped. Each
+/// wrapper calls the original, and `toString` is restored to the native text so
+/// the cheapest detection fails — but a determined fingerprint can still tell.
+/// That is the honest cost of seeing what a page logs, and it is why this is the
+/// only patched thing here.
+pub const PAGE_INSTRUMENT: &str = r#"(() => {
+  const KEY = "__ychromeConsole";
+  if (Object.prototype.hasOwnProperty.call(window, KEY)) { return "already"; }
+  const MAX = 400;
+  const buffer = [];
+  const push = (kind, level, text, extra) => {
+    if (buffer.length >= MAX) { buffer.shift(); }
+    const row = { kind: kind, level: level, text: String(text).slice(0, 2000), at: Date.now() };
+    if (extra) { for (const k in extra) { row[k] = extra[k]; } }
+    buffer.push(row);
+  };
+  Object.defineProperty(window, KEY, {
+    value: buffer, enumerable: false, configurable: true, writable: false,
+  });
+
+  // Additive, and therefore invisible to the page.
+  window.addEventListener("error", (event) => {
+    if (event.message) {
+      push("error", "error", event.message, {
+        source: event.filename || "", line: event.lineno || 0, col: event.colno || 0,
+        stack: (event.error && event.error.stack) ? String(event.error.stack).slice(0, 2000) : "",
+      });
+    } else if (event.target && event.target.src) {
+      // A subresource that failed to load fires `error` with no message. An SDK
+      // whose module 404s dies exactly here and says nothing else.
+      push("resource", "error", "failed to load", { source: String(event.target.src) });
+    }
+  }, true);
+  window.addEventListener("unhandledrejection", (event) => {
+    const reason = event.reason;
+    // The MESSAGE first, and the stack beside it. WebKit's `Error.stack` is
+    // bare frames with no message line, so preferring the stack reported
+    // "@sdk.js:79:32" for a rejection whose whole value was its sentence.
+    let text = reason;
+    if (reason instanceof Error) { text = reason.name + ": " + reason.message; }
+    else if (reason && typeof reason === "object") {
+      try { text = JSON.stringify(reason); } catch (_) { text = String(reason); }
+    }
+    push("rejection", "error", text, {
+      stack: (reason && reason.stack) ? String(reason.stack).slice(0, 2000) : "",
+    });
+  });
+
+  // The one patched thing. See the doc comment above.
+  const native = Function.prototype.toString;
+  for (const level of ["log", "info", "warn", "error", "debug"]) {
+    const original = console[level];
+    if (typeof original !== "function") { continue; }
+    const wrapper = function () {
+      try {
+        push("console", level, Array.prototype.map.call(arguments, (arg) => {
+          if (typeof arg === "string") { return arg; }
+          try { return JSON.stringify(arg); } catch (_) { return String(arg); }
+        }).join(" "));
+      } catch (_) { /* an instrument must never break the page */ }
+      return original.apply(console, arguments);
+    };
+    try {
+      Object.defineProperty(wrapper, "toString", {
+        value: () => native.call(original), configurable: true,
+      });
+      Object.defineProperty(wrapper, "name", { value: level, configurable: true });
+    } catch (_) { /* cosmetic only */ }
+    console[level] = wrapper;
+  }
+  return "installed";
+})()"#;
+
+/// Read the instrument's buffer, optionally emptying it.
+pub const CONSOLE_READ: &str = r#"(clear) => {
+  const rows = window.__ychromeConsole;
+  if (!rows) { return { installed: false, entries: [] }; }
+  const out = rows.slice();
+  if (clear) { rows.length = 0; }
+  return { installed: true, entries: out };
+}"#;
+
+#[cfg(test)]
+mod instrument_tests {
+    use super::*;
+
+    /// The instrument's whole licence to exist on every page is that a page
+    /// cannot tell. Errors and rejections must be captured ADDITIVELY — the
+    /// moment one of these becomes an assignment, we have taken a handler the
+    /// page owns, and a site that sets `window.onerror` after us would silently
+    /// lose ours (or we would lose theirs, which is worse).
+    #[test]
+    fn errors_and_rejections_are_captured_without_taking_anything_from_the_page() {
+        assert!(PAGE_INSTRUMENT.contains(r#"addEventListener("error""#));
+        assert!(PAGE_INSTRUMENT.contains(r#"addEventListener("unhandledrejection""#));
+        assert!(
+            !PAGE_INSTRUMENT.contains("window.onerror ="),
+            "assigning window.onerror takes a handler the page owns"
+        );
+        assert!(
+            !PAGE_INSTRUMENT.contains("onunhandledrejection ="),
+            "same rule for rejections"
+        );
+    }
+
+    /// `console` is the ONE patched thing, and the patch must call through and
+    /// hide its own source. A wrapper that swallowed the call would change what
+    /// the user sees in a real browser session on the same profile.
+    #[test]
+    fn the_console_patch_calls_through_and_does_not_advertise_itself() {
+        assert!(
+            PAGE_INSTRUMENT.contains("original.apply(console, arguments)"),
+            "the wrapper must call the real console, or the page loses its output"
+        );
+        assert!(
+            PAGE_INSTRUMENT.contains("native.call(original)"),
+            "toString must report the NATIVE source, or the cheapest sniff finds us"
+        );
+    }
+
+    /// An instrument that throws is worse than no instrument: it would break the
+    /// very page it is there to explain.
+    #[test]
+    fn the_instrument_never_lets_its_own_failure_reach_the_page() {
+        assert!(PAGE_INSTRUMENT.contains("an instrument must never break the page"));
+        assert!(
+            PAGE_INSTRUMENT.contains("enumerable: false"),
+            "a page that walks window must not trip over our buffer"
+        );
+        assert!(
+            PAGE_INSTRUMENT.contains(r#"hasOwnProperty.call(window, KEY)"#),
+            "re-injection must be a no-op, not a second set of wrappers"
+        );
+    }
+
+    /// A rejection's value is its sentence. WebKit's `Error.stack` carries bare
+    /// frames and no message line, so preferring the stack reported
+    /// "@sdk.js:79:32" for a rejection that said why it failed — measured.
+    #[test]
+    fn a_rejection_reports_its_message_and_keeps_the_stack_beside_it() {
+        let listener = PAGE_INSTRUMENT
+            .split("unhandledrejection")
+            .nth(1)
+            .expect("the rejection listener exists");
+        let body = &listener[..listener.find("});").unwrap_or(listener.len())];
+        assert!(
+            body.contains("reason.name") && body.contains("reason.message"),
+            "the message must be the text"
+        );
+        assert!(body.contains("stack:"), "the stack rides alongside, not instead");
+    }
+
+    #[test]
+    fn reading_the_buffer_clears_it_only_when_asked() {
+        assert!(CONSOLE_READ.contains("if (clear) { rows.length = 0; }"));
+        assert!(
+            CONSOLE_READ.contains("installed: false"),
+            "a page with no instrument must say so, not answer an empty list"
+        );
+    }
+}

@@ -1140,6 +1140,7 @@ fn build_page(width: i32, height: i32, profile: &str, opener: Option<&WebView>) 
     }
     arm_new_window(&view, profile);
     arm_script_dialogs(&view);
+    arm_page_instrument(&view);
     Ok(Page {
         window,
         view,
@@ -1203,6 +1204,33 @@ fn arm_new_window(view: &WebView, profile: &str) {
                 None
             }
         }
+    });
+}
+
+/// Install the page instrument on every document this view commits.
+///
+/// **At `Committed`, which is the earliest this engine can reach.** The document
+/// exists and its own scripts have not run, so an error raised by the page's
+/// first script is still captured. Earlier than that would mean a userscript in
+/// the profile's content manager — and that manager is the identity `/policy`
+/// declares, so putting a debugging aid in it would make the engine a different
+/// browser from the visible surface for every site, forever.
+///
+/// Re-installed per document rather than once per view: a navigation throws the
+/// buffer away with the window it lived on, which is correct — errors belong to
+/// the document that raised them.
+fn arm_page_instrument(view: &WebView) {
+    view.connect_load_changed(|view, event| {
+        if event != LoadEvent::Committed {
+            return;
+        }
+        view.evaluate_javascript(
+            super::js::PAGE_INSTRUMENT,
+            None,
+            None,
+            None::<&gio::Cancellable>,
+            |_result| {},
+        );
     });
 }
 
