@@ -547,7 +547,15 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
                         .and_then(|event| event.get("require_target"))
                         .and_then(Value::as_bool)
                         .unwrap_or(true);
-                    if required && !accepts_text(before.as_ref()) {
+                    // ⛔ A focused FRAME is exempt: the target is inside it and
+                    // this readback stops at the frame's border. Refusing there
+                    // is refusing the cross-origin payment case outright — see
+                    // `focus_is_a_frame`. The landing is reported as
+                    // unverifiable afterwards instead of being asserted here.
+                    if required
+                        && !accepts_text(before.as_ref())
+                        && !focus_is_a_frame(before.as_ref())
+                    {
                         let landed_on = before
                             .as_ref()
                             .and_then(|value| value["tag"].as_str())
@@ -1381,6 +1389,20 @@ fn accepts_text(readback: Option<&Value>) -> bool {
     })
 }
 
+/// Whether focus has descended into a SUBFRAME, where this readback cannot
+/// follow it.
+///
+/// This is the third answer the guard needs and did not have. `accepts_text`
+/// splits the world into "text can go here" and "text would be discarded", and
+/// a focused frame is neither: the keystrokes are delivered into the frame, and
+/// whether they land is a fact only that frame's document holds. Reporting it
+/// as "discarded" refuses a correct drive; reporting it as "accepts" would
+/// claim a verification that never happened. So it is named, and the reply says
+/// the landing was not verifiable rather than asserting either way.
+fn focus_is_a_frame(readback: Option<&Value>) -> bool {
+    readback.is_some_and(|value| value["frame"].as_bool().unwrap_or(false))
+}
+
 /// Measure where a `type` event's text landed, after it was dispatched.
 ///
 /// The verdict is `grew_by`, not a copy of the text: the field's length before
@@ -1429,7 +1451,19 @@ fn typed_landing(
         // not a page keeping a different amount than it was given; it is text
         // with nowhere to go, and it is the reported defect. A mask that strips
         // separators still ends on a real field and is reported, not refused.
-        "discarded": !accepts_text(after.as_ref()),
+        // A focused frame is NOT discarded text — it is text this readback
+        // cannot follow. Saying "discarded" there would stop the batch on a
+        // drive that was working.
+        "discarded": !accepts_text(after.as_ref()) && !focus_is_a_frame(after.as_ref()),
+        // ⭐ Said out loud rather than left to be inferred from a null length.
+        // A caller driving a field inside a frame gets "we could not see", not
+        // a silent success — the honest third answer.
+        "unverifiable": focus_is_a_frame(after.as_ref()),
+        "unverifiable_reason": if focus_is_a_frame(after.as_ref()) {
+            json!("focus is inside a subframe; only that frame's own document can measure the field")
+        } else {
+            Value::Null
+        },
         // The node the text went to, named the way a click's report names its
         // target. A `type` event has never carried this.
         "target": after.as_ref().map(|value| json!({
@@ -2996,6 +3030,60 @@ mod tests {
         assert!(
             accepts_text(Some(&json!({ "focused": true, "length": 7 }))),
             "a focused field holding text IS a target, however much it holds"
+        );
+    }
+
+    /// ⭐ A FOCUSED FRAME AND A FOCUSED BUTTON READ IDENTICALLY, AND THEY ARE
+    /// OPPOSITE FACTS.
+    ///
+    /// Both report `focused: true, length: null` from the top document, so
+    /// `accepts_text` says no to each. For a button that is right — the text
+    /// would be discarded. For a frame it is wrong: the keystrokes are
+    /// delivered INTO the frame, and only that frame's document could measure
+    /// where they went.
+    ///
+    /// Measured: with these two collapsed, `ychrome engine frames` refused its
+    /// last step with "would type into <iframe>, which holds no text" — a
+    /// payment field inside a bank's frame became undrivable one event after
+    /// the click that focused it.
+    #[test]
+    fn a_focused_frame_is_not_a_button_even_though_it_reads_like_one() {
+        let frame = json!({ "focused": true, "frame": true, "tag": "iframe",
+                            "length": Value::Null });
+        let button = json!({ "focused": true, "frame": false, "tag": "button",
+                             "length": Value::Null });
+        // The collapse that caused the regression: to `accepts_text` these are
+        // the same answer, which is exactly why the third predicate exists.
+        assert!(!accepts_text(Some(&frame)));
+        assert!(!accepts_text(Some(&button)));
+        assert!(
+            focus_is_a_frame(Some(&frame)),
+            "a focused frame must be recognised, or the guard refuses a working drive"
+        );
+        assert!(
+            !focus_is_a_frame(Some(&button)),
+            "a button must NOT be exempted, or the guard stops catching discarded text"
+        );
+        // An older readback, from before the flag existed, must not be read as
+        // a frame — absence of the field is not evidence of one.
+        assert!(!focus_is_a_frame(Some(&json!({ "focused": true, "length": 3 }))));
+        assert!(!focus_is_a_frame(None));
+    }
+
+    /// The predicate is only as good as the field it reads, and that field is
+    /// set in JavaScript on the other side of an `eval`. If the instrument
+    /// stopped reporting `frame`, `focus_is_a_frame` would answer false for
+    /// every page and the regression would return with all its tests green.
+    #[test]
+    fn the_focus_instrument_reports_whether_the_focused_node_is_a_frame() {
+        let source = crate::engine::js::FOCUS_READBACK;
+        assert!(
+            source.contains("'iframe'") && source.contains("'frame'"),
+            "the instrument must recognise both frame-owning tags"
+        );
+        assert!(
+            source.contains("frame: frame") && source.contains("frame: false"),
+            "every return path must carry the flag — a missing one reads as `not a frame`"
         );
     }
 

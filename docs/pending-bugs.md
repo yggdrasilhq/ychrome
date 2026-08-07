@@ -116,8 +116,10 @@ a screenshot is one an agent must not use to spend money.
 
 **Shape of the fix**, so it is not re-derived: `webkit_web_view_evaluate_javascript`
 takes a `world_name`, not a frame, and `WebKitFrame` exists in the web-process
-extension API only. A `frame=` selector on `/engine/eval` and `/engine/input` is
-the verb that is missing.
+extension API only. A `frame=` selector is the verb that is missing — but read
+"A CLOSED VERB SET IS STILL NOT ENOUGH" below before building it: `/engine/eval`
+must REFUSE `frame=` rather than honour it, and only `/engine/input` and a new
+read-only frame verb may carry one.
 
 ### ✅ THE COST QUESTION IS SETTLED: NO WEB-PROCESS EXTENSION IS NEEDED
 
@@ -164,41 +166,77 @@ path including a panic, and gated on a per-run token so a leftover copy is inert
 to any page. ⛔ **Do not lift that script into `src/`**: it accepts `eval` off
 the page's own message channel, which a shipped verb must not.
 
-### ⛔ THE ONE QUESTION THAT DECIDES THE VERB'S SHAPE — settle it FIRST
+### ✅ SETTLED BY MEASUREMENT: `postMessage` IS NOT WORLD-SCOPED ⇒ THE BRIDGE IS READ-ONLY
 
-The probe bridge runs in the **main world** (`@world main`), deliberately, so
-the gate's mutation control could see it. A shipped bridge would run in the
-engine's **isolated world** (`identity.rs` owns the one named constant) so the
-page cannot read its globals. That much is settled. What is NOT:
+**Measured 2026-08-08, `ychrome engine worlds`, 4/4 on dev.** The question this
+entry used to stop at — *does a `message` posted between frames reach listeners
+in an ISOLATED world, and can the page's own main world observe the same event?*
+— is answered, and the answer is the restrictive one.
 
-> **Does a `message` event posted between frames reach listeners in an ISOLATED
-> world, and can the page's own main world observe the same event?**
+Two userscripts, one template, differing ONLY in `@world`, both `@all-frames`,
+each recording what it heard into a `data-` attribute (the DOM is the one
+surface two worlds share; a global is not, which is why a global could not be
+the instrument). Then one post from each world, to itself and into the
+cross-origin child:
 
-Worlds isolate *globals*; they are not documented to isolate *event dispatch*,
-and in Chromium `postMessage` is explicitly NOT world-scoped — which is why
-extension content scripts use a separate messaging API. If WebKitGTK behaves the
-same way, **`postMessage` is page-observable and page-forgeable no matter which
-world the bridge lives in**, and the two designs diverge:
+| | globals from `/eval` | heard in top | heard in child |
+|---|---|---|---|
+| main-world probe | `number` | `main-self`, **`iso-self`** | `main-into-child`, **`iso-into-child`** |
+| isolated-world probe | `undefined` | **`main-self`**, `iso-self` | **`main-into-child`**, `iso-into-child` |
 
-- **If the isolated world does get its own delivery** ⇒ a per-page token in the
-  script body is a real secret (the page cannot read isolated globals), and the
-  bridge may carry `eval`.
-- **If not** ⇒ ⛔ the bridge must expose a **closed verb set** (resolve selector →
-  text / value / rect; set value; focus) with no path that evaluates a
-  page-supplied string. Otherwise a hostile TOP page can make our bridge run its
-  code inside the cross-origin child — a cross-origin escalation we would be
-  providing. A one-time nonce does not fix this: whichever document receives our
-  message can read the nonce out of it.
+The first column is the control: the worlds really are separate, because the
+isolated probe's global is invisible to `/engine/eval`. Every other cell is the
+finding. **Worlds isolate globals; they do not isolate event dispatch.**
+WebKitGTK behaves exactly as Chromium does, so:
 
-**What settles it:** one probe, two userscripts in the same document — an
-isolated-world listener and a main-world listener — and a `postMessage`; then
-read which recorded it. ⛔ Do it under the frames gate's own `PROFILE` with its
-`InstalledProbe` install/remove, **never** by dropping files into the user's
-`~/.yggterm/web-userscripts/`, which is their live browsing.
+- **a token in the script body is NOT a secret** — whichever document receives
+  our message reads the token straight out of it; and
+- **the page hears our replies**, whichever world our bridge lives in.
 
-⚠ Do NOT "fix" this by loosening origin checks. The frames are cross-origin
-because banks intend them to be — and nothing above does: the child reads its
-OWN document, in its own frame, and reports a value.
+⇒ **No `eval` path.** A bridge that evaluates a page-supplied string lets a
+hostile TOP page make our code run inside the bank's frame.
+
+### ⛔ AND A CLOSED VERB SET IS STILL NOT ENOUGH, IF IT WRITES
+
+This is the second consequence and it is the one that decides the design, so it
+is written down before someone builds the obvious thing. The messages are
+**forgeable**, not merely observable. A hostile top page can post a well-formed
+command to our bridge sitting inside a cross-origin child it embeds. So every op
+the bridge exposes is an op that page can invoke:
+
+- a forged **read** — the answer goes wherever the bridge sends it;
+- a forged **write** (`set_value`, `focus`) — a page mutating a document on
+  another origin, which is a same-origin-policy breach **we** would be
+  providing. A top page cannot do that today, and must not be able to because
+  we shipped a verb.
+
+The design that survives both facts, and it needs no new capability — every
+piece is already measured green in the table above:
+
+1. **The bridge READS only.** Resolve a selector inside the frame → `text`,
+   `value`, `rect`, `exists`. No mutation op exists to forge.
+2. **The reply does NOT travel by `postMessage`.** It goes content→UI-process
+   over `webkit_user_content_manager_register_script_message_handler_in_world`,
+   which no frame and no world can observe. A forged read then costs the forger
+   nothing: it cannot see the answer. (Commands still go out by cross-frame
+   `postMessage` and are therefore visible — what leaks is a selector, not a
+   capability.)
+3. **Writing is not a bridge op at all.** It is a real `GdkEvent` aimed by a
+   rect the bridge measured — steps 6-8 above, already proven end to end:
+   the click lands on the child's `#otp` with `isTrusted: true` and `424242`
+   typed after it reads back from inside the child.
+
+⇒ **`frame=` on `/engine/eval` must be REFUSED, not implemented** — with an
+error naming the read verb to use instead. The original "shape of the fix" at
+the top of this entry predates the measurement and is wrong on that one point;
+the rest of it stands.
+
+**What is still OPEN:** building it — the read-only frame verb, the isolated
+message handler, and `frame=` on `/engine/input`.
+
+⚠ Do NOT "fix" any of this by loosening origin checks. The frames are
+cross-origin because banks intend them to be — and nothing above does: the child
+reads its OWN document, in its own frame, and reports a value.
 
 ### ⛔ `rustfmt <file>` IS NOT FILE-SCOPED, AND THAT IS THE FORMATTER TRAP IN A NEW SHAPE
 
