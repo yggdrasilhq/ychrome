@@ -361,6 +361,76 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
                 },
             }
         }
+        // Type a stored CARD into the page's payment form.
+        //
+        // ⛔ THE VERB THE ENGINE'S OWN PREMISE NEEDED AND DID NOT HAVE. `ctl`
+        // exists so agent browsing never touches the operator's machine
+        // (`agent-engine.md` §4), and the co-browse doctrine prefers dev for
+        // exactly that reason — but `server app web fill-card` needs a
+        // registered GUI client, which dev has none of. So the one class of
+        // task with the strongest reason to stay off his laptop, entering
+        // payment credentials, was the one class only his laptop could finish.
+        // It cost two runs in 24 h: an RTI fee that fell back to netbanking and
+        // died on a stale bank password, and an India Post booking driven end
+        // to end here and then handed to a second agent to pay Rs 23.
+        //
+        // The PAN never exists in this route. It is read by the vault agent,
+        // embedded in the script by `sidebar::vault_card_fill_script`, and
+        // dropped — the same road the pane's card button takes, and the reason
+        // `the_fill_card_route_never_names_the_pan` guards the shape rather
+        // than the runtime.
+        //
+        // The reply names FIELDS in four buckets and never a value or a length:
+        // for a card the length IS the value's shape (a 16-digit `got` over a
+        // `cc-number` says which network issued it), so this is the one fill
+        // whose report stops at the label.
+        "fill-card" => {
+            let (Some(id), Some(item)) = (page_id, request.body.get("item").and_then(Value::as_str))
+            else {
+                return Reply::bad(400, "fill-card needs a page_id and item");
+            };
+            let user = request.body.get("user").and_then(Value::as_str);
+            // WHERE the PAN is going, read off the page rather than off the
+            // caller's request: the audit line's whole job is to say that, and
+            // a caller-supplied host would let it name somewhere the value did
+            // not go. Best-effort — an unreadable location leaves the line
+            // hostless rather than refusing a fill over a log field.
+            let host = engine
+                .eval(&id, "location.host")
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .filter(|host| !host.is_empty());
+            match crate::sidebar::vault_card_fill_script(
+                item,
+                user,
+                host.as_deref(),
+                "ychrome engine",
+            ) {
+                // A locked or absent agent is the VAULT's answer, not the
+                // page's — same 502 as `fill`, for the same reason: an agent
+                // that reads this as "wrong selector" will hunt the DOM for an
+                // hour over a vault nobody unlocked.
+                Err(error) => Reply::bad(502, format!("vault: {error}")),
+                Ok(script) => match engine.eval(&id, &script) {
+                    Ok(value) => Reply::Json(
+                        200,
+                        json!({
+                            "ok": true,
+                            "item": item,
+                            "host": host,
+                            // The pane's one-line summary, so the two surfaces
+                            // report a card fill in the same words.
+                            "kept": value.get("kept"),
+                            "filled": value.get("filled"),
+                            "mismatched": value.get("mismatched"),
+                            "absent": value.get("absent"),
+                            "no_value": value.get("no_value"),
+                        }),
+                    ),
+                    Err(error) => Reply::bad(400, error.to_string()),
+                },
+            }
+        }
         // Put cookies INTO a page's profile store — the missing half of the
         // jar being shared text on disk (the network process reads the jar
         // once at startup, so a file-level handoff from curl never lands).
@@ -734,7 +804,7 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
 /// So the list has ONE owner and the CLI reads it. `the_banner_lists_every_verb
 /// _the_router_answers` parses the dispatcher's own match arms and fails when
 /// the two disagree, which is what makes this a fact rather than a convention.
-pub const VERBS: [&str; 22] = [
+pub const VERBS: [&str; 23] = [
     "open",
     "close",
     "pages",
@@ -746,6 +816,7 @@ pub const VERBS: [&str; 22] = [
     "shot",
     "input",
     "fill",
+    "fill-card",
     "console",
     "cookie-import",
     "park",
@@ -764,8 +835,18 @@ pub const VERBS: [&str; 22] = [
 /// `park` is deliberately absent: parking a page must not first resume it.
 /// `close` is absent for the same reason — forgetting a parked page should not
 /// cost a page load.
-const DRIVES_A_PAGE: [&str; 10] = [
-    "goto", "nav", "eval", "shot", "dom", "input", "wait", "fill", "cookie-import", "console",
+const DRIVES_A_PAGE: [&str; 11] = [
+    "goto",
+    "nav",
+    "eval",
+    "shot",
+    "dom",
+    "input",
+    "wait",
+    "fill",
+    "fill-card",
+    "cookie-import",
+    "console",
 ];
 
 /// Parse the caller's cookies for `cookie-import` — an inline `cookies` array
@@ -2749,6 +2830,31 @@ mod tests {
         );
     }
 
+    /// ONE top-level route's body, scraped out of the dispatcher's source.
+    ///
+    /// ⛔ **THE TERMINATOR IS THE ARM'S OWN CLOSING BRACE, NOT A LATER VERB
+    /// SOMEONE TYPED BY HAND.** Each structural lock below used to stop at a
+    /// named neighbour — `fill` stopped at `"shot" =>` — so inserting a route
+    /// between them silently widened the scrape over code the lock does not
+    /// govern. That fired the day `fill-card` landed: the fill lock read a
+    /// comment two routes away that mentioned a password and failed a route
+    /// which had not changed by a character. A lock that fails on other
+    /// people's code is a lock that gets silenced, so the boundary is now the
+    /// only thing that actually marks the end of an arm.
+    fn route_body(source: &str, verb: &str) -> String {
+        let opened = source
+            .split(&format!("\"{verb}\" => {{"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("the {verb} route exists"));
+        opened
+            .lines()
+            // The dispatcher's arms close at eight spaces; nothing inside a
+            // body is that shallow, so this is the arm and only the arm.
+            .take_while(|line| *line != "        }" && *line != "        },")
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// ⛔ THE BANNER AND THE ROUTER MUST NOT BE ABLE TO DISAGREE.
     ///
     /// `fill` was reachable and unadvertised, so agents concluded the engine
@@ -2820,12 +2926,7 @@ mod tests {
     /// holds no text, and a readback AFTER for everything else.
     #[test]
     fn a_type_event_is_measured_against_the_page_and_not_the_request() {
-        let source = include_str!("api.rs");
-        let route = source
-            .split("\"input\" => {")
-            .nth(1)
-            .expect("the input route exists");
-        let body = &route[..route.find("\"nav\" =>").unwrap_or(route.len())];
+        let body = route_body(include_str!("api.rs"), "input");
         assert!(
             body.contains("focus_readback") && body.contains("typed_landing"),
             "a type event must be measured before and after it is dispatched"
@@ -2908,6 +3009,43 @@ mod tests {
             DRIVES_A_PAGE.contains(&"fill"),
             "fill targets a page_id; omitting it lets the governor park the page under it"
         );
+        // ⛔ And its card twin, where the cost of getting this wrong is worse:
+        // a login fill that lands on a parked page is retried, a card fill that
+        // does is a payment page the operator then has to redo by hand on his
+        // own laptop — the exact thing this verb exists to stop.
+        assert!(
+            DRIVES_A_PAGE.contains(&"fill-card"),
+            "fill-card targets a page_id; omitting it lets the governor park the page under it"
+        );
+    }
+
+    /// ⛔ THE PAN MUST NOT BE REACHABLE FROM THIS ROUTE, and the cheapest way to
+    /// keep that true is for the route never to hold it.
+    ///
+    /// The twin of [`the_fill_route_never_names_a_password_field`], and stricter
+    /// for a reason the vault agent already documents: a password can be
+    /// rotated on demand and a card number cannot, so a PAN that reaches a
+    /// reply, a log line or an agent transcript is durable damage. The route
+    /// asks `sidebar::vault_card_fill_script` for a SCRIPT, so the number exists
+    /// only inside the page-bound string.
+    #[test]
+    fn the_fill_card_route_never_names_the_pan() {
+        let body = route_body(include_str!("api.rs"), "fill-card");
+        // The QUOTED spellings, because those are the leak: `field("number")`,
+        // `reply["code"]`, a hand-rolled `"card-secret"` op. Matching the bare
+        // English word would fail on a comment that explains the boundary,
+        // which is a lock that punishes documenting itself.
+        for leak in ["\"number\"", "\"code\"", "card_secret", "card-secret"] {
+            assert!(
+                !body.contains(leak),
+                "the fill-card route must hand off to vault_card_fill_script, not touch the \
+                 secret itself ({leak})"
+            );
+        }
+        assert!(
+            body.contains("vault_card_fill_script"),
+            "the fill-card route must go through the sidebar's card path"
+        );
     }
 
     /// ⛔ THE SECRET MUST NOT BE REACHABLE FROM THE REPLY, and the cheapest way
@@ -2921,12 +3059,7 @@ mod tests {
     /// and this fails.
     #[test]
     fn the_fill_route_never_names_a_password_field() {
-        let source = include_str!("api.rs");
-        let route = source
-            .split("\"fill\" => {")
-            .nth(1)
-            .expect("the fill route exists");
-        let body = &route[..route.find("\"shot\" =>").unwrap_or(route.len())];
+        let body = route_body(include_str!("api.rs"), "fill");
         assert!(
             !body.contains("password"),
             "the fill route must hand off to vault_fill_script, not touch the secret itself"
