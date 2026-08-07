@@ -568,6 +568,47 @@ pub const CONSOLE_READ: &str = r#"(clear) => {
   return { installed: true, entries: out };
 }"#;
 
+/// Where typed text is about to go, and how much is there already.
+///
+/// ## Why a `type` event needs this and a click does not
+///
+/// A selector click resolves to a NODE before it is dispatched, so
+/// `/engine/input` can say what it aimed at. A `type` event resolves nothing —
+/// it goes to `document.activeElement`, whoever that is at the instant the key
+/// events arrive. So the batch `click #user, type, click #pw, type` has exactly
+/// two unaddressed events in it, and when an earlier event re-rendered the form
+/// the text lands on `<body>` and is discarded by the page.
+///
+/// That is the measured failure (2026-08-07): `{"dispatched":3,"ok":true}` over
+/// a login where a page-side readback then showed `user:""`, `pwlen:0`.
+/// **`dispatched` counts events SENT.** Nothing in the reply was derived from
+/// the page, so nothing in it could disagree with the request.
+///
+/// ⛔ A LENGTH, NEVER A VALUE — the same boundary the vault fill keeps. A
+/// caller who types a secret through `/engine/input` already holds it, but the
+/// daemon's journal and the reply must not become a second copy.
+pub const FOCUS_READBACK: &str = r#"(() => {
+  const el = document.activeElement;
+  if (!el || el === document.body || el === document.documentElement) {
+    return { focused: false, tag: el ? (el.tagName || '').toLowerCase() : null, length: 0 };
+  }
+  const editable = el.isContentEditable === true;
+  const text = typeof el.value === 'string'
+    ? el.value
+    : (editable ? (el.textContent || '') : null);
+  return {
+    focused: true,
+    tag: (el.tagName || '').toLowerCase(),
+    type: (el.getAttribute ? (el.getAttribute('type') || '') : '').toLowerCase(),
+    name: el.getAttribute ? (el.getAttribute('name') || el.getAttribute('id') || '') : '',
+    editable: editable,
+    // `null` and `0` are different answers: a focused <button> can hold no
+    // text at all, and typing into one is a different fault from typing into
+    // an empty input.
+    length: text === null ? null : text.length,
+  };
+})()"#;
+
 #[cfg(test)]
 mod instrument_tests {
     use super::*;
