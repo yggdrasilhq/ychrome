@@ -232,6 +232,14 @@ impl Signer {
             .as_str()
             .unwrap_or_default()
             .to_string();
+        // What the RP must receive is base64url of the credential id BYTES, NOT
+        // the vault's UUID spelling. Returning the UUID makes `rawId` decode to
+        // garbage and the RP rejects an otherwise valid assertion.
+        let credential_id_rp = candidate["credential_id_b64url"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .unwrap_or(credential_id.as_str())
+            .to_string();
         let user_handle = candidate["user_handle"].as_str().map(str::to_string);
 
         // Consent in hand: the agent mints UserPresence and signs.
@@ -246,7 +254,7 @@ impl Signer {
         .map_err(|error| GetError::Bad(error.to_string()))?;
 
         Ok(json!({
-            "credentialId": credential_id,
+            "credentialId": credential_id_rp,
             "clientDataJSON": b64url(client_data_json.as_bytes()),
             "authenticatorData": assertion["authenticator_data_b64"],
             "signature": assertion["signature_b64"],

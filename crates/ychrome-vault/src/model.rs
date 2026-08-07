@@ -324,6 +324,50 @@ pub enum Fido2AssertError {
     Fido2(#[from] crate::fido2::Fido2Error),
 }
 
+/// The RAW BYTES a WebAuthn credential id denotes, whatever spelling the vault
+/// stored it in. This exists because the two sides spell the same id differently:
+/// Bitwarden stores `credentialId` as a **hyphenated UUID string**, while a page
+/// hands `allowCredentials[].id` to the shim as **raw bytes**, which the shim
+/// base64url-encodes. Comparing those as strings can never match — that bug made
+/// every stored passkey invisible to every ceremony (measured 2026-08-07 against
+/// a Google sign-in: `no passkey in this vault answers that request`, for an
+/// rpId the vault demonstrably held).
+///
+/// Order matters: try UUID first, because a 36-char hyphenated UUID is not valid
+/// base64url and would otherwise fall through to its own UTF-8 bytes and still
+/// never match.
+pub fn credential_id_bytes(stored: &str) -> Vec<u8> {
+    use base64::Engine;
+    let text = stored.trim();
+    if let Some(bytes) = uuid_to_bytes(text) {
+        return bytes;
+    }
+    if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(text) {
+        return bytes;
+    }
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(text) {
+        return bytes;
+    }
+    text.as_bytes().to_vec()
+}
+
+/// A hyphenated UUID to its 16 bytes, or `None` if it is not one.
+fn uuid_to_bytes(text: &str) -> Option<Vec<u8>> {
+    let hex: String = text.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 || text.len() != 36 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..16)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+        .collect()
+}
+
+/// The spelling an RP must receive: base64url(no pad) of the credential id BYTES.
+pub fn credential_id_b64url(stored: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(credential_id_bytes(stored))
+}
+
 /// Decode a decrypted `keyValue` (base64 text) to the raw PKCS#8 DER bytes.
 /// Standard base64 first, then URL-safe, since clients have differed.
 fn decode_key_value(b64: &str) -> Option<Vec<u8>> {
@@ -494,7 +538,10 @@ pub struct PasskeyInfo {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PasskeyMatch {
     pub item_id: String,
+    /// The vault's own spelling (Bitwarden UUID) — what `fido2-assert` looks up.
     pub credential_id: String,
+    /// The spelling the RP must see: base64url of the credential id BYTES.
+    pub credential_id_b64url: String,
     pub rp_id: String,
     pub rp_name: Option<String>,
     pub user_name: Option<String>,
@@ -862,13 +909,20 @@ impl Vault {
                     // in a clientDataJSON, so it cannot answer a ceremony.
                     None => continue,
                 };
-                if !allow_credential_ids.is_empty()
-                    && !allow_credential_ids.iter().any(|id| id == &credential_id)
-                {
-                    continue;
+                // Compare by BYTES, never by spelling: the stored id is a UUID
+                // string and the requested one is base64url of the raw bytes.
+                if !allow_credential_ids.is_empty() {
+                    let want = credential_id_bytes(&credential_id);
+                    if !allow_credential_ids
+                        .iter()
+                        .any(|id| credential_id_bytes(id) == want)
+                    {
+                        continue;
+                    }
                 }
                 matches.push(PasskeyMatch {
                     item_id: cipher.id.clone(),
+                    credential_id_b64url: credential_id_b64url(&credential_id),
                     credential_id,
                     rp_id: rp_id.to_string(),
                     rp_name: decrypt(&credential.rp_name),
@@ -2270,6 +2324,52 @@ mod tests {
     }
 
     #[test]
+    fn a_uuid_stored_passkey_answers_an_allow_list_spelled_in_base64url() {
+        // THE REGRESSION. Bitwarden stores `credentialId` as a hyphenated UUID;
+        // a page hands `allowCredentials[].id` as raw bytes, which the shim
+        // base64url-encodes. Comparing the two spellings as strings matched
+        // NOTHING, so every stored passkey was invisible to every ceremony.
+        let key_bytes = [0x5au8; 64];
+        let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
+        let s = |text: &str| Some(seal(&key_bytes, text));
+        let uuid = "77b7f3f3-a3b6-4754-bcaf-b0e3e928f83e";
+        let cipher = RawCipher {
+            id: "item-1".into(),
+            item_type: 1,
+            name: Some(seal(&key_bytes, "a-google-item")),
+            fido2: vec![RawFido2Credential {
+                credential_id: s(uuid),
+                rp_id: s("google.com"),
+                user_name: s("an-account"),
+                key_value: s("secret"),
+                counter: s("0"),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], vec![], HashMap::new());
+
+        // What the shim actually sends: base64url of the UUID's 16 bytes.
+        let requested = credential_id_b64url(uuid);
+        assert_ne!(requested, uuid, "the two spellings must genuinely differ");
+
+        let matches = vault.passkeys_for_assertion("google.com", &[requested.clone()]);
+        assert_eq!(matches.len(), 1, "the stored passkey must answer its own id");
+        assert_eq!(matches[0].credential_id, uuid, "the vault keeps its spelling");
+        assert_eq!(
+            matches[0].credential_id_b64url, requested,
+            "the RP must be handed the byte spelling"
+        );
+
+        // And an allow-list naming a DIFFERENT credential still excludes it.
+        let other = credential_id_b64url("00000000-0000-4000-8000-000000000000");
+        assert!(vault
+            .passkeys_for_assertion("google.com", &[other])
+            .is_empty());
+    }
+
+    #[test]
+#[test]
     fn passkeys_for_assertion_resolves_by_rp_and_honors_allow_credentials() {
         let key_bytes = [0x5au8; 64];
         let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
