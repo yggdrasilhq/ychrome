@@ -1012,8 +1012,59 @@ fn run_status(as_json: bool) -> Result<()> {
 /// drops their sidebar rail, their pane drafts and any passkey signature in
 /// flight. This verb is the user saying "do it anyway, I am ready", and it
 /// reports what it cost rather than pretending it cost nothing.
+/// One census row as a person reads it: what it is, what it runs, and the
+/// verdict that decides whether anything may be done to it.
+fn print_census_row(row: &serde_json::Value, verdict_key: &str) {
+    let deleted = if row["exe_deleted"].as_bool() == Some(true) {
+        "  ⛔ its binary is DELETED from disk"
+    } else {
+        ""
+    };
+    println!(
+        "  pid {:<8} up {:>7}s  {} child(ren)  [{}]{}",
+        row["pid"].as_u64().unwrap_or(0),
+        row["up_secs"].as_u64().unwrap_or(0),
+        row["children"].as_u64().unwrap_or(0),
+        row[verdict_key].as_str().unwrap_or("?"),
+        deleted,
+    );
+    println!("    root: {}", row["serving_root"].as_str().unwrap_or("(holds no daemon.lock)"));
+    println!("    exe:  {}", row["exe"].as_str().unwrap_or("?"));
+    println!("    {}", row["note"].as_str().or_else(|| row["outcome"].as_str()).unwrap_or(""));
+}
+
 fn run_daemon_verb(sub: Option<&str>, as_json: bool) -> Result<()> {
     match sub {
+        // The read half. Run it before `reap` — it kills nothing and it names
+        // the root of every daemon on the host, which is the one fact
+        // `daemon restart` cannot see past.
+        Some("list") => {
+            let census = daemon::list()?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&census)?);
+                return Ok(());
+            }
+            let rows = census["daemons"].as_array().cloned().unwrap_or_default();
+            println!(
+                "{} ychrome daemon(s) on this host; this shell resolves {}",
+                rows.len(),
+                census["root"].as_str().unwrap_or("?"),
+            );
+            for row in &rows {
+                print_census_row(row, "verdict");
+            }
+            Ok(())
+        }
+        Some("reap") => {
+            let dry_run = std::env::args().any(|arg| arg == "--dry-run");
+            let done = daemon::reap(daemon::ReapScope::AlsoForeignRoots, dry_run, None)?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&done)?);
+                return Ok(());
+            }
+            print_reap(&done);
+            Ok(())
+        }
         Some("restart") => {
             let done = daemon::restart()?;
             if as_json {
@@ -1045,10 +1096,50 @@ fn run_daemon_verb(sub: Option<&str>, as_json: bool) -> Result<()> {
                     println!("  {}", row.as_str().unwrap_or("?"));
                 }
             }
+            // ⛔ THE HANDOVER IS NOT THE WHOLE HOST. `restart` retires the daemon
+            // on the socket it resolves and is blind to every daemon bound
+            // elsewhere, which is why three of them once accumulated on dev
+            // behind a restart that reported success.
+            //
+            // `Abandoned` only, and the narrowness is load-bearing: a daemon on
+            // another root may be a fixture BETWEEN CALLS, which is idle by every
+            // signal and still in use. A restart therefore collects what provably
+            // cannot be reached and NAMES the rest; ending them is `daemon reap`,
+            // which a person types on purpose.
+            //
+            // `old_pid` is excluded: it released its lock before answering and
+            // may still be taking its engine down, by design.
+            let swept = daemon::reap(
+                daemon::ReapScope::Abandoned,
+                false,
+                done["old_pid"].as_u64(),
+            )?;
+            print_reap(&swept);
             Ok(())
         }
-        Some(other) => bail!("unknown daemon verb {other:?} (known: restart)"),
-        None => bail!("usage: ychrome daemon restart"),
+        Some(other) => bail!("unknown daemon verb {other:?} (known: list, reap, restart)"),
+        None => bail!("usage: ychrome daemon <list|reap|restart>"),
+    }
+}
+
+/// What the sweep did, and — the half that matters — what it deliberately left
+/// alone and why. A reaper that only prints its kills reads as complete when it
+/// is not.
+fn print_reap(done: &serde_json::Value) {
+    let rows = done["daemons"].as_array().cloned().unwrap_or_default();
+    let others: Vec<&serde_json::Value> = rows.iter().collect();
+    if others.is_empty() {
+        println!("no other ychrome daemon on this host");
+        return;
+    }
+    let retired = done["retired"].as_array().map(Vec::len).unwrap_or(0);
+    if done["dry_run"].as_bool() == Some(true) {
+        println!("dry run — {} other daemon(s), nothing signalled:", others.len());
+    } else {
+        println!("{} other daemon(s), {retired} retired:", others.len());
+    }
+    for row in others {
+        print_census_row(row, "action");
     }
 }
 
@@ -1724,6 +1815,33 @@ mod second_invocation_tests {
             !drive.contains("emit_declare"),
             "the loop declares directly again, bypassing the register-then-declare \
              pairing that makes staleness impossible"
+        );
+    }
+
+    /// ⛔ `daemon restart` sweeps ONLY what no client can reach.
+    ///
+    /// The wide scope belongs to `daemon reap`, which a person types on purpose.
+    /// Widening it here would make every restart end idle daemons on roots it
+    /// knows nothing about — including a test fixture's, between two of its own
+    /// calls, where "idle" is true and "unused" is not. The scope rule itself is
+    /// proven in `daemon::tests::a_restart_scope_collects_the_unreachable_and_asks_nothing`;
+    /// this locks the caller that chooses it.
+    #[test]
+    fn the_restart_sweep_never_reaches_another_root() {
+        let source = include_str!("main.rs");
+        let arm = source
+            .split("Some(\"restart\") => {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n        Some(other)").next())
+            .expect("the restart arm");
+        assert!(
+            arm.contains("daemon::ReapScope::Abandoned"),
+            "the restart sweep must be the narrow one — a foreign root's daemon \
+             is not a restart's to end"
+        );
+        assert!(
+            !arm.contains("AlsoForeignRoots"),
+            "the restart arm reaches other roots again"
         );
     }
 
