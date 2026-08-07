@@ -3994,30 +3994,16 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
         // the script's return value names FIELDS, never values.
         "card-fill" => {
             let (name, user) = split_row_id(&value);
-            // `host` and `client` are for the agent's audit line and nothing
-            // else — no decision is taken on either. They travel because the
-            // vault's only durable record of a card fill is that line, and a
-            // line that cannot say WHERE the number went is half a record.
-            match vault_op(json!({
-                "op": "card-secret",
-                "name": name,
-                "user": opt_field(&user),
-                "host": host,
-                "client": "ychrome sidebar",
-            })) {
-                Ok(reply) => {
-                    let field = |key: &str| reply[key].as_str().unwrap_or_default();
-                    json!({
-                        "eval": card_fill_script(
-                            field("number"),
-                            field("code"),
-                            field("exp_month"),
-                            field("exp_year"),
-                            field("cardholder"),
-                        ),
-                        "toast": format!("Filled {name}."),
-                    })
-                }
+            // The `card-secret` op and the script it feeds have ONE owner
+            // ([`vault_card_fill_script`]), shared with the engine's
+            // `fill-card` route. `host` and `client` travel for the agent's
+            // audit line and nothing else.
+            let login = (!user.is_empty()).then_some(user.as_str());
+            match vault_card_fill_script(&name, login, host.as_deref(), "ychrome sidebar") {
+                Ok(eval) => json!({
+                    "eval": eval,
+                    "toast": format!("Filled {name}."),
+                }),
                 Err(error) => json!({ "toast": error.to_string() }),
             }
         }
@@ -5225,12 +5211,63 @@ fn fill_script(username: &str, password: &str) -> String {
     )
 }
 
+/// Ask the vault for a card and build the injector for it, for callers outside
+/// the pane.
+///
+/// The twin of [`vault_fill_script`], and it exists for the same reason: the
+/// engine plane needs exactly what the pane's `"card-fill"` action does, and the
+/// PAN must never become a string its caller handles. `host` and `client` are
+/// for the vault agent's audit line and nothing else — no decision is taken on
+/// either, but a line that cannot say WHERE the number went is half a record.
+///
+/// ⛔ **ONE OWNER FOR "card-secret → script".** The pane's action arm calls this
+/// too. Before it existed there was one copy, and the engine route would have
+/// been the second — two places that could disagree about which fields a release
+/// carries, and therefore about what the audit line claims.
+pub(crate) fn vault_card_fill_script(
+    name: &str,
+    user: Option<&str>,
+    host: Option<&str>,
+    client: &str,
+) -> Result<String> {
+    let reply = vault_op(json!({
+        "op": "card-secret",
+        "name": name,
+        "user": user.map_or(Value::Null, |user| Value::String(user.to_string())),
+        "host": host,
+        "client": client,
+    }))?;
+    let field = |key: &str| reply[key].as_str().unwrap_or_default();
+    Ok(card_fill_script(
+        field("number"),
+        field("code"),
+        field("exp_month"),
+        field("exp_year"),
+        field("cardholder"),
+    ))
+}
+
 /// Type a card into a payment form. The autocomplete tokens are the WHATWG
 /// names every payment form is supposed to carry; the name/id heuristics behind
 /// them catch the ones that do not.
 ///
-/// The script returns the list of FIELD NAMES it filled, never a value — that
-/// return string is what lands in the GUI's action log, and a PAN must not.
+/// The script returns FIELD NAMES, never a value — the GUI logs what comes back,
+/// and a PAN must not be in it.
+///
+/// ## ⛔ FOUR BUCKETS, BECAUSE SILENCE CONFLATES TWO DIFFERENT FAILURES
+///
+/// `filled` and `mismatched` describe fields the page HAS. The two ways a field
+/// can be missing are not the same question and used to be one silence:
+///
+/// - `absent` — the vault held the value and the FORM has no such box. Fine on
+///   a gateway that asks for the expiry as one `MM/YY` control.
+/// - `no_value` — the FORM asked and the vault entry does not carry it. That is
+///   a card that will be rejected at submit, and the fix is in the vault.
+///
+/// A caller that sees only `cc-number,cc-exp-month,cc-exp-year,cc-name` cannot
+/// tell which of those two took the CVV away, and both were reported by saying
+/// nothing at all. `kept` keeps the exact one-line summary the pane's action log
+/// has always shown, so the log is unchanged by this.
 fn card_fill_script(
     number: &str,
     code: &str,
@@ -5244,8 +5281,14 @@ fn card_fill_script(
   const pick = (...sel) => sel.map((s) => document.querySelector(s)).find((el) => el && !el.disabled) || null;
   const filled = [];
   const mismatched = [];
+  const absent = [];
+  const noValue = [];
   const put = (label, el, value) => {{
-    if (!value) return;
+    // The vault held nothing for this field. Named rather than skipped, but
+    // ONLY when the form asked: a page with no CVV box and a card with no CVV
+    // is a non-event, while a form that asks and a card that cannot answer is
+    // the payment that gets declined at submit.
+    if (!value) {{ if (el) {{ noValue.push(label); }} return; }}
     // ⛔ READ THE VERDICT, NOT ITS TRUTHINESS. `ychromeSet` answers an object
     // now, and every object is truthy — so a bare `if (ychromeSet(...))` would
     // report every card field as filled including the ones the page truncated
@@ -5254,6 +5297,7 @@ fn card_fill_script(
     const verdict = ychromeSet(el, value);
     if (verdict.ok) {{ filled.push(label); }}
     else if (verdict.present) {{ mismatched.push(label); }}
+    else {{ absent.push(label); }}
   }};
   put('cc-number', pick('input[autocomplete="cc-number"]', 'input[name*=cardnumber i]',
     'input[name*=card_number i]', 'input[id*=cardnumber i]', 'input[name*=cardno i]'), {number});
@@ -5269,7 +5313,14 @@ fn card_fill_script(
   // Silence would report a four-field fill as a five-field one, and the field
   // that vanished is the one the gateway is about to reject.
   const kept = filled.length ? filled.join(',') : 'no-card-fields';
-  return mismatched.length ? kept + ' unverified:' + mismatched.join(',') : kept;
+  return {{
+    // The pane's one-line summary, unchanged: this is what the GUI logs.
+    kept: mismatched.length ? kept + ' unverified:' + mismatched.join(',') : kept,
+    filled: filled,
+    mismatched: mismatched,
+    absent: absent,
+    no_value: noValue,
+  }};
 }})()"#,
         number = js_string(number),
         code = js_string(code),
@@ -7475,6 +7526,23 @@ mod tests {
         assert!(
             script.contains("mismatched"),
             "a field the page did not keep must be named, not dropped"
+        );
+        // ⛔ AND THE TWO SILENCES, WHICH ARE DIFFERENT QUESTIONS. A field can be
+        // missing because the FORM has no box for it (fine — plenty of gateways
+        // take the expiry as one control) or because the VAULT ENTRY does not
+        // carry it (not fine — that card is about to be declined at submit).
+        // Both used to be reported by saying nothing at all, so a caller
+        // reading four field names could not tell which had happened, and the
+        // remedies are in different places.
+        assert!(
+            script.contains("absent.push") && script.contains("noValue.push"),
+            "a form with no box and a card with no value must not be the same silence"
+        );
+        // `no_value` is only claimed when the FORM asked: a page with no CVV box
+        // and a card with no CVV is a non-event, not a finding.
+        assert!(
+            script.contains("if (el) { noValue.push(label); }"),
+            "a field the form never asked for is not a missing value"
         );
     }
 
