@@ -45,67 +45,52 @@ count and kill.**
 **Falsifier:** `pgrep -af "ychrome --daemon"` on a host after a restart. If only one daemon remains
 and no `(deleted)` binary appears in `/proc/<pid>/exe`, this is wrong.
 
-## ★★★ `ctl fill` REPORTS SUCCESS ON A WRONG WRITE — and two entries rest on that report as proof
+## ★★★ THE FILL AND INPUT VERBS REPORTED THE REQUEST, NOT THE EFFECT — readback shipped, live proof owed
 
-**Status:** OPEN. **Reported by lumenstore row 5.2** (the TWS/IBKR paper lane) 2026-08-07, while
-filling the IBKR paper-account signup. ⚠ **Not independently reproduced by the filer** — see
-*What would settle it*, which names the missing observation rather than implying it was made.
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-**The observation.** `ctl fill` answered `{"filled":"filled","ok":true}` while it had written a
-**31-character** value into a field whose vault secret is **20 characters**, and had left the
-**confirm field entirely empty**. It was caught only by a page-side readback that the caller wrote
-by hand. Nothing in the response distinguishes that run from a correct one.
+Reported by lumenstore row 5.2 (the TWS/IBKR paper lane) 2026-08-07 as two entries; they were one
+defect wearing two coats, and are fixed as one.
 
-### ⛔ Why this is worse than one bad verb: two entries were CLOSED on that response shape
+**What was measured.** `ctl fill` answered `{"filled":"filled","ok":true}` having written a
+**31-character** value into a field whose vault secret is **20**, leaving the confirm field
+**entirely empty**. Separately, a `click + type + click + type` batch answered
+**`dispatched:3, ok:true`** and landed nothing — a page-side readback showed `user:""`, `pwlen:0`.
 
-- **In this file**, [`ctl fill` WORKS BUT IS ABSENT FROM THE ENGINE'S USAGE BANNER](#ctl-fill-works-but-is-absent-from-the-engines-usage-banner)
-  states the verb "filled a real login the same day", citing `{"entry":"…","filled":"filled","ok":true}`.
-- **In `yggterm/docs/pending-bugs.md`**, the entry *"Agent engine: `ctl fill` is documented but has
-  no route"* sat at **FIXED IN CODE — LIVE PROOF OWED**, blocked on exactly one observation:
-  that same response against a real login form. It was **deleted** when a field report delivered it.
+**The root cause was one line.** `ychromeSet` returned a bare `true` whenever the element existed,
+so every caller's success field described *finding a node* while claiming to describe *filling it*.
+An assignment can be defeated after it returns in at least four ordinary ways — a `maxlength`, an
+`input` handler that reformats, a framework re-render, or a second field nobody wrote to — and all
+four answered `filled`. `type` events had it worse: they resolve nothing at all, going to
+`document.activeElement` at the instant the keys arrive, so a re-render sends the text to `<body>`.
 
-⇒ **The response proves ROUTING, not CORRECTNESS.** It shows the verb is reachable and does
-something. It is silent on whether what it did was right. Both closures were correct about
-reachability and neither is evidence the fill landed — the two claims were never separated.
+⛔ **Two entries had already been CLOSED citing that response shape as proof** (this file's banner
+entry, and yggterm's *"`ctl fill` is documented but has no route"*). The response proved ROUTING and
+was silent on CORRECTNESS; the two claims were never separated, so the lie propagated into the
+record. ⇒ **a status field that is not derived from a readback is decoration.**
 
-### ★ THE CLASS — the fill verbs' status fields are uninformative in BOTH directions
+**Shipped.** `ychromeSet` re-reads `el.value` after dispatching the events and answers
+`{present, ok, want, got}` — ⛔ **a LENGTH, never a value**, the same vault boundary `fill-card`
+keeps. `fill` gained a fourth verdict, **`unverified`**, which outranks the assignment, plus
+per-field `fields[]`, a `confirm` verdict and `secret_field_count`. A confirm twin is now filled —
+but only when the page NAMES it one, because on a change-password form the other field is the old
+secret and writing there is worse than leaving it empty; an unnamed second field reports
+`present-but-unnamed`. `/engine/input` measures each `type` event against the page
+(`grew_by`, `landed`, `waited_ms`, and the target it actually reached), and **refuses with 409
+BEFORE typing** into a node that holds no text, with a named opt-out (`"require_target": false`)
+for pages that read bare keystrokes. The card fill and the TOTP rung shared the same primitive and
+were silently affected: an object is truthy, so `if (value && ychromeSet(...))` would have reported
+every field as filled.
 
-`yggterm/docs/pending-bugs.md` already records the pessimistic twin: `server app web fill-card`
-answers **`matched:false` on fills that landed perfectly**, and its own note says `matched` "says
-nothing about the damage". **This is the optimistic twin, and the optimistic direction is the
-dangerous one** — a false `matched:false` invites a wasteful retry, while a false `filled:"filled"`
-invites *nothing at all*. The caller proceeds, and the account is created with a password nobody
-holds. ⇒ **one fix, one family: a status field that is not derived from a readback is decoration.**
+**The falsifying observations owed, both concrete:**
+1. one `ctl fill` against a form with a `maxlength` shorter than the secret — the reply must say
+   `filled:"unverified"` with a `fields[]` entry whose `got` is less than its `want`;
+2. one `ctl input` batch whose first event re-renders the form — the second `type` must come back
+   **409 `failed_at`** naming the tag it would have typed into, rather than `dispatched:N, ok:true`.
 
-### What would settle it
-
-A page-side readback inside `ctl fill` itself: compare `document.querySelector(sel).value.length`
-against the vault secret's length, check the confirm twin is non-empty, and answer
-`filled:"unverified"` when either disagrees. ⛔ **A LENGTH, never a value** — the vault boundary
-(`fill-card` answers a length) is right as it stands and this must not widen it.
-
-**The falsifying observation, which has NOT been made:** one `ctl fill` run against a form whose
-field length is known, where the response says `filled` *and* an independent readback confirms both
-the field and its confirm twin. Until that exists, `filled:"filled"` is not proof of a fill.
-
-**Workaround meanwhile:** read the secret into a shell variable and use `ctl input` type events —
-but see the entry directly below, which is why that workaround needs its own care.
-
-## ★★ `ctl input` BATCHES FAIL SILENTLY WHEN AN EARLIER EVENT CHANGES LAYOUT
-
-**Status:** OPEN. Same reporter, same session, 2026-08-07.
-
-A `click + type + click + type` batch against a portal login reported **`dispatched:3, ok:true`**
-and landed **nothing** — a page-side readback showed `user:""`, `pwlen:0`. Splitting it into
-separate `ctl input` calls and verifying `document.activeElement` between them worked **first try**.
-
-**The mechanism:** an earlier event in the batch changes the layout, so the later events resolve
-against nodes that have moved or been replaced. **`dispatched` counts events SENT, not events
-LANDED**, and `ok` describes the transport, not the outcome.
-
-⇒ **Same family as the entry above** — a self-reported success field with no readback behind it.
-⛔ **Never trust a batch's own success field.** Until per-event target resolution is reported, split
-layout-changing sequences into separate calls and assert `document.activeElement` between them.
+⚠ **`landed:false` over a real field is REPORTED, never refused**, and that is deliberate: a phone
+mask that strips separators and an OTP field that submits on its last digit are both correct pages
+that grow by the wrong amount. Only the unambiguous fault — text with nowhere to go — stops a batch.
 
 ## ⭐ A CARD ITEM IS UNREADABLE AND UNEDITABLE IN THE SIDEBAR — the View pane shows nothing, `edit` has no card options
 
@@ -209,26 +194,6 @@ leaving the same one line in `~/.yggterm/vault/audit.log`. A companion `ctl fill
 same hole for password-gated flows. ⛔ **The PAN boundary is correct and no ask here touches it:**
 no verb prints a card number, the secret stays behind the vault agent's `card-secret` op gated by
 the unlock alone. Keep that exactly as is.
-
-## `ctl fill` WORKS BUT IS ABSENT FROM THE ENGINE'S USAGE BANNER
-
-**Status:** OPEN. Same report, 2026-08-07.
-
-The banner advertises `open close pages goto nav wait eval dom shot input console cookie-import
-park resume pool metrics budget batch egress identity status` — no `fill`. Yet
-`ychrome ctl fill page_id=<p> entry=<vault-item>` answered
-`{"entry":"…","filled":"filled","ok":true}` and filled a real login the same day.
-
-> ⚠ **CORRECTED 2026-08-07: "and filled a real login" overstates what that response shows.** The
-> same response shape has since been observed on a WRONG write (31 chars into a 20-char secret,
-> confirm field empty) — see the `ctl fill` REPORTS SUCCESS ON A WRONG WRITE entry at the top of
-> this file. **The response is evidence the route exists, which is all this entry needs it for.**
-> The banner gap below is unaffected.
-
-⚠ **The cost is a belief, not a crash:** an agent reading the banner concludes the engine has no
-credential support at all, and that conclusion gets re-derived by every session that reads it. This
-is the inverse of the defect that entry used to describe (documented, no route) — the route landed
-and the banner did not follow. ⇒ **when a route ships, the banner is part of the route.**
 
 ## ★★ THE ENGINE CANNOT REACH INTO A CROSS-ORIGIN FRAME, AND THAT BLOCKED A PAYMENT
 
@@ -546,6 +511,7 @@ ceremony no agent surface can approve. Worth closing on its own merits.
 
 ## ★★★ THE PASSKEY SHIM PATCHES `navigator.credentials` ON EVERY PAGE, INCLUDING A CHALLENGE PAGE
 
+**Status:** OPEN
 **Found 2026-07-31 while investigating why a Cloudflare challenge on a
 brilliant.org login would not clear.** Not the cause of that report (the UA and
 the engine's cookie jar were, both fixed) but a real, measured incoherence that
@@ -680,6 +646,7 @@ invariant is untouched and locked: scoping decides only WHERE
 
 ## ★★ (yggterm) A PROFILE WHOSE WRITE-LOCK IS HELD ELSEWHERE OPENS WITH NO JAR
 
+**Status:** OPEN
 **Not in this repo — filed here because it is the other half of the cookie-jar
 failure ychrome fixed on its own engine plane, and an ychrome user meets it as
 "the login will not stick".**
@@ -724,6 +691,7 @@ pixel is owed.
 
 ## ★★★ A DAEMON HANDOVER STRANDS THE GUI ON A DEAD CONTROL PORT, AND SURFACES SILENTLY LOSE ADBLOCK
 
+**Status:** OPEN
 **User-reported 2026-07-31, immediately after a deploy + `ychrome daemon
 restart`.** The GUI raised:
 
@@ -866,6 +834,7 @@ answers "did anyone forget to cycle the clients" in one command.
 
 ## ★★ THE `dream-control-surfaces` ITEMS ARE BUGS, NOT ASPIRATIONS
 
+**Status:** OPEN
 `docs/dream-control-surfaces.md` is filed as a dream document. The operator's
 ruling, 2026-07-31: **these are bugs.** Framing a missing capability as a dream
 puts it outside every process that would fix it — it is not in a bug list, it has
@@ -891,6 +860,7 @@ and §7 table are already bug-shaped.
 
 ## ⚠ FLAKY TEST — `daemon_staleness` fails on a busy host, and it is NOT the code
 
+**Status:** OPEN
 **Characterised 2026-08-01 on dev, after it cost a session real time twice.**
 Two tests in `tests/daemon_staleness.rs` fail intermittently:
 
@@ -916,20 +886,3 @@ loaded CI host cannot meet — a timing test that fails on a busy machine teache
 agents to ignore red, which is worse than the flake.
 
 ---
-
-## ⚠ MINOR — `ychrome ctl --help` asks the engine to run `--help` as a verb
-
-Found while verifying the subcommand-swallow fix, 2026-08-01. The important
-half is closed (a bare unknown word exits non-zero and opens nothing), but:
-
-```
-$ ychrome ctl --help ; echo $?
-{"error":"unknown engine verb \"--help\"","ok":false}
-ychrome: engine replied 404
-1                                ← non-zero, so no false capability report
-```
-
-`ctl` forwards `--help` as if it were a verb rather than printing the usage that
-bare `ychrome ctl` already prints correctly. Cosmetic — it exits non-zero, so it
-cannot resurrect the false-deploy-report failure — but `--help` should not
-become a 404 from the engine.

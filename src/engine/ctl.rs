@@ -30,21 +30,43 @@ const STREAMING: [&str; 1] = ["batch"];
 /// them together so a rename cannot land on one side only.
 const SHOT_META_HEADER: &str = "x-ychrome-shot";
 
+/// The usage text, with the verb list read from the ROUTER rather than typed
+/// here. See [`super::api::VERBS`] for why: a hand-kept copy drifted, and an
+/// engine that could fill credentials advertised that it could not.
+fn usage() -> String {
+    // Wrapped by hand at a width that fits a terminal, because the list is
+    // long and a single line scrolls the rest of the banner off screen.
+    let verbs = super::api::VERBS;
+    let (head, tail) = verbs.split_at(verbs.len().min(11));
+    format!(
+        "usage: ychrome ctl <verb> [key=value ...] [out=FILE | --out FILE]\n\
+         verbs: {head}\n\
+         \x20      {tail}\n\
+         \n\
+         shot regions (all four write PNG bytes; out=FILE catches them):\n\
+         \x20  region=viewport                       what is on screen (default)\n\
+         \x20  region=full                           the whole scrollable document\n\
+         \x20  region=element selector='#main'       one element, cropped from the full page\n\
+         \x20  region=rect rect='{{\"x\":0,\"y\":0,\"w\":800,\"h\":600}}'  a document-space area\n\
+         \x20  prescroll=true                        walk the page first so lazy images load",
+        head = head.join(" "),
+        tail = tail.join(" "),
+    )
+}
+
 pub fn run(args: &[String]) -> Result<()> {
     let Some(verb) = args.first() else {
-        bail!(
-            "usage: ychrome ctl <verb> [key=value ...] [out=FILE | --out FILE]\n\
-             verbs: open close pages goto nav wait eval dom shot input console\n\
-             \x20      cookie-import park resume pool metrics budget batch egress identity status\n\
-             \n\
-             shot regions (all four write PNG bytes; out=FILE catches them):\n\
-             \x20  region=viewport                       what is on screen (default)\n\
-             \x20  region=full                           the whole scrollable document\n\
-             \x20  region=element selector='#main'       one element, cropped from the full page\n\
-             \x20  region=rect rect='{{\"x\":0,\"y\":0,\"w\":800,\"h\":600}}'  a document-space area\n\
-             \x20  prescroll=true                        walk the page first so lazy images load"
-        );
+        bail!(usage());
     };
+    // ⚠ `--help` was forwarded to the engine AS A VERB, so it came back as
+    // `{"error":"unknown engine verb \"--help\"","ok":false}` over a 404. It
+    // exits non-zero either way, so nothing false was ever reported — but the
+    // one word a caller types when they are already lost should not answer with
+    // a routing error about itself.
+    if matches!(verb.as_str(), "--help" | "-h" | "help") {
+        println!("{}", usage());
+        return Ok(());
+    }
     let mut body = serde_json::Map::new();
     let mut out_path: Option<String> = None;
     let mut index = 1;

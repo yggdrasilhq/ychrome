@@ -11,6 +11,7 @@
 //! from it.
 
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -320,6 +321,15 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
         // caller can tell "the vault answered but the page had no password
         // field" from "the vault refused", instead of both arriving as a bare
         // success the way they would if this returned only `ok`.
+        //
+        // ⛔ AND A FOURTH WORD, `unverified`, WHICH IS THE POINT OF THE REPLY.
+        // The first three describe what the script SET OUT to do. Only a
+        // readback of what the page is holding afterwards can separate a fill
+        // that landed from one that was truncated, reformatted, re-rendered
+        // away, or written into one of two fields — and until 2026-08-07 all
+        // four of those answered `filled`. `fields` carries the per-field
+        // readback (a LENGTH, never a value) and `confirm` names what happened
+        // to a second secret field. See `sidebar::SET_FIELD`.
         "fill" => {
             let (Some(id), Some(entry)) =
                 (page_id, request.body.get("entry").and_then(Value::as_str))
@@ -336,7 +346,16 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
                 Ok(script) => match engine.eval(&id, &script) {
                     Ok(value) => Reply::Json(
                         200,
-                        json!({ "ok": true, "entry": entry, "filled": value }),
+                        json!({
+                            "ok": true,
+                            "entry": entry,
+                            // `filled` stays a STRING: it is the documented
+                            // field and the one every existing caller reads.
+                            "filled": value.get("filled").unwrap_or(&value),
+                            "fields": value.get("fields"),
+                            "confirm": value.get("confirm"),
+                            "secret_field_count": value.get("secret_field_count"),
+                        }),
                     ),
                     Err(error) => Reply::bad(400, error.to_string()),
                 },
@@ -423,9 +442,66 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
             // exists to refuse. A mid-batch refusal is a fact about the PAGE,
             // and it is answered with the count actually dispatched and the
             // index that stopped it, so the resulting state has a name.
+            //
+            // ⛔ AND A `type` EVENT IS MEASURED AFTERWARDS, because there is
+            // nothing to resolve BEFORE it: text goes wherever the focus is
+            // when the keys arrive. `typed_landing` is the only thing in this
+            // reply derived from the page rather than from the request.
             let mut dispatched = 0u32;
             let mut resolved: Vec<Value> = Vec::new();
             for (index, item) in pending.into_iter().enumerate() {
+                // Held only when this event is a `type`: the readback is two
+                // extra round trips and a settle, and a click already reports
+                // the node it resolved to.
+                let typing = match &item {
+                    PendingInput::Ready(InputEvent::Text { text }) => {
+                        Some((text.chars().count(), focus_readback(&engine, &id)))
+                    }
+                    _ => None,
+                };
+                // ⛔ TEXT WITH NOWHERE TO GO IS REFUSED BEFORE IT IS TYPED.
+                // This is the measured failure: an earlier event in the batch
+                // re-rendered the form, focus fell back to `<body>`, and the
+                // remaining `type` events were swallowed by the page while the
+                // reply said `dispatched:3, ok:true`. Refusing here — rather
+                // than reporting afterwards — is what keeps a secret out of a
+                // page that was never going to hold it, and stops the batch
+                // before the NEXT event compounds the mistake.
+                //
+                // The opt-out is named because the case is real: a page that
+                // listens for a bare keypress ("press / to search") has no
+                // focused field by design. `"require_target": false` says so.
+                if let Some((_, before)) = typing.as_ref() {
+                    let required = raw
+                        .get(index)
+                        .and_then(|event| event.get("require_target"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    if required && !accepts_text(before.as_ref()) {
+                        let landed_on = before
+                            .as_ref()
+                            .and_then(|value| value["tag"].as_str())
+                            .unwrap_or("nothing readable");
+                        return Reply::Json(
+                            409,
+                            json!({
+                                "ok": false,
+                                "error": format!(
+                                    "event {index} would type into <{landed_on}>, which holds no \
+                                     text — the page has no focused editable field, so the text \
+                                     would be discarded and reported as dispatched. Click the \
+                                     field first (a selector click resolves at dispatch time), or \
+                                     pass \"require_target\": false if this page reads bare \
+                                     keystrokes."
+                                ),
+                                "dispatched": dispatched,
+                                "failed_at": index,
+                                "focus": before,
+                                "resolved": resolved,
+                            }),
+                        );
+                    }
+                }
                 let outcome = resolve_pending(&engine, &id, item)
                     .and_then(|(event, report)| Ok((engine.input(&id, vec![event])?, report)));
                 match outcome {
@@ -433,6 +509,9 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
                         dispatched += count;
                         if let Some(report) = report {
                             resolved.push(report);
+                        }
+                        if let Some((want, before)) = typing {
+                            resolved.push(typed_landing(&engine, &id, index, want, before));
                         }
                     }
                     Err(error) => {
@@ -616,6 +695,42 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
         other => Reply::bad(404, format!("unknown engine verb {other:?}")),
     }
 }
+
+/// Every verb the router answers, in the order the CLI advertises them.
+///
+/// ⛔ **THE BANNER IS PART OF THE ROUTE.** `fill` shipped and the hand-written
+/// usage string did not follow, so for weeks `ychrome ctl` advertised an engine
+/// with no credential support at all — while `ctl fill` worked. The cost is a
+/// belief rather than a crash, which is worse: every session that read the
+/// banner re-derived "the engine cannot do credentials" and built around it.
+///
+/// So the list has ONE owner and the CLI reads it. `the_banner_lists_every_verb
+/// _the_router_answers` parses the dispatcher's own match arms and fails when
+/// the two disagree, which is what makes this a fact rather than a convention.
+pub const VERBS: [&str; 22] = [
+    "open",
+    "close",
+    "pages",
+    "goto",
+    "nav",
+    "wait",
+    "eval",
+    "dom",
+    "shot",
+    "input",
+    "fill",
+    "console",
+    "cookie-import",
+    "park",
+    "resume",
+    "pool",
+    "metrics",
+    "budget",
+    "batch",
+    "egress",
+    "identity",
+    "status",
+];
 
 /// Verbs that drive a NAMED page, and therefore need it live and touched.
 ///
@@ -1128,6 +1243,92 @@ fn resolve_pending(
             ))
         }
     }
+}
+
+/// How long typed text gets to reach the DOM before the field is re-read.
+///
+/// Input events cross a process boundary: the UI process dispatches them and
+/// the WEB process applies them, so a readback in the next round trip can
+/// legitimately arrive before the field has changed. This polls rather than
+/// sleeping a flat budget — a field that took 12 ms is not made more certain by
+/// waiting 300 — and it reports how long it waited, so a page that is merely
+/// slow can be told apart from one that dropped the text.
+const TYPED_SETTLE: Duration = Duration::from_millis(400);
+const TYPED_POLL: Duration = Duration::from_millis(20);
+
+/// What has the focus, and how much text it already holds.
+///
+/// A failure to read is NOT reported as "nothing focused" — that would turn an
+/// instrument fault into a verdict about the page, which is the exact confusion
+/// this lane exists to end. An unreadable page answers `null` and the caller
+/// sees an absent measurement rather than a false one.
+fn focus_readback(engine: &Engine, id: &str) -> Option<Value> {
+    engine.eval(id, js::FOCUS_READBACK).ok()
+}
+
+/// Whether a field is somewhere text can actually go.
+fn accepts_text(readback: Option<&Value>) -> bool {
+    readback.is_some_and(|value| {
+        value["focused"].as_bool().unwrap_or(false) && !value["length"].is_null()
+    })
+}
+
+/// Measure where a `type` event's text landed, after it was dispatched.
+///
+/// The verdict is `grew_by`, not a copy of the text: the field's length before
+/// and after, differenced. `landed` is true when it grew by exactly what was
+/// typed — the honest reading of "the page kept it".
+///
+/// ⚠ `landed: false` over an editable target is REPORTED, never refused. A
+/// phone-number mask that strips separators, and an OTP field that submits and
+/// clears on its last digit, are both correct pages that grow by the wrong
+/// amount. The unambiguous fault — text with nowhere to go — is caught BEFORE
+/// dispatch instead, where refusing still prevents the write.
+fn typed_landing(
+    engine: &Engine,
+    id: &str,
+    index: usize,
+    want: usize,
+    before: Option<Value>,
+) -> Value {
+    let baseline = before
+        .as_ref()
+        .and_then(|value| value["length"].as_u64())
+        .unwrap_or(0);
+    let deadline = Instant::now() + TYPED_SETTLE;
+    let mut after = focus_readback(engine, id);
+    let mut waited_ms = 0u64;
+    while Instant::now() < deadline {
+        let grew = after
+            .as_ref()
+            .and_then(|value| value["length"].as_u64())
+            .is_some_and(|length| length >= baseline + want as u64);
+        if grew {
+            break;
+        }
+        thread::sleep(TYPED_POLL);
+        waited_ms += TYPED_POLL.as_millis() as u64;
+        after = focus_readback(engine, id);
+    }
+    let now = after.as_ref().and_then(|value| value["length"].as_u64());
+    json!({
+        "event": index,
+        "kind": "type",
+        // The node the text went to, named the way a click's report names its
+        // target. A `type` event has never carried this.
+        "target": after.as_ref().map(|value| json!({
+            "tag": value["tag"],
+            "type": value["type"],
+            "name": value["name"],
+            "editable": value["editable"],
+        })),
+        "want": want,
+        "before": before.as_ref().map(|value| value["length"].clone()),
+        "after": now,
+        "grew_by": now.map(|length| length as i64 - baseline as i64),
+        "landed": now.is_some_and(|length| length == baseline + want as u64),
+        "waited_ms": waited_ms,
+    })
 }
 
 /// How long a scroll gets to settle before the rect is RE-measured.
@@ -2510,6 +2711,145 @@ mod tests {
             !js::CLICK_MEASURE.contains("hit.contains(el)"),
             "an ancestor that contains the target is not the target: a click there reaches the \
              ANCESTOR, and this clause is exactly how a hidden decoy passed for a live control"
+        );
+    }
+
+    /// ⛔ THE BANNER AND THE ROUTER MUST NOT BE ABLE TO DISAGREE.
+    ///
+    /// `fill` was reachable and unadvertised, so agents concluded the engine
+    /// had no credential support. This parses the dispatcher's own match arms
+    /// out of the source and holds them against [`VERBS`], so a new route that
+    /// forgets the banner fails here instead of in a field report months later.
+    #[test]
+    fn the_banner_lists_every_verb_the_router_answers() {
+        let source = include_str!("api.rs");
+        let dispatcher = source
+            .split("fn route(")
+            .nth(1)
+            .expect("the router exists")
+            .split("\n/// Every verb the router answers")
+            .next()
+            .expect("the dispatcher ends before the verb list");
+        let mut arms: Vec<String> = Vec::new();
+        for line in dispatcher.lines() {
+            // ⚠ TOP-LEVEL ARMS ONLY, keyed on indentation. The first version of
+            // this test scraped the whole dispatcher body and reported `html` —
+            // which is a `mode` inside `dom`, not a route. A nested match arm
+            // is not a verb, and a test that cannot tell the difference would
+            // have to be silenced, which is how a lock stops locking.
+            let indent = line.len() - line.trim_start().len();
+            if indent != 8 {
+                continue;
+            }
+            let trimmed = line.trim();
+            // An arm looks like:  "open" => {   or   "pool" | "metrics" => …
+            let Some((head, _)) = trimmed.split_once("=>") else {
+                continue;
+            };
+            if !head.starts_with('"') {
+                continue;
+            }
+            for token in head.split('|') {
+                let name = token.trim().trim_matches(|c| c == '"' || c == ' ');
+                // `""` is the bare-status alias, not a verb a caller types.
+                if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
+                    arms.push(name.to_string());
+                }
+            }
+        }
+        assert!(
+            arms.len() > 15,
+            "the arm scraper found only {arms:?} — it stopped matching the router's shape"
+        );
+        for arm in &arms {
+            assert!(
+                VERBS.contains(&arm.as_str()),
+                "the router answers {arm:?} and the banner never mentions it — \
+                 a route that is not advertised is a capability nobody knows exists"
+            );
+        }
+        for verb in VERBS {
+            assert!(
+                arms.iter().any(|arm| arm == verb),
+                "the banner advertises {verb:?} and the router has no arm for it"
+            );
+        }
+    }
+
+    /// ⛔ A `type` EVENT MUST BE MEASURED, BECAUSE IT RESOLVES NOTHING.
+    ///
+    /// The batch `click, type, click, type` answered `dispatched:3, ok:true`
+    /// over a login that a page-side readback then showed empty. `dispatched`
+    /// counts events SENT; nothing in that reply came from the page. This locks
+    /// the two halves of the answer: a refusal BEFORE typing into a node that
+    /// holds no text, and a readback AFTER for everything else.
+    #[test]
+    fn a_type_event_is_measured_against_the_page_and_not_the_request() {
+        let source = include_str!("api.rs");
+        let route = source
+            .split("\"input\" => {")
+            .nth(1)
+            .expect("the input route exists");
+        let body = &route[..route.find("\"nav\" =>").unwrap_or(route.len())];
+        assert!(
+            body.contains("focus_readback") && body.contains("typed_landing"),
+            "a type event must be measured before and after it is dispatched"
+        );
+        assert!(
+            body.contains("accepts_text"),
+            "text with nowhere to go must be caught BEFORE it is typed — after is too late, \
+             the secret is already in the page"
+        );
+        assert!(
+            body.contains("require_target"),
+            "the refusal needs a named opt-out for pages that read bare keystrokes"
+        );
+    }
+
+    /// ⛔ A LENGTH, NEVER A VALUE. `/engine/input` is the one route a caller
+    /// can put a secret through, so its own reply must not become a second
+    /// copy of it — the same boundary `fill` keeps.
+    #[test]
+    fn the_typed_landing_report_carries_a_length_and_never_the_text() {
+        let source = include_str!("api.rs");
+        let report = source
+            .split("fn typed_landing(")
+            .nth(1)
+            .expect("typed_landing exists");
+        let body = &report[..report.find("\n}\n").unwrap_or(report.len())];
+        assert!(
+            body.contains("grew_by") && body.contains("\"landed\""),
+            "the verdict must be the difference the page kept"
+        );
+        for leak in ["text.clone()", "\"text\":", "text.to_string()"] {
+            assert!(
+                !body.contains(leak),
+                "the report must not carry the typed text itself ({leak})"
+            );
+        }
+    }
+
+    /// `landed:false` over a real field is REPORTED, not refused: an input mask
+    /// that strips separators and an OTP field that submits on its last digit
+    /// both grow by the wrong amount and are both correct pages. Only the
+    /// unambiguous fault — no editable target at all — stops a batch.
+    #[test]
+    fn a_field_that_kept_the_wrong_amount_is_reported_rather_than_refused() {
+        assert!(
+            !accepts_text(None),
+            "an unreadable page is not a target"
+        );
+        assert!(
+            !accepts_text(Some(&json!({ "focused": false, "length": 0 }))),
+            "nothing focused is not a target"
+        );
+        assert!(
+            !accepts_text(Some(&json!({ "focused": true, "length": Value::Null }))),
+            "a focused node that holds no text — a button — is not a target"
+        );
+        assert!(
+            accepts_text(Some(&json!({ "focused": true, "length": 7 }))),
+            "a focused field holding text IS a target, however much it holds"
         );
     }
 
