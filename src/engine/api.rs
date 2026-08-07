@@ -511,7 +511,34 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
                             resolved.push(report);
                         }
                         if let Some((want, before)) = typing {
-                            resolved.push(typed_landing(&engine, &id, index, want, before));
+                            let landing = typed_landing(&engine, &id, index, want, before);
+                            let discarded = landing["discarded"].as_bool().unwrap_or(false);
+                            resolved.push(landing);
+                            // The pre-dispatch guard cannot catch this one: the
+                            // field was there when we checked, and the page took
+                            // it away in response to the first keystroke. So the
+                            // batch stops HERE instead of answering `ok: true`
+                            // over text the page threw away — and it stops before
+                            // the next event compounds it.
+                            if discarded {
+                                return Reply::Json(
+                                    409,
+                                    json!({
+                                        "ok": false,
+                                        "error": format!(
+                                            "event {index} typed {want} character(s) and the page \
+                                             kept none of them — the focus left the field while it \
+                                             was being typed, which is what a form re-render does \
+                                             mid-batch. Split the batch and assert the target \
+                                             between the halves, or wait for the page to settle \
+                                             first."
+                                        ),
+                                        "dispatched": dispatched,
+                                        "failed_at": index,
+                                        "resolved": resolved,
+                                    }),
+                                );
+                            }
                         }
                     }
                     Err(error) => {
@@ -1314,6 +1341,14 @@ fn typed_landing(
     json!({
         "event": index,
         "kind": "type",
+        // ⛔ THE UNAMBIGUOUS FAULT, SEPARATED FROM THE MERELY SURPRISING ONE.
+        // Measured on the harness 2026-08-08: a form that rebuilds itself on
+        // its first `input` event blurs the focus mid-word, so the rest of the
+        // text reaches `<body>` — `grew_by: 0`, `target.tag: "body"`. That is
+        // not a page keeping a different amount than it was given; it is text
+        // with nowhere to go, and it is the reported defect. A mask that strips
+        // separators still ends on a real field and is reported, not refused.
+        "discarded": !accepts_text(after.as_ref()),
         // The node the text went to, named the way a click's report names its
         // target. A `type` event has never carried this.
         "target": after.as_ref().map(|value| json!({
@@ -2803,6 +2838,16 @@ mod tests {
         assert!(
             body.contains("require_target"),
             "the refusal needs a named opt-out for pages that read bare keystrokes"
+        );
+        // ⛔ The pre-dispatch guard CANNOT catch the reported case: the field
+        // was there when it was checked, and the page took it away in response
+        // to the first keystroke. Measured on the harness — `grew_by: 0`,
+        // `target.tag: "body"`. Without this second gate the batch answers
+        // `ok: true` over text the page threw away, which is the whole report.
+        assert!(
+            body.contains("discarded"),
+            "a type event whose text the page kept NONE of must stop the batch, not be \
+             reported under `ok: true`"
         );
     }
 

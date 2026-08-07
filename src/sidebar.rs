@@ -5070,12 +5070,20 @@ fn js_string(value: &str) -> String {
 /// correct one, and two other bug entries had already been closed citing this
 /// same response shape as proof — so the lie propagated into the record.
 ///
-/// The assignment can be defeated after it returns, in at least four ordinary
-/// ways: a `maxlength` truncates it, an `input` handler reformats it, a
-/// framework re-renders from state that never saw it, or the page holds a
-/// second field nobody wrote to. **The only thing that knows is the field.**
-/// So the value is re-read after the events are dispatched and the verdict is
-/// derived from what the page is HOLDING.
+/// The assignment can be defeated after it returns, in at least three ordinary
+/// ways: an `input` handler reformats or clamps it (every card, phone and
+/// length-capped mask does this, and it runs SYNCHRONOUSLY inside the dispatch
+/// below), a framework re-renders from state that never saw it, or the page
+/// holds a second field nobody wrote to. **The only thing that knows is the
+/// field.** So the value is re-read after the events are dispatched and the
+/// verdict is derived from what the page is HOLDING.
+///
+/// ⚠ **`maxlength` is NOT one of them, and assuming it was cost a measurement**
+/// (2026-08-08): the attribute constrains what a USER may type, and a
+/// programmatic `el.value = …` is not user input. A 20-character secret written
+/// into a `maxlength=8` field reads back as **20**. The harness keeps that case
+/// as a labelled control so it is not rediscovered —
+/// `tests/fixtures/fill-readback-harness.html`.
 ///
 /// ⛔ **A LENGTH, NEVER A VALUE.** The vault boundary is that a caller learns
 /// which fields were filled and never what went into them (`fill-card` already
