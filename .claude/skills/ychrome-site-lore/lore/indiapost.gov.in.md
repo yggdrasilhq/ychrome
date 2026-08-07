@@ -182,3 +182,114 @@ which silently suppressed the paper-cost line, the one line the tool exists for.
 ⇒ **The general form, past paper:** when an action consumes something of his that does not come
 back — a sheet, a bank OTP, a one-shot captcha, a non-refundable booking — **state the cost in
 units before spending it, not after.**
+
+## track-without-captcha-via-server-actions · WORKS
+task: 
+model: claude-opus-5
+date: 2026-08-07
+tags: 
+
+⭐⭐ **TRACKING NEEDS NO CAPTCHA, NO BROWSER, AND NO GUI HOST. The captcha on the home page is
+CLIENT-SIDE ONLY.** This closes the "⛔ TRACKING IS NOT SOLVED EITHER" entry above, which was
+correct about its three dead guesses and wrong about the conclusion.
+
+Every earlier session paid for tracking twice: once to solve the image captcha in a browser, and
+again days later when the result URL had expired (`/track-result/article-tracking/<token>` is
+scoped to the search SESSION, not the article — re-requested three days on, all four answered
+*"Tracking session has expired"*). There is no durable per-article URL. There did not need to be.
+
+## The mechanism
+
+`www.indiapost.gov.in` is a Next.js app and the tracking work is done by two **server actions**,
+neither of which takes a captcha argument:
+
+    getTrackingToken()            -> a short-lived signed token  ({"exp":…,"nonce":…}.<sig>)
+    trackArticle(token, article)  -> booking details + the FULL scan chain, as JSON
+
+The captcha is checked in the client component before it calls them:
+
+    if (!r && !T && !a) { setCaptchaError("Please complete the captcha verification"); return false }
+
+⇒ Call the actions directly. Two POSTs, no session, no image, no GUI:
+
+```sh
+UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36'
+TOK=$(curl -sS -X POST https://www.indiapost.gov.in/ \
+        -H 'Next-Action: 00b4f44fd7cd8e5a9d969100904e4880581555ea21' \
+        -H 'Content-Type: text/plain;charset=UTF-8' -H "User-Agent: $UA" \
+        --data-raw '[]' | sed -n 's/^1:"\(.*\)"$/\1/p')
+
+curl -sS -X POST https://www.indiapost.gov.in/ \
+     -H 'Next-Action: 60d4c45fc5727f9c4c3efc1c93b182559c9cedbaaf' \
+     -H 'Content-Type: text/plain;charset=UTF-8' -H "User-Agent: $UA" \
+     --data-raw "[\"$TOK\",\"EY492675435IN\"]" | sed -n 's/^1://p'
+```
+
+```json
+{"data":{"booking_details":{"article_number":"EY492675435IN","article_type":"SP_INLAND_DOC",
+ "booking_date":"2026-08-07T05:36:44Z","booking_office_name":"Paschim Putiari SO",
+ "booking_pin":"700041","destination_office_name":"Kolkata GPO DC","destination_pincode":"700001",
+ "weight_value":"20","delivery_confirmed_on":null},
+ "tracking_details":[{"date":"2026-08-07T05:36:44.109Z","office":"Paschim Putiari SO",
+ "eventcode":"ITEM_BOOK","event":"Item Booked","officeid":"33660261","remarks":""}],
+ "success":true,"message":"data retrieved successfully","error":null}}
+```
+
+## The four traps, each one measured
+
+1. ⛔ **READ THE FLIGHT LINE BY PREFIX (`1:`), NEVER BY POSITION.** The response is a React-Flight
+   stream and it carries the whole RE-RENDERED PAGE alongside the answer — 142 kB of it, on line
+   `0:`. "Last line", "longest line" or "parse the body as JSON" all pick the page. The action's
+   return value is the line beginning `1:`.
+2. ⚠ **THE ACTION IDS ARE BUILD HASHES.** They change when India Post redeploys. A 404/500 or an
+   empty token means STALE IDS, not a dead route — re-derive them from the live JS bundles:
+   `grep -oE 'createServerReference\)\("[0-9a-f]{20,}"[^)]*"(getTrackingToken|trackArticle)"'`
+   over everything under `/_next/static/chunks/`. `scripts/track.py --rediscover` in the
+   atlasStore manager does exactly this and prints CHANGED/unchanged per action.
+3. ⚠ **THE Z ON THE TIMESTAMPS IS A LIE — the values are IST wall-clock.** `booking_date`
+   `2026-08-07T05:36:44Z` is a booking made at 05:36:44 **IST**. Shifting by +5:30 invents a
+   booking that never happened. Render as given.
+4. ⛔ **"Item Booked" IS A PAYMENT EVENT ON THE ONLINE RAIL, NOT A CUSTODY EVENT.** EY492675435IN
+   was booked (paid) online at 05:36:44 and physically handed to the counter at ~13:10 the same
+   day; the scan chain shows only the 05:36:44 row, overstating India Post's possession by
+   **7 h 34 min**. At a counter the two coincide. ⇒ Never cite the booking scan as a dispatch
+   date, and never measure transit from it.
+
+Other tabs on the same widget use plain REST rather than server actions — `BOOKING_REF_TRACKING_URL`
+(`?reference=<ref>` → the article numbers under a booking reference), `MONEY_ORDER_TRACKING_URL`,
+`COMPLAINT_ID_TRACKING_URL`. The captcha backend is `app.indiapost.gov.in/becaptcha`; nothing here
+touches it.
+
+⛔ A consignment number is a live evidentiary identifier: it goes to India Post's own endpoint and
+nowhere else. Third-party trackers exist and must not be used, however convenient.
+
+⇒ Because it is free, **track often instead of once**. atlasStore
+`scripts/track.py [--all]` appends every new scan event to
+`graph/notes/tracking/<ARTICLE>.json` with the moment it was first observed — which both defeats
+the ~3-month purge (the ledger is itself the durable capture; the 2026-08-03 harvest survived only
+as screenshots) and turns "did this article get delayed?" into a series instead of an argument.
+
+## ⛔ A RAIL'S NATIONAL AVAILABILITY IS NOT ITS AVAILABILITY AT A GIVEN OFFICE
+
+Owner field report, 2026-08-07, dropping a Click-n-Book prepaid article at **Paschim Putiari SO
+(700041)**, his own sub-office:
+
+> *"It would been less hassle if I had not booked online. I am the first online customer and the
+> counter lady didnot know what to do with the envelope and was started at the label. Finally
+> after 10-15mins back and forth with calls, the postmaster … she informed me 'please leave your
+> phone number … and we do not yet have the power given to us for pickup'."*
+
+- **Click-n-Book DROP-OFF: accepted, but no procedure.** First online customer at that office;
+  ~15 minutes and the postmaster to resolve. Budget a conversation, not a drop-and-go.
+- ⛔ **Click-n-Book PICKUP: NOT ENABLED at that office** — and **the portal does not know it.**
+  It offered a pickup slot (date locked, `min == max`) and quoted the Rs 50 under-Rs-500 pickup
+  charge for an office that cannot perform one. A dispatch planned around that pickup would have
+  been paid for and stranded.
+- The rail did buy something real: the portal booked the article FROM that sub-office
+  (`booking_office_name` confirms it), making the office 400 m away a valid Speed Post origin.
+
+⇒ Record rail readiness **per office**, and read it before planning a dispatch. atlasStore keeps
+it in `graph/postal-offices.toml` and `scripts/postal.py` prints it above the packing list — the
+FORESEEABLE logic applied to the rail instead of the queue. The general form: **when an action
+spends something that does not come back — a sheet, an OTP, a non-refundable booking, a trip to a
+counter — state the cost in units before spending it, not after.**
