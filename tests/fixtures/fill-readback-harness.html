@@ -26,9 +26,18 @@
      <body>, and the text is discarded. The batch used to answer
      `dispatched:N, ok:true`.
 
+  3. `#card-form` is a payment form, and it is the only place `ctl fill-card`
+     may be proven. ⛔ **Never a gateway**: a real card payment is the
+     operator's, per action, every time. Load it with `?card=hostile` and it
+     becomes the two ways a payment form defeats a fill — the number field
+     grows its own separators, and the security-code box is not there at all —
+     which are the `mismatched` and `absent` buckets of the reply.
+
   ⚠ Every value here is INVENTED. A fixture is published source, and an example
   copied from the operator's life is a leak that ships (see
-  `feedback-never-write-a-real-example-into-a-public-repo`).
+  `feedback-never-write-a-real-example-into-a-public-repo`). The page holds no
+  card number of any kind, invented or otherwise: what a fill puts in it comes
+  from the host's vault agent and is never written down here.
 -->
 <style>
   body { font: 14px/1.6 system-ui, sans-serif; margin: 2rem; max-width: 40rem; }
@@ -61,6 +70,25 @@
   </fieldset>
 </form>
 
+<!-- CASE 3: a payment form, carrying the WHATWG autocomplete tokens a gateway
+     is supposed to carry. `?card=hostile` turns it into the two forms that
+     defeat a card fill. -->
+<form id="card-form">
+  <fieldset>
+    <legend>3 — a payment form, for <code>ctl fill-card</code></legend>
+    <label>Card number
+      <input id="cc-number" name="cardnumber" type="text" autocomplete="cc-number"></label>
+    <label>Security code
+      <input id="cc-csc" name="cvv" type="text" autocomplete="cc-csc"></label>
+    <label>Expiry month
+      <input id="cc-exp-month" name="expmonth" type="text" autocomplete="cc-exp-month"></label>
+    <label>Expiry year
+      <input id="cc-exp-year" name="expyear" type="text" autocomplete="cc-exp-year"></label>
+    <label>Name on card
+      <input id="cc-name" name="cardholder" type="text" autocomplete="cc-name"></label>
+  </fieldset>
+</form>
+
 <script>
   // A formatting control: it rewrites its own value on every `input`, which is
   // what a card-number mask, a phone mask and a length-capped field all do.
@@ -90,11 +118,36 @@
     });
   })();
 
+  // CASE 3's hostile arm, off by default so the plain load stays the
+  // well-behaved control. Both halves are ordinary payment-form behaviour:
+  //   · the number field inserts its own separators, so what it HOLDS is
+  //     longer than what was written — the `mismatched` bucket;
+  //   · the security code has no box on this page at all, while the vault
+  //     entry has one — the `absent` bucket.
+  if (location.search.indexOf('card=hostile') >= 0) {
+    document.getElementById('cc-number').addEventListener('input', function () {
+      const digits = this.value.replace(/\s+/g, '');
+      const grouped = digits.replace(/(.{4})(?=.)/g, '$1 ');
+      if (grouped !== this.value) this.value = grouped;
+    });
+    const csc = document.getElementById('cc-csc');
+    csc.parentNode.parentNode.removeChild(csc.parentNode);
+  }
+
   // A secret-free readback for the harness's own use: lengths only, so a proof
   // transcript can be pasted into a bug entry without carrying a value.
+  //
+  // ⛔ EXCEPT FOR THE CARD FIELDS, WHERE A LENGTH IS ITSELF A DISCLOSURE. 15
+  // digits and 16 digits name different card networks, and a transcript that
+  // records "the PAN this vault entry holds is 15 long" has narrowed it for
+  // whoever reads that transcript later. A card field reports only whether it
+  // is holding anything.
   window.harnessLengths = function () {
-    return Array.from(document.querySelectorAll('input')).map((el) => ({
-      id: el.id, length: el.value.length,
-    }));
+    const card = document.getElementById('card-form');
+    return Array.from(document.querySelectorAll('input')).map((el) => (
+      card && card.contains(el)
+        ? { id: el.id, filled: el.value.length > 0 }
+        : { id: el.id, length: el.value.length }
+    ));
   };
 </script>

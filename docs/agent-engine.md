@@ -311,15 +311,51 @@ POST /input {page_id, events: [
   | 400 {ok:false, error}                         # the BATCH is malformed
   | 409 {ok:false, error, dispatched, failed_at, resolved}   # the PAGE refused
 POST /fill  {page_id, entry, user?}               # vault autofill — SHIPPED 2026-08-02
-  → {ok, entry, filled: "filled"|"user-only"|"no-fields"}
+  → {ok, entry, filled: "filled"|"user-only"|"no-fields"|"unverified",
+     fields: [{field, target, present, ok, want, got}…], confirm, secret_field_count}
   | 502 {error: "vault: …"}                       # the VAULT refused (locked, no item)
     `user` disambiguates when one item name holds several logins.
     The reply names FIELDS, never a value: the secret comes off the host's
     vault agent, goes straight into the eval script, and is dropped.
+    ⛔ `unverified` is the word that matters, added 2026-08-07: the other
+    three describe what the script SET OUT to do, and only `fields`' readback
+    (a LENGTH, never a value) separates a fill that landed from one the page
+    truncated, reformatted or re-rendered away. All four used to answer
+    `filled`.
     ⚠ This line described a route that did not exist for months, and the
     gap was only found when a run needed it and had to put the payload in a
     0600 file instead. A documented verb with no implementation is worse
     than an undocumented one: it is read as a capability and planned around.
+POST /fill-card {page_id, item, user?}            # card autofill — SHIPPED 2026-08-08
+  → {ok, item, host, kept, filled: [label…], mismatched: [label…],
+     absent: [label…], no_value: [label…]}
+  | 502 {error: "vault: …"}                       # the VAULT refused (locked, no item)
+    Types a stored card into the page's payment form: cc-number, cc-csc,
+    cc-exp-month, cc-exp-year, cc-name. `kept` is the pane's one-line summary,
+    so both surfaces report a card fill in the same words.
+    ⛔ FIELD LABELS ONLY — not even a length, which is where this is stricter
+    than `/fill`. For a card the length IS a disclosure: 15 digits and 16
+    digits name different networks. The PAN is read by the host's vault agent,
+    embedded in the eval script, and dropped; no ychrome verb prints one, by
+    construction, because a number in a scrollback or an agent transcript is
+    durable and unlike a password cannot be rotated on demand.
+    The four buckets are four different outcomes and the middle two used to
+    be one silence:
+      filled      — written and read back holding exactly what was written
+      mismatched  — the box is there and is holding something else (an input
+                    mask that regrouped the digits); the fill is NOT done
+      absent      — the vault had it and the FORM has no such box (common:
+                    one MM/YY control instead of two)
+      no_value    — the FORM asked and the vault entry does not carry it.
+                    That card is about to be declined, and the fix is in the
+                    vault, not on the page.
+    ⛔ PROVE IT ON `tests/fixtures/fill-readback-harness.html` (case 3, and
+    `?card=hostile` for the mismatched/absent arms) — NEVER on a gateway. A
+    real card payment is the operator's, per action, every time.
+    ⚠ Why this exists: `server app web fill-card` needs a registered GUI
+    client, and dev has none — so the one class of task with the strongest
+    reason to stay off the operator's laptop was the only class that had to
+    run on it. It cost two runs in 24 h.
 ```
 
 Input dispatch goes through the WPE view backend's event API
