@@ -66,6 +66,21 @@
 //! carry the token per page rather than per run and would not accept `eval` from
 //! the page's own message channel at all. Do not lift this script into
 //! `src/`.
+//!
+//! # Probe 2: is `postMessage` delivery WORLD-SCOPED? (`ychrome engine worlds`)
+//!
+//! Probe 1 settles that we CAN reach into a cross-origin child. It does not
+//! settle what the `frame=` verb may CARRY, which is a security question and
+//! has its own answer — see [`run_worlds`], and `docs/pending-bugs.md` for what
+//! the answer forces the design to be. In one line: **worlds isolate globals,
+//! not event dispatch**, so a `postMessage` bridge is page-observable and
+//! page-forgeable in any world, and the shipped verb must therefore be
+//! read-only with its replies routed to the UI process rather than back across
+//! the page's own message channel.
+//!
+//! ⚠ The two probes share ONE fixture ([`open_fixture`]) on purpose. A second
+//! wiring of the same two origins is a second thing to keep honest, and the one
+//! that drifted would still look green.
 
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -75,7 +90,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use super::api::{dispatch, json_status as json_reply, request};
-use super::gateway::{document, spawn_origin};
+use super::gateway::{Hits, document, spawn_origin};
 
 /// The profile every page in this proof opens under. Its own, so the run
 /// touches no jar an agent or the user is using.
@@ -88,6 +103,18 @@ const BRIDGE_STEM: &str = "ychrome-frame-bridge-probe";
 /// The stem of the MUTATION CONTROL: the same world, the same match, and no
 /// `@all-frames`. Without this, step 2 proves only "a userscript ran somewhere".
 const TOPONLY_STEM: &str = "ychrome-frame-toponly-probe";
+
+/// The two instantiations of [`WORLD_PROBE_TEMPLATE`] — see [`run_worlds`].
+/// Their stems carry the label, because the label is also the attribute prefix
+/// each one writes, and a mismatch between the two would read as silence.
+const WORLD_ISO_STEM: &str = "ychrome-world-iso-probe";
+const WORLD_MAIN_STEM: &str = "ychrome-world-main-probe";
+
+/// The label each world probe stamps on everything it writes. One constant per
+/// script, used for the stem, the `@world` instantiation and the `data-` prefix
+/// at once, so the three can never drift apart.
+const ISO_LABEL: &str = "iso";
+const MAIN_LABEL: &str = "main";
 
 /// How long a bridge round trip may take.
 const CALL_TIMEOUT_MS: u64 = 6000;
@@ -212,7 +239,74 @@ Object.defineProperty(window, "__ychromeTopOnly", {
 });
 "#;
 
-/// Both probe scripts, removed on EVERY exit path including a panic.
+/// ⭐ The world-delivery probe, instantiated TWICE from this ONE template — once
+/// in the isolated world and once in the main world.
+///
+/// `{WORLD}` and `{LABEL}` are the only substitutions besides the run token, so
+/// any difference in what the two copies record is a difference the **world**
+/// made and nothing else. That is what makes this a measurement rather than two
+/// scripts that happen to disagree.
+///
+/// The instrument turns on one asymmetry: **worlds do not share globals, but
+/// they do share the DOM.** So each copy records what it heard into a `data-`
+/// attribute on `documentElement`, where the other world — and `/engine/eval`,
+/// which runs in the main world — can read it out. A global would be invisible
+/// from outside its own world, which is exactly the thing being measured and
+/// therefore cannot be the thing doing the measuring.
+///
+/// Posting happens at `load`. The top document reaches `load` only after every
+/// subframe has loaded, so the child's `document-start` listeners are already
+/// installed when a message is sent — which is what makes a *silence* measured
+/// afterwards a real silence rather than a race.
+const WORLD_PROBE_TEMPLATE: &str = r#"// ==UserScript==
+// @name         ychrome-world-{LABEL}-probe
+// @version      1.0.0
+// @match        *://*/*
+// @all-frames   true
+// @world        {WORLD}
+// @run-at       document-start
+// ==/UserScript==
+(() => {
+  const LABEL = "{LABEL}";
+  const TOKEN = "{TOKEN}";
+  const mark = (kind, value) => {
+    try {
+      document.documentElement.setAttribute(
+        "data-ychrome-" + LABEL + "-" + kind, value);
+    } catch (ignored) {}
+  };
+  const heard = [];
+  Object.defineProperty(window, "__ychromeWorld_" + LABEL, {
+    value: 1, enumerable: false, configurable: true, writable: false
+  });
+  window.addEventListener("message", (event) => {
+    const data = event.data;
+    if (!data || typeof data !== "object" || data.worldProbe !== TOKEN) { return; }
+    heard.push(data.from);
+    mark("heard", JSON.stringify(heard));
+  });
+  mark("ran", window.top === window ? "top" : "child");
+  if (window.top !== window) { return; }
+  window.addEventListener("load", () => {
+    try {
+      window.postMessage(
+        { worldProbe: TOKEN, from: LABEL + "-self" }, location.origin);
+    } catch (ignored) {}
+    const frame = document.getElementById("pay");
+    if (frame && frame.contentWindow) {
+      try {
+        frame.contentWindow.postMessage(
+          { worldProbe: TOKEN, from: LABEL + "-into-child" },
+          new URL(frame.getAttribute("src"), location.href).origin);
+      } catch (ignored) {}
+    }
+    mark("posted", "1");
+  });
+})();
+"#;
+
+/// Every probe script this module can install, removed on EVERY exit path
+/// including a panic.
 ///
 /// `webpolicy::install_userscript` writes into the shared userscript directory,
 /// which is the user's real one when `HOME` is real. parity.rs sets the
@@ -223,8 +317,12 @@ struct InstalledProbe;
 
 impl Drop for InstalledProbe {
     fn drop(&mut self) {
-        let _ = crate::webpolicy::delete_userscript(BRIDGE_STEM);
-        let _ = crate::webpolicy::delete_userscript(TOPONLY_STEM);
+        // Every stem, not only the ones this run installed: a stem left behind
+        // by a killed run is exactly the thing the guard exists to clear, and
+        // deleting one that was never installed is a no-op error we discard.
+        for stem in [BRIDGE_STEM, TOPONLY_STEM, WORLD_ISO_STEM, WORLD_MAIN_STEM] {
+            let _ = crate::webpolicy::delete_userscript(stem);
+        }
     }
 }
 
@@ -277,6 +375,74 @@ fn bank_page() -> String {
          <p><input id=\"otp\" style=\"width:240px;height:34px;font:16px monospace\"></p>\
          <p><button id=\"pay\" style=\"width:120px;height:36px\">Pay</button></p>",
     )
+}
+
+/// The two origins, serving, with the merchant page already open.
+///
+/// ONE copy, because both proofs in this module drive the same two documents
+/// and the geometry is load-bearing in the first of them (the decoy band, the
+/// `border:0`). A second wiring of the same fixture is a second thing to keep
+/// honest, and the one that drifted would still look green.
+struct Fixture {
+    page: String,
+    merchant_base: String,
+    bank_base: String,
+    merchant_hits: Hits,
+    bank_hits: Hits,
+}
+
+fn open_fixture() -> Result<Fixture> {
+    let merchant_listener = TcpListener::bind("127.0.0.1:0")?;
+    let bank_listener = TcpListener::bind("127.0.0.1:0")?;
+    let merchant_base = format!(
+        "http://127.0.0.1:{}",
+        merchant_listener.local_addr()?.port()
+    );
+    let bank_base = format!("http://127.0.0.1:{}", bank_listener.local_addr()?.port());
+
+    let bank_for_merchant = bank_base.clone();
+    let (_, merchant_hits) = spawn_origin(
+        merchant_listener,
+        Arc::new(move |_method: &str, path: &str| {
+            if path == "/" || path.starts_with("/pay") {
+                (200u16, Vec::new(), merchant_page(&bank_for_merchant))
+            } else {
+                (404u16, Vec::new(), "no such merchant route".to_string())
+            }
+        }),
+    )?;
+    let (_, bank_hits) = spawn_origin(
+        bank_listener,
+        Arc::new(|_method: &str, path: &str| {
+            if path.starts_with("/bank") {
+                (200u16, Vec::new(), bank_page())
+            } else {
+                (404u16, Vec::new(), "no such bank route".to_string())
+            }
+        }),
+    )?;
+
+    crate::daemon::journal(
+        "engine.frames.start",
+        json!({ "merchant": merchant_base, "bank": bank_base }),
+    );
+
+    let (status, body) = call(
+        "open",
+        json!({ "url": format!("{merchant_base}/pay"), "profile": PROFILE }),
+    );
+    let page = body["page_id"].as_str().unwrap_or_default().to_string();
+    if status != 200 || page.is_empty() {
+        anyhow::bail!("the frames fixture would not open: {status} {body}");
+    }
+
+    Ok(Fixture {
+        page,
+        merchant_base,
+        bank_base,
+        merchant_hits,
+        bank_hits,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -370,52 +536,18 @@ pub fn run() -> Result<Value> {
     crate::webpolicy::install_userscript(TOPONLY_STEM, TOPONLY_SCRIPT)
         .context("installing the top-frame-only control userscript")?;
 
-    let merchant_listener = TcpListener::bind("127.0.0.1:0")?;
-    let bank_listener = TcpListener::bind("127.0.0.1:0")?;
-    let merchant_base = format!(
-        "http://127.0.0.1:{}",
-        merchant_listener.local_addr()?.port()
-    );
-    let bank_base = format!("http://127.0.0.1:{}", bank_listener.local_addr()?.port());
-
-    let bank_for_merchant = bank_base.clone();
-    let (_, merchant_hits) = spawn_origin(
-        merchant_listener,
-        Arc::new(move |_method: &str, path: &str| {
-            if path == "/" || path.starts_with("/pay") {
-                (200u16, Vec::new(), merchant_page(&bank_for_merchant))
-            } else {
-                (404u16, Vec::new(), "no such merchant route".to_string())
-            }
-        }),
-    )?;
-    let (_, bank_hits) = spawn_origin(
-        bank_listener,
-        Arc::new(|_method: &str, path: &str| {
-            if path.starts_with("/bank") {
-                (200u16, Vec::new(), bank_page())
-            } else {
-                (404u16, Vec::new(), "no such bank route".to_string())
-            }
-        }),
-    )?;
-
-    crate::daemon::journal(
-        "engine.frames.start",
-        json!({ "merchant": merchant_base, "bank": bank_base }),
-    );
+    let fixture = open_fixture()?;
+    let Fixture {
+        page,
+        merchant_base,
+        bank_base,
+        merchant_hits,
+        bank_hits,
+    } = &fixture;
+    let page = page.clone();
 
     let mut steps: Vec<Step> = Vec::new();
     let mut seq: u64 = 0;
-
-    let (status, body) = call(
-        "open",
-        json!({ "url": format!("{merchant_base}/pay"), "profile": PROFILE }),
-    );
-    let page = body["page_id"].as_str().unwrap_or_default().to_string();
-    if status != 200 || page.is_empty() {
-        anyhow::bail!("the frames fixture would not open: {status} {body}");
-    }
 
     // The child announcing itself is the only evidence a document really
     // arrived in the frame AND that our code is inside it. An iframe element
@@ -618,6 +750,242 @@ pub fn run() -> Result<Value> {
     Ok(report)
 }
 
+// ---------------------------------------------------------------------------
+// Probe 2: is `postMessage` delivery WORLD-SCOPED? (`ychrome engine worlds`)
+// ---------------------------------------------------------------------------
+//
+// The frames proof above settled that we CAN reach into a cross-origin child.
+// This one settles what the `frame=` verb is ALLOWED to carry, which is a
+// different question and has a security answer rather than a capability one:
+//
+// > Does a `message` event posted between frames reach listeners in an ISOLATED
+// > world, and can the page's own MAIN world observe the same event?
+//
+// Worlds isolate *globals*; they are not documented to isolate *event
+// dispatch*, and in Chromium `postMessage` is explicitly not world-scoped —
+// which is why extension content scripts need a separate messaging API. If
+// WebKitGTK agrees, then a bridge in the engine's isolated world is still
+// speaking on a channel the page can hear and forge, and:
+//
+// - a token in the script body is NOT a secret, because whichever document
+//   receives our message reads the token straight out of it; and
+// - a bridge that evaluates a page-supplied string is a cross-origin
+//   escalation WE would be providing — a hostile top page could make our code
+//   run inside the bank's frame.
+//
+// ⇒ the verb must then expose a CLOSED set (resolve a selector to text / value
+// / rect, set a value, focus) and no `eval` path at all.
+
+/// One instantiation of [`WORLD_PROBE_TEMPLATE`].
+fn world_probe(label: &str, world: &str, token: &str) -> String {
+    WORLD_PROBE_TEMPLATE
+        .replace("{LABEL}", label)
+        .replace("{WORLD}", world)
+        .replace("{TOKEN}", token)
+}
+
+/// The `from` tags a recorder heard, decoded from the attribute text it wrote.
+///
+/// Takes the attribute's own text (a JSON array), NOT the wire wrapper — the
+/// caller unwraps the child's `JSON.stringify` first, because a value that came
+/// back through the bridge is encoded once more than one read locally.
+fn heard_tags(attribute_text: &Value) -> Vec<String> {
+    attribute_text
+        .as_str()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .as_ref()
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The value a bridge reply carries, unwrapped from the child's
+/// `JSON.stringify`.
+fn child_value(reply: &Value) -> Value {
+    reply["json"]
+        .as_str()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or(Value::Null)
+}
+
+/// Read a probe's `data-` attribute out of the TOP document. `/engine/eval`
+/// runs in the main world, and the DOM is shared, so this reaches the isolated
+/// probe's marker as readily as the main one's.
+fn top_attr(page: &str, label: &str, kind: &str) -> Value {
+    read(
+        page,
+        &format!("document.documentElement.getAttribute('data-ychrome-{label}-{kind}')"),
+    )
+}
+
+/// The same attribute, read from INSIDE the cross-origin child through the
+/// bridge proved by [`run`]. The top document cannot read the child's DOM —
+/// that is step 1 of the other proof — so this is the only way to see what the
+/// child's two recorders heard.
+fn child_attr(page: &str, seq: &mut u64, label: &str, kind: &str) -> Value {
+    *seq += 1;
+    let reply = frame_call(
+        page,
+        *seq,
+        0,
+        &format!("document.documentElement.getAttribute('data-ychrome-{label}-{kind}')"),
+    );
+    child_value(&reply)
+}
+
+pub fn run_worlds() -> Result<Value> {
+    let started = Instant::now();
+    let token = run_token();
+
+    let _guard = InstalledProbe;
+    // The bridge is the READ INSTRUMENT here, not the thing under test: the
+    // child's markers live in the child's DOM, which the top document cannot
+    // read. It is main-world on purpose — a bridge in the isolated world would
+    // be unreadable by `/engine/eval` for precisely the reason being measured,
+    // so the instrument would inherit the unknown it exists to resolve.
+    crate::webpolicy::install_userscript(BRIDGE_STEM, &BRIDGE_TEMPLATE.replace("{TOKEN}", &token))
+        .context("installing the frame-bridge read instrument")?;
+    crate::webpolicy::install_userscript(
+        WORLD_ISO_STEM,
+        &world_probe(ISO_LABEL, "isolated", &token),
+    )
+    .context("installing the isolated-world probe userscript")?;
+    crate::webpolicy::install_userscript(
+        WORLD_MAIN_STEM,
+        &world_probe(MAIN_LABEL, "main", &token),
+    )
+    .context("installing the main-world probe userscript")?;
+
+    let fixture = open_fixture()?;
+    let page = fixture.page.clone();
+
+    let mut steps: Vec<Step> = Vec::new();
+    let mut seq: u64 = 0;
+
+    // Both probes post at `load` and stamp `posted`; the bridge's child half
+    // announces itself. Waiting on all three is what makes a silence below a
+    // measurement rather than a race.
+    let _ = dispatch(&request(
+        "wait",
+        json!({
+            "page_id": page,
+            "until": { "js": format!(
+                "window.__ychromeFrames && window.__ychromeFrames.length > 0 && \
+                 document.documentElement.getAttribute('data-ychrome-{ISO_LABEL}-posted') === '1' && \
+                 document.documentElement.getAttribute('data-ychrome-{MAIN_LABEL}-posted') === '1'") },
+            "timeout_ms": CALL_TIMEOUT_MS,
+        }),
+    ));
+    // Delivery of a `message` is a task, not a synchronous call, so a settle is
+    // owed after the posts land — and a silence is only honest once it has had
+    // the same chance to speak that a heard event had.
+    std::thread::sleep(Duration::from_millis(1200));
+
+    // ---- W1. the two worlds really ARE separate ---------------------------
+    // Without this, every reading below could be one world talking to itself.
+    // `/engine/eval` runs in the main world, so the main probe's global must be
+    // visible to it and the isolated probe's must not.
+    let main_global = read(&page, &format!("typeof window.__ychromeWorld_{MAIN_LABEL}"));
+    let iso_global = read(&page, &format!("typeof window.__ychromeWorld_{ISO_LABEL}"));
+    let worlds_separate = main_global == json!("number") && iso_global == json!("undefined");
+    steps.push(Step {
+        name: "the two probes really are in DIFFERENT worlds: globals do not cross",
+        pass: worlds_separate,
+        detail: json!({ "main_world_global_from_eval": main_global,
+                        "isolated_world_global_from_eval": iso_global }),
+    });
+
+    // ---- W2. both probes ran, in both frames ------------------------------
+    let iso_ran_top = top_attr(&page, ISO_LABEL, "ran");
+    let main_ran_top = top_attr(&page, MAIN_LABEL, "ran");
+    let iso_ran_child = child_attr(&page, &mut seq, ISO_LABEL, "ran");
+    let main_ran_child = child_attr(&page, &mut seq, MAIN_LABEL, "ran");
+    let both_present = iso_ran_top == json!("top")
+        && main_ran_top == json!("top")
+        && iso_ran_child == json!("child")
+        && main_ran_child == json!("child");
+    steps.push(Step {
+        name: "both probes ran in BOTH frames, so a silence below is a silence and not an absence",
+        pass: both_present,
+        detail: json!({ "iso": { "top": iso_ran_top, "child": iso_ran_child },
+                        "main": { "top": main_ran_top, "child": main_ran_child } }),
+    });
+
+    // ---- W3. the instrument can hear anything at all ----------------------
+    // The main probe posted to its own window and to the child. If its own
+    // main-world listeners heard neither, nothing below distinguishes "worlds
+    // are partitioned" from "this fixture never delivered a message".
+    let main_heard_top = heard_tags(&top_attr(&page, MAIN_LABEL, "heard"));
+    let main_heard_child = heard_tags(&child_attr(&page, &mut seq, MAIN_LABEL, "heard"));
+    let instrument_live = main_heard_top.iter().any(|tag| tag == "main-self")
+        && main_heard_child.iter().any(|tag| tag == "main-into-child");
+    steps.push(Step {
+        name: "CONTROL: a message DOES arrive — same-world, same-document AND cross-frame",
+        pass: instrument_live,
+        detail: json!({ "top_main_heard": main_heard_top, "child_main_heard": main_heard_child }),
+    });
+
+    // ---- W4. the answer -----------------------------------------------------
+    let iso_heard_top = heard_tags(&top_attr(&page, ISO_LABEL, "heard"));
+    let iso_heard_child = heard_tags(&child_attr(&page, &mut seq, ISO_LABEL, "heard"));
+
+    // Can our own bridge work at all from the isolated world?
+    let isolated_receives_cross_frame = iso_heard_child.iter().any(|tag| tag == "iso-into-child");
+    // ⛔ Can the PAGE hear what we send it? This is the one that decides the verb.
+    let main_observes_our_post = main_heard_child.iter().any(|tag| tag == "iso-into-child")
+        || main_heard_top.iter().any(|tag| tag == "iso-self");
+    // ⛔ Can the PAGE drive our bridge? The forgery half of the same coin.
+    let isolated_hears_page_post = iso_heard_child.iter().any(|tag| tag == "main-into-child")
+        || iso_heard_top.iter().any(|tag| tag == "main-self");
+
+    let world_scoped = !main_observes_our_post && !isolated_hears_page_post;
+    let verb_shape = if world_scoped && isolated_receives_cross_frame {
+        "eval-permitted: delivery is world-partitioned, so a per-page token is a real secret"
+    } else {
+        "closed-verb-set: postMessage is page-observable and page-forgeable, so no eval path"
+    };
+    steps.push(Step {
+        name: "MEASURED: whether `message` delivery is world-scoped (reported, not asserted)",
+        pass: true,
+        detail: json!({
+            "isolated_world_receives_cross_frame": isolated_receives_cross_frame,
+            "page_main_world_observes_our_post": main_observes_our_post,
+            "isolated_world_hears_a_page_post": isolated_hears_page_post,
+            "top_iso_heard": iso_heard_top,
+            "child_iso_heard": iso_heard_child,
+        }),
+    });
+
+    let _ = dispatch(&request("close", json!({ "page_id": page })));
+
+    // ⭐ The gate asserts the INSTRUMENT, never the answer. Both answers are
+    // real findings; a fixture that stopped delivering messages is not.
+    let pass = steps.iter().all(|step| step.pass);
+    for step in &steps {
+        crate::daemon::journal("engine.worlds.step", step.to_json());
+    }
+    let report = json!({
+        "pass": pass,
+        "question": "does a `message` posted between frames reach an ISOLATED-world \
+                     listener, and can the page's own main world observe it?",
+        "postmessage_delivery_is_world_scoped": world_scoped,
+        "isolated_world_receives_cross_frame": isolated_receives_cross_frame,
+        "page_main_world_observes_our_post": main_observes_our_post,
+        "isolated_world_hears_a_page_post": isolated_hears_page_post,
+        "verb_shape": verb_shape,
+        "merchant": fixture.merchant_base,
+        "bank": fixture.bank_base,
+        "steps": steps.iter().map(Step::to_json).collect::<Vec<_>>(),
+        "elapsed_ms": started.elapsed().as_millis(),
+    });
+    crate::daemon::journal("engine.worlds.report", report.clone());
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,5 +1052,83 @@ mod tests {
     #[test]
     fn a_run_token_is_not_a_constant() {
         assert_ne!(run_token(), run_token());
+    }
+
+    /// ⭐ The world probe's whole claim is "same script, different world". If
+    /// the two instantiations differ anywhere else, a difference in what they
+    /// hear is not attributable to the world and the measurement is void.
+    #[test]
+    fn the_two_world_probes_differ_in_exactly_the_world() {
+        let iso = crate::userscript::parse(&world_probe(ISO_LABEL, "isolated", "t"));
+        let main = crate::userscript::parse(&world_probe(MAIN_LABEL, "main", "t"));
+        assert_eq!(iso.world, crate::userscript::ScriptWorld::Isolated);
+        assert_eq!(main.world, crate::userscript::ScriptWorld::Main);
+        assert_eq!(iso.matches, main.matches, "same @match, or it is not a pair");
+        assert!(
+            iso.all_frames && main.all_frames,
+            "both must reach the child, or only one of them could ever hear a cross-frame post"
+        );
+        // Under ONE neutral label, the two bodies must differ in the `@world`
+        // value and nowhere else. The real labels cannot be used for this
+        // comparison — `ISO_LABEL` is a substring of `isolated`, so replacing
+        // it would rewrite the very line under test.
+        let with_world = |world: &str| {
+            WORLD_PROBE_TEMPLATE
+                .replace("{LABEL}", "L")
+                .replace("{TOKEN}", "t")
+                .replace("{WORLD}", world)
+        };
+        assert_eq!(
+            with_world("isolated").replace("isolated", "W"),
+            with_world("main").replace("main", "W"),
+            "the two probes must differ in the @world value and nothing else"
+        );
+        // And the world must be substituted in exactly one place, or "the same
+        // script in two worlds" is a claim about more than one line.
+        assert_eq!(WORLD_PROBE_TEMPLATE.matches("{WORLD}").count(), 1);
+    }
+
+    /// The recorder must write to the DOM, which both worlds share. A global
+    /// would be invisible from outside its own world — which is the very thing
+    /// under measurement, so it cannot also be the measuring instrument.
+    #[test]
+    fn a_world_probe_records_into_the_shared_dom_not_a_global() {
+        let body = world_probe(ISO_LABEL, "isolated", "t");
+        assert!(
+            body.contains("document.documentElement.setAttribute"),
+            "the recorder must land in the DOM"
+        );
+        assert!(
+            body.contains("data-ychrome-\" + LABEL + \"-\" + kind"),
+            "the marker must carry the probe's own label, or the two probes collide"
+        );
+    }
+
+    /// The stem, the label and the attribute prefix are one identity. If a stem
+    /// stopped naming its label, the run would install fine, record fine, and
+    /// be read back under a name nothing ever wrote.
+    #[test]
+    fn each_world_probe_stem_names_its_own_label() {
+        assert!(WORLD_ISO_STEM.contains(ISO_LABEL));
+        assert!(WORLD_MAIN_STEM.contains(MAIN_LABEL));
+        assert_ne!(ISO_LABEL, MAIN_LABEL);
+    }
+
+    /// The guard must clear every stem this module can install. A leftover
+    /// `@all-frames` script with an `eval` in it is the one artefact here that
+    /// must never outlive the run.
+    #[test]
+    fn the_guard_clears_every_stem_this_module_installs() {
+        let source = include_str!("frames.rs");
+        let guard = source
+            .split("impl Drop for InstalledProbe")
+            .nth(1)
+            .expect("the guard must exist");
+        for stem in ["BRIDGE_STEM", "TOPONLY_STEM", "WORLD_ISO_STEM", "WORLD_MAIN_STEM"] {
+            assert!(
+                guard[..guard.find("\n}").unwrap_or(guard.len())].contains(stem),
+                "{stem} is installed by this module but not removed by the guard"
+            );
+        }
     }
 }

@@ -369,16 +369,43 @@ pub fn run_verb(sub: Option<&str>, as_json: bool) -> Result<()> {
             }
             Ok(())
         }
+        Some("worlds") => {
+            let report = frames::run_worlds()?;
+            if as_json {
+                println!("{report}");
+            } else {
+                println!(
+                    "postMessage delivery is world-scoped: {}",
+                    report["postmessage_delivery_is_world_scoped"],
+                );
+                for step in report["steps"].as_array().into_iter().flatten() {
+                    println!(
+                        "  {} {}",
+                        if step["pass"].as_bool() == Some(true) {
+                            "PASS"
+                        } else {
+                            "FAIL"
+                        },
+                        step["step"].as_str().unwrap_or(""),
+                    );
+                }
+                println!("  verb shape: {}", report["verb_shape"].as_str().unwrap_or(""));
+            }
+            if report["pass"].as_bool() != Some(true) {
+                bail!("the world-delivery INSTRUMENT failed — the answer above is not measured");
+            }
+            Ok(())
+        }
         Some(other) => {
             bail!(
-                "unknown engine verb {other:?} \
-                 (known: probe, gate, flow, hit, gateway, embed, frames, bench, govern, parity)"
+                "unknown engine verb {other:?} (known: probe, gate, flow, hit, \
+                 gateway, embed, frames, worlds, bench, govern, parity)"
             )
         }
         None => {
             bail!(
                 "usage: ychrome engine \
-                 <probe|gate|flow|hit|gateway|embed|frames|bench|govern|parity> [--json]"
+                 <probe|gate|flow|hit|gateway|embed|frames|worlds|bench|govern|parity> [--json]"
             )
         }
     }
