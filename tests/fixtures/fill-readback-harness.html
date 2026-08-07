@@ -1,0 +1,100 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>fill + input readback harness</title>
+<!--
+  The two falsifiers named in `docs/pending-bugs.md` § THE FILL AND INPUT VERBS
+  REPORTED THE REQUEST, NOT THE EFFECT, reproduced on a page that cannot be
+  reached from the network.
+
+  1. `#truncating` clamps itself to eight characters from its own `input`
+     handler, which is what a formatting control does. Before the readback
+     landed, a fill into this field answered `filled:"filled"` — the assignment
+     returned, and the assignment was the whole verdict. It must now answer
+     `unverified` with a `fields[]` entry whose `got` is less than its `want`.
+
+     ⛔ **`maxlength` alone does NOT do this, and believing it did cost a
+     measurement.** The attribute constrains what a USER can type; a
+     programmatic `el.value = …` is not user input and sails straight past it.
+     Measured here 2026-08-08: a 20-character secret into `maxlength=8` read
+     back as **20**. `#maxlength-control` is kept in the page as exactly that —
+     a control that proves the attribute is not a mechanism — so nobody
+     rediscovers it by writing this fixture again.
+
+  2. `#rerender` tears its own form down and rebuilds it on the first `input`
+     event, which is what a framework re-render does to a batch: the events
+     after it resolve against nodes that no longer exist, focus falls back to
+     <body>, and the text is discarded. The batch used to answer
+     `dispatched:N, ok:true`.
+
+  ⚠ Every value here is INVENTED. A fixture is published source, and an example
+  copied from the operator's life is a leak that ships (see
+  `feedback-never-write-a-real-example-into-a-public-repo`).
+-->
+<style>
+  body { font: 14px/1.6 system-ui, sans-serif; margin: 2rem; max-width: 40rem; }
+  fieldset { margin-bottom: 1.5rem; }
+  label { display: block; margin: .4rem 0; }
+  input { font: inherit; padding: .3rem; width: 18rem; }
+</style>
+
+<h1>fill + input readback harness</h1>
+
+<!-- CASE 1: a login form whose secret field truncates, with a NAMED confirm
+     twin beside it. The twin is what the field report found empty. -->
+<form id="truncating-form">
+  <fieldset>
+    <legend>1 — the field keeps less than it was given</legend>
+    <label>User <input id="user" name="username" type="text" autocomplete="username"></label>
+    <label>Secret <input id="truncating" name="password" type="password"></label>
+    <label>Confirm <input id="twin" name="confirm-password" type="password"></label>
+    <label>maxlength control
+      <input id="maxlength-control" name="ml" type="text" maxlength="8"></label>
+  </fieldset>
+</form>
+
+<!-- CASE 2: the form rebuilds itself the moment anything is typed into it. -->
+<form id="rerender-form">
+  <fieldset>
+    <legend>2 — the form re-renders under the batch</legend>
+    <label>Search <input id="rerender" name="q" type="text"></label>
+    <label>Second <input id="second" name="q2" type="text"></label>
+  </fieldset>
+</form>
+
+<script>
+  // A formatting control: it rewrites its own value on every `input`, which is
+  // what a card-number mask, a phone mask and a length-capped field all do.
+  // `ychromeSet` dispatches `input` after assigning, so this runs synchronously
+  // inside the fill and the readback sees the clamped value — the honest
+  // reproduction of "the page kept less than it was given".
+  document.getElementById('truncating').addEventListener('input', function () {
+    if (this.value.length > 8) this.value = this.value.slice(0, 8);
+  });
+
+  // One `input` event is enough: replace the fieldset with a fresh copy, which
+  // discards the live nodes exactly the way a re-render does. The replacement
+  // deliberately keeps the same ids, so a selector still resolves — the node it
+  // resolves to is simply not the one that had the focus.
+  (function () {
+    const form = document.getElementById('rerender-form');
+    let rebuilt = false;
+    form.addEventListener('input', function () {
+      if (rebuilt) return;
+      rebuilt = true;
+      const fresh = form.querySelector('fieldset').cloneNode(true);
+      fresh.querySelectorAll('input').forEach((el) => { el.value = ''; });
+      form.replaceChild(fresh, form.querySelector('fieldset'));
+      if (document.activeElement && document.activeElement.blur) {
+        document.activeElement.blur();
+      }
+    });
+  })();
+
+  // A secret-free readback for the harness's own use: lengths only, so a proof
+  // transcript can be pasted into a bug entry without carrying a value.
+  window.harnessLengths = function () {
+    return Array.from(document.querySelectorAll('input')).map((el) => ({
+      id: el.id, length: el.value.length,
+    }));
+  };
+</script>
