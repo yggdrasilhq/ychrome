@@ -492,6 +492,18 @@ struct EditDraft {
     /// one costs a probe at load time — the `notes` op, whose value is dropped
     /// and only its success kept.
     has_notes: bool,
+    /// The item is a card, so the form shows the four boxes its content
+    /// actually lives in. Read off the listing's `item_type`, the same field
+    /// the View pane and the fill button read.
+    is_card: bool,
+    /// A number is stored. Derived from `last4`, which the secret-free `card`
+    /// op already answers — asking `card-secret` would release a PAN and write
+    /// an audit line just to fill in a boolean on a form load.
+    ///
+    /// ⚠ There is deliberately no `has_card_code` twin: nothing secret-free
+    /// knows it, and inventing one would mean a release per form load. The CVV
+    /// box says what it does instead of implying what is behind it.
+    has_card_number: bool,
     /// A custom field to set, name here and value on the action only.
     field_name: String,
     field_hidden: bool,
@@ -530,6 +542,13 @@ struct EditFields {
     /// One uri per line — the pane's spelling of the CLI's repeated `--uri`.
     uris: String,
     folder: String,
+    /// A card's secret-free content, loaded so the form can show what is stored
+    /// and diffed like every other field — an unchanged box must not re-encrypt
+    /// and move `revisionDate` for nothing.
+    card_brand: String,
+    card_holder: String,
+    card_exp_month: String,
+    card_exp_year: String,
 }
 
 /// How long a vault's copy may go unrefreshed before the pane says so, and
@@ -2530,6 +2549,23 @@ fn view_value_row(
     })
 }
 
+/// One row of a card's secret-free metadata.
+///
+/// The same `list-row` the credential rows use, minus the eye and the copy
+/// verb — deliberately, and not as an omission to fix later. Those two ride on
+/// [`StoredField`], whose whole job is naming a value the vault will hand back
+/// on demand; a brand and an expiry are already on screen, and a PAN is the one
+/// value this client will not fetch for either affordance. A row that offered
+/// an eye it could never satisfy would be the widget lying about the boundary.
+fn view_card_row(key: &str, title: &str, value: &str) -> Value {
+    json!({
+        "kind": "list-row",
+        "id": format!("card:{key}"),
+        "title": title,
+        "subtitle": value,
+    })
+}
+
 /// What a masked value looks like at rest. A COUNT-FREE run of dots: a mask
 /// whose length matched the secret would leak the secret's length to anyone
 /// looking over a shoulder, and every other client draws a fixed run too.
@@ -2616,6 +2652,67 @@ fn view_tab_widgets(draft: &ViewDraft, reveal: Option<&Reveal>) -> Vec<Value> {
         }));
     }
 
+    // WHAT THE CARD IS. Brand, cardholder, expiry, last four — the five facts
+    // `ychrome-vault card` has always printed, from the same reader.
+    //
+    // ⛔ THIS SECTION EXISTS BECAUSE ITS ABSENCE WITHHELD THE ONE FIELD THAT
+    // PREVENTS CHARGING THE WRONG PERSON. The pane used to say only "this is a
+    // card, its number reaches a page through the fill button" and then fall
+    // through to Autofill / Notes / History — so a card rendered as an entry
+    // with no content, which is exactly how the operator described it. Two
+    // cards from one issuer with the same product name are told apart by last4
+    // and by nothing else on the row.
+    //
+    // ⚖ And none of it is a secrets question, which is what made it a bug
+    // rather than a boundary: the agent's own `card` op classifies these five
+    // as safe and refuses the PAN and the CVV, so the pane was being stricter
+    // than the vault about data the vault already publishes.
+    if is_card {
+        widgets.push(json!({"kind": "section", "text": "Card", "card": true}));
+        let card = &detail["card"];
+        let card_text = |key: &str| card[key].as_str().unwrap_or_default().to_string();
+        let mut shown = false;
+        for (key, label) in [("brand", "Brand"), ("cardholder", "Name on card")] {
+            let value = card_text(key);
+            if !value.is_empty() {
+                shown = true;
+                widgets.push(view_card_row(key, label, &value));
+            }
+        }
+        // ONE row, because the expiry is one fact. Two rows reading "11" and
+        // "2029" make the reader assemble a date the vault already knows.
+        let (month, year) = (card_text("exp_month"), card_text("exp_year"));
+        if !month.is_empty() || !year.is_empty() {
+            shown = true;
+            let expiry = match (month.as_str(), year.as_str()) {
+                ("", year) => year.to_string(),
+                (month, "") => month.to_string(),
+                (month, year) => format!("{month:0>2}/{year}"),
+            };
+            widgets.push(view_card_row("expiry", "Expires", &expiry));
+        }
+        // Four digits identify a card to its owner and are not the credential —
+        // the same call `Vault::card` makes when it derives them from a PAN it
+        // drops in the same expression.
+        let last4 = card_text("last4");
+        if !last4.is_empty() {
+            shown = true;
+            widgets.push(view_card_row("last4", "Number", &format!("•••• {last4}")));
+        }
+        if !shown {
+            widgets.push(json!({
+                "kind": "label", "muted": true,
+                "text": "This card entry stores no brand, name, expiry or number.",
+            }));
+        }
+        // The old whole-section sentence, demoted to a footer: here it reads as
+        // the explanation it always was, instead of as the entire content.
+        widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": "The full number and the CVV are never shown here — they reach a page only through the card fill button, and no ychrome command prints them.",
+        }));
+    }
+
     // LOGIN CREDENTIALS.
     widgets.push(json!({"kind": "section", "text": "Login credentials", "card": true}));
     let user = text("username");
@@ -2623,7 +2720,7 @@ fn view_tab_widgets(draft: &ViewDraft, reveal: Option<&Reveal>) -> Vec<Value> {
         widgets.push(json!({
             "kind": "label", "muted": true,
             "text": if is_card {
-                "This is a card. Its number and CVV reach a page only through the card fill button — they are never shown here."
+                "This card stores no login."
             } else {
                 "This entry stores no credentials."
             },
@@ -2888,6 +2985,61 @@ fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
             "placeholder": "No folder",
         }),
     ];
+
+    // CARD — the six boxes a card's content actually lives in.
+    //
+    // ⛔ WITHOUT THIS THE READ HALF WOULD HAVE BEEN THE WHOLE FIX, AND THAT IS
+    // WORSE THAN NEITHER. Seeing an expiry you cannot change moves the dead end
+    // one screen later: every card expires, and this client's reason to exist
+    // is not having to open the Bitwarden web vault. The operator hit both
+    // halves in the same minute.
+    if draft.is_card {
+        widgets.push(json!({"kind": "section", "text": "Card", "card": true}));
+        widgets.push(json!({
+            "kind": "text-input", "id": "edit_card_brand", "label": "Brand",
+            "value": draft.current.card_brand,
+            "placeholder": "Visa, Mastercard, …",
+        }));
+        widgets.push(json!({
+            "kind": "text-input", "id": "edit_card_holder", "label": "Name on card",
+            "value": draft.current.card_holder,
+        }));
+        widgets.push(json!({
+            "kind": "text-input", "id": "edit_card_exp_month", "label": "Expiry month",
+            "value": draft.current.card_exp_month,
+            "placeholder": "1-12",
+        }));
+        widgets.push(json!({
+            "kind": "text-input", "id": "edit_card_exp_year", "label": "Expiry year",
+            "value": draft.current.card_exp_year,
+            "placeholder": "four digits, e.g. 2031",
+        }));
+        // ⛔ THE TWO SECRETS GET NO EYE AND NO COPY, unlike the password box
+        // above. Those ride on [`StoredField`], whose contract is "the vault
+        // will hand this back on demand" — and a PAN is the one value this
+        // client will not fetch for a widget. An eye that could never be
+        // satisfied is the form lying about the boundary.
+        widgets.push(json!({
+            "kind": "text-input", "id": "edit_card_number", "label": "Card number",
+            "secret": true, "value": "",
+            "placeholder": if draft.has_card_number {
+                "A number is stored. Leave empty to keep it."
+            } else {
+                "No number stored"
+            },
+        }));
+        widgets.push(json!({
+            "kind": "text-input", "id": "edit_card_code", "label": "Security code",
+            "secret": true, "value": "",
+            // No "a code is stored" twin: nothing secret-free knows that, and
+            // asking would release the card to answer a placeholder.
+            "placeholder": "Leave empty to keep whatever is stored",
+        }));
+        widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": "An empty box leaves that field alone. The number and the code are never shown back — this pane can write them and cannot read them.",
+        }));
+    }
 
     // LOGIN CREDENTIALS — the three boxes the user came for.
     widgets.push(json!({"kind": "section", "text": "Login credentials", "card": true}));
@@ -3247,6 +3399,17 @@ fn load_edit_draft(name: &str, user: &str) -> Result<EditDraft> {
         })
         .ok_or_else(|| anyhow::anyhow!("{name} is no longer in the vault — sync and try again"))?;
 
+    // A card's own content, from the same secret-free op the CLI and the View
+    // pane read. A refusal ("is not a card") is the answer for every other item
+    // type, not an error — hence `.ok()`.
+    let is_card = item["item_type"].as_u64() == Some(u64::from(CIPHER_TYPE_CARD));
+    let card = is_card
+        .then(|| vault_op(json!({"op": "card", "name": name, "user": opt_field(user)})).ok())
+        .flatten()
+        .map(|reply| reply["card"].clone())
+        .unwrap_or(Value::Null);
+    let card_text = |key: &str| card[key].as_str().unwrap_or_default().to_string();
+
     let fields = EditFields {
         name: item["name"].as_str().unwrap_or_default().to_string(),
         user: item["username"].as_str().unwrap_or_default().to_string(),
@@ -3260,6 +3423,10 @@ fn load_edit_draft(name: &str, user: &str) -> Result<EditDraft> {
             })
             .unwrap_or_default(),
         folder: item["folder"].as_str().unwrap_or_default().to_string(),
+        card_brand: card_text("brand"),
+        card_holder: card_text("cardholder"),
+        card_exp_month: card_text("exp_month"),
+        card_exp_year: card_text("exp_year"),
     };
     // Names only, and a failure here is not fatal: an item whose fields cannot
     // be read is still worth editing for its username.
@@ -3292,6 +3459,8 @@ fn load_edit_draft(name: &str, user: &str) -> Result<EditDraft> {
         has_totp: item["has_totp"].as_bool().unwrap_or(false),
         has_passkey: item["has_passkey"].as_bool().unwrap_or(false),
         has_notes,
+        is_card,
+        has_card_number: !card_text("last4").is_empty(),
         ..EditDraft::default()
     })
 }
@@ -3351,6 +3520,47 @@ fn build_edit_request(draft: &EditDraft, values: &Value) -> Option<Value> {
     if !notes.is_empty() {
         object.insert("notes".into(), json!(notes));
         changed = true;
+    }
+
+    // THE CARD. The four metadata boxes diff like every other field; the two
+    // secrets follow the password's rule — sent only when the user typed one,
+    // because the form is never shown their stored value to compare against.
+    for (op_key, current, original) in [
+        (
+            "card_brand",
+            &draft.current.card_brand,
+            &draft.original.card_brand,
+        ),
+        (
+            "card_holder",
+            &draft.current.card_holder,
+            &draft.original.card_holder,
+        ),
+        (
+            "card_exp_month",
+            &draft.current.card_exp_month,
+            &draft.original.card_exp_month,
+        ),
+        (
+            "card_exp_year",
+            &draft.current.card_exp_year,
+            &draft.original.card_exp_year,
+        ),
+    ] {
+        if current != original && !current.trim().is_empty() {
+            object.insert(op_key.into(), json!(current.trim()));
+            changed = true;
+        }
+    }
+    for (op_key, widget_id) in [
+        ("card_number", "edit_card_number"),
+        ("card_code", "edit_card_code"),
+    ] {
+        let secret = typed(widget_id);
+        if !secret.is_empty() {
+            object.insert(op_key.into(), json!(secret));
+            changed = true;
+        }
     }
 
     let field_value = typed("edit_field_value");
@@ -6592,6 +6802,161 @@ mod tests {
     // form is negotiable; this is not. The boxes for a password, an
     // authenticator secret, the notes and a field value are declared EMPTY, and
     // what the form pre-fills is only what a secret-free listing already knows.
+    /// A ViewDraft over a CARD, as the `view` op answers one: the five
+    /// secret-free facts under `card`, and a PAN and a CVV planted beside them
+    /// as decoys the pane must never echo even if an agent ever handed them
+    /// over. Every value invented.
+    fn card_view_fixture() -> ViewDraft {
+        ViewDraft {
+            target_name: "Meridian Everyday".into(),
+            target_user: String::new(),
+            detail: json!({
+                "id": "card1",
+                "name": "Meridian Everyday",
+                "username": "",
+                "folder": "Cards",
+                "item_type": 3,
+                "has_password": false,
+                "has_totp": false,
+                "has_passkey": false,
+                "has_notes": false,
+                "field_names": [],
+                "passkeys": [],
+                "uris": [],
+                "password_history": [],
+                "card": {
+                    "brand": "Visa",
+                    "cardholder": "RIVKA HOLLANDER",
+                    "exp_month": "3",
+                    "exp_year": "2031",
+                    "last4": "8814",
+                },
+                "number": "4111111111118814",
+                "code": "737",
+            }),
+            confirm_delete: false,
+        }
+    }
+
+    /// ⛔ THE PANE WITHHELD THE ONE FIELD THAT PREVENTS CHARGING THE WRONG
+    /// PERSON. A card rendered as an entry with no content — the View builder
+    /// had a single card branch that said "its number reaches a page through
+    /// the fill button" and then fell through to Autofill / Notes / History.
+    /// Meanwhile `ychrome-vault card` printed brand, cardholder, expiry and
+    /// last4 on the CLI, so the two disagreed about the same five fields with
+    /// the CLI right. Two cards from one issuer with the same product name are
+    /// told apart by last4 and by nothing else.
+    #[test]
+    fn a_card_view_shows_its_five_facts_and_still_no_secret() {
+        let widgets = view_tab_widgets(&card_view_fixture(), None);
+        let wire = json!(widgets).to_string();
+
+        let subtitle = |id: &str| {
+            widgets
+                .iter()
+                .find(|widget| widget["id"] == id)
+                .unwrap_or_else(|| panic!("no {id} row in {wire}"))["subtitle"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(subtitle("card:brand"), "Visa");
+        assert_eq!(subtitle("card:cardholder"), "RIVKA HOLLANDER");
+        // ONE row, because the expiry is one fact — "3" and "2031" on separate
+        // rows makes the reader assemble a date the vault already knows.
+        assert_eq!(subtitle("card:expiry"), "03/2031");
+        assert_eq!(subtitle("card:last4"), "•••• 8814");
+        assert!(
+            widgets
+                .iter()
+                .any(|widget| widget["kind"] == "section" && widget["text"] == "Card"),
+            "the facts need a section of their own: {wire}"
+        );
+
+        // THE boundary, unchanged by any of the above.
+        assert!(!wire.contains("4111111111118814"), "PAN leaked: {wire}");
+        assert!(!wire.contains("737"), "CVV leaked: {wire}");
+        // ⛔ And no card row wears an eye or a copy: both ride on StoredField,
+        // whose contract is "the vault hands this back on demand", and a PAN is
+        // the one value this client will not fetch for a widget.
+        for id in ["card:brand", "card:cardholder", "card:expiry", "card:last4"] {
+            let row = widgets.iter().find(|widget| widget["id"] == id).unwrap();
+            assert!(
+                row["actions"].is_null(),
+                "{id} offers a verb it cannot satisfy: {row}"
+            );
+        }
+
+        // A LOGIN grows no card section — the branch is on the item's own type.
+        let login = json!(view_tab_widgets(&view_fixture(), None)).to_string();
+        assert!(!login.contains("card:last4"), "{login}");
+    }
+
+    /// ⛔ DO NOT FIX HALF OF IT. An expiry you can SEE and cannot CHANGE moves
+    /// the dead end one screen later, and every card expires. The operator hit
+    /// both halves in the same minute.
+    #[test]
+    fn the_edit_form_can_change_a_card_and_never_shows_one_back() {
+        let stored = EditFields {
+            name: "Meridian Everyday".into(),
+            card_brand: "Visa".into(),
+            card_holder: "RIVKA HOLLANDER".into(),
+            card_exp_month: "3".into(),
+            card_exp_year: "2031".into(),
+            ..EditFields::default()
+        };
+        let draft = EditDraft {
+            target_name: "Meridian Everyday".into(),
+            is_card: true,
+            has_card_number: true,
+            // `original` is what was LOADED and `current` what is on screen —
+            // equal until something is typed, which is what makes "send only
+            // what changed" testable at all.
+            original: stored.clone(),
+            current: stored,
+            ..EditDraft::default()
+        };
+        let widgets = edit_tab_widgets(&draft, None);
+        let widget = |id: &str| {
+            widgets
+                .iter()
+                .find(|widget| widget["id"] == id)
+                .unwrap_or_else(|| panic!("no {id} box"))
+                .clone()
+        };
+        assert_eq!(widget("edit_card_brand")["value"], "Visa");
+        assert_eq!(widget("edit_card_exp_month")["value"], "3");
+        assert_eq!(widget("edit_card_exp_year")["value"], "2031");
+        // The two secrets are declared, declared SECRET, and declared EMPTY —
+        // the same rule the password box keeps. This form can write them and
+        // cannot read them.
+        for id in ["edit_card_number", "edit_card_code"] {
+            let box_ = widget(id);
+            assert_eq!(box_["secret"], true, "{id} is not marked secret");
+            assert_eq!(box_["value"], "", "{id} pre-filled something");
+            assert!(box_["actions"].is_null(), "{id} offers an eye it cannot satisfy");
+        }
+        // A login form grows none of it.
+        let login = json!(edit_tab_widgets(&EditDraft::default(), None)).to_string();
+        assert!(!login.contains("edit_card_number"), "{login}");
+
+        // AND THE SAVE CARRIES IT. A changed box travels; an untouched one does
+        // not (re-encrypting for nothing moves `revisionDate` and staler every
+        // other client's copy); a secret travels only when one was typed.
+        let mut edited = draft.clone();
+        edited.current.card_exp_year = "2033".into();
+        let request = build_edit_request(&edited, &json!({"edit_card_code": "424"}))
+            .expect("a changed expiry is a change");
+        assert_eq!(request["card_exp_year"], "2033");
+        assert_eq!(request["card_code"], "424");
+        assert!(request.get("card_brand").is_none(), "unchanged: {request}");
+        assert!(request.get("card_number").is_none(), "untyped: {request}");
+        assert!(
+            build_edit_request(&draft, &json!({})).is_none(),
+            "nothing typed and nothing changed is not an edit"
+        );
+    }
+
     /// A ViewDraft over a detail record that carries every kind of value the
     /// pane can draw, plus decoys the schema must never echo.
     fn view_fixture() -> ViewDraft {
@@ -6782,6 +7147,7 @@ mod tests {
                 user: "octocat".into(),
                 uris: "https://github.com".into(),
                 folder: "Work".into(),
+                ..EditFields::default()
             },
             field_names: vec!["API Key".into(), "Recovery Code".into()],
             ..EditDraft::default()
@@ -7271,6 +7637,7 @@ mod tests {
             user: "octocat".into(),
             uris: "https://github.com".into(),
             folder: "Work".into(),
+            ..EditFields::default()
         };
         let draft = EditDraft {
             target_name: "github.com".into(),

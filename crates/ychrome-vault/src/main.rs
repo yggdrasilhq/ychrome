@@ -210,6 +210,30 @@ enum Command {
         /// an error, not a silent no-op.
         #[arg(long, value_name = "NAME")]
         remove_field: Vec<String>,
+        /// Set a card's brand (Visa, Mastercard, …).
+        #[arg(long, value_name = "BRAND")]
+        card_brand: Option<String>,
+        /// Set the name printed on a card.
+        #[arg(long, value_name = "NAME")]
+        card_holder: Option<String>,
+        /// Set a card's expiry month, 1-12.
+        #[arg(long, value_name = "MM")]
+        card_exp_month: Option<String>,
+        /// Set a card's expiry year, four digits.
+        #[arg(long, value_name = "YYYY")]
+        card_exp_year: Option<String>,
+        /// Read a new card number from stdin.
+        ///
+        /// ⛔ THERE IS NO `--card-number VALUE` FORM, AND THERE WILL NOT BE. A
+        /// PAN in argv is readable by every process on this host through `ps`
+        /// and lands in the shell's history file; unlike a password it cannot
+        /// be rotated on demand once it leaks.
+        #[arg(long, conflicts_with_all = ["password", "set_hidden_field", "card_code"])]
+        card_number: bool,
+        /// Read a new card security code (CVV) from stdin. Same reason as
+        /// `--card-number`: never argv.
+        #[arg(long, conflicts_with_all = ["password", "set_hidden_field"])]
+        card_code: bool,
         /// Read a new password from stdin. The old one is kept in the item's
         /// password history.
         #[arg(long)]
@@ -719,6 +743,12 @@ fn main() -> Result<()> {
             set_field,
             set_hidden_field,
             remove_field,
+            card_brand,
+            card_holder,
+            card_exp_month,
+            card_exp_year,
+            card_number,
+            card_code,
             password,
             generate,
             length,
@@ -751,6 +781,14 @@ fn main() -> Result<()> {
             if let Some(field) = &set_hidden_field {
                 hidden_value = Some(read_secret(&format!("value for custom field {field:?}"))?);
             }
+            // The card's two secrets come the same way, and clap has already
+            // ruled out asking for more than one stdin value in a run.
+            let card_number_value = card_number
+                .then(|| read_secret("new card number"))
+                .transpose()?;
+            let card_code_value = card_code
+                .then(|| read_secret("new card security code"))
+                .transpose()?;
             let password = match (password, hidden_value) {
                 (true, _) => Some(read_secret("new password")?),
                 (false, Some(value)) => {
@@ -771,6 +809,9 @@ fn main() -> Result<()> {
                     "totp": totp, "clear": clear, "notes": notes, "folder": folder,
                     "fields": fields,
                     "password": password,
+                    "card_brand": card_brand, "card_holder": card_holder,
+                    "card_exp_month": card_exp_month, "card_exp_year": card_exp_year,
+                    "card_number": card_number_value, "card_code": card_code_value,
                     "generate": generate, "length": length, "symbols": !no_symbols,
                 }),
             )?;
