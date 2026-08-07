@@ -108,3 +108,144 @@ native-setter injection then throws *"The HTMLInputElement.value setter can only
 instances of HTMLInputElement"* — real `ctl input` click+type is the only route that works there.
 ⇒ Unresolved: whether this is a portal-side defect or a rejected character class. **Do not
 retry blind** — each attempt burns an OTP and risks a lockout on an account with a live booking.
+
+## drop-off-booked-and-paid-surcharge-and-input-rungs · WORKS
+task: 
+model: claude-opus-5
+date: 2026-08-07
+tags: 
+
+Second full run of Click-n-Book, **DROP OFF branch, booked AND PAID** on 2026-08-07 04:57-05:40 IST.
+Driven on the **yggterm `web` plane on the GUI host** (ychrome profile `agent-ipbook`), not the `ctl`
+engine, because the card rail is a `server app web` verb and `ctl` has no card verb.
+Article `EY492675435IN`, Rs 23 tariff, **Rs 23.25 debited** (see THE SURCHARGE).
+Everything below was measured this run and several items CORRECT the 2026-08-07 entry above.
+
+## ⛔⛔ THE SURCHARGE — app.indiapost.gov.in is a UPI-FIRST portal, not a card-first one
+
+The gateway page states in its own words: **"Note: No charges for UPI & Debit cards"**, and the
+credit-card leg then debited **Rs 23.25 against a quoted Rs 23.00** — a credit-card-only
+convenience fee of **Rs 0.25 (~1.09%)**. The owner's ruling at the moment of payment:
+**"Next time we go UPI route for Indiapost."**
+⇒ Under the standing instrument order (card first *unless it carries an extra charge the others do
+not*), **UPI is the correct first choice here** and the card is the fallback. Cost moves you down
+the list. The `ePay` tile expands to **UPI · Credit Card · Debit Card · Net Banking**.
+
+## ⛔ THE LOGIN PAGE DOES NOT HYDRATE ON FIRST LOAD — and it looks exactly like a bad password
+
+On first entry to `/customer-selfservice/login`: **no DOM node carries a `__reactFiber$` key**, the
+Login button is `disabled: true` forever, and typing moves `input.value` while React state never
+follows. **`location.reload()` fixes it** — after the reload the fibers attach and the button
+enables the instant both fields hold values. Diagnose it with
+`Object.keys(document.body.children[0]).filter(k=>k.startsWith('__react'))` — an empty array means
+reload, not re-check the credentials. Same family as the known `Loading chunk NNNN failed`.
+
+## ⛔⛔ THE PINCODE MODAL: which of its four steps need TRUSTED input, exactly
+
+The existing "it is a modal launcher" note is right but too coarse. Per step:
+
+| step | rung that works | rung that FAILS |
+|---|---|---|
+| open the modal | **trusted** `web do click --selector '#<field>'` | page-side pointer sequence: focuses the field, **no modal** |
+| type the pincode | **trusted** `web do fill --mechanism real-keys` | native-setter injection → the modal auto-searches and **hangs on `Searching...` forever**, and then will not close |
+| press Search | trusted click on `button` text `Search` | — |
+| pick the result row | **page-side pointer sequence** on `tr > td:first-child button` | a trusted click is usually refused `target_moved … outside the viewport` (the row sits below 800px and the dialog scrolls internally, so `scrollIntoView` on the cell does not help) |
+
+⛔⛔ **AND THE TRAP THAT COSTS A WHOLE FORM: a PAGE-SIDE select fills the field but LEAVES THE MODAL
+OPEN**, while a trusted select closes it. **An open modal stays bound to the field that opened it**,
+so the next field's click lands on the stale modal and the next selection **writes into the WRONG
+field.** Measured: a destination search wrote 700001 into `dropOffPincode` AND `originPincode`.
+⇒ **After a page-side select, close the dialog with a TRUSTED click on its own `Close` button, then
+assert the modal is gone before touching another field.** Detector:
+
+```js
+[...document.querySelectorAll('.fixed')].some(d => d.innerText.includes('Enter pincode or office name'))
+```
+
+⚠ Also: the old "click the result row ~30px in from its left edge" is **too imprecise**. On a row
+whose left edge was 161 the Select button's centre was **x≈201**; a click at 191 hit cell padding
+and produced the misleading toast **`Error fetching pincode data`**. Address the button, not a pixel.
+
+⚠ **The 700001 search returns a DIFFERENT ROW SET run to run** — sometimes ONE row whose Office Name
+is `Kolkata GPO DC`, sometimes ~10 (`KOLKATA GPO`, `Lalbazar SO`, `Customs House SO` …) that all
+share `Idc Id 33840013` / `Idc Name Kolkata GPO DC`. **Match on the Idc Name column** or the matcher
+fails at random. Whichever row is picked, `boId` resolves to `Kolkata GPO DC`.
+
+## The input rung is PER-WIDGET on this page — there is no single answer
+
+- **Radix `[role=combobox]`** (Mail Service Type, Mail Shape) **REFUSES `web do click`**: it answers
+  `accepted:true, delivered:false` while the element hit-tests clean and is not disabled. The
+  **page-side pointer sequence opens it first try**, and its `[role=option]` children take page-side
+  clicks too.
+- **The Suggested Services card needs a TRUSTED click**; a page-side sequence on it does nothing.
+- **The `div.cursor-pointer` Pick Up / Drop Off cards, the T&C `button[role=checkbox]#terms`, the
+  declaration checkboxes and the icon-only Next button all take page-side pointer sequences.**
+- **Sender/recipient text fields take a page-side native-setter injection cleanly** — all 13 filled
+  in one script and survived submit validation.
+⇒ Expect to switch rungs per widget and **read back the effect every time**; `delivered:false` here
+is an honest refusal, not a transport failure.
+
+## ⭐ Mail Service Type is DISABLED until the tariff round-trip finishes, and BLUR is the trigger
+
+The tariff fetch fires on the weight field's **blur**, not its input. Set `#physicalWeight` then send
+`Tab`; the API answers
+
+```json
+{"chargeable_weight":20,"local_flag":true,"price":19,"base_tariff":19,
+ "cgst":2,"sgst":2,"igst":0,"gst":4,"total_with_tax":23}
+```
+
+and **the Suggested Services modal opens by itself**. An agent that clicks the combobox before the
+blur reads a disabled control and concludes the page is broken. (Confirms the GST-inclusive
+arithmetic: Rs 19.50 + 18% ≈ Rs 23, quoted as base 19 + GST 4.)
+
+## ⛔ CORRECTION: Submit → the T&C dialog → OK is the WHOLE add-to-cart
+
+The earlier entry says "Submit raises the dialog, then a SECOND Submit adds the article". **On the
+drop-off branch that is wrong and dangerous**: after pressing OK the footer already read
+`View Cart (1)` / `Complete Booking with (Rs.23)`. **A second Submit would have added a second
+article.** Verify the cart counter instead of pressing Submit twice.
+
+## ⛔⛔ THE PAYMENT LEG OPENS A NEW TAB VIA `window.open`, AND YOU MUST HOOK IT
+
+`Complete Booking` → `ePay` → `Credit Card` calls `window.open('/pmtgw/unified//<hex>')` — note the
+**double slash** — and the parent page then shows only *"We have opened the payment page in a new
+tab"* with a **10-minute timer** and a `Verify Payment` button. Facts:
+
+- The new tab **registers as `tab_id 1` of the SAME yggterm session** (`server app state |
+  jq .web_surface_tabs`) and becomes the active tab, so `web eval --session <path>` addresses it
+  with no extra flag. ⚠ **There is no verb to switch back to tab 0** — plan to finish in the payment
+  tab.
+- To capture the URL, hook `window.open` **before** triggering the gateway:
+  `window.open=function(u){window.__opened.push(String(u));return {closed:false,close(){},focus(){}};}`
+  Cancelling the "Payment Gateway Opened" dialog returns you to the method list, so the gateway can
+  be re-triggered with the hook armed. **Re-triggering costs nothing — it mints a payment session,
+  not a charge.**
+- ⚠ `ychrome --profile <p> <url>` from a SECOND yggterm session does **not** create a second surface:
+  it hands the URL to the already-running ychrome for that profile, which opens it as a tab on the
+  FIRST session's surface. The second session then answers `no_declare` to `web ensure` — a correct
+  refusal, not a broken tool.
+- The success page carries **Transaction ID · DoP Order No · Bank Reference No · Amount**, and its
+  URL query is a **JWT whose payload holds `amount`, `status`, `txnId`, `refId`, `indentid`,
+  `txnprocessedat`** — decode it for a machine-readable receipt.
+
+## ⚠ TAKE A LONG SURFACE LEASE — the reclaim eats the whole form
+
+Twice the surface was reclaimed mid-form (`web ensure` → *"page was unresponsive; a rebuild is
+queued"*), each time dropping the SPA back to `/home` and **losing every field entered**. It stopped
+after **`web ensure --session <s> --ttl 3600`**. ⇒ on any multi-step form take a long lease up front
+and re-`ensure` between steps. Three full restarts were paid for this.
+
+## Confirmed unchanged, and worth restating
+
+- **The article barcode is allotted at CART-ADD, before payment** (`#articleId` held
+  `EY492675435IN` as soon as the sender step rendered).
+- Deep-linking an inner route is still REFUSED — navigate by clicking the tile's `<a href>`.
+- Name fields are **letters and spaces only** (so `State Public` / `Information` / `Officer`), and
+  `recepientMobileNumber` must start 6-9, so an office landline is refused.
+- **Drop Off shows its cutoff as soon as the office is chosen**: *"Please Drop off the article before
+  1500 Hrs at Paschim Putiari SO"*. No pickup charge on this branch.
+- **My Bookings → filter combobox → `Domestic Booking`** is where a paid article is verified; it
+  defaults to `International Booking` and shows *No Data Available*, which reads like a lost booking.
+- ⛔ **The `Receipt` and `Label` buttons in that report produced NOTHING** on a yggterm surface — no
+  `window.open`, no dialog, no file in `~/Downloads`. Unsolved; the receipt could not be captured.
