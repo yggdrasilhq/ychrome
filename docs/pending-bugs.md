@@ -7,6 +7,68 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ★★★ `ctl fill` REPORTS SUCCESS ON A WRONG WRITE — and two entries rest on that report as proof
+
+**Status:** OPEN. **Reported by lumenstore row 5.2** (the TWS/IBKR paper lane) 2026-08-07, while
+filling the IBKR paper-account signup. ⚠ **Not independently reproduced by the filer** — see
+*What would settle it*, which names the missing observation rather than implying it was made.
+
+**The observation.** `ctl fill` answered `{"filled":"filled","ok":true}` while it had written a
+**31-character** value into a field whose vault secret is **20 characters**, and had left the
+**confirm field entirely empty**. It was caught only by a page-side readback that the caller wrote
+by hand. Nothing in the response distinguishes that run from a correct one.
+
+### ⛔ Why this is worse than one bad verb: two entries were CLOSED on that response shape
+
+- **In this file**, [`ctl fill` WORKS BUT IS ABSENT FROM THE ENGINE'S USAGE BANNER](#ctl-fill-works-but-is-absent-from-the-engines-usage-banner)
+  states the verb "filled a real login the same day", citing `{"entry":"…","filled":"filled","ok":true}`.
+- **In `yggterm/docs/pending-bugs.md`**, the entry *"Agent engine: `ctl fill` is documented but has
+  no route"* sat at **FIXED IN CODE — LIVE PROOF OWED**, blocked on exactly one observation:
+  that same response against a real login form. It was **deleted** when a field report delivered it.
+
+⇒ **The response proves ROUTING, not CORRECTNESS.** It shows the verb is reachable and does
+something. It is silent on whether what it did was right. Both closures were correct about
+reachability and neither is evidence the fill landed — the two claims were never separated.
+
+### ★ THE CLASS — the fill verbs' status fields are uninformative in BOTH directions
+
+`yggterm/docs/pending-bugs.md` already records the pessimistic twin: `server app web fill-card`
+answers **`matched:false` on fills that landed perfectly**, and its own note says `matched` "says
+nothing about the damage". **This is the optimistic twin, and the optimistic direction is the
+dangerous one** — a false `matched:false` invites a wasteful retry, while a false `filled:"filled"`
+invites *nothing at all*. The caller proceeds, and the account is created with a password nobody
+holds. ⇒ **one fix, one family: a status field that is not derived from a readback is decoration.**
+
+### What would settle it
+
+A page-side readback inside `ctl fill` itself: compare `document.querySelector(sel).value.length`
+against the vault secret's length, check the confirm twin is non-empty, and answer
+`filled:"unverified"` when either disagrees. ⛔ **A LENGTH, never a value** — the vault boundary
+(`fill-card` answers a length) is right as it stands and this must not widen it.
+
+**The falsifying observation, which has NOT been made:** one `ctl fill` run against a form whose
+field length is known, where the response says `filled` *and* an independent readback confirms both
+the field and its confirm twin. Until that exists, `filled:"filled"` is not proof of a fill.
+
+**Workaround meanwhile:** read the secret into a shell variable and use `ctl input` type events —
+but see the entry directly below, which is why that workaround needs its own care.
+
+## ★★ `ctl input` BATCHES FAIL SILENTLY WHEN AN EARLIER EVENT CHANGES LAYOUT
+
+**Status:** OPEN. Same reporter, same session, 2026-08-07.
+
+A `click + type + click + type` batch against a portal login reported **`dispatched:3, ok:true`**
+and landed **nothing** — a page-side readback showed `user:""`, `pwlen:0`. Splitting it into
+separate `ctl input` calls and verifying `document.activeElement` between them worked **first try**.
+
+**The mechanism:** an earlier event in the batch changes the layout, so the later events resolve
+against nodes that have moved or been replaced. **`dispatched` counts events SENT, not events
+LANDED**, and `ok` describes the transport, not the outcome.
+
+⇒ **Same family as the entry above** — a self-reported success field with no readback behind it.
+⛔ **Never trust a batch's own success field.** Until per-event target resolution is reported, split
+layout-changing sequences into separate calls and assert `document.activeElement` between them.
+
 ## ⭐ A CARD ITEM IS UNREADABLE AND UNEDITABLE IN THE SIDEBAR — the View pane shows nothing, `edit` has no card options
 
 **Status:** OPEN. **Reported by the operator 2026-08-07**, in his own words, while he was paying an
@@ -118,6 +180,12 @@ The banner advertises `open close pages goto nav wait eval dom shot input consol
 park resume pool metrics budget batch egress identity status` — no `fill`. Yet
 `ychrome ctl fill page_id=<p> entry=<vault-item>` answered
 `{"entry":"…","filled":"filled","ok":true}` and filled a real login the same day.
+
+> ⚠ **CORRECTED 2026-08-07: "and filled a real login" overstates what that response shows.** The
+> same response shape has since been observed on a WRONG write (31 chars into a 20-char secret,
+> confirm field empty) — see the `ctl fill` REPORTS SUCCESS ON A WRONG WRITE entry at the top of
+> this file. **The response is evidence the route exists, which is all this entry needs it for.**
+> The banner gap below is unaffected.
 
 ⚠ **The cost is a belief, not a crash:** an agent reading the banner concludes the engine has no
 credential support at all, and that conclusion gets re-derived by every session that reads it. This
