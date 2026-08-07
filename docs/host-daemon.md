@@ -264,6 +264,43 @@ and so cannot be asked what it is holding. It is treated as busy: loud, never
 killed. Installing this change therefore leaves each host's running daemon in
 place until someone runs `ychrome daemon restart` there, once.
 
+**A SURFACE IS NOT THE ONLY THING ATTACHED.** The engine (§7) keeps its pages in
+this process, so a daemon with an empty session registry can still be the sole
+owner of an agent's `pg_000001`. `retire_if_idle` counts both, and reports both
+(`held_by`, `engine_pages`) on every reply — including the retiring one, so a
+caller can say why it was safe. Judging idleness on the registry alone retired
+daemons out from under running `ctl` scripts.
+
+### 6.2 The census — `daemon list` / `daemon reap`
+
+`daemon restart` retires the daemon on the socket IT resolves and nothing else.
+A daemon bound under another `HOME` — a fixture root, an under-glass sandbox, an
+old `$YGGTERM_HOME` — is invisible to it and therefore immortal. Measured on dev
+2026-08-08: three daemons, two on binaries deleted from disk, the oldest up
+153 h, each holding an Xvfb and a network process.
+
+The census reads three facts from the kernel, never from a guess:
+
+| axis | read from | why it decides |
+|---|---|---|
+| ownership | is a `daemon.lock` FD open in `/proc/<pid>/fd`? | `DaemonLock` opens that file only while it holds the flock, and closes it in `release()` — so the FD *is* "I am serving". No FD ⇒ it retired and never exited, and its socket belongs to whoever holds the lock now, so nothing can reach it. |
+| socket path | the lock's directory | tells a foreign root from ours without trusting `$HOME` |
+| binary liveness | `/proc/<pid>/exe`, `(deleted)` marker kept | ⚠ reported, never a kill gate — a test using that daemon does not care that we rebuilt underneath it |
+
+⛔ **Identify, then retire.** The retire is never ours to decide for a root we do
+not serve: `daemon reap` sends `retire_if_idle` to ITS socket and the daemon
+answers under its own lock. And `restart` sweeps only the **unreachable** —
+lockless past a 60 s grace (the window in which a daemon that was told to `stop`
+is legitimately lockless while it takes its engine down), or holding a lock with
+nothing answering on its socket. Widening `restart` to ask foreign roots broke
+this repo's own daemon fixtures at once: one BETWEEN CALLS holds no surface and
+no page, so it is idle by every signal available from outside and still in use.
+"Idle" justifies a retire a person asked for; never one that happens to them.
+
+⚠ A socket that **accepts** the connection and answers late is a busy daemon, not
+a dead one. Only a refused connect means unreachable — collapsing the two is how
+a busy daemon gets killed.
+
 ## 7. The agent engine mounts here (settled)
 
 `docs/agent-engine.md` §3 is amended: no separate `engine.sock`/token/

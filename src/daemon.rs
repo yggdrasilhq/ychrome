@@ -31,7 +31,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -844,13 +844,9 @@ fn handle_unix_conn(daemon: &Arc<Daemon>, stream: UnixStream) -> bool {
         // outdated daemon in place for the length of its expiry window.
         "retire_if_idle" => {
             daemon.reap();
-            let held = daemon.live_session_ids();
-            if held.is_empty() {
-                should_exit = true;
-                json!({ "ok": true, "retiring": true })
-            } else {
-                json!({ "ok": true, "retiring": false, "held_by": held })
-            }
+            let verdict = idle_verdict(&daemon.live_session_ids(), engine_pages_held());
+            should_exit = verdict["retiring"].as_bool() == Some(true);
+            verdict
         }
         // The deliberate form (`ychrome daemon restart`): retire whatever is
         // attached, because a person asked for it in as many words.
@@ -895,6 +891,32 @@ fn handle_unix_conn(daemon: &Arc<Daemon>, stream: UnixStream) -> bool {
     let _ = writeln!(stream, "{reply}");
     let _ = stream.flush();
     should_exit
+}
+
+/// How many pages the agent engine is holding in THIS process.
+///
+/// ⛔ A SURFACE IS NOT THE ONLY THING ATTACHED TO A DAEMON. The engine mounts
+/// under `/engine/*` on the same socket and keeps its pages in this process, so
+/// a daemon with no registered browser session can still be the sole owner of an
+/// agent's `pg_000001`. Judging idleness on `live_session_ids` alone therefore
+/// retired daemons out from under running `ctl` scripts — the "no page
+/// \"pg_000001\"" class of failure — and it is exactly the mistake a reaper
+/// repeats at scale.
+fn engine_pages_held() -> usize {
+    crate::engine::pool::pool().counts().2
+}
+
+/// The retire decision, pure so the clause that protects an in-flight page can
+/// be proven without a daemon. `held_by` and `engine_pages` are always reported,
+/// including on the retiring reply, so a caller can say WHY it was safe.
+fn idle_verdict(held: &[String], engine_pages: usize) -> Value {
+    let retiring = held.is_empty() && engine_pages == 0;
+    json!({
+        "ok": true,
+        "retiring": retiring,
+        "held_by": held,
+        "engine_pages": engine_pages,
+    })
 }
 
 /// Append one audit line. Best-effort — the daemon must not die over a journal
@@ -1564,6 +1586,489 @@ pub fn status() -> Result<Value> {
     socket_request(&json!({ "op": "status" })).context("querying the ychrome daemon")
 }
 
+// ---------------------------------------------------------------------------
+// The census — every ychrome daemon on this host, and what may be done to it
+// ---------------------------------------------------------------------------
+//
+// ⛔ `daemon restart` retires the daemon on the socket IT resolves, and nothing
+// else. A daemon bound under another `HOME` — a fixture root, an under-glass
+// sandbox, an old `$YGGTERM_HOME` — is invisible to it and therefore immortal.
+// Measured on dev 2026-08-08, immediately after a clean restart: THREE
+// `ychrome --daemon` processes, two of them on binaries deleted from disk, the
+// oldest up 153 h, each holding an Xvfb and a WebKit network process.
+//
+// The rule this section exists to enforce is **identify, then retire** — never
+// count and kill by age. Each of those daemons may legitimately be serving a
+// fixture root a test is using, and a reaper that guesses takes a page out from
+// under it. So the census reasons about the three things that actually decide
+// it, and each is read from the kernel rather than inferred:
+//
+//   1. **ownership** — does the process hold `daemon.lock`? `DaemonLock` opens
+//      that file only while it holds the flock and closes it in `release()`, at
+//      the same instant it unlinks its socket, so the presence of the FD in
+//      `/proc/<pid>/fd` IS "I am the serving daemon". No lock ⇒ it retired and
+//      never exited, and nothing can reach it.
+//   2. **socket path** — the lock's directory names the root it serves, which
+//      is how a foreign root is told from ours without trusting `$HOME`.
+//   3. **binary liveness** — `/proc/<pid>/exe` keeps the kernel's `(deleted)`
+//      marker, so a daemon serving code that no longer exists on disk says so.
+//      ⚠ Reported, never a kill gate: a deleted binary is a diagnosis, and a
+//      test using that daemon does not care that we rebuilt underneath it.
+//
+// And the retire itself is never ours to decide for a foreign root. `retire_if_idle`
+// is the daemon's OWN judgement, made under its OWN lock, in one round trip that
+// nothing can race — it refuses while anything is attached. That is what makes
+// reaping a root we know nothing about safe.
+
+/// A daemon that holds no lock must have been running at least this long before
+/// the reaper terminates it.
+///
+/// The window it guards: a daemon that has just been told to `stop` releases the
+/// lock BEFORE it tears its engine down, so for the length of that teardown it is
+/// lockless and still alive by design. Teardown is sub-second; the measured
+/// leaks were up 30 h and 153 h.
+///
+/// ⚠ The honest limit: this is the process's age, not "how long it has been
+/// lockless", which nothing records. A long-lived daemon whose teardown wedges is
+/// therefore reapable straight away — correct in the case that matters (a wedged
+/// teardown is exactly what leaks) but it is a guess about a young one, not a
+/// proof about an old one.
+const ABANDONED_GRACE_SECS: u64 = 60;
+
+/// One `ychrome --daemon` process on this host, as the kernel describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaemonCensus {
+    pub pid: u32,
+    /// `/proc/<pid>/exe`, with the kernel's `(deleted)` marker kept.
+    pub exe: String,
+    /// Its binary no longer exists at that path.
+    pub exe_deleted: bool,
+    /// The `…/.yggterm/ychrome` directory whose `daemon.lock` it holds open.
+    /// `None` means it holds none, i.e. it is not serving anything.
+    pub lock_dir: Option<PathBuf>,
+    /// Its `$HOME`. Diagnostic only, and it is the ONLY clue left about which
+    /// root a lockless daemon once served.
+    pub home: Option<PathBuf>,
+    pub up_secs: u64,
+    pub children: usize,
+}
+
+/// What may be done to a censused daemon. The whole safety argument is here, so
+/// it is decided by one pure function with no process access at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Disposition {
+    /// This process.
+    Ourselves,
+    /// It holds the singleton for the root we resolve. `daemon restart` owns
+    /// that handover; the reaper must never race it.
+    ServingHere,
+    /// It holds the singleton for another root. Ask it to retire and let IT
+    /// decide — we cannot know what is attached to a root we do not serve.
+    AskElsewhere { sock: PathBuf },
+    /// It holds no singleton and is old enough that it cannot be mid-teardown.
+    /// Its socket, if one exists, belongs to whoever holds the lock now, so no
+    /// client can be reaching this process at all.
+    Terminate,
+    /// Lockless, but young enough to be a daemon still winding down.
+    TooYoung,
+}
+
+pub(crate) fn disposition(entry: &DaemonCensus, our_dir: &Path, self_pid: u32) -> Disposition {
+    if entry.pid == self_pid {
+        return Disposition::Ourselves;
+    }
+    match entry.lock_dir.as_deref() {
+        Some(dir) if dir == our_dir => Disposition::ServingHere,
+        Some(dir) => Disposition::AskElsewhere {
+            sock: dir.join("daemon.sock"),
+        },
+        None if entry.up_secs >= ABANDONED_GRACE_SECS => Disposition::Terminate,
+        None => Disposition::TooYoung,
+    }
+}
+
+/// Is this argv a ychrome daemon? Exact basename, because `ychrome-vault` is a
+/// different program that also lives on this host and also takes flags.
+pub(crate) fn is_a_ychrome_daemon(argv: &[String]) -> bool {
+    let Some(program) = argv.first() else {
+        return false;
+    };
+    Path::new(program)
+        .file_name()
+        .is_some_and(|name| name == "ychrome")
+        && argv[1..].iter().any(|arg| arg == "--daemon")
+}
+
+/// The `…/.yggterm/ychrome` directory an open FD names, if that FD is a
+/// `daemon.lock`. Anything else about the path is deliberately not checked: the
+/// root may be `/tmp/…` under a fixture `HOME` just as legitimately as `~`.
+pub(crate) fn lock_dir_of_fd(target: &str) -> Option<PathBuf> {
+    let path = Path::new(target.strip_suffix(" (deleted)").unwrap_or(target));
+    if path.file_name()? != "daemon.lock" {
+        return None;
+    }
+    let dir = path.parent()?;
+    (dir.file_name()? == "ychrome").then(|| dir.to_path_buf())
+}
+
+/// Every ychrome daemon this uid owns, read straight out of `/proc`.
+pub(crate) fn census() -> Vec<DaemonCensus> {
+    let our_uid = unsafe { libc::getuid() };
+    let now = SystemTime::now();
+    let mut found: Vec<DaemonCensus> = Vec::new();
+    let mut parents: HashMap<u32, usize> = HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let dir = entry.path();
+        if let Some(ppid) = read_ppid_of(&dir) {
+            *parents.entry(ppid).or_insert(0) += 1;
+        }
+        let Ok(meta) = std::fs::metadata(&dir) else {
+            continue;
+        };
+        // Ours only: another uid's daemon is never ours to reason about, let
+        // alone signal.
+        if std::os::unix::fs::MetadataExt::uid(&meta) != our_uid {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(dir.join("cmdline")) else {
+            continue;
+        };
+        let argv: Vec<String> = raw
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect();
+        if !is_a_ychrome_daemon(&argv) {
+            continue;
+        }
+        let exe = std::fs::read_link(dir.join("exe"))
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // The process directory's mtime is when the process started, which is
+        // enough for a grace window and does not need `stat`'s field offsets
+        // (unparseable when a comm holds a parenthesis).
+        let up_secs = meta
+            .modified()
+            .ok()
+            .and_then(|started| now.duration_since(started).ok())
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        found.push(DaemonCensus {
+            pid,
+            exe_deleted: exe.ends_with(" (deleted)"),
+            exe,
+            lock_dir: lock_dir_held_by(&dir),
+            home: home_of(&dir),
+            up_secs,
+            children: 0,
+        });
+    }
+    for entry in &mut found {
+        entry.children = parents.get(&entry.pid).copied().unwrap_or(0);
+    }
+    found.sort_by_key(|entry| entry.pid);
+    found
+}
+
+fn read_ppid_of(proc_dir: &Path) -> Option<u32> {
+    let status = std::fs::read_to_string(proc_dir.join("status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+fn lock_dir_held_by(proc_dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(proc_dir.join("fd"))
+        .ok()?
+        .flatten()
+        .find_map(|fd| {
+            let target = std::fs::read_link(fd.path()).ok()?;
+            lock_dir_of_fd(&target.to_string_lossy())
+        })
+}
+
+fn home_of(proc_dir: &Path) -> Option<PathBuf> {
+    let raw = std::fs::read(proc_dir.join("environ")).ok()?;
+    raw.split(|byte| *byte == 0)
+        .filter_map(|part| std::str::from_utf8(part).ok())
+        .find_map(|part| part.strip_prefix("HOME="))
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// What a socket said when we knocked. The distinction that matters is
+/// **connect** vs **reply**: a daemon serving a legacy op inline accepts the
+/// connection and answers late, while a socket nothing owns refuses outright.
+/// Collapsing the two into "unreachable" is how a busy daemon gets killed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SocketProbe {
+    /// Nothing is listening — the path is gone, or the connect was refused.
+    Unreachable,
+    /// It accepted us but did not answer in time. ALIVE, and busy.
+    Silent,
+    Reply(Value),
+}
+
+fn probe_socket(sock: &Path, request: &Value) -> SocketProbe {
+    let Ok(mut stream) = UnixStream::connect(sock) else {
+        return SocketProbe::Unreachable;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    if writeln!(stream, "{request}").is_err() || stream.flush().is_err() {
+        return SocketProbe::Silent;
+    }
+    let mut line = String::new();
+    match BufReader::new(stream).read_line(&mut line) {
+        Ok(0) | Err(_) => SocketProbe::Silent,
+        Ok(_) => match serde_json::from_str(line.trim()) {
+            Ok(value) => SocketProbe::Reply(value),
+            Err(_) => SocketProbe::Silent,
+        },
+    }
+}
+
+fn wait_for_exit(pid: u32, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        if !Path::new(&format!("/proc/{pid}")).exists() {
+            return true;
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn describe(entry: &DaemonCensus) -> Value {
+    json!({
+        "pid": entry.pid,
+        "exe": entry.exe,
+        "exe_deleted": entry.exe_deleted,
+        "serving_root": entry.lock_dir.as_ref().map(|dir| dir.to_string_lossy()),
+        "home": entry.home.as_ref().map(|dir| dir.to_string_lossy()),
+        "up_secs": entry.up_secs,
+        "children": entry.children,
+    })
+}
+
+/// `ychrome daemon list` — the census, with a verdict per daemon and nothing
+/// killed. The read half of the reaper, and the one to run first.
+pub fn list() -> Result<Value> {
+    let our_dir = daemon_dir()?;
+    let self_pid = std::process::id();
+    let rows: Vec<Value> = census()
+        .iter()
+        .map(|entry| {
+            let mut row = describe(entry);
+            let (verdict, note) = match disposition(entry, &our_dir, self_pid) {
+                Disposition::Ourselves => ("self", "this process".to_string()),
+                Disposition::ServingHere => (
+                    "serving",
+                    format!("holds the singleton for {} — `daemon restart` retires it", our_dir.display()),
+                ),
+                Disposition::AskElsewhere { sock } => (
+                    "serving_elsewhere",
+                    format!("holds the singleton for another root ({}) — `daemon reap` asks it to retire and it refuses if anything is attached", sock.display()),
+                ),
+                Disposition::Terminate => (
+                    "abandoned",
+                    "holds no singleton: it retired and never exited, and no client can reach it".to_string(),
+                ),
+                Disposition::TooYoung => (
+                    "retiring",
+                    format!("holds no singleton but is only {}s old — it may still be tearing its engine down", entry.up_secs),
+                ),
+            };
+            row["verdict"] = json!(verdict);
+            row["note"] = json!(note);
+            row
+        })
+        .collect();
+    Ok(json!({ "root": our_dir.to_string_lossy(), "daemons": rows }))
+}
+
+/// How far a sweep reaches. ⛔ THE TWO ARE NOT INTERCHANGEABLE, and the split is
+/// not caution — it is a measured result.
+///
+/// `Abandoned` is the half that needs no judgement: a lockless daemon released
+/// the singleton and never exited, its socket belongs to whoever holds the lock
+/// now, and therefore no client can reach it. Nothing can be using it, so
+/// `daemon restart` sweeps it automatically.
+///
+/// `AlsoForeignRoots` additionally asks daemons on OTHER roots to retire if they
+/// are idle, and that is a **deliberate** act only. Wiring it into `restart`
+/// broke `a_fresh_daemon_is_left_alone_by_every_invocation` at once: this repo's
+/// own daemon fixtures each run a daemon under their own `HOME`, and one BETWEEN
+/// CALLS holds no surface and no page — it is idle by every signal available to
+/// us and still legitimately in use. `retire_if_idle` cannot see that, and no
+/// probe from outside can. So "idle" justifies a retire a person asked for; it
+/// never justifies one that happens to them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReapScope {
+    Abandoned,
+    AlsoForeignRoots,
+}
+
+/// Does a sweep at this scope ACT on this plan, or only report it?
+///
+/// Pure, and separate from the loop that signals, because it is the clause that
+/// spares a fixture between calls — and the integration test that first caught
+/// the over-reach only catches it when the fixtures happen to be idle at the
+/// same instant, which makes it a witness rather than a lock.
+pub(crate) fn acts_on(plan: &Disposition, scope: ReapScope) -> bool {
+    match plan {
+        Disposition::Terminate => true,
+        Disposition::AskElsewhere { .. } => scope == ReapScope::AlsoForeignRoots,
+        Disposition::Ourselves | Disposition::ServingHere | Disposition::TooYoung => false,
+    }
+}
+
+/// Retire what the census marks retirable, and NAME every daemon it leaves
+/// alone and why. A reaper that prints only its kills reads as complete when it
+/// is not.
+///
+/// Two acts, and they are not the same act:
+///   - **abandoned** ⇒ `SIGTERM`. Its handler takes the engine and the Xvfb down
+///     with it, which a `SIGKILL` cannot; the kill is a last resort and says so.
+///   - **serving elsewhere** ⇒ `retire_if_idle` on ITS socket, under
+///     `AlsoForeignRoots` only. The daemon decides, under its own lock, and
+///     refuses while it holds a surface or an engine page. That refusal is what
+///     keeps an agent's in-flight page alive; the scope split above is what
+///     keeps a between-calls fixture alive.
+pub fn reap(scope: ReapScope, dry_run: bool, exclude: Option<u64>) -> Result<Value> {
+    let our_dir = daemon_dir()?;
+    let self_pid = std::process::id();
+    let mut acted: Vec<Value> = Vec::new();
+    for entry in census() {
+        if exclude == Some(u64::from(entry.pid)) {
+            let mut row = describe(&entry);
+            row["action"] = json!("skipped");
+            row["outcome"] = json!("the daemon this restart just retired — it exits on its own");
+            acted.push(row);
+            continue;
+        }
+        let plan = disposition(&entry, &our_dir, self_pid);
+        let mut row = describe(&entry);
+        let (action, outcome) = match &plan {
+            Disposition::Ourselves => continue,
+            Disposition::ServingHere => (
+                "kept",
+                "it is serving this root".to_string(),
+            ),
+            Disposition::TooYoung => (
+                "kept",
+                format!("lockless but only {}s old — too young to tell from a daemon still winding down", entry.up_secs),
+            ),
+            Disposition::Terminate if dry_run => ("would_terminate", "abandoned".to_string()),
+            Disposition::Terminate => {
+                unsafe { libc::kill(entry.pid as i32, libc::SIGTERM) };
+                if wait_for_exit(entry.pid, Duration::from_secs(8)) {
+                    ("terminated", "abandoned; SIGTERM took its engine down with it".to_string())
+                } else {
+                    unsafe { libc::kill(entry.pid as i32, libc::SIGKILL) };
+                    let gone = wait_for_exit(entry.pid, Duration::from_secs(2));
+                    (
+                        if gone { "killed" } else { "unkillable" },
+                        "abandoned and did not answer SIGTERM in 8s; a SIGKILL skips its handler, \
+                         so its Xvfb is left for the next daemon start to reap"
+                            .to_string(),
+                    )
+                }
+            }
+            Disposition::AskElsewhere { .. } if !acts_on(&plan, scope) => (
+                "kept",
+                "it serves another root — `ychrome daemon reap` asks it to retire, a restart never does"
+                    .to_string(),
+            ),
+            Disposition::AskElsewhere { sock } => {
+                if dry_run {
+                    ("would_ask", format!("would ask {} to retire if idle", sock.display()))
+                } else {
+                    match probe_socket(sock, &json!({ "op": "retire_if_idle" })) {
+                        SocketProbe::Reply(reply)
+                            if reply.get("retiring").and_then(Value::as_bool) == Some(true) =>
+                        {
+                            let gone = wait_for_exit(entry.pid, Duration::from_secs(10));
+                            (
+                                if gone { "retired" } else { "retiring" },
+                                "it was idle and retired itself".to_string(),
+                            )
+                        }
+                        SocketProbe::Reply(reply)
+                            if reply.get("ok").and_then(Value::as_bool) == Some(false) =>
+                        {
+                            ("kept", "it predates `retire_if_idle` and cannot say what is attached to it".to_string())
+                        }
+                        SocketProbe::Reply(reply) => {
+                            let held = reply["held_by"].as_array().map(Vec::len).unwrap_or(0);
+                            let pages = reply["engine_pages"].as_u64().unwrap_or(0);
+                            row["held_by"] = reply["held_by"].clone();
+                            (
+                                "kept",
+                                format!("it refused: {held} surface(s) and {pages} engine page(s) attached"),
+                            )
+                        }
+                        // Accepted the connection, answered late: alive and busy.
+                        // The one reading that must NOT become a kill.
+                        SocketProbe::Silent => (
+                            "kept",
+                            "its socket accepted the connection but did not answer in 5s — alive and busy".to_string(),
+                        ),
+                        SocketProbe::Unreachable if entry.up_secs < ABANDONED_GRACE_SECS => (
+                            "kept",
+                            "nothing answers on its socket, but it is too young to tell from one still coming up".to_string(),
+                        ),
+                        // It holds a lock but nothing can connect to its socket:
+                        // a client reaches a daemon only through that socket, so
+                        // no test can be using this one.
+                        SocketProbe::Unreachable => {
+                            unsafe { libc::kill(entry.pid as i32, libc::SIGTERM) };
+                            let gone = wait_for_exit(entry.pid, Duration::from_secs(8));
+                            (
+                                if gone { "terminated" } else { "terminating" },
+                                "it holds a lock but nothing answers on its socket, so no client can reach it".to_string(),
+                            )
+                        }
+                    }
+                }
+            }
+        };
+        row["action"] = json!(action);
+        row["outcome"] = json!(outcome);
+        acted.push(row);
+    }
+    let retired: Vec<u64> = acted
+        .iter()
+        .filter(|row| {
+            matches!(
+                row["action"].as_str(),
+                Some("terminated" | "killed" | "retired")
+            )
+        })
+        .filter_map(|row| row["pid"].as_u64())
+        .collect();
+    journal(
+        "daemon.reap",
+        json!({ "scope": format!("{scope:?}"), "dry_run": dry_run, "retired": retired, "daemons": acted.len() }),
+    );
+    Ok(json!({
+        "ok": true,
+        "scope": format!("{scope:?}"),
+        "dry_run": dry_run,
+        "root": our_dir.to_string_lossy(),
+        "retired": retired,
+        "daemons": acted,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1831,6 +2336,213 @@ mod tests {
         let gone = PathBuf::from("/tmp/ych-exe-nonexistent (deleted)");
         assert_eq!(spawnable_exe(gone.clone()), gone);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // THE CENSUS: identify, then retire — never count and kill.
+    // -----------------------------------------------------------------------
+
+    fn censused(pid: u32, lock_dir: Option<&str>, up_secs: u64) -> DaemonCensus {
+        DaemonCensus {
+            pid,
+            exe: "/home/x/.local/bin/ychrome".to_string(),
+            exe_deleted: false,
+            lock_dir: lock_dir.map(PathBuf::from),
+            home: Some(PathBuf::from("/home/x")),
+            up_secs,
+            children: 3,
+        }
+    }
+
+    /// ⛔ THE CLAUSE THE WHOLE REAPER RESTS ON. A daemon under another `HOME` may
+    /// be serving a fixture root a test is using right now, and we cannot see
+    /// into it — so the only sound act is to ASK, on its own socket, and let it
+    /// refuse. Turning this arm into a kill is the bug the entry was filed to
+    /// prevent.
+    #[test]
+    fn a_daemon_serving_another_root_is_asked_never_terminated() {
+        let ours = PathBuf::from("/home/x/.yggterm/ychrome");
+        let plan = disposition(
+            &censused(4242, Some("/tmp/ycc/.yggterm/ychrome"), 550_000),
+            &ours,
+            9,
+        );
+        assert_eq!(
+            plan,
+            Disposition::AskElsewhere {
+                sock: PathBuf::from("/tmp/ycc/.yggterm/ychrome/daemon.sock"),
+            },
+            "a foreign root is asked on ITS socket — age never decides"
+        );
+    }
+
+    /// The daemon on our own root belongs to `daemon restart`. Two mechanisms
+    /// racing one handover is how a bind lands on a socket the other is about to
+    /// unlink.
+    #[test]
+    fn the_daemon_on_our_root_is_left_to_restart() {
+        let ours = PathBuf::from("/home/x/.yggterm/ychrome");
+        assert_eq!(
+            disposition(&censused(4242, Some("/home/x/.yggterm/ychrome"), 900), &ours, 9),
+            Disposition::ServingHere
+        );
+    }
+
+    /// No lock means it released the singleton and never exited: its socket
+    /// belongs to whoever holds the lock now, so no client can reach it.
+    #[test]
+    fn a_lockless_daemon_past_the_grace_is_abandoned() {
+        let ours = PathBuf::from("/home/x/.yggterm/ychrome");
+        assert_eq!(
+            disposition(&censused(4242, None, ABANDONED_GRACE_SECS), &ours, 9),
+            Disposition::Terminate
+        );
+    }
+
+    /// A daemon told to `stop` releases the lock BEFORE tearing its engine down,
+    /// so "lockless" is a legitimate state for the length of that teardown.
+    #[test]
+    fn a_lockless_daemon_inside_the_grace_is_left_alone() {
+        let ours = PathBuf::from("/home/x/.yggterm/ychrome");
+        assert_eq!(
+            disposition(&censused(4242, None, ABANDONED_GRACE_SECS - 1), &ours, 9),
+            Disposition::TooYoung
+        );
+    }
+
+    #[test]
+    fn the_reaper_never_disposes_of_the_process_running_it() {
+        let ours = PathBuf::from("/home/x/.yggterm/ychrome");
+        assert_eq!(
+            disposition(&censused(9, None, 900_000), &ours, 9),
+            Disposition::Ourselves,
+            "our own pid is lockless in a CLI process — without this arm \
+             `ychrome daemon reap` would SIGTERM itself"
+        );
+    }
+
+    /// The FD is what proves ownership, so its parse is what decides whether a
+    /// daemon looks abandoned. Reading `daemon.sock` — the sibling every daemon
+    /// also holds — as the lock would make every daemon look like it is serving.
+    #[test]
+    fn only_a_daemon_lock_fd_names_the_root_it_serves() {
+        assert_eq!(
+            lock_dir_of_fd("/tmp/ycc/.yggterm/ychrome/daemon.lock"),
+            Some(PathBuf::from("/tmp/ycc/.yggterm/ychrome"))
+        );
+        // The kernel keeps the marker when the file was replaced under it.
+        assert_eq!(
+            lock_dir_of_fd("/tmp/ycc/.yggterm/ychrome/daemon.lock (deleted)"),
+            Some(PathBuf::from("/tmp/ycc/.yggterm/ychrome"))
+        );
+        assert_eq!(lock_dir_of_fd("/tmp/ycc/.yggterm/ychrome/daemon.sock"), None);
+        assert_eq!(lock_dir_of_fd("/tmp/ycc/.yggterm/vault/daemon.lock"), None);
+        assert_eq!(lock_dir_of_fd("/dev/urandom"), None);
+    }
+
+    /// `ychrome-vault` is a different program on the same host that also takes
+    /// flags. A prefix match here would put it in the census and SIGTERM it.
+    #[test]
+    fn the_census_matches_ychrome_daemons_and_nothing_adjacent() {
+        let argv = |parts: &[&str]| -> Vec<String> {
+            parts.iter().map(|part| part.to_string()).collect()
+        };
+        assert!(is_a_ychrome_daemon(&argv(&[
+            "/home/x/gh/ychrome/target/release/ychrome",
+            "--daemon"
+        ])));
+        assert!(!is_a_ychrome_daemon(&argv(&[
+            "/home/x/.local/bin/ychrome-vault",
+            "--daemon"
+        ])));
+        assert!(!is_a_ychrome_daemon(&argv(&[
+            "/home/x/.local/bin/ychrome",
+            "https://example.invalid"
+        ])));
+        assert!(!is_a_ychrome_daemon(&argv(&[
+            "/home/x/.local/bin/ychrome",
+            "ctl",
+            "shot"
+        ])));
+        assert!(!is_a_ychrome_daemon(&[]));
+    }
+
+    /// ⛔ A RESTART MUST NEVER END A DAEMON ON ANOTHER ROOT. Its idleness is not
+    /// evidence: this repo's own fixtures each run one under their own `HOME`,
+    /// and one BETWEEN CALLS holds no surface and no page while being very much
+    /// in use. Only the lockless case — which no client can reach at all — is a
+    /// restart's to collect.
+    #[test]
+    fn a_restart_scope_collects_the_unreachable_and_asks_nothing() {
+        let foreign = Disposition::AskElsewhere {
+            sock: PathBuf::from("/tmp/ycc/.yggterm/ychrome/daemon.sock"),
+        };
+        assert!(!acts_on(&foreign, ReapScope::Abandoned));
+        assert!(acts_on(&foreign, ReapScope::AlsoForeignRoots));
+        // The unreachable half needs no scope: both sweeps take it.
+        assert!(acts_on(&Disposition::Terminate, ReapScope::Abandoned));
+        assert!(acts_on(&Disposition::Terminate, ReapScope::AlsoForeignRoots));
+        // And nothing else is ever acted on, at either scope.
+        for scope in [ReapScope::Abandoned, ReapScope::AlsoForeignRoots] {
+            assert!(!acts_on(&Disposition::ServingHere, scope));
+            assert!(!acts_on(&Disposition::TooYoung, scope));
+            assert!(!acts_on(&Disposition::Ourselves, scope));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // IDLENESS: a surface is not the only thing attached to a daemon.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_engine_page_alone_refuses_the_retire() {
+        let verdict = idle_verdict(&[], 1);
+        assert_eq!(verdict["retiring"], json!(false));
+        assert_eq!(verdict["engine_pages"], json!(1));
+    }
+
+    #[test]
+    fn a_surface_alone_refuses_the_retire() {
+        assert_eq!(idle_verdict(&["env-a".to_string()], 0)["retiring"], json!(false));
+    }
+
+    #[test]
+    fn a_daemon_holding_neither_retires() {
+        assert_eq!(idle_verdict(&[], 0)["retiring"], json!(true));
+    }
+
+    /// ⛔ `idle_verdict` being pure proves nothing unless the number fed to it is
+    /// the LIVE page registry. Without this, `engine_pages_held` could return a
+    /// constant 0 and every purity test above would still pass while the reaper
+    /// killed pages.
+    #[test]
+    fn the_page_count_is_read_from_the_live_pool() {
+        let before = engine_pages_held();
+        crate::engine::pool::adopt("pg_census_probe", "about:blank", "default", (800, 600));
+        let after = engine_pages_held();
+        crate::engine::pool::pool().remove("pg_census_probe");
+        assert_eq!(
+            after,
+            before + 1,
+            "engine_pages_held must read pool().counts(), not a constant"
+        );
+    }
+
+    /// And that the op actually asks. The verdict is only load-bearing if
+    /// `retire_if_idle` is the caller.
+    #[test]
+    fn retire_if_idle_consults_the_engine_pages() {
+        let source = include_str!("daemon.rs");
+        let body = source
+            .split("\"retire_if_idle\" => {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n        }").next())
+            .expect("the retire_if_idle arm");
+        assert!(
+            body.contains("engine_pages_held()"),
+            "retire_if_idle must count engine pages, not just registered \
+             surfaces — a daemon can be the sole owner of an agent's page"
+        );
     }
 
     // -----------------------------------------------------------------------
