@@ -52,49 +52,12 @@ happens to hold. `emit_fido2_request` already takes a `session` argument and cur
 for diagnostics only ("the GUI routes the OSC by the STREAM it arrived on, not this field") —
 under a daemon that comment is precisely the bug.
 
-**Do not confuse this with the orphaning below.** A `ychrome daemon restart` ALSO leaves live
+**Do not confuse this with daemon orphaning** (that one is fixed — `daemon list`/`daemon reap`,
+`docs/host-daemon.md` §6.2). A `ychrome daemon restart` ALSO leaves live
 surfaces pointing at the retired daemon's control port (observed: `connect 127.0.0.1:41459:
 Connection refused`, GUI toast "Web policy unavailable … Its surfaces open unprotected", which
 additionally strips the userscripts and therefore the shim). That is a second, separate defect
 on the same path; fixing either one alone still leaves passkeys broken.
-
-## ⚠ `daemon restart` RETIRES ONLY THE DAEMON ON THE LIVE SOCKET — the rest accumulate forever
-
-**Status:** OPEN
-
-Measured on `dev` 2026-08-07 by the graph-router orchestrator, immediately after a clean
-`ychrome daemon restart` (pid 1667242 retired → 2999778 serving, 4 surfaces re-registered in ~4 s —
-**the restart itself worked exactly as documented**).
-
-⛔ **Two OTHER ychrome daemons survived it**, both running **binaries deleted from disk**:
-
-```
-pid  742285  up  30h   /home/user/gh/ychrome/target/release/ychrome --daemon   (deleted)
-pid 3022293  up 153h   /home/user/gh/ychrome/target/release/ychrome --daemon   (deleted)   ~6.4 days
-```
-
-Neither is an empty husk: **7 sockets and 3 child processes each**. The older one listens on
-`/tmp/ycc/.yggterm/ychrome/daemon.sock` — **a different socket root** from the installed daemon's
-`~/.yggterm/ychrome/daemon.sock`.
-
-**The mechanism, and it is not a bug in the restart:** `daemon restart` retires the daemon bound to
-the socket it resolves. A daemon bound **elsewhere** — a dev build, a test fixture root, an older
-`$YGGTERM_HOME` — is invisible to it and therefore immortal. Every development run can leave one,
-and nothing ever collects them.
-
-⚠ **Why this matters beyond tidiness:** each one holds sockets and children, they run **code that no
-longer exists on disk**, and they make any capability probe on the host **ambiguous** — the same
-shape as yggterm's own long-standing daemon proliferation (28 daemons on `dev`, 26 on deleted
-binaries, oldest up 24 days). A probe that asks "what does ychrome do here" can be answered by a
-six-day-old build.
-
-**Owed:** a reaper — or a `daemon list` — that reasons about **socket path + binary liveness +
-ownership**, not just the current socket. ⛔ It must not simply kill by age: these hold children, and
-one of them may legitimately serve a fixture root a test is using. **Identify, then retire; do not
-count and kill.**
-
-**Falsifier:** `pgrep -af "ychrome --daemon"` on a host after a restart. If only one daemon remains
-and no `(deleted)` binary appears in `/proc/<pid>/exe`, this is wrong.
 
 ## ★★ THE ENGINE CANNOT REACH INTO A CROSS-ORIGIN FRAME, AND THAT BLOCKED A PAYMENT
 
