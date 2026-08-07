@@ -135,3 +135,50 @@ authority here, not the earlier recollection.**
 ⇒ **The label carries exactly: From block (name, address, PIN, phone) · To block (designation,
 office, address, PIN, phone). Nothing else.** No email, no contents marking, no internal codes
 (that last one was already law — tray codes and slugs never print).
+
+## paper-cost-announce-before-printing · WORKS
+task: how much paper a label run will cost, and what to say before spending it
+model: claude-fable-5
+date: 2026-08-07
+tags: 
+
+⛔⛔ **OWNER ESCALATION 2026-08-07 — ANNOUNCE THE PAPER COST, ASK, THEN PRINT.**
+> *"With so much paper wastage I feel like crying to be honest. We should really optimize
+> shipping labels in one page or use bad one-sided pages. I need you to tell me these next
+> time we print."*
+
+This supersedes the earlier "do not auto-print" line by making the obligation POSITIVE. Before
+any print job, state four things and wait:
+
+1. **How many sheets, and how full the last one is** — a percentage, not an impression.
+2. **What could ride along.** A batch one article short is worth waiting for; the pickup/postal
+   batching law applies to paper too.
+3. **Whether a one-side-used sheet will do.** He keeps paper already printed on one side, and
+   drafts, labels and working copies belong on the blank back: `-o sides=one-sided`, manual feed.
+   ⛔ Never duplex a reused sheet; never send one out of the house.
+4. **Whether it needs printing at all.** One envelope is hand-addressed faster than a label sheet
+   can be rendered, checked and corrected.
+
+⛔ **Under about 60% page fill, printing without saying so first IS the failure.**
+
+## What the tooling now does about it
+
+`atlasStore/git/graph-manager/scripts/labels.py`:
+- prints its own **`⚠ PAPER COST: N sheet(s), about X% full`** line and, under 60%, tells the
+  operator to offer batching or a reused sheet before printing;
+- **refuses** a single-article sheet without `--force` (the 2026-08-06 sheet used ~10% of an A4);
+- **refuses** any recipient with no phone number, the exact field that had to be handwritten;
+- packs **two columns per row via a `<table>`**.
+
+⚠ **WeasyPrint does not paginate flex containers.** A `display:flex; flex-wrap` grid with
+`page-break-inside: avoid` rendered an **empty first page** and spilled 5 labels across 3 sheets.
+A table paginates row by row and fits about 10 articles per A4. Use tables for anything that must
+break across pages.
+
+⚠ **Counting `/Type /Page` tokens to get a page count returns nothing on WeasyPrint output** —
+which silently suppressed the paper-cost line, the one line the tool exists for. Shell out to
+`pdfinfo` instead.
+
+⇒ **The general form, past paper:** when an action consumes something of his that does not come
+back — a sheet, a bank OTP, a one-shot captcha, a non-refundable booking — **state the cost in
+units before spending it, not after.**
