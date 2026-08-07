@@ -1248,6 +1248,15 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
                 folder_id,
                 fields: field_edits(request)?,
                 clear: clear_fields(request)?,
+                // A card's own content. `edit_value` for the same reason the
+                // rest use it: an empty value must reach `edit_body` to be
+                // REFUSED there, not vanish into "you named no fields".
+                card_brand: edit_value(request, "card_brand"),
+                card_holder: edit_value(request, "card_holder"),
+                card_exp_month: edit_value(request, "card_exp_month"),
+                card_exp_year: edit_value(request, "card_exp_year"),
+                card_number: edit_value(request, "card_number"),
+                card_code: edit_value(request, "card_code"),
             };
             if edit.is_empty() {
                 bail!("edit needs at least one field to change");

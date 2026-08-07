@@ -221,6 +221,29 @@ pub struct CipherEdit {
     pub fields: Vec<FieldEdit>,
     /// Fields to REMOVE. Ordered so an edit's shape is deterministic.
     pub clear: std::collections::BTreeSet<ClearField>,
+    /// A card's own content, which none of the fields above can reach.
+    ///
+    /// ⛔ WITHOUT THESE, A CARD WAS UNEDITABLE BY THIS CLIENT AT ALL. `edit`
+    /// modelled rename / user / uri / totp / notes / custom-field / folder —
+    /// and a card has none of those as its real content, so the only reachable
+    /// edits on one were its title, its notes and its custom fields. Every card
+    /// expires; updating one meant opening the Bitwarden web vault, which is
+    /// the single thing this client exists to avoid.
+    pub card_brand: Option<String>,
+    pub card_holder: Option<String>,
+    pub card_exp_month: Option<String>,
+    pub card_exp_year: Option<String>,
+    /// The PAN and the CVV. They are ordinary `Option<String>` here because
+    /// [`edit_body`] must encrypt them like any other field — the boundary that
+    /// matters is at the EDGES: no CLI flag carries them in argv (they are read
+    /// from stdin like `add`'s password), and [`verify_edit`] reports them as
+    /// labels, so neither ever reaches a `--json` reply, a `ps` listing or a
+    /// shell history.
+    ///
+    /// [`edit_body`]: Vault::edit_body
+    /// [`verify_edit`]: Vault::verify_edit
+    pub card_number: Option<String>,
+    pub card_code: Option<String>,
 }
 
 impl CipherEdit {
@@ -234,6 +257,7 @@ impl CipherEdit {
             && self.folder_id.is_none()
             && self.fields.is_empty()
             && self.clear.is_empty()
+            && !self.touches_card()
     }
 
     /// Whether the edit touches a field that only exists on a login cipher.
@@ -243,6 +267,24 @@ impl CipherEdit {
             || self.totp.is_some()
             || !self.uris.is_empty()
             || self.clear.iter().any(|field| field.is_login_only())
+    }
+
+    /// Whether the edit touches a field that only exists on a card cipher.
+    ///
+    /// The exact twin of [`touches_login`], and it must stay one: a card field
+    /// aimed at a login is the same mistake in the other direction, and it
+    /// would write a `card` object onto an item whose type says it has none —
+    /// invisible to every reader afterwards, because `card_object` refuses to
+    /// look at a non-card.
+    ///
+    /// [`touches_login`]: CipherEdit::touches_login
+    pub(crate) fn touches_card(&self) -> bool {
+        self.card_brand.is_some()
+            || self.card_holder.is_some()
+            || self.card_exp_month.is_some()
+            || self.card_exp_year.is_some()
+            || self.card_number.is_some()
+            || self.card_code.is_some()
     }
 
     /// The set-side twin of a clear, so "set and clear in one edit" can be
@@ -284,6 +326,13 @@ pub enum EditError {
     NoRawRecord(String),
     #[error("{0} is not a login item, so it has no username, password, totp or uri")]
     NotALogin(String),
+    #[error("{0} is not a card item, so it has no brand, cardholder, expiry, number or code")]
+    NotACard(String),
+    #[error(
+        "{0:?} is not a usable card {1}; an expiry that syncs cleanly and is wrong is \
+         refused at the gateway months later, with nothing to point at"
+    )]
+    BadCardExpiry(String, &'static str),
     #[error(
         "refusing to set a field to the empty string; to remove a value use \
          `--clear <field>` or `--remove-field <name>`"
@@ -439,6 +488,23 @@ pub struct ItemDetail {
     /// One entry per REPLACED password, newest first — dates only. The values
     /// are read one at a time through [`Vault::past_password`].
     pub password_history: Vec<PastPassword>,
+    /// A card item's secret-free metadata, from the SAME reader the `card` op
+    /// and the CLI use ([`Vault::card`]). `None` for everything that is not a
+    /// card.
+    ///
+    /// ⛔ IT BELONGS ON THE DETAIL BECAUSE THE DETAIL IS WHAT A PANE DRAWS.
+    /// Before this, `ychrome-vault card` printed brand, cardholder, expiry and
+    /// last4 while the sidebar's View pane showed a card as an entry with no
+    /// content at all — the CLI and the pane disagreeing about the same five
+    /// fields, with the CLI right. The operator's loss was concrete: he keeps
+    /// two cards from the same issuer with the same product name, and **last4
+    /// is the only thing that tells them apart at a glance**, so the pane was
+    /// withholding the one field that stops the wrong person being charged.
+    ///
+    /// No PAN and no CVV are reachable from here, by construction:
+    /// [`CardInfo`] cannot carry them. `card_secret` remains the only path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card: Option<CardInfo>,
 }
 
 /// A past password's metadata. The value is deliberately absent: a history list
@@ -1076,6 +1142,9 @@ impl Vault {
         if edit.touches_login() && cipher.item_type != CIPHER_TYPE_LOGIN {
             return Err(EditError::NotALogin(id.to_string()));
         }
+        if edit.touches_card() && cipher.item_type != CIPHER_TYPE_CARD {
+            return Err(EditError::NotACard(id.to_string()));
+        }
         for cleared in &edit.clear {
             if edit.also_set(*cleared) {
                 return Err(EditError::ClearAndSet(cleared.as_str()));
@@ -1087,6 +1156,12 @@ impl Vault {
             &edit.password,
             &edit.totp,
             &edit.notes,
+            &edit.card_brand,
+            &edit.card_holder,
+            &edit.card_exp_month,
+            &edit.card_exp_year,
+            &edit.card_number,
+            &edit.card_code,
         ] {
             if value.as_deref().is_some_and(str::is_empty) {
                 return Err(EditError::EmptyValue);
@@ -1094,6 +1169,26 @@ impl Vault {
         }
         if edit.uris.iter().any(String::is_empty) {
             return Err(EditError::EmptyValue);
+        }
+        // ⛔ THE EXPIRY IS THE ONE CARD FIELD WITH A SHAPE, AND A WRONG ONE IS
+        // SILENT. A month of "13" or a year of "29" encrypts, syncs and reads
+        // back perfectly; the first thing that objects is a payment gateway,
+        // months later, with nothing on screen to point at. Refuse here rather
+        // than in the CLI, because the pane and the agent op reach `edit_body`
+        // without passing through it.
+        if let Some(month) = &edit.card_exp_month
+            && !matches!(month.parse::<u8>(), Ok(1..=12))
+        {
+            return Err(EditError::BadCardExpiry(month.clone(), "month (want 1-12)"));
+        }
+        if let Some(year) = &edit.card_exp_year
+            && !(year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()))
+        {
+            return Err(EditError::BadCardExpiry(
+                year.clone(),
+                "year (want four digits, e.g. 2031 — a two-digit year is stored verbatim \
+                 and read back as the year 29)",
+            ));
         }
         // A custom field named twice in one edit has no defined outcome — the
         // second write would silently win, or the remove would, depending on
@@ -1195,6 +1290,34 @@ impl Vault {
             }
             set_ci(&mut login, "uris", Value::Array(uris));
         }
+        // THE CARD OBJECT, patched exactly the way `login` is above: lifted out
+        // whole, only the named keys replaced, put back. Bitwarden's spellings
+        // (`cardholderName`, `expMonth`, `expYear`) are what `Vault::card`
+        // reads, so the writer and the reader cannot drift apart.
+        //
+        // ⛔ EVERY KEY IS ENCRYPTED, INCLUDING THE EXPIRY AND THE BRAND. They
+        // look like harmless strings and the server stores them as ciphertext
+        // like everything else; writing one in the clear produces an item that
+        // syncs cleanly and then reads back as garbage in every other client —
+        // the silent corruption raw-patching exists to prevent.
+        if edit.touches_card() {
+            let mut card = remove_ci(&mut body, "card")
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            for (key, value) in [
+                ("brand", &edit.card_brand),
+                ("cardholderName", &edit.card_holder),
+                ("expMonth", &edit.card_exp_month),
+                ("expYear", &edit.card_exp_year),
+                ("number", &edit.card_number),
+                ("code", &edit.card_code),
+            ] {
+                if let Some(value) = value {
+                    set_ci(&mut card, key, encrypt(value)?);
+                }
+            }
+            set_ci(&mut body, "card", Value::Object(card));
+        }
         for change in &edit.fields {
             apply_field_edit(&mut body, change, &key)?;
         }
@@ -1284,6 +1407,62 @@ impl Vault {
         }
         if let Some(folder_id) = &edit.folder_id {
             check("folder", cipher.folder_id.as_ref() == Some(folder_id));
+        }
+        // THE CARD, re-read through the same two readers everything else uses —
+        // `card` for the metadata, `card_secret` for the PAN and the CVV. The
+        // comparison happens here, inside the crate, and only a LABEL leaves:
+        // `verify_edit`'s whole contract is that its output can be printed.
+        if edit.touches_card() {
+            let card = self.card(id);
+            let mut card_check = |label: &str, stored: Option<&String>, wanted: &Option<String>| {
+                if let Some(wanted) = wanted {
+                    check(label, stored == Some(wanted));
+                }
+            };
+            let info = card.as_ref();
+            card_check(
+                "card-brand",
+                info.and_then(|card| card.brand.as_ref()),
+                &edit.card_brand,
+            );
+            card_check(
+                "card-holder",
+                info.and_then(|card| card.cardholder.as_ref()),
+                &edit.card_holder,
+            );
+            card_check(
+                "card-exp-month",
+                info.and_then(|card| card.exp_month.as_ref()),
+                &edit.card_exp_month,
+            );
+            card_check(
+                "card-exp-year",
+                info.and_then(|card| card.exp_year.as_ref()),
+                &edit.card_exp_year,
+            );
+            // The secret half is read only when it was asked for, so an edit
+            // that never touched the number does not decrypt one to check it.
+            if edit.card_number.is_some() || edit.card_code.is_some() {
+                let secret = self.card_secret(id);
+                if let Some(number) = &edit.card_number {
+                    check(
+                        "card-number",
+                        secret
+                            .as_ref()
+                            .and_then(|secret| secret.number.as_deref())
+                            .is_some_and(|stored| stored == number),
+                    );
+                }
+                if let Some(code) = &edit.card_code {
+                    check(
+                        "card-code",
+                        secret
+                            .as_ref()
+                            .and_then(|secret| secret.code.as_deref())
+                            .is_some_and(|stored| stored == code),
+                    );
+                }
+            }
         }
         for change in &edit.fields {
             let stored = self
@@ -1447,6 +1626,10 @@ impl Vault {
                         .map(str::to_string),
                 })
                 .collect(),
+            // `card` already answers `None` for a non-card, off the record's own
+            // `type` — so this asks once rather than testing the type here and
+            // letting two places decide what a card is.
+            card: self.card(id),
             item,
         })
     }
@@ -3077,7 +3260,7 @@ mod tests {
         let vault = card_vault(
             &key_bytes,
             &[
-                ("cardholderName", "AVIKALPA KUNDU"),
+                ("cardholderName", "RIVKA HOLLANDER"),
                 ("brand", "Visa"),
                 ("number", "4111 1111 1111 4242"),
                 ("expMonth", "11"),
@@ -3088,7 +3271,7 @@ mod tests {
 
         let card = vault.card("card1").expect("a type-3 cipher is a card");
         assert_eq!(card.brand.as_deref(), Some("Visa"));
-        assert_eq!(card.cardholder.as_deref(), Some("AVIKALPA KUNDU"));
+        assert_eq!(card.cardholder.as_deref(), Some("RIVKA HOLLANDER"));
         assert_eq!(card.exp_month.as_deref(), Some("11"));
         assert_eq!(card.exp_year.as_deref(), Some("2029"));
         // Separators are not digits: the last four are 4242, not "4242" with a
@@ -3143,6 +3326,171 @@ mod tests {
         assert!(logins.card("c1").is_none(), "a login is not a card");
         assert!(logins.card_secret("c1").is_none());
         assert!(vault.card("nope").is_none());
+    }
+
+    /// ⛔ A CARD WAS UNEDITABLE BY THIS CLIENT AT ALL, and every card expires.
+    ///
+    /// `edit` modelled rename / user / uri / totp / notes / custom-field /
+    /// folder — none of which is a card's real content — so the only reachable
+    /// edits on one were its title, its notes and its custom fields. Updating an
+    /// expiry meant opening the Bitwarden web vault, the single thing this
+    /// client exists to avoid.
+    ///
+    /// This proves the write lands, that it is CIPHERTEXT (a brand or an expiry
+    /// written in the clear syncs cleanly and then reads back as garbage in
+    /// every other client), and that untouched keys survive.
+    #[test]
+    fn edit_body_writes_a_card_and_leaves_the_keys_it_was_not_given() {
+        let key_bytes = [0x71u8; 64];
+        let vault = card_vault(
+            &key_bytes,
+            &[
+                ("brand", "Visa"),
+                ("cardholderName", "RIVKA HOLLANDER"),
+                ("expMonth", "11"),
+                ("expYear", "2029"),
+                ("number", "4111 1111 1111 4242"),
+                ("code", "737"),
+            ],
+        );
+        let body = vault
+            .edit_body(
+                "card1",
+                &CipherEdit {
+                    card_exp_month: Some("3".into()),
+                    card_exp_year: Some("2031".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("a card takes a card edit");
+        let card = body["card"].as_object().expect("the card object survives");
+
+        // What was asked for is there, and it is SEALED.
+        for (key, plain) in [("expMonth", "3"), ("expYear", "2031")] {
+            let stored = card[key].as_str().expect("a string");
+            assert_ne!(stored, plain, "{key} was written in the clear: {stored}");
+            let enc = EncString::parse(stored).expect("an EncString");
+            let key_for = vault.cipher_key(vault.find("card1").unwrap()).unwrap();
+            assert_eq!(key_for.decrypt_to_string(&enc).unwrap(), plain);
+        }
+        // And what was NOT asked for is untouched, byte for byte — the same
+        // raw-patching promise `login` keeps. A rebuilt card object would have
+        // silently dropped the PAN, which no other client could restore.
+        let original = vault.find("card1").unwrap().raw["card"]
+            .as_object()
+            .unwrap()
+            .clone();
+        for key in ["brand", "cardholderName", "number", "code"] {
+            assert_eq!(card[key], original[key], "{key} was rewritten for nothing");
+        }
+    }
+
+    /// A card field aimed at a login is the same mistake as a password aimed at
+    /// a card, and it is the worse direction: it would write a `card` object
+    /// onto an item whose type says it has none, where `card_object` refuses to
+    /// look at it — invisible to every reader afterwards.
+    ///
+    /// And the expiry is refused on SHAPE, because a wrong one is silent. "13"
+    /// and "29" encrypt, sync and read back perfectly; the first thing that
+    /// objects is a payment gateway, months later.
+    #[test]
+    fn edit_body_refuses_a_card_edit_on_a_login_and_an_expiry_that_cannot_be_one() {
+        let key_bytes = [0x72u8; 64];
+        let logins = login_vault(&key_bytes);
+        let wrong_type = logins.edit_body(
+            "c1",
+            &CipherEdit {
+                card_brand: Some("Visa".into()),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(wrong_type, Err(EditError::NotACard(_))));
+
+        let cards = card_vault(&key_bytes, &[("brand", "Visa")]);
+        for bad in ["13", "0", "March", ""] {
+            let refused = cards.edit_body(
+                "card1",
+                &CipherEdit {
+                    card_exp_month: Some(bad.into()),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                matches!(
+                    refused,
+                    Err(EditError::BadCardExpiry(..) | EditError::EmptyValue)
+                ),
+                "month {bad:?} was accepted"
+            );
+        }
+        // ⚠ A TWO-DIGIT YEAR IS THE DANGEROUS ONE: it is what is printed on the
+        // card, it looks right in every box, and it is stored verbatim — so the
+        // card then reads back as expiring in the year 29.
+        let short_year = cards.edit_body(
+            "card1",
+            &CipherEdit {
+                card_exp_year: Some("29".into()),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(short_year, Err(EditError::BadCardExpiry(..))));
+        // And the shapes that ARE right are taken, including a padded month.
+        for (month, year) in [("3", "2031"), ("03", "2031"), ("12", "2099")] {
+            assert!(
+                cards
+                    .edit_body(
+                        "card1",
+                        &CipherEdit {
+                            card_exp_month: Some(month.into()),
+                            card_exp_year: Some(year.into()),
+                            ..Default::default()
+                        }
+                    )
+                    .is_ok(),
+                "{month}/{year} was refused"
+            );
+        }
+    }
+
+    /// The receipt must be a READBACK, and for a card that means both readers:
+    /// `card` for the metadata and `card_secret` for the PAN and the CVV. A
+    /// `PUT` returning 200 says the server accepted a body, never that the
+    /// field is what the user asked it to be.
+    ///
+    /// ⛔ And only LABELS leave. `verify_edit`'s whole contract is that its
+    /// output can be printed, so a card verification that echoed values would
+    /// put a PAN in every `--json` reply.
+    #[test]
+    fn verify_edit_reads_a_card_back_and_reports_labels_only() {
+        let key_bytes = [0x73u8; 64];
+        let stored = card_vault(
+            &key_bytes,
+            &[
+                ("brand", "Visa"),
+                ("expMonth", "11"),
+                ("expYear", "2029"),
+                ("number", "4111 1111 1111 4242"),
+                ("code", "737"),
+            ],
+        );
+        // What the vault already holds verifies; what it does not, does not.
+        let verification = stored.verify_edit(
+            "card1",
+            &CipherEdit {
+                card_brand: Some("Visa".into()),
+                card_exp_year: Some("2031".into()),
+                card_number: Some("4111 1111 1111 4242".into()),
+                card_code: Some("999".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(verification.landed, ["card-brand", "card-number"]);
+        assert_eq!(verification.missing, ["card-exp-year", "card-code"]);
+
+        let wire = serde_json::to_string(&verification).unwrap();
+        for secret in ["4111", "4242", "737", "999"] {
+            assert!(!wire.contains(secret), "a card value reached the receipt: {wire}");
+        }
     }
 
     // A custom field with nothing to show says WHICH of the two reasons it is.
