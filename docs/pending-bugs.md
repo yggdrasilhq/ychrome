@@ -234,6 +234,34 @@ the rest of it stands.
 **What is still OPEN:** building it — the read-only frame verb, the isolated
 message handler, and `frame=` on `/engine/input`.
 
+### ⛔ ONE THING IN THAT DESIGN IS STILL UNMEASURED — measure it FIRST
+
+Point 2 above is load-bearing and is currently a reasonable expectation, not a
+reading. Do not build on it unchecked; the last expectation about worlds in this
+entry was wrong.
+
+> Does `window.webkit.messageHandlers.<name>.postMessage()` work from inside a
+> CROSS-ORIGIN child frame, when the handler was registered
+> `..._in_world(ISOLATED_WORLD)` — and does the UI process receive it?
+
+If it does not, the private reply channel does not exist and the design changes
+again: with replies forced back across `postMessage`, even a read verb hands the
+top page a same-origin-policy bypass, and the honest answer becomes that the
+child may report only what the caller already knew (a rect, an existence bit) —
+or that a web-process extension is back on the table after all, for the reply
+path alone rather than for reach.
+
+⚠ Two sub-questions, and the second is the one that bites: the handler must be
+registered on the `UserContentManager` BEFORE the page loads (so this touches
+`identity.rs`, not just a userscript), and `script-message-received` hands back a
+value and the WebView — **not the frame** — so a child must self-identify in its
+own payload and that claim is unverifiable from outside. A frame that lies about
+which frame it is costs nothing today, but a verb that ROUTES on it would be
+trusting a page's word.
+
+Same instrument as the measurement above: extend `ychrome engine worlds` under
+its own `PROFILE` and `InstalledProbe`, with the cross-origin control intact.
+
 ⚠ Do NOT "fix" any of this by loosening origin checks. The frames are
 cross-origin because banks intend them to be — and nothing above does: the child
 reads its OWN document, in its own frame, and reports a value.
