@@ -45,53 +45,6 @@ count and kill.**
 **Falsifier:** `pgrep -af "ychrome --daemon"` on a host after a restart. If only one daemon remains
 and no `(deleted)` binary appears in `/proc/<pid>/exe`, this is wrong.
 
-## ★★★ THE FILL AND INPUT VERBS REPORTED THE REQUEST, NOT THE EFFECT — readback shipped, live proof owed
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-Reported by lumenstore row 5.2 (the TWS/IBKR paper lane) 2026-08-07 as two entries; they were one
-defect wearing two coats, and are fixed as one.
-
-**What was measured.** `ctl fill` answered `{"filled":"filled","ok":true}` having written a
-**31-character** value into a field whose vault secret is **20**, leaving the confirm field
-**entirely empty**. Separately, a `click + type + click + type` batch answered
-**`dispatched:3, ok:true`** and landed nothing — a page-side readback showed `user:""`, `pwlen:0`.
-
-**The root cause was one line.** `ychromeSet` returned a bare `true` whenever the element existed,
-so every caller's success field described *finding a node* while claiming to describe *filling it*.
-An assignment can be defeated after it returns in at least four ordinary ways — a `maxlength`, an
-`input` handler that reformats, a framework re-render, or a second field nobody wrote to — and all
-four answered `filled`. `type` events had it worse: they resolve nothing at all, going to
-`document.activeElement` at the instant the keys arrive, so a re-render sends the text to `<body>`.
-
-⛔ **Two entries had already been CLOSED citing that response shape as proof** (this file's banner
-entry, and yggterm's *"`ctl fill` is documented but has no route"*). The response proved ROUTING and
-was silent on CORRECTNESS; the two claims were never separated, so the lie propagated into the
-record. ⇒ **a status field that is not derived from a readback is decoration.**
-
-**Shipped.** `ychromeSet` re-reads `el.value` after dispatching the events and answers
-`{present, ok, want, got}` — ⛔ **a LENGTH, never a value**, the same vault boundary `fill-card`
-keeps. `fill` gained a fourth verdict, **`unverified`**, which outranks the assignment, plus
-per-field `fields[]`, a `confirm` verdict and `secret_field_count`. A confirm twin is now filled —
-but only when the page NAMES it one, because on a change-password form the other field is the old
-secret and writing there is worse than leaving it empty; an unnamed second field reports
-`present-but-unnamed`. `/engine/input` measures each `type` event against the page
-(`grew_by`, `landed`, `waited_ms`, and the target it actually reached), and **refuses with 409
-BEFORE typing** into a node that holds no text, with a named opt-out (`"require_target": false`)
-for pages that read bare keystrokes. The card fill and the TOTP rung shared the same primitive and
-were silently affected: an object is truthy, so `if (value && ychromeSet(...))` would have reported
-every field as filled.
-
-**The falsifying observations owed, both concrete:**
-1. one `ctl fill` against a form with a `maxlength` shorter than the secret — the reply must say
-   `filled:"unverified"` with a `fields[]` entry whose `got` is less than its `want`;
-2. one `ctl input` batch whose first event re-renders the form — the second `type` must come back
-   **409 `failed_at`** naming the tag it would have typed into, rather than `dispatched:N, ok:true`.
-
-⚠ **`landed:false` over a real field is REPORTED, never refused**, and that is deliberate: a phone
-mask that strips separators and an OTP field that submits on its last digit are both correct pages
-that grow by the wrong amount. Only the unambiguous fault — text with nowhere to go — stops a batch.
-
 ## ⭐ A CARD ITEM IS UNREADABLE AND UNEDITABLE IN THE SIDEBAR — the View pane shows nothing, `edit` has no card options
 
 **Status:** OPEN. **Reported by the operator 2026-08-07**, in his own words, while he was paying an
