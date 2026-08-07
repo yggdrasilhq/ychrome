@@ -7,6 +7,40 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ⚠ VAULT PANE vs THE BITWARDEN EXTENSION — the parity gap, itemised
+
+**Status:** OPEN. Owner directive 2026-08-08: *"Make our vault GUI and implementation on par
+with Bitwarden's extension."* Tonight closed the defects that broke FUNCTION or that he could
+see; this entry is the honest remainder, so nobody reads the green ticks as parity.
+
+**Closed 2026-08-08** (do not re-open): passkeys were invisible to every ceremony
+(credential-id spelling); `icon:copy`/`icon:eye`/`icon:dice` printed as literal text over the
+value; row icons too small and un-grounded; a stored passkey shown nowhere on the edit form or
+in the list.
+
+**Still missing, roughly in the order a user meets them:**
+
+1. **No passkey autofill, and no picker.** THE big one. A passkey is only usable when the SITE
+   starts a ceremony; the Fill tab lists logins only, so there is no "sign in with this
+   passkey" affordance and no way to CHOOSE among several for one site. Bitwarden offers it
+   from the item. ⛔ Blocked behind the presence-request bug above — a picker is pointless
+   while no grant can be delivered.
+2. **No passkey removal.** An item's passkey can be read but not deleted from the pane.
+3. **A created passkey confirms nothing.** `fido2-create` mints and stores correctly, but the
+   sidebar says nothing afterwards, so the user trusts a silent success — the same class the
+   owner's own razor names: *a status field without a readback is decoration*.
+4. **`clear_notes` / `clear_totp` are standing toggles**, not per-field actions. They read as
+   two duplicated delete switches while scrolling and were reported as such. Bitwarden removes
+   a value where the value lives.
+5. **Cards and identities have no real editor.** `item_type` 3 and 4 render, and a card fills,
+   but neither can be edited — and 130 of ~1125 items in this vault are not logins.
+6. **The GUI's modal state is unobservable.** `server app state` exposes no `pending_fido2`, so
+   neither an agent nor a test can tell whether a ceremony is actually in front of the user or
+   was dropped. That is what made the presence-request bug take a full session to corner.
+
+⚠ **Sequencing:** items 1–3 all sit behind the presence-request fix. Do that first or the work
+cannot be verified end to end — which is exactly the trap this session fell into.
+
 ## ⛔⛔ A PASSKEY CAN NEVER BE APPROVED: the presence request is written to the DAEMON'S `/dev/null` stdout
 
 **Status:** OPEN — this makes `navigator.credentials.get()` unusable on every daemon-served
