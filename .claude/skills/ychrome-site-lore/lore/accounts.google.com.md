@@ -76,3 +76,59 @@ deliberate and cannot be answered by an agent.
 
 ⛔ **A tab opened while the vault was LOCKED has no shim for its whole life** —
 userscripts bind at surface creation. Unlock first, then open the tab.
+
+## unmapped-surface-has-no-raf-reload-is-not-the-fix · WORKS
+task: sign-in on an unrevealed surface for the androiddeveloper flow
+model: claude-opus-5
+date: 2026-08-07
+tags: 
+
+Correction and root cause for the "SPA view swap stalls" entry above, measured
+2026-08-07 on the `service=androiddeveloper` sign-in (Play Console signup).
+
+## The reload fix does NOT hold for this flow
+
+The earlier entry says "the fix is `location.reload()` after each navigation". On this
+flow that is WRONG and costs the login: `/v3/signin/challenge/pwd?TL=…` carries a
+SINGLE-USE token, and reloading it bounces straight back to `/v3/signin/identifier`
+with the typed identifier lost. Measured twice, both times a clean bounce.
+
+## The real cause: an unmapped surface has no animation frames
+
+On a `--no-activate` surface `document.visibilityState === 'hidden'` and
+**`requestAnimationFrame` never fires** (measured: no callback in 3 s; timers and
+promises still run). Google's view swap is frame-driven, so it half-completes:
+the incoming screen is in the DOM but its `c-wiz` keeps the inline `display: none`
+the swap would have cleared, which is why the inputs measure 0x0 with
+`offsetParent: null`.
+
+## The fix that works, without revealing the surface
+
+Do what the missing frame would have done:
+
+    // 1. land every frozen animation/transition
+    document.getAnimations().forEach(a => { try { a.finish() } catch(e){} })
+    // 2. finish the half-done view swap: keep the LAST c-wiz.A77ntc, hide the rest
+    const wz=[...document.querySelectorAll('c-wiz.A77ntc')]
+    const incoming=wz[wz.length-1]
+    wz.forEach(w=>{ if(w!==incoming) w.style.display='none' })
+    incoming.style.removeProperty('display')
+    // 3. the transition scrim eats clicks even at opacity .5 — let them through
+    document.querySelectorAll('div.ZQxJQe').forEach(s=>s.style.pointerEvents='none')
+
+After that the real password box measures 376x52 and takes real keys, and
+`Try another way` becomes hittable (before step 3 it answers `target_moved
+(the point lands on div)` — that div IS the scrim, not a bad selector).
+
+## Two more things this run proved
+
+- **`fill-vault` can silently drop characters.** The verb answered `chars: 40` while the
+  page held **32**. Clear the field and refill; the second attempt landed all 40. The
+  ONLY trustworthy signal is a page-side `.value.length` read — the verb's own count is
+  what it MEANT to type, not what arrived.
+- `web totp --entry … --user …` fills the code but answers with EMPTY fields
+  (`chars: null`); the page-side read (`#totpPin` length 6) is the only confirmation.
+- 2FA routing: when the account is passkey-default, `Try another way` lists the lanes.
+  The device-prompt lane can be present but DEAD — it renders as
+  "Tap Yes on your phone or tablet — **Device can't be reached right now**". Read that
+  line before choosing a lane; the vault's Authenticator/TOTP lane needs no owner.
