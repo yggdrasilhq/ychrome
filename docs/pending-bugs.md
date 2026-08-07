@@ -7,6 +7,73 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ⭐ A CARD ITEM IS UNREADABLE AND UNEDITABLE IN THE SIDEBAR — the View pane shows nothing, `edit` has no card options
+
+**Status:** OPEN. **Reported by the operator 2026-08-07**, in his own words, while he was paying an
+India Post booking by card on guihost: *"ychrome-vault edit/or see details of card is broken and no
+detail other than note can be seen in the GUI sidebar."* Relayed from the atlasStore lobe;
+booking run log: `~/data/atlasStore/graph/notes/indiapost-rti-a-booking-run-2026-08-07.md`.
+
+**Two halves, and neither is a secrets-policy question — that is what makes this a bug and not a
+boundary.**
+
+### 1. The View pane renders NO card facts, though the agent already answers them secret-free
+
+`view_tab_widgets` (`src/sidebar.rs`) has one card branch and it is a dead end:
+
+```rust
+let is_card = detail["item_type"].as_u64() == Some(u64::from(CIPHER_TYPE_CARD));
+// … "Login credentials" section …
+text: if is_card {
+    "This is a card. Its number and CVV reach a page only through the card fill button — they are never shown here."
+}
+```
+
+After that line the builder falls through to Autofill / Notes / History. **There is no card
+section**, so brand, cardholder, expiry month, expiry year and **last4** are all invisible — and
+those five are exactly what `ychrome-vault card <name>` already prints on the CLI:
+
+```
+$ ychrome-vault card 'IDFC WOW AVIKALPA' | awk -F'\t' '{print NF}'
+5      # brand, cardholder, expMonth, expYear, last4 — all PRESENT, all non-empty
+```
+
+⇒ **The CLI and the pane disagree about the same five fields**, and the CLI is right: a PAN and a
+CVV are secrets, a **last4 and an expiry are not** — the whole point of `ychrome-vault card`'s
+docstring is that it prints metadata and never the number. So the pane is withholding data its own
+agent classifies as safe, and the operator's practical loss is real: **with two IDFC WOW cards in
+the vault (his `IDFC WOW AVIKALPA` and his sister's `IDFC Credit Card WOW bon`), last4 is the only
+thing that tells them apart at a glance** — and picking the wrong one charges the wrong person.
+That confusion has already cost a session once (see `[[reference_idfc_wow_card_item]]`).
+
+**Ask:** a **"Card" section** in `view_tab_widgets` when `is_card`, carrying brand · cardholder ·
+`MM/YYYY` · `•••• last4` as ordinary rows, sourced from the same `card` op the CLI uses. The number
+and the CVV keep their masks and their eye-less treatment — nothing about this asks for a PAN in a
+schema. Keep the existing sentence as the section's muted footer, where it reads as an explanation
+rather than as the entire content.
+
+### 2. `edit` cannot change a card at all — not from the pane, not from the CLI
+
+```
+$ ychrome-vault edit --help | grep -iE 'card|brand|cardholder|exp|number|code'
+(nothing but --set-field's help text)
+```
+
+`edit` models `--rename / --set-user / --uri / --totp / --notes / --set-field / --folder`. **A card
+has none of those as its real content**, so the only edits reachable on a card item are its title,
+its notes and its custom fields — which is precisely the operator's *"no detail other than note"*.
+An expiring card (they all expire) currently cannot be updated by this client at all; it has to be
+edited in the Bitwarden web vault, which is the one thing this CLI exists to avoid.
+
+**Ask:** `--card-brand / --card-holder / --card-exp-month / --card-exp-year / --card-number /
+--card-code`, with the two secret ones **read from stdin like `add`'s password**, never from argv
+(argv reaches `ps` and shell history). Same re-read-after-write proof `edit` already gives every
+other field. The pane's Edit tab then grows the same fields under its existing "empty box means
+leave this alone" rule, which already handles secrets correctly.
+
+⚠ **Do not fix half of it.** Being able to SEE a card's expiry without being able to CHANGE it just
+moves the dead end one screen later; the operator hit both in the same minute.
+
 ## ⭐ THE ENGINE CANNOT PAY BY CARD — `ctl fill-card` does not exist
 
 **Status:** OPEN. Raised by the operator 2026-08-07 via the atlasStore lobe; triaged here from
