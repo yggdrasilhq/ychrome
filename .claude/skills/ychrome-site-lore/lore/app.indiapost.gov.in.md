@@ -212,8 +212,14 @@ article.** Verify the cart counter instead of pressing Submit twice.
 **double slash** — and the parent page then shows only *"We have opened the payment page in a new
 tab"* with a **10-minute timer** and a `Verify Payment` button. Facts:
 
-- The new tab **registers as `tab_id 1` of the SAME yggterm session** (`server app state |
-  jq .web_surface_tabs`) and becomes the active tab, so `web eval --session <path>` addresses it
+- ⛔ **The popup itself is BLOCKED on a yggterm surface** — after the click the parent shows its
+  "we have opened the payment page in a new tab" copy, and `server app state | jq .web_surface_tabs`
+  still lists **only tab 0**. The page's `window.open` returned null. (Client bug, filed:
+  `yggterm/docs/pending-bugs.md` § *WEBKIT'S OWN POPUP BLOCKER*.) ⇒ **hook `window.open`, capture
+  the URL, and open it yourself** — that is the working route today, and it is what the hook below
+  is for.
+- Relaunching the captured URL with `ychrome --profile <same> <url>` makes it **`tab_id 1` of the
+  SAME yggterm session**, and it becomes the active tab, so `web eval --session <path>` addresses it
   with no extra flag. ⚠ **There is no verb to switch back to tab 0** — plan to finish in the payment
   tab.
 - To capture the URL, hook `window.open` **before** triggering the gateway:
@@ -247,5 +253,15 @@ and re-`ensure` between steps. Three full restarts were paid for this.
   1500 Hrs at Paschim Putiari SO"*. No pickup charge on this branch.
 - **My Bookings → filter combobox → `Domestic Booking`** is where a paid article is verified; it
   defaults to `International Booking` and shows *No Data Available*, which reads like a lost booking.
-- ⛔ **The `Receipt` and `Label` buttons in that report produced NOTHING** on a yggterm surface — no
-  `window.open`, no dialog, no file in `~/Downloads`. Unsolved; the receipt could not be captured.
+- ⛔⛔ **CORRECTION, same day, from the operator driving it by hand: the `Receipt` and `Label`
+  buttons are NOT broken and the site is fine — THE POPUP IS BEING BLOCKED.** In a normal browser
+  the webapp says so out loud (*"popup is getting blocked"*); on a yggterm surface the agent sees
+  **nothing at all** — no `window.open` on a monkey-patched hook, no dialog, no download — and this
+  entry originally recorded that silence as "the buttons produce nothing". **That reading was
+  wrong.** ⇒ **On this plane, treat "a button that opens a document did nothing" as a BLOCKED POPUP
+  until proven otherwise.** Cause and the fix are filed as a client bug, not a site fact:
+  `yggterm/docs/pending-bugs.md` § *WEBKIT'S OWN POPUP BLOCKER EATS `window.open`* — nothing sets
+  `javascript_can_open_windows_automatically`, WebKit defaults it false, and it then refuses any
+  `window.open` outside a live user-activation window, which an `await` spends. The same cause ate
+  the payment gateway's own popup (below). Until it lands, the receipt cannot be captured from a
+  surface — every identifier needed to re-fetch it is in the booking row.
