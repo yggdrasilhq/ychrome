@@ -590,15 +590,33 @@ pub const CONSOLE_READ: &str = r#"(clear) => {
 pub const FOCUS_READBACK: &str = r#"(() => {
   const el = document.activeElement;
   if (!el || el === document.body || el === document.documentElement) {
-    return { focused: false, tag: el ? (el.tagName || '').toLowerCase() : null, length: 0 };
+    return { focused: false, frame: false,
+             tag: el ? (el.tagName || '').toLowerCase() : null, length: 0 };
   }
+  const tag = (el.tagName || '').toLowerCase();
+  // ⭐ A FOCUSED FRAME IS "I CANNOT SEE", NOT "THERE IS NOTHING THERE".
+  //
+  // When focus has descended into a subframe, the TOP document's
+  // `activeElement` is the <iframe> ELEMENT — the real target is the field
+  // inside, and only that frame's own document could measure it. An <iframe>
+  // holds no text, so every reading below says `length: null`, which is
+  // character-for-character what a focused <button> says. Those are opposite
+  // facts: text typed at a button is discarded, and text typed at a frame is
+  // delivered into it.
+  //
+  // Collapsing them cost the cross-origin frame proof its last step: the type
+  // guard read `<iframe>`, concluded "the page has no focused editable field",
+  // and refused to dispatch — so a payment field inside a bank's frame became
+  // undrivable at exactly the moment the click had just focused it.
+  const frame = tag === 'iframe' || tag === 'frame';
   const editable = el.isContentEditable === true;
   const text = typeof el.value === 'string'
     ? el.value
     : (editable ? (el.textContent || '') : null);
   return {
     focused: true,
-    tag: (el.tagName || '').toLowerCase(),
+    frame: frame,
+    tag: tag,
     type: (el.getAttribute ? (el.getAttribute('type') || '') : '').toLowerCase(),
     name: el.getAttribute ? (el.getAttribute('name') || el.getAttribute('id') || '') : '',
     editable: editable,
