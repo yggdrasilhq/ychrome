@@ -5058,15 +5058,49 @@ fn js_string(value: &str) -> String {
 /// Set a field the way a real user would: assign, then fire `input` and
 /// `change`, or a framework-controlled field silently reverts on the next
 /// render.
+///
+/// ## ⛔ THE RETURN IS A READBACK, NOT AN ACKNOWLEDGEMENT
+///
+/// This used to `return true` whenever the element existed, which made every
+/// caller's success field a statement about *finding a node*, dressed as a
+/// statement about *filling it*. It was caught in the field on 2026-08-07: a
+/// `ctl fill` answered `{"filled":"filled","ok":true}` having put a
+/// **31-character** value into a field whose secret is **20**, and having left
+/// the confirm twin empty. Nothing in the reply could tell that run from a
+/// correct one, and two other bug entries had already been closed citing this
+/// same response shape as proof — so the lie propagated into the record.
+///
+/// The assignment can be defeated after it returns, in at least four ordinary
+/// ways: a `maxlength` truncates it, an `input` handler reformats it, a
+/// framework re-renders from state that never saw it, or the page holds a
+/// second field nobody wrote to. **The only thing that knows is the field.**
+/// So the value is re-read after the events are dispatched and the verdict is
+/// derived from what the page is HOLDING.
+///
+/// ⛔ **A LENGTH, NEVER A VALUE.** The vault boundary is that a caller learns
+/// which fields were filled and never what went into them (`fill-card` already
+/// answers a length, and this must not widen that). A length separates a wrong
+/// write from a right one without reconstructing the secret.
 const SET_FIELD: &str = r#"
 function ychromeSet(el, value) {
-  if (!el) return false;
+  const want = typeof value === 'string' ? value.length : -1;
+  if (!el) return { present: false, ok: false, want: want, got: -1 };
   const proto = Object.getPrototypeOf(el);
   const setter = Object.getOwnPropertyDescriptor(proto, 'value');
   if (setter && setter.set) { setter.set.call(el, value); } else { el.value = value; }
   el.dispatchEvent(new Event('input', { bubbles: true }));
   el.dispatchEvent(new Event('change', { bubbles: true }));
-  return true;
+  const got = typeof el.value === 'string' ? el.value.length : -1;
+  return { present: true, ok: got === want, want: want, got: got };
+}
+function ychromeField(el) {
+  if (!el) return null;
+  return {
+    tag: (el.tagName || '').toLowerCase(),
+    type: (el.getAttribute('type') || '').toLowerCase(),
+    name: el.getAttribute('name') || el.getAttribute('id') ||
+          el.getAttribute('autocomplete') || '',
+  };
 }
 "#;
 
@@ -5108,11 +5142,35 @@ pub(crate) fn vault_fill_script(name: &str, user: Option<&str>) -> Result<String
     Ok(fill_script(username, password))
 }
 
+/// Fill a login, and answer with what the page is holding afterwards.
+///
+/// `filled` keeps its documented vocabulary — `filled`, `user-only`,
+/// `no-fields` — because callers and `docs/agent-engine.md` already read it as
+/// a string. What is new is a fourth word, **`unverified`**, and the per-field
+/// readback that decides it. See [`SET_FIELD`] for why an assignment is not
+/// evidence of a fill.
+///
+/// ## The confirm twin, and why a second secret field is not always one
+///
+/// The field report that opened this lane had the confirm field **entirely
+/// empty** while the reply said `filled` — because this script only ever looked
+/// at `querySelector`, the FIRST match. A signup form that gets one of its two
+/// secret fields is not filled, it is half-filled, and the caller was told
+/// nothing about the half that was missed.
+///
+/// ⛔ **But a second secret field is only written when it SAYS it is a
+/// confirm.** On a change-password form the other field is the OLD secret, and
+/// writing the new one there is worse than leaving it empty — it is a wrong
+/// write that would then read back as correct. When the page has a second field
+/// that does not name itself, this fills only the first and reports
+/// `present-but-unnamed`, so the caller can see the thing it was left to decide
+/// rather than discovering it at submit time.
 fn fill_script(username: &str, password: &str) -> String {
     format!(
         r#"(function() {{
 {SET_FIELD}
-  const pw = document.querySelector('input[type=password]:not([disabled])');
+  const secrets = Array.from(document.querySelectorAll('input[type=password]:not([disabled])'));
+  const pw = secrets[0] || null;
   let user = null;
   if (pw) {{
     const form = pw.form || document;
@@ -5124,10 +5182,35 @@ fn fill_script(username: &str, password: &str) -> String {
   if (!user) {{
     user = document.querySelector('input[autocomplete=username], input[name*=user i], input[type=email]');
   }}
-  const filledUser = {username} ? ychromeSet(user, {username}) : false;
-  const filledPw = ychromeSet(pw, {password});
+  const CONFIRM = /confirm|retype|re-type|repeat|verify|again/i;
+  const describes = (el) => [el.getAttribute('name'), el.getAttribute('id'),
+    el.getAttribute('placeholder'), el.getAttribute('aria-label'),
+    el.getAttribute('autocomplete')].filter(Boolean).join(' ');
+  const twin = secrets.slice(1).find((el) => CONFIRM.test(describes(el))) || null;
+  const fields = [];
+  const record = (label, el, verdict) => {{
+    fields.push(Object.assign({{ field: label, target: ychromeField(el) }}, verdict));
+    return verdict;
+  }};
+  const userVerdict = {username} ? record('username', user, ychromeSet(user, {username})) : null;
+  const pwVerdict = record('secret', pw, ychromeSet(pw, {password}));
+  const twinVerdict = twin ? record('secret-confirm', twin, ychromeSet(twin, {password})) : null;
   if (pw) {{ pw.focus(); }}
-  return filledPw ? 'filled' : (filledUser ? 'user-only' : 'no-fields');
+  let filled = pwVerdict.present
+    ? 'filled'
+    : ((userVerdict && userVerdict.present) ? 'user-only' : 'no-fields');
+  // ⛔ THE READBACK OUTRANKS THE ASSIGNMENT. A caller reads 'filled' as "the
+  // form is ready to submit"; if any field we wrote is not holding what we
+  // wrote, that sentence is false and the honest answer is that this run was
+  // not verified.
+  if (fields.some((f) => f.present && !f.ok)) {{ filled = 'unverified'; }}
+  return {{
+    filled: filled,
+    fields: fields,
+    secret_field_count: secrets.length,
+    confirm: twin ? (twinVerdict.ok ? 'filled' : 'unverified')
+                  : (secrets.length > 1 ? 'present-but-unnamed' : 'absent'),
+  }};
 }})()"#,
         username = js_string(username),
         password = js_string(password),
@@ -5152,8 +5235,17 @@ fn card_fill_script(
 {SET_FIELD}
   const pick = (...sel) => sel.map((s) => document.querySelector(s)).find((el) => el && !el.disabled) || null;
   const filled = [];
+  const mismatched = [];
   const put = (label, el, value) => {{
-    if (value && ychromeSet(el, value)) {{ filled.push(label); }}
+    if (!value) return;
+    // ⛔ READ THE VERDICT, NOT ITS TRUTHINESS. `ychromeSet` answers an object
+    // now, and every object is truthy — so a bare `if (ychromeSet(...))` would
+    // report every card field as filled including the ones the page truncated
+    // or reformatted. A `cc-number` that a gateway's own input mask rewrote is
+    // exactly the case this must not call success.
+    const verdict = ychromeSet(el, value);
+    if (verdict.ok) {{ filled.push(label); }}
+    else if (verdict.present) {{ mismatched.push(label); }}
   }};
   put('cc-number', pick('input[autocomplete="cc-number"]', 'input[name*=cardnumber i]',
     'input[name*=card_number i]', 'input[id*=cardnumber i]', 'input[name*=cardno i]'), {number});
@@ -5165,7 +5257,11 @@ fn card_fill_script(
     'input[name*=expyear i]', '[name*=exp_year i]'), {exp_year});
   put('cc-name', pick('input[autocomplete="cc-name"]', 'input[name*=cardholder i]',
     'input[name*=nameoncard i]'), {cardholder});
-  return filled.length ? filled.join(',') : 'no-card-fields';
+  // A field the page did not keep is named separately rather than dropped.
+  // Silence would report a four-field fill as a five-field one, and the field
+  // that vanished is the one the gateway is about to reject.
+  const kept = filled.length ? filled.join(',') : 'no-card-fields';
+  return mismatched.length ? kept + ' unverified:' + mismatched.join(',') : kept;
 }})()"#,
         number = js_string(number),
         code = js_string(code),
@@ -5315,9 +5411,16 @@ fn totp_script(code: &str) -> String {
   }}
   const otp = findField(document);
   if (otp) {{
-    ychromeSet(otp, {code});
-    otp.focus();
-    return 'filled';
+    // ⛔ Rung 1 only counts if the field KEPT it. A one-time-code input is the
+    // likeliest place in a page to reject an assignment — they are commonly
+    // `maxlength=1` per digit, or a masked control that rewrites on `input` —
+    // and reporting 'filled' over a field holding nothing would skip rungs 2
+    // and 3, which exist precisely so the code is always reachable. A failed
+    // write falls THROUGH to the clipboard and then to the painted box.
+    if (ychromeSet(otp, {code}).ok) {{
+      otp.focus();
+      return 'filled';
+    }}
   }}
   try {{
     if (navigator.clipboard && navigator.clipboard.writeText) {{
@@ -7283,6 +7386,100 @@ mod tests {
             "{refused}",
         );
         println!("reveal + copy against a live agent: OK");
+    }
+
+    /// ⛔ THE LOCK ON THE WHOLE LANE: a set must be judged by a RE-READ.
+    ///
+    /// `ychromeSet` returned a bare `true` whenever the element existed, so
+    /// every caller's success field described finding a node while claiming to
+    /// describe filling it. The field report that caught it (2026-08-07) had a
+    /// 31-character value in a 20-character secret's field and an empty confirm
+    /// twin, reported as `{"filled":"filled","ok":true}`.
+    ///
+    /// This asserts the SHAPE, because the runtime needs a page: the setter
+    /// must read `el.value` back AFTER dispatching the events, and the verdict
+    /// must be a comparison rather than a constant.
+    #[test]
+    fn a_set_field_is_judged_by_reading_the_field_back() {
+        let (_, after_write) = SET_FIELD
+            .split_once("dispatchEvent(new Event('change'")
+            .expect("the set still fires a change event");
+        assert!(
+            after_write.contains("el.value"),
+            "the verdict must come from re-reading the field, not from the assignment: {after_write}"
+        );
+        assert!(
+            after_write.contains("got === want"),
+            "the verdict must COMPARE what the page kept against what was written"
+        );
+        assert!(
+            !after_write.contains("return true"),
+            "a constant true is the bug this test exists to catch"
+        );
+        // ⛔ A LENGTH, NEVER A VALUE — the vault boundary. If this ever returns
+        // the string itself, the secret becomes reachable from a reply.
+        assert!(
+            after_write.contains(".length"),
+            "the readback must report a length"
+        );
+    }
+
+    /// A login fill must answer `unverified` when a field did not keep what was
+    /// written, and must name a second secret field rather than silently
+    /// filling only the first.
+    #[test]
+    fn a_fill_that_is_not_held_by_the_page_is_not_reported_as_filled() {
+        let script = fill_script("someone", "hunter2hunter2hunter2");
+        assert!(
+            script.contains("'unverified'"),
+            "the fourth verdict must exist — the first three describe intent, not effect"
+        );
+        assert!(
+            script.contains("f.present && !f.ok"),
+            "the readback must OUTRANK the assignment when deciding `filled`"
+        );
+        // The confirm twin: written only when the page says it is one, and
+        // named when a second secret field does not say so.
+        assert!(
+            script.contains("secret-confirm") && script.contains("present-but-unnamed"),
+            "a second secret field must be either filled as a confirm or NAMED"
+        );
+        assert!(
+            script.contains("confirm|retype"),
+            "the twin is identified by what the page calls it, never by position"
+        );
+    }
+
+    /// The card fill shares `ychromeSet`, and an object is always truthy — so
+    /// the old `if (value && ychromeSet(...))` would have reported every field
+    /// as filled, including ones a payment form's input mask rewrote.
+    #[test]
+    fn the_card_fill_reads_the_verdict_rather_than_its_truthiness() {
+        let script = card_fill_script("4111111111111111", "737", "11", "2029", "A K");
+        assert!(
+            script.contains("verdict.ok"),
+            "the card fill must branch on the readback verdict"
+        );
+        assert!(
+            !script.contains("value && ychromeSet"),
+            "an object is truthy — branching on the call itself reports every field as filled"
+        );
+        assert!(
+            script.contains("mismatched"),
+            "a field the page did not keep must be named, not dropped"
+        );
+    }
+
+    /// The one-time-code fill is rung 1 of three, and rungs 2 and 3 exist so
+    /// the code is always reachable. Claiming rung 1 over a field that dropped
+    /// the write skips both of them.
+    #[test]
+    fn a_totp_that_the_field_did_not_keep_falls_through_to_the_next_rung() {
+        let script = totp_script("123456");
+        assert!(
+            script.contains("ychromeSet(otp, \"123456\").ok"),
+            "rung 1 must be claimed only on a verified write"
+        );
     }
 
     // The secret is embedded in the eval script (that is the design), but it
