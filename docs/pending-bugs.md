@@ -112,42 +112,6 @@ leave this alone" rule, which already handles secrets correctly.
 ⚠ **Do not fix half of it.** Being able to SEE a card's expiry without being able to CHANGE it just
 moves the dead end one screen later; the operator hit both in the same minute.
 
-## ⭐ THE ENGINE CANNOT PAY BY CARD — `ctl fill-card` does not exist
-
-**Status:** OPEN. Raised by the operator 2026-08-07 via the atlasStore lobe; triaged here from
-`yggterm/docs/agent-cobrowse-gaps-2026-08-07.md`, which holds the full field report and the
-measurement table.
-
-```
-$ ychrome ctl fill-card
-{"error":"unknown engine verb \"fill-card\"","ok":false}      # engine replied 404
-```
-
-⛔ **This defeats the engine's own premise.** `ctl` exists so agent browsing never touches the
-operator's machine (`agent-engine.md` §4: "how agent browsing finally stops touching guihost"), and
-the co-browse doctrine prefers dev for exactly that reason. But `server app web fill-card` needs a
-registered GUI client — dev has **0**, guihost has **1** — so **every card payment is forced onto the
-laptop the human is working on.** The one class of task with the strongest reason to stay off his
-machine, entering payment credentials, is the one class the engine cannot finish.
-
-⚠ **Not a fleet non-uniformity, and that was checked first** because it was the operator's
-suspicion: `ychrome-vault card` works on dev, and dev and guihost run a **byte-identical** yggterm
-binary with an **identical `web` verb set including `fill-card`**. Nothing is missing from dev's
-install. The gap is one missing verb on one driver.
-
-**Costed twice in 24 h:** an RTI fee payment took the netbanking rail (and died on a stale bank
-password) because the card rail was not reachable from the driver in use; and an India Post
-Click-n-Book booking was driven end to end on `ctl` — login, five-step wizard, pincode modals,
-cart — then handed to a second agent on guihost at 05:00 to pay **Rs 23**.
-
-**Ask:** `ctl fill-card page_id=<p> item=<name> field=<number|expiry|code|holder> target=<sel>`,
-mirroring `server app web fill-card` over the **same vault agent `card-secret` op** (never the CLI,
-which prints no PAN), answering `{item, field, chars, matched}` — a length, never a value — and
-leaving the same one line in `~/.yggterm/vault/audit.log`. A companion `ctl fill-vault` closes the
-same hole for password-gated flows. ⛔ **The PAN boundary is correct and no ask here touches it:**
-no verb prints a card number, the secret stays behind the vault agent's `card-secret` op gated by
-the unlock alone. Keep that exactly as is.
-
 ## ★★ THE ENGINE CANNOT REACH INTO A CROSS-ORIGIN FRAME, AND THAT BLOCKED A PAYMENT
 
 **Status:** OPEN. Found by the atlasStore lobe, 2026-08-06 (run 5, ychrome
