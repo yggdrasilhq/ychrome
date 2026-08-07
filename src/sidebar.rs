@@ -484,6 +484,10 @@ struct EditDraft {
     /// an eye for it without the password itself going anywhere near a schema.
     has_password: bool,
     has_totp: bool,
+    /// The entry stores at least one passkey. A boolean, exactly like the two
+    /// above — the listing already carries it, so saying so costs nothing and
+    /// NOT saying it is what made a stored passkey invisible on this form.
+    has_passkey: bool,
     /// Notes are not in a listing (they live only in the raw record), so this
     /// one costs a probe at load time — the `notes` op, whose value is dropped
     /// and only its success kept.
@@ -1851,7 +1855,16 @@ fn item_row(item: &Value) -> Value {
         // THE ROW BODY OPENS THE ENTRY. Everything else on the row puts a value
         // in the PAGE; this is the one affordance that gives the user the item.
         "row_action": "view-open",
-        "icon": if is_card { "icon:card" } else { "icon:globe" },
+        // A passkey entry is a DIFFERENT kind of thing to sign in with, and the
+        // list is where you choose. Bitwarden badges it; this row said "globe"
+        // and left the user to guess which of eight Google entries held one.
+        "icon": if is_card {
+            "icon:card"
+        } else if item["has_passkey"].as_bool().unwrap_or(false) {
+            "icon:key"
+        } else {
+            "icon:globe"
+        },
         "actions": actions,
         "menu": menu,
     })
@@ -2952,6 +2965,24 @@ fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
     }));
 
     // AUTOFILL OPTIONS — where this entry matches.
+    // PASSKEYS. Read-only on purpose: a passkey is a keypair a SITE enrolled,
+    // not a string a form can retype. Bitwarden's editor shows it and offers
+    // removal only; showing nothing made the vault look like it had lost one.
+    if draft.has_passkey {
+        widgets.push(json!({"kind": "section", "text": "Passkey", "card": true}));
+        widgets.push(json!({
+            "kind": "list-row",
+            "id": "edit_passkey",
+            "icon": "icon:key",
+            "title": "A passkey is stored on this entry",
+            "subtitle": "Enrolled by the site. Open the entry to see when it was created.",
+        }));
+        widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": "Passkeys are not edited here — a site enrols one and this browser signs with it.",
+        }));
+    }
+
     widgets.push(json!({"kind": "section", "text": "Autofill options", "card": true}));
     widgets.push(json!({
         "kind": "text-input", "id": "edit_uris", "label": "Website (one URI per line)",
@@ -3259,6 +3290,7 @@ fn load_edit_draft(name: &str, user: &str) -> Result<EditDraft> {
         field_names,
         has_password: item["has_password"].as_bool().unwrap_or(false),
         has_totp: item["has_totp"].as_bool().unwrap_or(false),
+        has_passkey: item["has_passkey"].as_bool().unwrap_or(false),
         has_notes,
         ..EditDraft::default()
     })
