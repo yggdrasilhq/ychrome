@@ -7,6 +7,57 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ⛔⛔ A PASSKEY CAN NEVER BE APPROVED: the presence request is written to the DAEMON'S `/dev/null` stdout
+
+**Status:** OPEN — this makes `navigator.credentials.get()` unusable on every daemon-served
+surface, which is all of them.
+
+Measured on guihost 2026-08-08, driving a real Google sign-in end to end.
+
+`passkey::emit_fido2_request` publishes the ceremony as an OSC on **stdout**:
+
+```rust
+let mut stdout = std::io::stdout().lock();
+let _ = write!(stdout, "\u{1b}]7717;fido2;request;{encoded}\u{7}");
+```
+
+That is correct for a ychrome launched **inside a yggterm row**, where stdout IS the row's PTY
+and yggterm parses the sequence into `PendingFido2Dialog`. It is wrong for the architecture we
+actually run:
+
+```
+ychrome --daemon (pid 1191332)   /proc/PID/fd/1 -> /dev/null      <-- serves the surfaces
+foreground ychrome (pid 1145528) /proc/PID/fd/1 -> /dev/pts/12
+```
+
+**The daemon serves the pages, and the daemon's stdout is `/dev/null`.** So the request is
+written into nothing, no modal is ever raised, and the ceremony parks on the `Signer` condvar
+for the full `CEREMONY_TIMEOUT` (120 s) waiting for a `/fido2/grant` that nobody was ever asked
+to send. The page then shows Google's "Something went wrong".
+
+**Three independent confirmations that nothing downstream is at fault:**
+
+1. The shim IS installed on the page (`navigator.credentials.get` stringifies to our JS).
+2. The vault RESOLVES the passkey — after the 2026-08-08 credential-id fix the call returns no
+   error at all, where it previously answered `no passkey in this vault answers that request`.
+3. `~/.yggterm/vault/audit.log` contains **zero** `fido2` lines, ever. `fido2-assert` is only
+   reached after a grant, so its absence proves the grant never arrives — the failure is upstream
+   of the vault, not in it.
+
+**What the fix has to do:** route the presence request over a channel that survives the daemon,
+the same way everything else the GUI needs already does — the per-session control endpoint the
+surface already declares (the `sidebar` declaration `/fido2/grant` is POSTed back to). The OSC
+must be emitted on the OWNING SESSION'S stream, not on whatever stdout the emitting process
+happens to hold. `emit_fido2_request` already takes a `session` argument and currently uses it
+for diagnostics only ("the GUI routes the OSC by the STREAM it arrived on, not this field") —
+under a daemon that comment is precisely the bug.
+
+**Do not confuse this with the orphaning below.** A `ychrome daemon restart` ALSO leaves live
+surfaces pointing at the retired daemon's control port (observed: `connect 127.0.0.1:41459:
+Connection refused`, GUI toast "Web policy unavailable … Its surfaces open unprotected", which
+additionally strips the userscripts and therefore the shim). That is a second, separate defect
+on the same path; fixing either one alone still leaves passkeys broken.
+
 ## ⚠ `daemon restart` RETIRES ONLY THE DAEMON ON THE LIVE SOCKET — the rest accumulate forever
 
 **Status:** OPEN
