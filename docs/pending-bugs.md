@@ -130,6 +130,38 @@ path including a panic, and gated on a per-run token so a leftover copy is inert
 to any page. ⛔ **Do not lift that script into `src/`**: it accepts `eval` off
 the page's own message channel, which a shipped verb must not.
 
+### ⛔ THE ONE QUESTION THAT DECIDES THE VERB'S SHAPE — settle it FIRST
+
+The probe bridge runs in the **main world** (`@world main`), deliberately, so
+the gate's mutation control could see it. A shipped bridge would run in the
+engine's **isolated world** (`identity.rs` owns the one named constant) so the
+page cannot read its globals. That much is settled. What is NOT:
+
+> **Does a `message` event posted between frames reach listeners in an ISOLATED
+> world, and can the page's own main world observe the same event?**
+
+Worlds isolate *globals*; they are not documented to isolate *event dispatch*,
+and in Chromium `postMessage` is explicitly NOT world-scoped — which is why
+extension content scripts use a separate messaging API. If WebKitGTK behaves the
+same way, **`postMessage` is page-observable and page-forgeable no matter which
+world the bridge lives in**, and the two designs diverge:
+
+- **If the isolated world does get its own delivery** ⇒ a per-page token in the
+  script body is a real secret (the page cannot read isolated globals), and the
+  bridge may carry `eval`.
+- **If not** ⇒ ⛔ the bridge must expose a **closed verb set** (resolve selector →
+  text / value / rect; set value; focus) with no path that evaluates a
+  page-supplied string. Otherwise a hostile TOP page can make our bridge run its
+  code inside the cross-origin child — a cross-origin escalation we would be
+  providing. A one-time nonce does not fix this: whichever document receives our
+  message can read the nonce out of it.
+
+**What settles it:** one probe, two userscripts in the same document — an
+isolated-world listener and a main-world listener — and a `postMessage`; then
+read which recorded it. ⛔ Do it under the frames gate's own `PROFILE` with its
+`InstalledProbe` install/remove, **never** by dropping files into the user's
+`~/.yggterm/web-userscripts/`, which is their live browsing.
+
 ⚠ Do NOT "fix" this by loosening origin checks. The frames are cross-origin
 because banks intend them to be — and nothing above does: the child reads its
 OWN document, in its own frame, and reports a value.
