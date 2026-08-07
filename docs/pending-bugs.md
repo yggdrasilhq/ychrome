@@ -7,6 +7,44 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ⚠ `daemon restart` RETIRES ONLY THE DAEMON ON THE LIVE SOCKET — the rest accumulate forever
+
+**Status:** OPEN
+
+Measured on `dev` 2026-08-07 by the graph-router orchestrator, immediately after a clean
+`ychrome daemon restart` (pid 1667242 retired → 2999778 serving, 4 surfaces re-registered in ~4 s —
+**the restart itself worked exactly as documented**).
+
+⛔ **Two OTHER ychrome daemons survived it**, both running **binaries deleted from disk**:
+
+```
+pid  742285  up  30h   /home/pi/gh/ychrome/target/release/ychrome --daemon   (deleted)
+pid 3022293  up 153h   /home/pi/gh/ychrome/target/release/ychrome --daemon   (deleted)   ~6.4 days
+```
+
+Neither is an empty husk: **7 sockets and 3 child processes each**. The older one listens on
+`/tmp/ycc/.yggterm/ychrome/daemon.sock` — **a different socket root** from the installed daemon's
+`~/.yggterm/ychrome/daemon.sock`.
+
+**The mechanism, and it is not a bug in the restart:** `daemon restart` retires the daemon bound to
+the socket it resolves. A daemon bound **elsewhere** — a dev build, a test fixture root, an older
+`$YGGTERM_HOME` — is invisible to it and therefore immortal. Every development run can leave one,
+and nothing ever collects them.
+
+⚠ **Why this matters beyond tidiness:** each one holds sockets and children, they run **code that no
+longer exists on disk**, and they make any capability probe on the host **ambiguous** — the same
+shape as yggterm's own long-standing daemon proliferation (28 daemons on `dev`, 26 on deleted
+binaries, oldest up 24 days). A probe that asks "what does ychrome do here" can be answered by a
+six-day-old build.
+
+**Owed:** a reaper — or a `daemon list` — that reasons about **socket path + binary liveness +
+ownership**, not just the current socket. ⛔ It must not simply kill by age: these hold children, and
+one of them may legitimately serve a fixture root a test is using. **Identify, then retire; do not
+count and kill.**
+
+**Falsifier:** `pgrep -af "ychrome --daemon"` on a host after a restart. If only one daemon remains
+and no `(deleted)` binary appears in `/proc/<pid>/exe`, this is wrong.
+
 ## ★★★ `ctl fill` REPORTS SUCCESS ON A WRONG WRITE — and two entries rest on that report as proof
 
 **Status:** OPEN. **Reported by lumenstore row 5.2** (the TWS/IBKR paper lane) 2026-08-07, while
