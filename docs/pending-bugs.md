@@ -7,6 +7,90 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ⛔ OWNER-REPORTED: AN OTP LOGIN VERIFIES INTO NOTHING — bakingo.com, works in Firefox and Chromium
+
+**Status:** OPEN
+
+⭐ **Owner-reported 2026-08-08:** *"Our browser might be missing some std. web
+feature: consider this site https://www.bakingo.com/ I logined it using
+mobile/otp but after clicking verify on correct otp nothing happens in ychrome.
+I tried in firefox/chromium based browsers the same flow logged in the user or
+[asked] for more details in my case of registering."*
+
+**Why this one is filed high.** It is a SILENT dead end on a checkout flow, with
+a working control in two other engines, on a correct OTP. Whatever is missing
+does not throw where the user can see it — the button simply does nothing — so
+every site that uses the same capability fails the same invisible way and we
+would never hear about most of them. The value at risk is not one bakery: it is
+"can this browser be the one he actually uses".
+
+⚠ **NOT ROOT-CAUSED. Do not guess a cause from the engine's reputation.** The
+repo already carries three separate findings that WebKitGTK lacks things Chromium
+has, and the temptation is to write "WebKitGTK gap" on this and close it. That
+would be a story, not a measurement — the same failure could be our own missing
+handler, which is exactly what the dead camera turned out to be
+(`[[finding-webkitgtk-no-webusb-serial-hid]]`: *"a dead camera was OUR missing
+`permission-request` handler"*). ⛔ The engine is the LAST hypothesis, not the
+first.
+
+**The measurement that settles it, in order — the console is the instrument:**
+1. Open the JS console on the failing page and read it at the moment of the
+   click. An uncaught `TypeError: x is not a function` names the missing API
+   outright and ends the investigation in one step.
+2. If the console is silent, the click may not be reaching the handler at all
+   (an overlay, a form submit we cancel, a popup we never opened). ⚠ Check
+   whether the verify step opens a window — we have no `close` signal for
+   `window.close()` (`[[finding-webkitgtk-popup-close-and-related-view-ucm]]`).
+3. Watch the network for the verify POST. **A request that never leaves is a
+   different bug from one that returns 200 and is ignored**, and only this step
+   separates them.
+4. ⚠ **The eval bridge itself can be dead on every page**
+   (`[[bug-class-web-eval-bridge-dead-all-pages]]`). Prove the console answers
+   at all before reading a silence as evidence of anything.
+
+⛔ **Do NOT drive the owner's real OTP flow to reproduce.** It costs a live SMS
+to his number and one attempt per code. Reproduce against the site's own
+pre-verify state first, and if a real OTP is genuinely required, that is an owner
+gate — park it rather than burning his codes.
+
+**Falsifier:** the same flow in ychrome with the console open. A named JS error
+identifies the gap; a clean console with no outbound verify request means the
+click never reached the handler and the engine is not implicated.
+
+## ⭐ OWNER-REPORTED: TABS CANNOT BE SHIFT-SELECTED, SO THEY MUST BE FILED ONE AT A TIME
+
+**Status:** OPEN
+
+⭐ **Owner-reported 2026-08-08:** *"I cannot shift select multiple entries in
+ychrome to drag them into a folder."*
+
+The sidebar tree's whole promise is the one in its own onboarding copy — *"Tabs
+move out of the page into a sidebar tree with folders you can [organise]"*
+(`src/sidebar.rs`). Filing a session's worth of tabs one drag at a time is the
+work that promise exists to remove, so this is a gap in the feature's reason for
+existing, not a nicety.
+
+⚠ **NOT ROOT-CAUSED — do not treat the following as the diagnosis.** A scout for
+the usual spellings (`selected_ids`, `selection`, `shift_key`, `multi_select`)
+finds nothing in `src/sidebar.rs`, and the only `drag` hits are unrelated. That
+is consistent with selection being SINGLE-VALUED by construction (one active
+row) rather than with a shift handler that is present but broken — but it is a
+grep, not a measurement, and the next agent owes a real one before writing code.
+
+**Two things to settle before any patch, because they are spec calls:**
+1. **What is a selection?** Today a row is "selected" to mean ACTIVE (the tab
+   being shown). A multi-selection is a second, different thing, and collapsing
+   them is how one concept ends up with two owners. Decide whether the tree
+   grows a selection SET beside the active row, or whether active becomes a
+   member of it.
+2. **What does a drag carry?** Every drop target currently receives one row.
+   Widening the payload to N rows touches the drop handlers, not just the
+   selection, and a half-applied change would move some of a selection and
+   silently leave the rest.
+
+**Falsifier:** shift-click two tabs in the sidebar tree and read back whatever
+the sidebar exposes as its selection. One id means this entry stands.
+
 ## ⚠ VAULT PANE vs THE BITWARDEN EXTENSION — the parity gap, itemised
 
 **Status:** OPEN. Owner directive 2026-08-08: *"Make our vault GUI and implementation on par
