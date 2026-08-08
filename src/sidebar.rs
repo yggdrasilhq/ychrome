@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
-use ychrome_vault_proto::CIPHER_TYPE_CARD;
+use ychrome_vault_proto::{CIPHER_TYPE_CARD, CIPHER_TYPE_LOGIN, CIPHER_TYPE_NOTE};
 
 /// The pane ids ychrome declares. yggterm only ever echoes them back.
 const VAULT_PANE: &str = "vault";
@@ -437,18 +437,58 @@ const MAX_GENERATE_LENGTH: i64 = 128;
 ///
 /// The password is deliberately absent. It reaches this process as one action's
 /// `values.add_password`, goes straight to `ychrome-vault add`'s stdin, and is
-/// dropped — it is never stored, never echoed into a schema.
-#[derive(Default)]
+/// dropped — it is never stored, never echoed into a schema. A card's NUMBER
+/// and CVV are absent for the same reason and are handled the same way.
 struct AddDraft {
+    /// WHICH KIND of item is being made, as a Bitwarden cipher type. The whole
+    /// form is a function of this: a note has no username and no password box,
+    /// a card has no uri. Default login, which is what the tab could make
+    /// before it could make anything else.
+    ///
+    /// ⛔ It SURVIVES a re-seed. The rest of the draft is seeded from the page
+    /// host, but "I am writing a note" is a choice about the item, not a fact
+    /// about the site — dropping it on navigation put the user back on the
+    /// login form with their note text still in the box.
+    item_type: u8,
     name: String,
     user: String,
     uri: String,
     folder: String,
     notes: String,
+    /// A card's own fields. Empty for every other type, and never sent for one:
+    /// a `card` object on a login is invisible to every reader afterwards.
+    /// The PAN and the CVV are NOT here — see the note on the Add tab's
+    /// widgets for why they live only in the submitted values.
+    card_holder: String,
+    card_brand: String,
+    card_exp_month: String,
+    card_exp_year: String,
     /// The page host this draft was seeded from, so re-entering the tab on the
     /// same site does not clobber what the user typed, and browsing to a new
     /// site does re-seed.
     seeded_host: Option<String>,
+}
+
+/// ⛔ Hand-written, for ONE field: `item_type` must default to a REAL cipher
+/// type, and `u8::default()` is 0, which Bitwarden does not define. A derived
+/// Default would have made every fresh draft an item of no type at all, and
+/// the agent refuses those — correctly, and unhelpfully.
+impl Default for AddDraft {
+    fn default() -> Self {
+        Self {
+            item_type: CIPHER_TYPE_LOGIN,
+            name: String::new(),
+            user: String::new(),
+            uri: String::new(),
+            folder: String::new(),
+            notes: String::new(),
+            card_holder: String::new(),
+            card_brand: String::new(),
+            card_exp_month: String::new(),
+            card_exp_year: String::new(),
+            seeded_host: None,
+        }
+    }
 }
 
 /// The Edit tab's draft.
@@ -630,11 +670,25 @@ impl PaneState {
         if self.add.seeded_host.as_deref() == host {
             return;
         }
+        // The KIND survives; the site-derived fields are re-seeded. A user who
+        // picked Note and then followed a link must not find a login form.
+        let item_type = self.add.item_type;
         self.add = AddDraft {
-            name: host.unwrap_or_default().to_string(),
-            uri: host
-                .map(|host| format!("https://{host}"))
-                .unwrap_or_default(),
+            item_type,
+            // Only a LOGIN is named and addressed after the page. A note or a
+            // card that happened to be started on github.com is not "about"
+            // github.com, and pre-filling its name with a host it will never
+            // match on is a worse guess than an empty box.
+            name: match item_type {
+                CIPHER_TYPE_LOGIN => host.unwrap_or_default().to_string(),
+                _ => String::new(),
+            },
+            uri: match item_type {
+                CIPHER_TYPE_LOGIN => host
+                    .map(|host| format!("https://{host}"))
+                    .unwrap_or_default(),
+                _ => String::new(),
+            },
             seeded_host: host.map(str::to_string),
             ..AddDraft::default()
         };
@@ -2215,38 +2269,7 @@ fn unlocked_schema(
 
     match state.tab.as_str() {
         "add" => {
-            widgets.push(json!({"kind": "section", "text": "Add a login", "card": true}));
-            widgets.push(json!({"kind": "text-input", "id": "add_name", "label": "Name", "placeholder": "example.com", "value": state.add.name}));
-            widgets.push(json!({"kind": "text-input", "id": "add_user", "label": "Username", "placeholder": "you@example.com", "value": state.add.user}));
-            widgets.push(json!({"kind": "text-input", "id": "add_uri", "label": "URI", "placeholder": "https://example.com", "value": state.add.uri}));
-            widgets.push(json!({"kind": "text-input", "id": "add_folder", "label": "Folder (optional)", "value": state.add.folder}));
-            widgets.push(json!({
-                "kind": "text-input", "id": "add_notes", "label": "Notes (optional)",
-                "placeholder": "Anything to remember", "value": state.add.notes,
-                "multiline": true, "rows": 10,
-            }));
-            widgets.push(json!({
-                "kind": "text-input", "id": "add_password", "label": "Password",
-                "placeholder": "Leave empty to generate one", "secret": true, "value": "",
-            }));
-            widgets.push(json!({"kind": "section", "text": "Generator", "card": true}));
-            widgets.push(json!({
-                "kind": "number-input", "id": "generate_length", "label": "Length",
-                "value": state.generate_length,
-                "min": MIN_GENERATE_LENGTH, "max": MAX_GENERATE_LENGTH,
-            }));
-            widgets.push(json!({
-                "kind": "toggle", "id": "generate_no_symbols", "label": "No symbols",
-                "value": state.generate_no_symbols,
-            }));
-            widgets.push(json!({
-                "kind": "label", "muted": true,
-                "text": "An empty password is rolled on this host with the settings above and stored straight into the vault. It never crosses the terminal or the GUI. Name the entry after the site's host so fill matching finds it.",
-            }));
-            widgets.push(json!({
-                "kind": "button", "id": "add", "action": "add", "primary": true,
-                "label": "Save to vault",
-            }));
+            widgets.extend(add_tab_widgets(state, status));
         }
         "view" => {
             widgets.extend(view_tab_widgets(&state.view, reveal));
@@ -2610,6 +2633,179 @@ fn human_date(iso: &str) -> String {
 /// ⛔ IT IS A PAGE, NOT A TOOLTIP. Clicking a row used to do nothing at all: the
 /// row's three glyphs put values into the PAGE and none of them gave the user
 /// the item. The user asked for this shape explicitly, with a screenshot of
+/// Which cipher types THIS HOST'S agent can actually create, read off the
+/// capability it declares in `status`.
+///
+/// ⛔ Absent ⇒ LOGINS ONLY, and that is not a guess: an agent that predates
+/// typed creates ignores `item_type` and files whatever it is sent as a login,
+/// replying `ok`. The agent is host-resident and outlives this binary, so the
+/// mismatch is normal after a ychrome deploy, not exotic — it is exactly the
+/// window in which a user's note would be silently saved as a login.
+fn agent_creatable_types(status: &Value) -> Vec<u8> {
+    match status["creates_item_types"].as_array() {
+        Some(types) => types
+            .iter()
+            .filter_map(|value| value.as_u64())
+            .filter_map(|value| u8::try_from(value).ok())
+            .collect(),
+        None => vec![CIPHER_TYPE_LOGIN],
+    }
+}
+
+/// The Add tab: a KIND picker, then the form that kind actually has.
+///
+/// ⛔ USER-REPORTED, 2026-08-08: this tab could only ever make a login. The
+/// user went to save a note and found no way to. A vault whose GUI can create
+/// one of its item types is not a vault client, it is a password box — and the
+/// missing types were invisible, because a form that offers no choice looks
+/// complete.
+///
+/// **One form per type, never one form with the wrong boxes greyed out.** A
+/// password field on a note is a field the vault has nowhere to put: the agent
+/// would encrypt it into a `login` object on a type-2 cipher, where no reader
+/// in this client (or in Bitwarden's own) will ever look at it again. The
+/// types come from [`ychrome_vault_proto`] so the pane, the agent and the model
+/// agree on what "3" means.
+///
+/// The KIND picker is the same `tabs` widget the pane's own header uses —
+/// contributed panes reuse yggterm's widget vocabulary rather than inventing a
+/// radio group only this pane knows how to draw.
+fn add_tab_widgets(state: &PaneState, status: &Value) -> Vec<Value> {
+    let mut widgets = vec![json!({
+        "kind": "tabs",
+        "id": "add_type",
+        "action": "add_type",
+        "active": state.add.item_type.to_string(),
+        "tabs": [
+            {"id": CIPHER_TYPE_LOGIN.to_string(), "label": "Login"},
+            {"id": CIPHER_TYPE_NOTE.to_string(), "label": "Note"},
+            {"id": CIPHER_TYPE_CARD.to_string(), "label": "Card"},
+        ],
+    })];
+    // Say it BEFORE the form, not after the save fails: a stale agent cannot
+    // build this type, and the fix is one command on this host.
+    if !agent_creatable_types(status).contains(&state.add.item_type) {
+        widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": "This host's vault agent is older than this browser and can only create logins. Run `ychrome-vault handover` on this host — it keeps the vault unlocked — then this form will save.",
+        }));
+    }
+    let heading = match state.add.item_type {
+        CIPHER_TYPE_NOTE => "Add a note",
+        CIPHER_TYPE_CARD => "Add a card",
+        _ => "Add a login",
+    };
+    widgets.push(json!({"kind": "section", "text": heading, "card": true}));
+    // Every type has a name, and it is the only required field.
+    let name_placeholder = match state.add.item_type {
+        CIPHER_TYPE_NOTE => "Boiler service code",
+        CIPHER_TYPE_CARD => "Bank of Invention debit",
+        _ => "example.com",
+    };
+    widgets.push(json!({
+        "kind": "text-input", "id": "add_name", "label": "Name",
+        "placeholder": name_placeholder, "value": state.add.name,
+    }));
+
+    match state.add.item_type {
+        CIPHER_TYPE_NOTE => {
+            // A note's whole content IS the notes field, so it is not
+            // "(optional)" here and it leads the form rather than trailing it.
+            widgets.push(json!({
+                "kind": "text-input", "id": "add_notes", "label": "Note",
+                "placeholder": "Anything to remember", "value": state.add.notes,
+                "multiline": true, "rows": 14,
+            }));
+        }
+        CIPHER_TYPE_CARD => {
+            widgets.push(json!({
+                "kind": "text-input", "id": "add_card_holder", "label": "Cardholder",
+                "placeholder": "as printed on the card", "value": state.add.card_holder,
+            }));
+            widgets.push(json!({
+                "kind": "text-input", "id": "add_card_brand", "label": "Brand (optional)",
+                "placeholder": "Visa", "value": state.add.card_brand,
+            }));
+            // ⛔ THE PAN AND THE CVV ARE SECRETS AND ARE NOT DRAFT STATE. They
+            // reach this process once, in the submitted values, go to the
+            // agent, and are dropped — the same rule the password box follows,
+            // and a stricter one is deserved: unlike a password, a card number
+            // cannot be rotated on demand.
+            widgets.push(json!({
+                "kind": "text-input", "id": "add_card_number", "label": "Number",
+                "placeholder": "•••• •••• •••• ••••", "secret": true, "value": "",
+            }));
+            widgets.push(json!({
+                "kind": "text-input", "id": "add_card_exp_month", "label": "Expiry month",
+                "placeholder": "11", "value": state.add.card_exp_month,
+            }));
+            widgets.push(json!({
+                "kind": "text-input", "id": "add_card_exp_year", "label": "Expiry year",
+                "placeholder": "2031", "value": state.add.card_exp_year,
+            }));
+            widgets.push(json!({
+                "kind": "text-input", "id": "add_card_code", "label": "Security code",
+                "placeholder": "the CVV", "secret": true, "value": "",
+            }));
+        }
+        _ => {
+            widgets.push(json!({
+                "kind": "text-input", "id": "add_user", "label": "Username",
+                "placeholder": "you@example.com", "value": state.add.user,
+            }));
+            widgets.push(json!({
+                "kind": "text-input", "id": "add_uri", "label": "URI",
+                "placeholder": "https://example.com", "value": state.add.uri,
+            }));
+        }
+    }
+
+    widgets.push(json!({
+        "kind": "text-input", "id": "add_folder", "label": "Folder (optional)",
+        "value": state.add.folder,
+    }));
+    // A note already has its content box above; every other type gets notes as
+    // the trailing optional field it has always been.
+    if state.add.item_type != CIPHER_TYPE_NOTE {
+        widgets.push(json!({
+            "kind": "text-input", "id": "add_notes", "label": "Notes (optional)",
+            "placeholder": "Anything to remember", "value": state.add.notes,
+            "multiline": true, "rows": 10,
+        }));
+    }
+
+    // THE GENERATOR IS THE LOGIN'S, and it is drawn only for a login. Offering
+    // to roll a password for a note would promise a secret the item has no
+    // field to hold — the agent drops the generate flag for exactly that
+    // reason, and a form that asks for something the backend discards is a lie
+    // about what was saved.
+    if state.add.item_type == CIPHER_TYPE_LOGIN {
+        widgets.push(json!({
+            "kind": "text-input", "id": "add_password", "label": "Password",
+            "placeholder": "Leave empty to generate one", "secret": true, "value": "",
+        }));
+        widgets.push(json!({"kind": "section", "text": "Generator", "card": true}));
+        widgets.push(json!({
+            "kind": "number-input", "id": "generate_length", "label": "Length",
+            "value": state.generate_length,
+            "min": MIN_GENERATE_LENGTH, "max": MAX_GENERATE_LENGTH,
+        }));
+        widgets.push(json!({
+            "kind": "toggle", "id": "generate_no_symbols", "label": "No symbols",
+            "value": state.generate_no_symbols,
+        }));
+        widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": "An empty password is rolled on this host with the settings above and stored straight into the vault. It never crosses the terminal or the GUI. Name the entry after the site's host so fill matching finds it.",
+        }));
+    }
+    widgets.push(json!({
+        "kind": "button", "id": "add", "action": "add", "primary": true,
+        "label": "Save to vault",
+    }));
+    widgets
+}
+
 /// Bitwarden's own view (2026-08-04) — credential card, autofill card, notes
 /// card, item history with **password history already expanded**, and an action
 /// bar whose first element is a big Edit button beside an archive and a delete.
@@ -3314,6 +3510,22 @@ fn absorb_draft(state: &mut PaneState, values: &Value) {
     if let Some(notes) = text("add_notes") {
         state.add.notes = notes;
     }
+    // A card's NON-SECRET half only. `add_card_number` and `add_card_code` are
+    // deliberately absent for the same reason `add_password` is: they reach
+    // this process on the save action, go straight to the agent, and are
+    // dropped. A PAN held in a draft is a stored secret nobody asked for.
+    if let Some(holder) = text("add_card_holder") {
+        state.add.card_holder = holder;
+    }
+    if let Some(brand) = text("add_card_brand") {
+        state.add.card_brand = brand;
+    }
+    if let Some(month) = text("add_card_exp_month") {
+        state.add.card_exp_month = month;
+    }
+    if let Some(year) = text("add_card_exp_year") {
+        state.add.card_exp_year = year;
+    }
     if let Some(length) = values["generate_length"].as_str() {
         // An empty or half-typed number box must not wipe the setting.
         if let Ok(length) = length.parse::<i64>() {
@@ -3650,6 +3862,27 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 state.query.clear();
                 if state.tab == "add" {
                     state.seed_add_draft(host.as_deref());
+                }
+            }
+            reschema(state, host.as_deref())
+        }
+        // The KIND picker. The draft was absorbed above, so switching type
+        // KEEPS what the user has typed into the fields both forms share — a
+        // name typed under Login is still the name under Note. Only the type
+        // moves.
+        "add_type" => {
+            {
+                let mut state = state.lock().unwrap();
+                // An unparseable id cannot silently become a login: the picker
+                // only ever emits the three it drew, so anything else is a bug
+                // in the GUI and the type is left alone rather than guessed.
+                if let Ok(item_type) = value.parse::<u8>()
+                    && matches!(
+                        item_type,
+                        CIPHER_TYPE_LOGIN | CIPHER_TYPE_NOTE | CIPHER_TYPE_CARD
+                    )
+                {
+                    state.add.item_type = item_type;
                 }
             }
             reschema(state, host.as_deref())
@@ -4119,14 +4352,21 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
         "add" => {
             // The draft was absorbed above, so it is this process's copy that
             // is authoritative — and it survives a failed save.
-            let (name, user, uri, folder, notes, length, no_symbols) = {
+            let (item_type, name, user, uri, folder, notes, card, length, no_symbols) = {
                 let state = state.lock().unwrap();
                 (
+                    state.add.item_type,
                     state.add.name.trim().to_string(),
                     state.add.user.trim().to_string(),
                     state.add.uri.trim().to_string(),
                     state.add.folder.trim().to_string(),
                     state.add.notes.trim().to_string(),
+                    (
+                        state.add.card_holder.trim().to_string(),
+                        state.add.card_brand.trim().to_string(),
+                        state.add.card_exp_month.trim().to_string(),
+                        state.add.card_exp_year.trim().to_string(),
+                    ),
                     state.generate_length,
                     state.generate_no_symbols,
                 )
@@ -4134,41 +4374,106 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
             if name.is_empty() {
                 return json!({ "toast": "An item needs a name." });
             }
-            // The typed password is used for this call and dropped. An empty one
-            // means generate: rolled on this host, stored encrypted, and never
-            // echoed back — a schema is not a place for a secret. The op carries
-            // present-or-null fields, exactly the shape the CLI sent the agent.
+            // ⛔ REFUSE BEFORE WRITING. A stale agent does not reject an
+            // `item_type` it has never heard of — it drops it and creates a
+            // LOGIN, then reports success. There is no undo for that: the user
+            // believes they saved a note. Ask what the agent can build, and
+            // only send what it says it can.
+            if !agent_creatable_types(&vault_status().unwrap_or_else(|_| json!({})))
+                .contains(&item_type)
+            {
+                return json!({ "toast": "This host's vault agent is older than this browser and can only create logins. Run `ychrome-vault handover` on this host, then save again. Nothing was written." });
+            }
+            // ⛔ REFUSE BEFORE WRITING. A stale agent does not reject an
+            // `item_type` it has never heard of — it drops it and creates a
+            // LOGIN, then reports success. There is no undo for that: the user
+            // believes they saved a note. Ask what the agent can build, and
+            // only send what it says it can.
+            if !agent_creatable_types(&vault_status().unwrap_or_else(|_| json!({})))
+                .contains(&item_type)
+            {
+                return json!({ "toast": "This host's vault agent is older than this browser and can only create logins. Run `ychrome-vault handover` on this host, then save again. Nothing was written." });
+            }
+            // The typed secrets are used for this call and dropped. An empty
+            // password means GENERATE, and only for a login: rolled on this
+            // host, stored encrypted, and never echoed back — a schema is not a
+            // place for a secret. The op carries present-or-null fields,
+            // exactly the shape the CLI sent the agent.
             let password = values["add_password"].as_str().unwrap_or_default();
-            let op = json!({
+            let generate = item_type == CIPHER_TYPE_LOGIN && password.is_empty();
+            let (card_holder, card_brand, card_exp_month, card_exp_year) = card;
+            // ⛔ The type-specific fields are sent for the item's OWN type and
+            // for no other. A `user` on a note or a `card_number` on a login is
+            // data the vault has nowhere to keep and no reader will ever look
+            // at again — see the model's `new_item_body`.
+            let mut op = json!({
                 "op": "add",
+                "item_type": item_type,
                 "name": name,
-                "user": opt_field(&user),
-                "uri": opt_field(&uri),
                 "folder": opt_field(&folder),
                 "notes": opt_field(&notes),
-                "totp": Value::Null,
-                "password": opt_field(password),
-                "generate": password.is_empty(),
-                "length": length,
-                "symbols": !no_symbols,
             });
+            let fields = op.as_object_mut().expect("the op above is an object");
+            match item_type {
+                CIPHER_TYPE_NOTE => {
+                    if notes.is_empty() {
+                        return json!({ "toast": "A note needs something written in it." });
+                    }
+                }
+                CIPHER_TYPE_CARD => {
+                    let number = values["add_card_number"].as_str().unwrap_or_default();
+                    let code = values["add_card_code"].as_str().unwrap_or_default();
+                    fields.insert("card_holder".into(), opt_field(&card_holder));
+                    fields.insert("card_brand".into(), opt_field(&card_brand));
+                    fields.insert("card_number".into(), opt_field(number));
+                    fields.insert("card_exp_month".into(), opt_field(&card_exp_month));
+                    fields.insert("card_exp_year".into(), opt_field(&card_exp_year));
+                    fields.insert("card_code".into(), opt_field(code));
+                }
+                _ => {
+                    fields.insert("user".into(), opt_field(&user));
+                    fields.insert("uri".into(), opt_field(&uri));
+                    fields.insert("totp".into(), Value::Null);
+                    fields.insert("password".into(), opt_field(password));
+                    fields.insert("generate".into(), json!(generate));
+                    fields.insert("length".into(), json!(length));
+                    fields.insert("symbols".into(), json!(!no_symbols));
+                }
+            }
             match vault_op(op) {
+                // ⛔ A SET IS NOT A FILL, and the pre-flight above is a check
+                // against a DIFFERENT round trip. The agent could have been
+                // handed over between the two, so the reply is asked what type
+                // it actually built; a mismatch means the item exists and is
+                // the wrong kind, which the user must be told outright.
+                Ok(reply) if reply["item_type"].as_u64() != Some(u64::from(item_type)) => {
+                    json!({ "toast": format!("The vault agent did not confirm the type it built, so {name} may have been saved as a login. Check it in the Fill tab, run `ychrome-vault handover` on this host, and re-save if it is wrong.") })
+                }
                 Ok(_) => {
-                    let how = if password.is_empty() {
-                        "a generated password"
-                    } else {
-                        "the password you typed"
+                    // Say WHAT was made, not just that something was. "Added X"
+                    // on a form that used to only make logins is exactly how a
+                    // note filed as a login would have gone unnoticed.
+                    let made = match item_type {
+                        CIPHER_TYPE_NOTE => "note".to_string(),
+                        CIPHER_TYPE_CARD => "card".to_string(),
+                        _ if generate => "login with a generated password".to_string(),
+                        _ => "login with the password you typed".to_string(),
                     };
                     {
                         // The item exists now: clear the draft so the tab is
                         // ready for the next one rather than re-adding this.
+                        // The KIND stays — someone adding one note is usually
+                        // adding two.
                         let mut state = state.lock().unwrap();
-                        state.add = AddDraft::default();
+                        state.add = AddDraft {
+                            item_type,
+                            ..AddDraft::default()
+                        };
                         state.seed_add_draft(host.as_deref());
                     }
                     merge(
                         reschema(state, host.as_deref()),
-                        json!({ "toast": format!("Added {name} with {how}.") }),
+                        json!({ "toast": format!("Added {name} as a {made}.") }),
                     )
                 }
                 Err(error) => json!({ "toast": error.to_string() }),
@@ -8073,6 +8378,156 @@ mod tests {
         // The generator knobs round-trip through the schema.
         assert_eq!(named("generate_length"), DEFAULT_GENERATE_LENGTH);
         assert_eq!(named("generate_no_symbols"), false);
+    }
+
+    /// ⛔ USER-REPORTED, 2026-08-08: the Add tab could only make a LOGIN. The
+    /// user went to save a note and there was no way to.
+    ///
+    /// The instrument is the schema the GUI would actually draw, asserted per
+    /// type; the answer is which fields each one offers. A form that shows the
+    /// wrong boxes is the same bug wearing a picker, so each arm asserts what
+    /// must be ABSENT as loudly as what must be there.
+    #[test]
+    fn the_add_tab_can_make_a_note_and_a_card_not_only_a_login() {
+        let schema_for = |item_type: u8| -> Vec<Value> {
+            let mut state = PaneState {
+                tab: "add".to_string(),
+                ..PaneState::default()
+            };
+            state.add.item_type = item_type;
+            state.seed_add_draft(Some("github.com"));
+            unlocked_schema(
+                &state,
+                Some("github.com"),
+                &json!({"state": "unlocked"}),
+                None,
+            )["widgets"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        let has = |widgets: &[Value], id: &str| widgets.iter().any(|widget| widget["id"] == id);
+
+        // THE PICKER exists at all, and offers all three.
+        let login = schema_for(CIPHER_TYPE_LOGIN);
+        let picker = login
+            .iter()
+            .find(|widget| widget["id"] == "add_type")
+            .expect("the Add tab must offer a choice of item type");
+        let offered: Vec<&str> = picker["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tab| tab["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(offered, vec!["Login", "Note", "Card"]);
+        assert_eq!(picker["active"], "1", "the picker must show the live type");
+
+        // A LOGIN keeps everything it had.
+        assert!(has(&login, "add_user") && has(&login, "add_uri"));
+        assert!(has(&login, "add_password") && has(&login, "generate_length"));
+
+        // A NOTE is a name and its text. No username, no uri, and — the one
+        // that matters — no password box: a note has nowhere to keep one, so
+        // offering it would promise a secret that is silently discarded.
+        let note = schema_for(CIPHER_TYPE_NOTE);
+        assert!(has(&note, "add_name") && has(&note, "add_notes"));
+        for absent in ["add_user", "add_uri", "add_password", "generate_length"] {
+            assert!(
+                !has(&note, absent),
+                "a note must not offer {absent}: {}",
+                json!(note)
+            );
+        }
+        // …and its name is NOT pre-filled with the page host. A note started on
+        // github.com is not about github.com.
+        let value = |widgets: &[Value], id: &str| {
+            widgets
+                .iter()
+                .find(|widget| widget["id"] == id)
+                .unwrap_or_else(|| panic!("no {id}"))["value"]
+                .clone()
+        };
+        assert_eq!(value(&note, "add_name"), "");
+
+        // A CARD offers the six fields the card reader reads back, and the two
+        // that are secrets are masked and carry no value.
+        let card = schema_for(CIPHER_TYPE_CARD);
+        for field in [
+            "add_card_holder",
+            "add_card_brand",
+            "add_card_number",
+            "add_card_exp_month",
+            "add_card_exp_year",
+            "add_card_code",
+        ] {
+            assert!(has(&card, field), "a card must offer {field}");
+        }
+        for secret in ["add_card_number", "add_card_code"] {
+            let widget = card.iter().find(|w| w["id"] == secret).unwrap();
+            assert_eq!(widget["secret"], true, "{secret} must be masked");
+            assert_eq!(
+                widget["value"], "",
+                "{secret} must never ride back in a schema — a PAN cannot be \
+                 rotated the way a password can"
+            );
+        }
+        assert!(!has(&card, "add_user"), "a card has no username");
+        assert!(!has(&card, "add_password"), "a card has no password");
+    }
+
+    /// The card's non-secret half round-trips through the draft; its PAN and
+    /// CVV deliberately do NOT — they must never become stored state.
+    #[test]
+    fn a_cards_draft_holds_its_metadata_and_never_its_number() {
+        let mut state = PaneState::default();
+        absorb_draft(
+            &mut state,
+            &json!({
+                "add_card_holder": "A Reader",
+                "add_card_brand": "Visa",
+                "add_card_exp_month": "11",
+                "add_card_exp_year": "2031",
+                "add_card_number": "4111111111111111",
+                "add_card_code": "737",
+            }),
+        );
+        assert_eq!(state.add.card_holder, "A Reader");
+        assert_eq!(state.add.card_brand, "Visa");
+        assert_eq!(state.add.card_exp_month, "11");
+        assert_eq!(state.add.card_exp_year, "2031");
+        // The PAN and CVV have no home in the draft at all — the proof is that
+        // the whole state cannot be made to contain them.
+        let wire = format!(
+            "{}{}{}{}",
+            state.add.card_holder,
+            state.add.card_brand,
+            state.add.card_exp_month,
+            state.add.card_exp_year
+        );
+        assert!(!wire.contains("4111111111111111") && !wire.contains("737"));
+    }
+
+    /// Switching kind keeps what the user typed into the fields both forms
+    /// share, and a re-seed does not drag them back to Login.
+    #[test]
+    fn the_kind_survives_a_re_seed_and_the_shared_fields_survive_the_switch() {
+        let mut state = PaneState::default();
+        state.add.item_type = CIPHER_TYPE_NOTE;
+        state.add.notes = "engineer said 4417".to_string();
+        state.seed_add_draft(Some("github.com"));
+        assert_eq!(
+            state.add.item_type, CIPHER_TYPE_NOTE,
+            "a navigation must not put the user back on the login form"
+        );
+        // The seed cleared the site-derived fields, which for a note are empty
+        // by construction, and left the type.
+        assert_eq!(state.add.name, "");
+        // …and a LOGIN draft is still seeded from the page, unchanged.
+        let mut login = PaneState::default();
+        login.seed_add_draft(Some("github.com"));
+        assert_eq!(login.add.name, "github.com");
+        assert_eq!(login.add.uri, "https://github.com");
     }
 
     // The draft is seeded once per host: re-entering the tab must not clobber
