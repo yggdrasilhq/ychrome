@@ -231,36 +231,58 @@ error naming the read verb to use instead. The original "shape of the fix" at
 the top of this entry predates the measurement and is wrong on that one point;
 the rest of it stands.
 
-**What is still OPEN:** building it — the read-only frame verb, the isolated
-message handler, and `frame=` on `/engine/input`.
+⚠ This design rested on one unmeasured assumption — that a reply can leave the
+child WITHOUT crossing the page's own message channel. It has since been
+measured; the section below is where that stands, and it owns what is left open.
 
-### ⛔ ONE THING IN THAT DESIGN IS STILL UNMEASURED — measure it FIRST
+### ✅ SETTLED BY MEASUREMENT: THE PRIVATE REPLY CHANNEL EXISTS, AND IT IS WORLD-SCOPED
 
-Point 2 above is load-bearing and is currently a reasonable expectation, not a
-reading. Do not build on it unchecked; the last expectation about worlds in this
-entry was wrong.
+**Measured 2026-08-08, `ychrome engine worlds`, 7/7 on dev.** Point 2 above was
+the last expectation in this entry, and unlike the previous one it holds. The
+question was:
 
 > Does `window.webkit.messageHandlers.<name>.postMessage()` work from inside a
 > CROSS-ORIGIN child frame, when the handler was registered
 > `..._in_world(ISOLATED_WORLD)` — and does the UI process receive it?
 
-If it does not, the private reply channel does not exist and the design changes
-again: with replies forced back across `postMessage`, even a read verb hands the
-top page a same-origin-policy bypass, and the honest answer becomes that the
-child may report only what the caller already knew (a rect, an existence bit) —
-or that a web-process extension is back on the table after all, for the reply
-path alone rather than for reach.
+Two channels registered on the profile's `UserContentManager` before the page
+loaded — one `..._in_world("ychrome")`, one plain — and the same two
+`@all-frames` world probes as the table above, each asking both channels in both
+frames, at `document-start` and again at `load` (twice, because a handler that
+merely arrived late would otherwise read as no handler, and that false negative
+puts a web-process extension back on the table for nothing).
 
-⚠ Two sub-questions, and the second is the one that bites: the handler must be
-registered on the `UserContentManager` BEFORE the page loads (so this touches
-`identity.rs`, not just a userscript), and `script-message-received` hands back a
-value and the WebView — **not the frame** — so a child must self-identify in its
-own payload and that claim is unverifiable from outside. A frame that lies about
-which frame it is costs nothing today, but a verb that ROUTES on it would be
-trusting a page's word.
+| | sees the ISOLATED-world handler | sees the MAIN-world handler |
+|---|---|---|
+| main-world probe, top | `undefined` | `object` → **delivered** |
+| main-world probe, cross-origin child | `undefined` | `object` → **delivered** |
+| isolated-world probe, top | `object` → **delivered** | `undefined` |
+| isolated-world probe, **cross-origin child** | `object` → **DELIVERED** | `undefined` |
 
-Same instrument as the measurement above: extend `ychrome engine worlds` under
-its own `PROFILE` and `InstalledProbe`, with the cross-origin control intact.
+⇒ **`window.webkit.messageHandlers` IS world-scoped, where `postMessage`
+dispatch is not.** Two channels in one substrate with opposite answers, which is
+exactly why neither could be assumed from the other. The bottom-right-but-one
+cell is the answer: a cross-origin child, running our code in the engine's own
+world, reaches the UI process — and the page's own world cannot see, call, or
+forge that handler. The main-world channel is the control that makes a silence
+readable: it delivers from the top frame (handlers work here at all) AND from
+the cross-origin child (a child can reach the UI process at all), so a silence
+on the isolated channel would have been about the WORLD and nothing else.
+
+⇒ **Design point 2 stands as written. Build it.** No web-process extension is
+needed for the reply path either.
+
+⚠ **The self-identification limit is real and unchanged.** In this binding
+`script-message-received` hands back the `UserContentManager` — not even the
+WebView, let alone the frame — so every `frame` and `origin` in a payload is the
+sender's OWN CLAIM. Reading such a claim is harmless. **A verb that ROUTED on
+it would be trusting a page's word about which document it is**, so the verb
+must address a frame by the caller's own index/selector and treat the payload as
+data, never as identity. `identity::delivered_messages()` says so at its
+definition.
+
+**What is still OPEN:** building it — the read-only frame verb, and `frame=` on
+`/engine/input`. Every mechanism it needs is now measured green.
 
 ⚠ Do NOT "fix" any of this by loosening origin checks. The frames are
 cross-origin because banks intend them to be — and nothing above does: the child
