@@ -93,6 +93,16 @@ field survives; encrypt under the **cipher's** key; echo `revisionDate` as
   change**. A skill that lies is worse than no skill.
 - `cargo fmt --check` is not clean on `ychrome-vault` (it predates the settings).
   Do not reformat the crate. `cargo clippy` has 3 pre-existing warnings — add none.
+- ⛔ **`rustfmt <file>` IS NOT FILE-SCOPED — it follows `mod` declarations.**
+  `cargo fmt` reformats the whole workspace and buried a 385-line change on
+  2026-08-06; the obvious escape, `rustfmt src/engine/mod.rs`, then reformatted
+  `api.rs`, `host.rs`, `js.rs` and `substrate.rs` — four files that change had
+  never touched — and cost a revert the same day. The spelling that works:
+  `rustfmt --edition 2024 --check --config skip_children=true <file>`.
+  ⚠ `--skip-children` as a bare FLAG is not recognised by rustfmt 1.8, so the
+  earlier note recommending it was wrong. Audit `git diff --stat` after
+  formatting, every time: a formatter that silently widens its own blast radius
+  looks exactly like a clean run until someone reads the diff.
 - After every rebuild of the vault binary: `ychrome-vault stop-agent`. It
   re-locks the vault, so install the binary **before** asking the user to unlock.
 - No em-dashes in prose the user reads.

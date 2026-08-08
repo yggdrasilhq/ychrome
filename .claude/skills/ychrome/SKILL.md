@@ -1067,15 +1067,54 @@ rect measured *inside* the child plus the iframe's own rect is that coordinate.
 Proven: a click there lands on the child's own `#otp` with `isTrusted: true`,
 and text typed after it reads back from inside the child.
 
-⚠ The `frame=` verb is still **not built** — see `docs/pending-bugs.md`. And ⛔
-**do not lift the probe's bridge script into `src/`**: it accepts `eval` off the
-page's own message channel, which is fine for an instrument that lives for one
-run behind a per-run token and is not fine for a product.
+### ✅ AND IT IS BUILT — `ctl frame`, and `frame=` on `ctl input` (2026-08-08)
+
+```sh
+ychrome ctl frame page_id=$p frame='#pay' selector='#otp'
+#   → {ok, frame:{box,target_origin,…}, exists, count, tag, text, value, rect,
+#      visible, in_viewport, on_target, point:{x,y}}
+ychrome ctl input page_id=$p \
+    events='[{"type":"click","frame":"#pay","selector":"#otp"},
+             {"type":"type","text":"424242"}]'
+```
+
+**`frame` is a CSS selector for the frame element in the TOP document, or its
+index.** Never a value the frame reported about itself: `script-message-received`
+hands back the content manager, not the frame, so every `frame`/`origin` in a
+payload is the sender's own CLAIM. Reading one is harmless; routing on one is
+trusting a page's word about which document it is.
+
+⛔ **`ctl eval` REFUSES `frame=`, by name, and always will.** That is the design.
+The command reaching the bridge travels by cross-frame `postMessage`, whose
+delivery is NOT world-scoped (`engine worlds`, 7/7) — so a hostile TOP page can
+forge it. An `eval` op would then let that page run our code inside the bank's
+frame. No token helps: whichever document receives the message reads the token
+out of it. ⇒ **the bridge READS only**, and its answer goes to the UI process on
+a handler registered in the engine's own world, which the page cannot see or
+call. A forged read costs the forger nothing.
+
+⛔ **Still do not lift the PROBE's bridge into `src/`** — the shipped one is
+`src/engine/frame.rs` and it is a different script. The probe's accepts `eval`
+off the page's own message channel, which is fine for an instrument that lives
+for one run and is not fine for a product.
+
+⚠ **Two refusals belong to frames alone, and both are honest rather than
+best-effort.** `outside_frame_viewport` — the engine does not scroll a
+cross-origin child, because scrolling is a mutation and every op here is
+forgeable. `point_outside_frame` — the resolved point fell outside the iframe's
+box, where a click would land on the EMBEDDING page. Everything else keeps the
+top-document resolver's exact words (`target_moved`, zero-size element).
+
+Gate: `ychrome engine frame-verb` (8/8 on dev, 2026-08-08). It installs NO probe
+script — the bridge it exercises is the one `identity::build` attaches to every
+engine profile, so a green run is evidence about the shipped path.
 
 ⛔ **`rustfmt <file>` FOLLOWS `mod` DECLARATIONS.** "Use `rustfmt` not `cargo
 fmt`" is not enough: `rustfmt src/engine/mod.rs` reformatted four files the
-change had never touched. Use **`rustfmt --skip-children <file>`** and read
-`git diff --stat` afterwards.
+change had never touched. Use
+**`rustfmt --edition 2024 --check --config skip_children=true <file>`** and read
+`git diff --stat` afterwards. ⚠ `--skip-children` as a bare FLAG is not
+recognised by rustfmt 1.8, so the older note recommending it was wrong.
 
 ### ⛔ The engine's cookie jar was MEMORY-ONLY until 2026-07-31
 

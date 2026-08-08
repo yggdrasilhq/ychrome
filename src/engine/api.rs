@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
+use super::frame;
 use super::host::{CookieSpec, Engine, InputEvent, NavAction, PixelRect, ShotRegion};
 use super::js;
 use super::pool::{self, pool};
@@ -304,6 +305,35 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
             }
         }
         "eval" => {
+            // ⛔ `frame=` IS REFUSED HERE, BY NAME, AND THAT IS THE DESIGN
+            // RATHER THAN A GAP.
+            //
+            // Honouring it would mean a bridge inside the child that evaluates a
+            // string it was handed. Commands reach that bridge by cross-frame
+            // `postMessage`, whose delivery is NOT world-scoped (measured —
+            // `ychrome engine worlds`), so a hostile TOP page can post a
+            // well-formed one. That is a page making our code run inside another
+            // origin's document: a same-origin-policy breach WE would be
+            // providing, and no token defends against it — whichever document
+            // receives the message reads the token straight out of it.
+            //
+            // The read verb exists so the legitimate need is still served, and
+            // the refusal names it rather than leaving a caller to guess.
+            if request
+                .body
+                .get("frame")
+                .is_some_and(|value| !value.is_null())
+            {
+                return Reply::bad(
+                    400,
+                    "/engine/eval refuses `frame=` and always will: evaluating a caller's script \
+                     inside a cross-origin child means a bridge that runs page-supplied strings, \
+                     and the embedding page can forge the command that carries one. Use \
+                     /engine/frame instead — it resolves a selector INSIDE the frame and answers \
+                     exists/count/text/value/rect/point, read-only. To DRIVE the frame, pass the \
+                     same `frame=` to /engine/input, which aims a real event by that rect.",
+                );
+            }
             let (Some(id), Some(js)) = (page_id, request.body.get("js").and_then(Value::as_str))
             else {
                 return Reply::bad(400, "eval needs a page_id and js");
@@ -311,6 +341,60 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
             match engine.eval(&id, js) {
                 Ok(value) => Reply::Json(200, json!({ "ok": true, "value": value })),
                 Err(error) => Reply::bad(400, error.to_string()),
+            }
+        }
+        // Read a selector INSIDE a cross-origin child frame — the one thing
+        // `/engine/eval` cannot do and must not be taught to (see its arm).
+        //
+        // The reply is the child's own answer plus `point`: the viewport
+        // coordinate a click would have to land on, which is the frame's box
+        // plus the element's rect inside it. `point` is here rather than left to
+        // the caller because `/engine/input`'s `frame=` computes it through the
+        // SAME function — one owner, so a caller who clicks by hand and a caller
+        // who passes `frame=` aim at the same pixel.
+        "frame" => {
+            let Some(id) = page_id else {
+                return Reply::bad(400, "frame needs a page_id");
+            };
+            let Some(selector) = request.body.get("selector").and_then(Value::as_str) else {
+                return Reply::bad(
+                    400,
+                    "frame needs a `selector` to resolve inside the frame (and a `frame` naming \
+                     which one)",
+                );
+            };
+            let target = match frame::parse_target(&request.body) {
+                Ok(target) => target,
+                Err(message) => return Reply::bad(400, message),
+            };
+            let nth = match request.body.get("nth") {
+                None | Some(Value::Null) => 0,
+                Some(value) => match value.as_u64() {
+                    Some(nth) => nth as usize,
+                    None => {
+                        return Reply::bad(
+                            400,
+                            format!("`nth` must be a non-negative integer, got {value}"),
+                        );
+                    }
+                },
+            };
+            let started = Instant::now();
+            match frame::read(
+                &engine,
+                &id,
+                &target,
+                selector,
+                nth,
+                frame::timeout_ms(&request.body),
+            ) {
+                Ok(read) => {
+                    let mut report = frame::read_report(&read);
+                    report["selector"] = json!(selector);
+                    report["elapsed_ms"] = json!(started.elapsed().as_millis());
+                    Reply::Json(200, report)
+                }
+                Err((status, message)) => Reply::bad(status, message),
             }
         }
         // Autofill a vault item into the page's login form.
@@ -812,7 +896,7 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
 /// So the list has ONE owner and the CLI reads it. `the_banner_lists_every_verb
 /// _the_router_answers` parses the dispatcher's own match arms and fails when
 /// the two disagree, which is what makes this a fact rather than a convention.
-pub const VERBS: [&str; 23] = [
+pub const VERBS: [&str; 24] = [
     "open",
     "close",
     "pages",
@@ -820,6 +904,7 @@ pub const VERBS: [&str; 23] = [
     "nav",
     "wait",
     "eval",
+    "frame",
     "dom",
     "shot",
     "input",
@@ -843,10 +928,11 @@ pub const VERBS: [&str; 23] = [
 /// `park` is deliberately absent: parking a page must not first resume it.
 /// `close` is absent for the same reason — forgetting a parked page should not
 /// cost a page load.
-const DRIVES_A_PAGE: [&str; 11] = [
+const DRIVES_A_PAGE: [&str; 12] = [
     "goto",
     "nav",
     "eval",
+    "frame",
     "shot",
     "dom",
     "input",
@@ -1226,6 +1312,7 @@ fn wait(engine: &Engine, id: &str, until: &Value, timeout: Duration) -> Result<V
 /// is at the moment its own event is dispatched**. Resolving a batch up front
 /// meant event 2's coordinates were measured before event 1 had moved anything,
 /// which is precisely the stale-rect click `target_moved` exists to refuse.
+#[derive(Debug)]
 enum PendingInput {
     /// Nothing left to decide: coordinates, text or a keyval, all from the
     /// caller.
@@ -1238,6 +1325,21 @@ enum PendingInput {
         nth: Option<usize>,
         /// Refuse instead of choosing when more than one match is hittable.
         require_unique: bool,
+        button: u32,
+        count: u32,
+    },
+    /// The same sugar, one document down: the selector is resolved INSIDE a
+    /// cross-origin child and the point is translated by the frame's own box.
+    ///
+    /// A separate variant rather than an `Option<FrameTarget>` on the one above,
+    /// because the two resolvers share no code and refuse for different reasons
+    /// — the top-document one scrolls and walks a hittable pool, and the frame
+    /// one may do neither (`frame::click_target` says why).
+    FrameSelectorClick {
+        frame: frame::FrameTarget,
+        selector: String,
+        nth: usize,
+        timeout_ms: u64,
         button: u32,
         count: u32,
     },
@@ -1262,6 +1364,33 @@ fn parse_input(event: &Value) -> Result<PendingInput> {
                 other => bail!("unknown mouse button {other:?} (left|middle|right)"),
             };
             let count = event["count"].as_u64().unwrap_or(1).clamp(1, 3) as u32;
+            // ⭐ `frame=` FIRST, because a frame click and a top-document click
+            // ask different questions of the same `selector`. Answering the
+            // top-document one for an event that named a frame would resolve the
+            // selector in the WRONG document and dispatch there — a click
+            // reported as landed in a frame it never entered.
+            if event.get("frame").is_some_and(|value| !value.is_null()) {
+                let Some(selector) = event["selector"].as_str() else {
+                    bail!(
+                        "a click into a frame needs a `selector` to resolve INSIDE it — a bare \
+                         x/y is already in the page's own viewport and needs no frame"
+                    );
+                };
+                let target = frame::parse_target(event).map_err(anyhow::Error::msg)?;
+                return Ok(PendingInput::FrameSelectorClick {
+                    frame: target,
+                    selector: selector.to_string(),
+                    nth: match event.get("nth") {
+                        None | Some(Value::Null) => 0,
+                        Some(value) => value.as_u64().map(|n| n as usize).ok_or_else(|| {
+                            anyhow::anyhow!("`nth` must be a non-negative integer, got {value}")
+                        })?,
+                    },
+                    timeout_ms: frame::timeout_ms(event),
+                    button,
+                    count,
+                });
+            }
             match event["selector"].as_str() {
                 Some(selector) => Ok(PendingInput::SelectorClick {
                     selector: selector.to_string(),
@@ -1356,6 +1485,27 @@ fn resolve_pending(
                     count,
                 },
                 Some(target.report),
+            ))
+        }
+        PendingInput::FrameSelectorClick {
+            frame: target,
+            selector,
+            nth,
+            timeout_ms,
+            button,
+            count,
+        } => {
+            let (x, y, report) =
+                frame::click_target(engine, id, &target, &selector, nth, timeout_ms)
+                    .map_err(|(_, message)| anyhow::anyhow!(message))?;
+            Ok((
+                InputEvent::Click {
+                    x,
+                    y,
+                    button,
+                    count,
+                },
+                Some(report),
             ))
         }
     }
@@ -2814,7 +2964,7 @@ mod tests {
                 assert_eq!(button, 3);
                 assert_eq!(count, 2);
             }
-            PendingInput::Ready(_) => panic!("a selector click must not resolve at parse time"),
+            other => panic!("a selector click must not resolve at parse time: {other:?}"),
         }
         // Coordinates need nothing from the page and must stay Ready.
         assert!(matches!(
@@ -2824,6 +2974,89 @@ mod tests {
         // A malformed `nth` is a caller error, caught before anything moves.
         assert!(parse_input(&json!({ "type": "click", "selector": ".go", "nth": -1 })).is_err());
         assert!(parse_input(&json!({ "type": "click" })).is_err());
+    }
+
+    /// ⭐ A CLICK THAT NAMES A FRAME MUST NOT BE PARSED AS A TOP-DOCUMENT ONE.
+    ///
+    /// The two ask different questions of the same `selector`, and answering the
+    /// top-document one for an event that named a frame resolves it in the WRONG
+    /// document and dispatches there — a click reported as landed in a frame it
+    /// never entered. The parser stays pure either way: a frame click still
+    /// touches no page.
+    #[test]
+    fn a_click_that_names_a_frame_is_parsed_as_a_frame_click() {
+        let parsed = parse_input(&json!({
+            "type": "click", "frame": "#pay", "selector": "#otp", "nth": 1
+        }))
+        .expect("a frame click parses");
+        match parsed {
+            PendingInput::FrameSelectorClick {
+                frame: target,
+                selector,
+                nth,
+                ..
+            } => {
+                assert_eq!(target.selector, "#pay");
+                assert_eq!(target.nth, 0);
+                assert_eq!(selector, "#otp");
+                assert_eq!(nth, 1);
+            }
+            other => panic!("a frame click must not become a top-document click: {other:?}"),
+        }
+        // The index spelling addresses the same thing.
+        assert!(matches!(
+            parse_input(&json!({ "type": "click", "frame": 0, "selector": "#otp" }))
+                .expect("an indexed frame click parses"),
+            PendingInput::FrameSelectorClick { .. }
+        ));
+        // ⛔ A frame with no selector is a caller error, NOT a click at the
+        // frame's own box: a bare x/y is already in the page's viewport and
+        // needs no frame at all, so honouring it would silently mean something
+        // else than the caller wrote.
+        assert!(parse_input(&json!({ "type": "click", "frame": "#pay", "x": 1, "y": 2 })).is_err());
+        // And a null `frame` is absent, not an address — otherwise a caller
+        // building events programmatically gets a frame refusal for a
+        // top-document click.
+        assert!(matches!(
+            parse_input(&json!({ "type": "click", "frame": null, "selector": ".go" }))
+                .expect("a null frame is no frame"),
+            PendingInput::SelectorClick { .. }
+        ));
+    }
+
+    /// ⛔ `frame=` ON `/engine/eval` IS REFUSED BY NAME, AND THE REFUSAL POINTS
+    /// AT THE VERB THAT DOES THE JOB.
+    ///
+    /// This is settled design, not a gap: a bridge that evaluates a
+    /// page-supplied string inside a cross-origin child is one the EMBEDDING
+    /// page can drive, because cross-frame `postMessage` delivery is not
+    /// world-scoped (measured, `ychrome engine worlds`). A future session
+    /// reading `eval` and seeing no frame support would otherwise reasonably
+    /// "finish" it.
+    #[test]
+    fn eval_refuses_a_frame_argument_and_names_the_read_verb() {
+        let body = route_body(include_str!("api.rs"), "eval");
+        // ⚠ The STRING LITERAL, not the expression around it. A predicate keyed
+        // on `request.body.get("frame")` broke the moment rustfmt split that
+        // call across four lines — a lock whose mechanism depends on an
+        // expression's layout punishes honestly-made edits, and this file has
+        // paid that price before.
+        assert!(
+            body.contains("\"frame\""),
+            "eval must look for `frame=` — a silently ignored one reads as support"
+        );
+        assert!(
+            body.contains("/engine/frame"),
+            "the refusal must name the verb that resolves inside a frame"
+        );
+        // And the refusal must come BEFORE the evaluation, or a caller's script
+        // runs in the top document while being told the argument was refused.
+        let refusal = body.find("/engine/frame").expect("the refusal exists");
+        let evaluate = body.find("engine.eval(").expect("eval evaluates");
+        assert!(
+            refusal < evaluate,
+            "the refusal must precede the evaluation, or the script has already run"
+        );
     }
 
     // The three scripts must agree on the globals they hand each other. Two

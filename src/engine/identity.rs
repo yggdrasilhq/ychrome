@@ -56,7 +56,11 @@ pub const COOKIE_JAR_FILE: &str = "cookies";
 /// A NAME is what makes a world isolated in WebKit; there is no "anonymous
 /// isolated world". One constant so every isolated script shares one world and
 /// can see each other's globals, exactly as they do on the visible surface.
-const ISOLATED_WORLD: &str = "ychrome";
+///
+/// Public because `Engine::eval_in_world` needs to name the SAME world the
+/// engine's own scripts run in — a second spelling would put the frame verb's
+/// dispatcher in a world where its own bridge does not exist.
+pub const ISOLATED_WORLD: &str = "ychrome";
 
 /// One profile's WebKit identity, built once and reused for every page on that
 /// profile.
@@ -121,6 +125,15 @@ static REGISTERED: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 /// Everything the UI process has received on an armed channel, oldest first.
 static DELIVERED: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 
+/// How many deliveries are kept before the oldest is dropped.
+///
+/// A cap, because the frame verb made this a SHIPPED path rather than a probe's
+/// scratch list: every cross-origin read a long-lived daemon ever performs would
+/// otherwise sit here forever. [`take_delivered`] removes what it consumes, so
+/// in normal operation the list holds only replies nobody claimed — a forged
+/// read from a page, or an answer that arrived after its caller timed out.
+const DELIVERED_CAP: usize = 512;
+
 /// Arm a channel for every profile identity built after this call.
 ///
 /// Process-wide rather than thread-local on purpose: the caller arming a
@@ -157,6 +170,27 @@ pub fn delivered_messages() -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// CONSUME the oldest delivery on `channel` whose payload the caller accepts.
+///
+/// Taking rather than reading is what makes a reply a reply: a caller correlates
+/// on its own request's identity, and once it has that answer nobody else may
+/// see it again. The predicate is the CALLER's, because the correlation rule
+/// belongs to whoever owns the protocol on that channel — this module owns the
+/// channel, not what travels on it.
+///
+/// ⚠ The predicate reads a payload, which is the SENDING FRAME'S OWN CLAIM
+/// (see [`delivered_messages`]). Correlating on a token the caller itself
+/// generated is sound; routing on a `frame` or `origin` the payload asserts is
+/// not, and no caller here does it.
+pub fn take_delivered(channel: &str, accepts: impl Fn(&Value) -> bool) -> Option<Value> {
+    let mut held = DELIVERED.lock().ok()?;
+    let index = held
+        .iter()
+        .position(|row| row["channel"] == json!(channel) && accepts(&row["payload"]))?;
+    let mut row = held.remove(index);
+    Some(row["payload"].take())
+}
+
 /// Register one channel on a manager and wire its receiver. Engine thread only.
 fn register_channel(content: &UserContentManager, channel: &MessageChannel) -> Value {
     let registered = match channel.world {
@@ -182,6 +216,12 @@ fn register_channel(content: &UserContentManager, channel: &MessageChannel) -> V
                 .and_then(|text: glib::GString| serde_json::from_str::<Value>(text.as_str()).ok())
                 .unwrap_or(Value::Null);
             if let Ok(mut held) = DELIVERED.lock() {
+                // Oldest out first. A flood from a page posting forged reads
+                // must not be able to grow this without bound, and the thing a
+                // caller is waiting for is always the NEWEST arrival.
+                while held.len() >= DELIVERED_CAP {
+                    held.remove(0);
+                }
                 held.push(json!({ "channel": name, "world": world, "payload": payload }));
             }
         });
@@ -284,18 +324,35 @@ fn build(profile: &str) -> Result<ProfileIdentity> {
 
     // The message channels FIRST, because "before the page loads" is the whole
     // requirement and nothing below opens a page.
-    let channel_detail: Vec<Value> = match CHANNELS.lock() {
-        Ok(channels) => channels
-            .iter()
-            .map(|channel| register_channel(&content, channel))
-            .collect(),
-        Err(_) => Vec::new(),
-    };
+    //
+    // The FRAME verb's reply channel leads, and it is not armed by a caller:
+    // `/engine/frame` is a shipped route, so its channel has to exist on every
+    // identity this engine ever builds rather than on the ones some earlier call
+    // happened to arm. It is registered in the engine's own world — a reply path
+    // the page can call is not a reply path (`super::frame`).
+    let mut channel_detail: Vec<Value> = vec![register_channel(
+        &content,
+        &MessageChannel {
+            name: super::frame::CHANNEL.to_string(),
+            world: ScriptWorld::Isolated,
+        },
+    )];
+    if let Ok(channels) = CHANNELS.lock() {
+        for channel in channels.iter() {
+            channel_detail.push(register_channel(&content, channel));
+        }
+    }
 
     let mut scripts_attached = 0;
     let mut script_detail = Vec::new();
-    for script in &policy.userscripts {
-        attach_script(&content, script)?;
+    // The frame bridge is the engine's OWN script, so it goes on before the
+    // profile's — and it goes on through the same `attach_script` every other
+    // script uses, reading its placement out of its own metadata block. A second
+    // placement decision here is how a script ends up in a world its channel was
+    // not registered in, silently.
+    for script in std::iter::once(super::frame::bridge()).chain(policy.userscripts.iter().cloned())
+    {
+        attach_script(&content, &script)?;
         scripts_attached += 1;
         script_detail.push(json!({
             "matches": script.matches.len(),
