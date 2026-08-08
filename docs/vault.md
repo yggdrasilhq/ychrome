@@ -528,6 +528,22 @@ be a lie about the affordance.
 EncStrings to `/api/ciphers`; the server never sees plaintext. `--generate`
 rolls the password here, so it never crosses a shell's argv.
 
+**It creates three cipher types, not one.** The agent's `add` op takes an
+`item_type` (Bitwarden's discriminant: `1` login, `2` secure note, `3` card);
+absent means login, so every caller written before it grew types is unchanged.
+The vault pane's Add tab picks the type and then draws the form THAT TYPE HAS —
+a note has no password box, a card has no uri. The pane could only ever make a
+login until 2026-08-08, which is how a user came to try saving a note and find
+no way to.
+
+⛔ **A type belongs in the create path only once this client can READ IT BACK.**
+Identity (type `4`) is therefore refused by the op rather than half-supported:
+nothing here decrypts an identity, so creating one would store fields the user
+can never see again — worse than not offering it, because the save succeeds.
+`generate` is a LOGIN's flag and is dropped for the other types; a note has
+nowhere to keep a password, and minting one would promise a secret with no
+reader.
+
 ### `edit` patches the raw record, it does not rebuild one
 
 A Bitwarden `PUT /api/ciphers/{id}` replaces the **whole** cipher. The server
@@ -661,11 +677,11 @@ cell. Verdicts: ✅ have · ⚠ partial · ✗ gap · ⛔ deliberately not.
 | Capability | Bitwarden | Keyguard | ychrome-vault | Verdict |
 | --- | --- | --- | --- | --- |
 | Login items | full | full | full | ✅ |
-| Card items | full | full | read + fill; edit name/notes/folder/fields | ⚠ no card-field editor |
+| Card items | full | full | **create**, read + fill; edit name/notes/folder/fields | ⚠ no card-field editor |
 | Identity items | full | full | not modelled | ✗ |
-| Secure notes | full | full | readable as notes | ⚠ |
+| Secure notes | full | full | read, edit, **and create** (CLI op + pane) | ✅ |
 | SSH keys | yes | yes | no | ⛔ the ssh-agent is not this tool's job |
-| Create item | yes | yes | `add`, logins only | ⚠ |
+| Create item | yes | yes | `add`: logins, secure notes, cards | ⚠ no identity — not readable either |
 | Edit item | yes | yes | full for logins, from CLI **and** the pane | ✅ |
 | See a stored value in the UI | eye per field | eye per field | eye per field, one render at a time (never pre-filled) | ✅ |
 | Copy a value from a row | username / password / code | same | same, in the row's right-click menu | ✅ |
