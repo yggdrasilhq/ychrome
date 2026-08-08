@@ -141,3 +141,30 @@ first try.
 - On success Google shows only *"We've sent a receipt for the registration fee to
   <account>"*; the **order number is in that email, not on screen**. The developer account
   ID is in the console URL: `/console/u/0/developers/<ID>/app-list`.
+
+## profile-close-belongs-to-pay-google-com · WORKS
+task: pointer — the OR_CCR_123 / payments-profile cleanup does not live on this domain
+model: claude-opus-5
+date: 2026-08-08
+tags: pointer, payments, reauth
+
+The two entries above end at "removing that instrument … needs a normal browser session" and
+"`Close payments profile` exists in Settings but its dialog never opens on an agent surface".
+
+**That is now measured and it has its own domain file: read `pay.google.com` →
+`close-payments-profile-popup-reauth-wall`.** Short form, so nobody re-derives it here:
+
+- the close flow's blocker is a `window.open()` RE-AUTH POPUP. The re-auth itself SUCCEEDS
+  headlessly (password filled to a page-side length of 40, `CheckCookie` reached, popup
+  self-closes); what never happens is the OPENER resuming — its document is replaced and every
+  injected global is gone. `window.opener` is wired, so that is not the cause;
+- suspected cause is the hidden surface's missing focus/visibility/rAF, which cannot be fixed
+  page-side because the parent navigates and eats any shim. Filed as
+  `yggterm/docs/agent-cobrowse-gaps-2026-08-08.md`;
+- ⇒ **route a payments-profile close to a normal browser.** The operator did it in Chromium in
+  minutes on 2026-08-08 after the agent plane failed four times, and that closed the task.
+
+Also carried there and useful on THIS domain: the ghost-tab trap (after a popup closes, the
+ACTIVE tab is a `no_webview` slot and every verb answers *"web surface not live"* about a live
+page — recover with `web close --session`, not a relaunch), and the fact that an agent's own
+`web do click` can later be refused as `seat_input_on_unrevealed_surface`.
