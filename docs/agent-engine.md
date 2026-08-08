@@ -240,6 +240,17 @@ POST /eval {page_id, js, await_promise: bool, timeout_ms}
   → {value} | {error}
     await_promise=true wraps in the callback shim (store to a token global,
     poll) — the engine does the polling so scripts never hand-roll it again
+    ⛔ `frame=` is REFUSED here, by name, and always will be — see /frame
+POST /frame {page_id,
+             frame: "css" | index,      # the FRAME element, in the TOP document
+             frame_nth?: k,
+             selector: "css", nth?: k,  # resolved INSIDE that frame
+             timeout_ms?: 4000}
+  → {ok, frame:{selector,nth,tag,box,target_origin,frames},
+     exists, count, nth, tag, text, text_length, text_truncated,
+     value, value_length, value_withheld, rect, viewport, visible,
+     in_viewport, on_target, hit_tag, hit_id,
+     point:{x,y}}                       # the viewport point a click must land on
 ```
 
 #### `/shot`'s four regions, and the two traps in full-page capture
@@ -296,11 +307,75 @@ ychrome ctl shot page_id=pg_000001 region=rect \
 `{matches, hittable, hidden, zero_size}` account — so "screenshot the button I
 am about to click" cannot pick a different element than the click will.
 
+#### `/frame` — the read-only reach into a cross-origin child
+
+A payment UI that renders inside a bank's `<iframe>` used to be unreachable
+entirely: `eval` runs in the TOP document, `window.frames[0].document` throws
+`SecurityError` by design, and no verb took a frame. That blocked a live RTI fee
+payment on 2026-08-06. `/frame` closes it, and its shape is dictated by four
+measurements rather than by taste (`ychrome engine frames`, `engine worlds`):
+
+| measured | why the verb looks like this |
+|---|---|
+| an `@all-frames` userscript RUNS inside a cross-origin child | that is how our code gets in — no web-process extension needed |
+| `postMessage` dispatch is **not** world-scoped | the command is page-observable AND page-forgeable ⇒ **the bridge reads only** |
+| `window.webkit.messageHandlers` **is** world-scoped | the ANSWER goes to the UI process, where a forger cannot hear it |
+| `script-message-received` hands back the content manager, not the frame | a payload's `frame`/`origin` is a CLAIM ⇒ address a frame by the CALLER's selector |
+
+So: a command goes out by `postMessage` addressed to the frame's own origin and
+carries a **selector**; what leaks to whatever occupies that frame is a selector,
+not a capability. The reply comes back on a channel registered in the engine's
+own world. A forged read therefore costs the forger nothing — it cannot see the
+answer — and because there is **no mutation op at all**, there is no forged write
+to worry about. A page cannot use us to set a value in a document on another
+origin, which is the same-origin-policy breach we would otherwise be providing.
+
+⛔ **`/eval` refuses `frame=` and always will.** Honouring it means a bridge that
+evaluates a page-supplied string inside another origin's document, and a hostile
+top page can forge the command that carries one. No token defends against that:
+whichever document receives the message reads the token straight out of it. The
+refusal names this verb instead.
+
+**Writing is not a bridge op** — it is a real `GdkEvent`, aimed by the rect the
+bridge measured. `point` is the frame's own box plus the element's rect inside
+it, and `/engine/input`'s `frame=` computes it through the same function, so a
+caller who clicks by hand and one who passes `frame=` aim at the same pixel.
+
+Two refusals are specific to a frame and both are honest rather than
+best-effort: **`outside_frame_viewport`** (the engine does not scroll a
+cross-origin child — scrolling is a mutation, and every op here is forgeable) and
+**`point_outside_frame`** (the element's rect resolved to a point outside the
+iframe's box, where a click would land on the EMBEDDING page, not in the frame).
+`target_moved` and `zero-size element` keep the top-document resolver's exact
+words, so one vocabulary carries across both.
+
+A password field answers with `value_length` and `value_withheld: "password"`,
+never the secret — the boundary `/fill` keeps. ⚠ The limit is named rather than
+pretended: a card NUMBER is an ordinary text input, so it is **not** covered.
+
+```sh
+ychrome ctl frame page_id=pg_000001 frame='#pay' selector='#otp'
+ychrome ctl input page_id=pg_000001 \
+    events='[{"type":"click","frame":"#pay","selector":"#otp"},
+             {"type":"type","text":"424242"}]'
+```
+
+Proven end to end by `ychrome engine frame-verb` on a two-origin fixture whose
+child page is **inert HTML** — no script, no listener — because a child that
+helped us would prove nothing about a real gateway. Its `#decoy` band occupies
+exactly where an untranslated point would land, so the click cannot pass by
+arithmetic accident.
+
 ### Acting (trusted input — the whole point)
 
 ```
 POST /input {page_id, events: [
   {"type":"click",  "selector":"css", "nth"?: k, "require_unique"?: bool}
+| {"type":"click",  "frame":"css"|index, "frame_nth"?: k, "selector":"css", "nth"?: k}
+                                                 # resolved INSIDE a cross-origin
+                                                 # child; the point is the frame's
+                                                 # box plus the element's own rect
+                                                 # (`/frame` owns that arithmetic)
 | {"type":"click",  "x":…, "y":…, "button":"left"|"right"|"middle", "count":1|2}
 | {"type":"move",   "x":…, "y":…}                # real hover — menus, tooltips work
 | {"type":"type",   "text":"…"}                  # keyevents to the focused element
