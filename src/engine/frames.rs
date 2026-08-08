@@ -78,6 +78,14 @@
 //! read-only with its replies routed to the UI process rather than back across
 //! the page's own message channel.
 //!
+//! That last clause was a reasonable expectation and nothing more, so
+//! [`run_worlds`] measures it too: **does a script message handler registered
+//! `..._in_world(ISOLATED_WORLD)` reach the UI process from inside a
+//! CROSS-ORIGIN child?** It does — and unlike `postMessage`, the handler IS
+//! world-scoped, so the page's own world cannot call it. Two channels in one
+//! substrate with opposite answers, which is why neither could be assumed from
+//! the other.
+//!
 //! ⚠ The two probes share ONE fixture ([`open_fixture`]) on purpose. A second
 //! wiring of the same two origins is a second thing to keep honest, and the one
 //! that drifted would still look green.
@@ -115,6 +123,16 @@ const WORLD_MAIN_STEM: &str = "ychrome-world-main-probe";
 /// at once, so the three can never drift apart.
 const ISO_LABEL: &str = "iso";
 const MAIN_LABEL: &str = "main";
+
+/// The two content→UI-process channels [`run_worlds`] arms — one registered in
+/// the engine's ISOLATED world, one in the page's MAIN world.
+///
+/// Two, not one, because a silence on the isolated channel has to be
+/// distinguishable from "script message handlers do not work here at all". The
+/// main-world channel is that control, and a cross-origin child reaching it is
+/// the control for the frame variable as well.
+const ISO_CHANNEL: &str = "ychromeProbeIso";
+const MAIN_CHANNEL: &str = "ychromeProbeMain";
 
 /// How long a bridge round trip may take.
 const CALL_TIMEOUT_MS: u64 = 6000;
@@ -269,6 +287,8 @@ const WORLD_PROBE_TEMPLATE: &str = r#"// ==UserScript==
 (() => {
   const LABEL = "{LABEL}";
   const TOKEN = "{TOKEN}";
+  const CHANNELS = { iso: "{ISO_CHANNEL}", main: "{MAIN_CHANNEL}" };
+  const WHERE = window.top === window ? "top" : "child";
   const mark = (kind, value) => {
     try {
       document.documentElement.setAttribute(
@@ -285,7 +305,30 @@ const WORLD_PROBE_TEMPLATE: &str = r#"// ==UserScript==
     heard.push(data.from);
     mark("heard", JSON.stringify(heard));
   });
-  mark("ran", window.top === window ? "top" : "child");
+  mark("ran", WHERE);
+  // The channel probe, run TWICE. `window.webkit.messageHandlers` is populated
+  // from the content manager's registrations as the document is created, so a
+  // handler should be there at document-start — but a probe that only looked
+  // then would report "no channel" for one that merely arrived late, and a
+  // false negative here sends the design back to a web-process extension.
+  const probeChannels = (phase) => {
+    const handlers = (window.webkit && window.webkit.messageHandlers) || null;
+    for (const key of Object.keys(CHANNELS)) {
+      const handler = handlers ? handlers[CHANNELS[key]] : undefined;
+      mark("chan-" + key + "-" + phase, typeof handler);
+      if (!handler) { continue; }
+      try {
+        handler.postMessage({
+          channelProbe: TOKEN, world: LABEL, frame: WHERE, phase: phase,
+          href: String(location.href), origin: String(location.origin)
+        });
+      } catch (error) {
+        mark("chan-" + key + "-" + phase + "-threw", String(error));
+      }
+    }
+  };
+  probeChannels("start");
+  window.addEventListener("load", () => { probeChannels("load"); });
   if (window.top !== window) { return; }
   window.addEventListener("load", () => {
     try {
@@ -782,6 +825,8 @@ fn world_probe(label: &str, world: &str, token: &str) -> String {
         .replace("{LABEL}", label)
         .replace("{WORLD}", world)
         .replace("{TOKEN}", token)
+        .replace("{ISO_CHANNEL}", ISO_CHANNEL)
+        .replace("{MAIN_CHANNEL}", MAIN_CHANNEL)
 }
 
 /// The `from` tags a recorder heard, decoded from the attribute text it wrote.
@@ -840,6 +885,15 @@ fn child_attr(page: &str, seq: &mut u64, label: &str, kind: &str) -> Value {
 pub fn run_worlds() -> Result<Value> {
     let started = Instant::now();
     let token = run_token();
+
+    // ⛔ BEFORE the fixture, and that is not a style preference. A profile's
+    // identity is built on its first page and cached forever after, and
+    // `window.webkit.messageHandlers` is populated from the manager's
+    // registrations as a document is created — so a channel armed after
+    // `open_fixture` would exist on nothing the fixture can see, and every
+    // reading below would be a false negative about the substrate.
+    super::identity::arm_message_channel(ISO_CHANNEL, crate::userscript::ScriptWorld::Isolated);
+    super::identity::arm_message_channel(MAIN_CHANNEL, crate::userscript::ScriptWorld::Main);
 
     let _guard = InstalledProbe;
     // The bridge is the READ INSTRUMENT here, not the thing under test: the
@@ -960,6 +1014,105 @@ pub fn run_worlds() -> Result<Value> {
         }),
     });
 
+    // ---- W5-W7. the private reply channel ----------------------------------
+    //
+    // Probe 2's answer above forbids an `eval` path and forces the bridge to be
+    // read-only. It does NOT settle where a read's ANSWER travels, and the
+    // whole design rests on that: if the reply has to come back across
+    // `postMessage`, the top page hears every answer about the child's origin
+    // and even a read verb is a same-origin-policy bypass we would be
+    // providing. The claim being checked is that a frame can speak to the UI
+    // PROCESS instead, over a handler registered in the engine's own world.
+    let registrations = super::identity::channel_registrations();
+    let registered = |name: &str| {
+        registrations
+            .iter()
+            .any(|row| row["name"] == json!(name) && row["registered"] == json!(true))
+    };
+    steps.push(Step {
+        name: "INSTRUMENT: both message channels were REGISTERED before the page loaded",
+        pass: registered(ISO_CHANNEL) && registered(MAIN_CHANNEL),
+        detail: json!({ "registrations": registrations,
+                        "isolated_world_channel": ISO_CHANNEL,
+                        "main_world_channel": MAIN_CHANNEL }),
+    });
+
+    // What each world SAW, in each frame, at each phase — the typeof of the
+    // handler object. `undefined` here and no delivery below are one fact; a
+    // handler that was visible and still delivered nothing is a different one.
+    let mut visibility = json!({});
+    for label in [ISO_LABEL, MAIN_LABEL] {
+        for key in ["iso", "main"] {
+            for phase in ["start", "load"] {
+                let kind = format!("chan-{key}-{phase}");
+                visibility[format!("{label}.top.{kind}")] = top_attr(&page, label, &kind);
+                visibility[format!("{label}.child.{kind}")] =
+                    child_attr(&page, &mut seq, label, &kind);
+            }
+        }
+    }
+
+    let delivered = super::identity::delivered_messages();
+    let arrived = |channel: &str, world: &str, frame: &str| {
+        delivered.iter().any(|row| {
+            row["channel"] == json!(channel)
+                && row["payload"]["world"] == json!(world)
+                && row["payload"]["frame"] == json!(frame)
+        })
+    };
+
+    // The control: a script message handler works AT ALL in this process, from
+    // the world it was registered in. Without it, silence on the isolated
+    // channel would not distinguish "the isolated world cannot" from "message
+    // handlers are not wired here".
+    let main_channel_from_top = arrived(MAIN_CHANNEL, MAIN_LABEL, "top");
+    // The second control, and it separates the FRAME variable from the WORLD
+    // one: a cross-origin child reaching the UI process on a main-world handler.
+    let main_channel_from_child = arrived(MAIN_CHANNEL, MAIN_LABEL, "child");
+    steps.push(Step {
+        name: "CONTROL: a script message handler DOES reach the UI process (main world, top frame)",
+        pass: main_channel_from_top,
+        detail: json!({ "main_channel_from_top": main_channel_from_top,
+                        "main_channel_from_cross_origin_child": main_channel_from_child }),
+    });
+
+    // ⭐ THE ANSWER.
+    let iso_channel_from_child = arrived(ISO_CHANNEL, ISO_LABEL, "child");
+    let iso_channel_from_top = arrived(ISO_CHANNEL, ISO_LABEL, "top");
+    // ⛔ The security half: can the PAGE's own world call the handler we
+    // registered in ours? If it can, the reply path is not private and a forged
+    // read gets its answer after all.
+    let page_reaches_isolated_channel =
+        arrived(ISO_CHANNEL, MAIN_LABEL, "top") || arrived(ISO_CHANNEL, MAIN_LABEL, "child");
+    let private_reply_channel = iso_channel_from_child && !page_reaches_isolated_channel;
+    let reply_path = if private_reply_channel {
+        "ui-process: a cross-origin child can answer on a handler the page cannot see"
+    } else if iso_channel_from_child {
+        "NOT PRIVATE: the channel reaches, but the page's own world can call it too"
+    } else {
+        "NO UI-PROCESS REPLY PATH from a cross-origin child — the design must change"
+    };
+    steps.push(Step {
+        name: "MEASURED: whether an ISOLATED-world message handler reaches the UI process \
+               from a CROSS-ORIGIN child (reported, not asserted)",
+        pass: true,
+        detail: json!({
+            "isolated_channel_from_cross_origin_child": iso_channel_from_child,
+            "isolated_channel_from_top": iso_channel_from_top,
+            "page_main_world_reaches_the_isolated_channel": page_reaches_isolated_channel,
+            "main_channel_from_top": main_channel_from_top,
+            "main_channel_from_cross_origin_child": main_channel_from_child,
+            "handler_visibility_by_world_frame_phase": visibility,
+            "delivered": delivered,
+            // ⚠ Not a caveat, a limit: `script-message-received` hands back the
+            // UserContentManager — not the WebView and not the frame — so every
+            // `frame`/`origin` above is the SENDER'S OWN CLAIM. A verb may read
+            // such a claim; one that ROUTED on it would be trusting a page's
+            // word about which document it is.
+            "frame_identity_is_self_claimed": true,
+        }),
+    });
+
     let _ = dispatch(&request("close", json!({ "page_id": page })));
 
     // ⭐ The gate asserts the INSTRUMENT, never the answer. Both answers are
@@ -977,6 +1130,10 @@ pub fn run_worlds() -> Result<Value> {
         "page_main_world_observes_our_post": main_observes_our_post,
         "isolated_world_hears_a_page_post": isolated_hears_page_post,
         "verb_shape": verb_shape,
+        "isolated_channel_from_cross_origin_child": iso_channel_from_child,
+        "page_main_world_reaches_the_isolated_channel": page_reaches_isolated_channel,
+        "private_reply_channel": private_reply_channel,
+        "reply_path": reply_path,
         "merchant": fixture.merchant_base,
         "bank": fixture.bank_base,
         "steps": steps.iter().map(Step::to_json).collect::<Vec<_>>(),
@@ -1068,24 +1225,91 @@ mod tests {
             iso.all_frames && main.all_frames,
             "both must reach the child, or only one of them could ever hear a cross-frame post"
         );
-        // Under ONE neutral label, the two bodies must differ in the `@world`
-        // value and nowhere else. The real labels cannot be used for this
-        // comparison — `ISO_LABEL` is a substring of `isolated`, so replacing
-        // it would rewrite the very line under test.
-        let with_world = |world: &str| {
-            WORLD_PROBE_TEMPLATE
-                .replace("{LABEL}", "L")
-                .replace("{TOKEN}", "t")
-                .replace("{WORLD}", world)
+        // Under ONE neutral label, the two bodies must be byte-identical apart
+        // from the `@world` metadata line — which is where `{WORLD}` lives, and
+        // the count below holds it to being the ONLY place it lives.
+        //
+        // This used to compare the two bodies after replacing each world's own
+        // WORD with a placeholder, and that broke the moment the script had a
+        // legitimate reason to contain the text "main" (the channel table). A
+        // comparison whose mechanism depends on a word never appearing in the
+        // body under test will keep breaking honestly-made edits, so it now
+        // cuts the one line instead of rewriting every match of a word.
+        let without_world_line = |body: &str| {
+            body.lines()
+                .filter(|line| !line.trim_start().starts_with("// @world"))
+                .collect::<Vec<_>>()
+                .join("\n")
         };
         assert_eq!(
-            with_world("isolated").replace("isolated", "W"),
-            with_world("main").replace("main", "W"),
-            "the two probes must differ in the @world value and nothing else"
+            without_world_line(&world_probe("L", "isolated", "t")),
+            without_world_line(&world_probe("L", "main", "t")),
+            "with the label held equal the two probes must differ in the @world \
+             line and nowhere else"
         );
         // And the world must be substituted in exactly one place, or "the same
         // script in two worlds" is a claim about more than one line.
         assert_eq!(WORLD_PROBE_TEMPLATE.matches("{WORLD}").count(), 1);
+        // The cut line must be the one that carries the world, or the
+        // comparison above is deleting something else and hiding a difference.
+        assert!(
+            world_probe("L", "isolated", "t")
+                .lines()
+                .any(|line| line.trim_start().starts_with("// @world")
+                    && line.contains("isolated"))
+        );
+    }
+
+    /// ⭐ A CHANNEL MUST BE ASKED FOR TWICE, OR A LATE HANDLER READS AS NO
+    /// HANDLER.
+    ///
+    /// `window.webkit.messageHandlers` is expected to be populated as the
+    /// document is created, but "expected" is what this entry keeps getting
+    /// wrong. A probe that looked only at `document-start` would report a
+    /// missing handler for one that merely arrived late — and a false negative
+    /// here does not fail quietly: it sends the design back to a web-process
+    /// extension for the reply path.
+    #[test]
+    fn the_channel_probe_looks_at_document_start_AND_at_load() {
+        let body = world_probe(ISO_LABEL, "isolated", "t");
+        assert!(body.contains("probeChannels(\"start\")"));
+        assert!(body.contains("probeChannels(\"load\")"));
+        // And the phase must reach the marker, or two looks are recorded as one.
+        assert!(body.contains("mark(\"chan-\" + key + \"-\" + phase, typeof handler)"));
+    }
+
+    /// ⭐ THE TWO CHANNELS ARE THE CONTROL PAIR, AND THEY MUST BE IN DIFFERENT
+    /// WORLDS — armed BEFORE the fixture opens.
+    ///
+    /// The measurement is "does an ISOLATED-world handler reach the UI process
+    /// from a cross-origin child". If both channels were armed in the same
+    /// world, the main-world one would stop being a control: a silence would no
+    /// longer separate "the isolated world cannot" from "handlers do not work
+    /// here". And a channel armed after `open_fixture` is registered on nothing
+    /// the fixture can see, so every reading would be a false negative.
+    #[test]
+    fn the_probe_arms_one_isolated_channel_and_one_main_channel() {
+        assert_ne!(ISO_CHANNEL, MAIN_CHANNEL);
+        let body = include_str!("frames.rs")
+            .split("pub fn run_worlds()")
+            .nth(1)
+            .expect("run_worlds must exist");
+        let opens_at = body
+            .find("open_fixture()")
+            .expect("run_worlds opens the fixture");
+        let arming = &body[..opens_at];
+        assert!(
+            arming.contains(
+                "arm_message_channel(ISO_CHANNEL, crate::userscript::ScriptWorld::Isolated)"
+            ),
+            "the measured channel must be armed in the ISOLATED world, before the fixture"
+        );
+        assert!(
+            arming.contains(
+                "arm_message_channel(MAIN_CHANNEL, crate::userscript::ScriptWorld::Main)"
+            ),
+            "the control channel must be armed in the MAIN world, before the fixture"
+        );
     }
 
     /// The recorder must write to the DOM, which both worlds share. A global

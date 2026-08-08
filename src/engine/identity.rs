@@ -15,6 +15,12 @@
 //! | per-site zoom | `webzoom::zoom_for_host` | `WebViewExt::set_zoom_level` |
 //! | egress | the caller's SOCKS endpoint | `NetworkProxySettings` |
 //!
+//! One thing it does own, because nothing else can: the profile's
+//! **content→UI-process message channels** ([`MessageChannel`]). A script
+//! message handler has to be registered on the `UserContentManager` before a
+//! document is created on it, and this module is where that manager is built —
+//! so an owner elsewhere would be an owner that arrives too late.
+//!
 //! The engine and the visible surface must be the SAME browser to a website.
 //! That is why the jar directory is `crate::profile_dir`'s, unmodified: a page
 //! logged in under profile X in the visible surface is logged in here with no
@@ -22,11 +28,13 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
 use glib::translate::{IntoGlib, ToGlibPtr, from_glib_full};
-use serde_json::json;
+use javascriptcore::ValueExt;
+use serde_json::{Value, json};
 use webkit2gtk::{
     CookieManagerExt, CookiePersistentStorage, NetworkProxyMode, NetworkProxySettings,
     UserContentInjectedFrames, UserContentManager, UserContentManagerExt, UserScript,
@@ -71,6 +79,122 @@ thread_local! {
     /// Per-profile identities, on the engine thread that owns the GTK objects.
     static IDENTITIES: RefCell<HashMap<String, ProfileIdentity>> =
         RefCell::new(HashMap::new());
+}
+
+// ---------------------------------------------------------------------------
+// Content → UI-process message channels
+// ---------------------------------------------------------------------------
+
+/// A content→UI-process channel: a WebKit **script message handler**,
+/// registered on a profile's `UserContentManager` in a named world.
+///
+/// It is the one direction that does not travel over the page's own wires. A
+/// `postMessage` between frames is observable and forgeable by whatever
+/// document sits in the frame (measured — `engine worlds`), so a reply that
+/// went back that way would hand the top page an answer about another origin.
+/// `window.webkit.messageHandlers.<name>.postMessage()` goes to the UI process
+/// instead, and a world it was not registered in has no such handler to call.
+///
+/// ⛔ **The world is load-bearing and getting it backwards is silent**, exactly
+/// as it is for a userscript: a handler registered in the main world is one the
+/// PAGE can call, and a reply channel the page can call is not a reply channel.
+pub struct MessageChannel {
+    pub name: String,
+    pub world: ScriptWorld,
+}
+
+/// The channels every identity built from here on will carry.
+///
+/// ⛔ **Registration has to happen while the identity is being BUILT.** An
+/// identity is constructed once, cached per profile, and every page on that
+/// profile loads against it — `window.webkit.messageHandlers` is populated from
+/// the manager's registrations as a document is created, so a channel armed
+/// after the first page opened exists on nothing that page can see.
+static CHANNELS: Mutex<Vec<MessageChannel>> = Mutex::new(Vec::new());
+
+/// What the REGISTRATION CALL answered, per channel, per profile built. The
+/// readback, not the request — `register_script_message_handler*` returns false
+/// for a name already taken, and a channel nobody registered is silent in
+/// exactly the way a channel that cannot reach us is.
+static REGISTERED: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+
+/// Everything the UI process has received on an armed channel, oldest first.
+static DELIVERED: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+
+/// Arm a channel for every profile identity built after this call.
+///
+/// Process-wide rather than thread-local on purpose: the caller arming a
+/// channel is not the engine thread that builds the identity, and the reader
+/// draining the deliveries is neither of them.
+pub fn arm_message_channel(name: &str, world: ScriptWorld) {
+    if let Ok(mut channels) = CHANNELS.lock() {
+        channels.push(MessageChannel {
+            name: name.to_string(),
+            world,
+        });
+    }
+}
+
+/// What each armed channel's registration call actually returned.
+pub fn channel_registrations() -> Vec<Value> {
+    REGISTERED
+        .lock()
+        .map(|held| held.clone())
+        .unwrap_or_default()
+}
+
+/// Everything the UI process has received on an armed channel, oldest first.
+///
+/// ⚠ **A record carries what the SENDING FRAME SAID ABOUT ITSELF, and nothing
+/// more.** `script-message-received` hands back the `UserContentManager` — not
+/// the WebView, and not the frame — so "I am the child at origin X" is a claim
+/// this process cannot check. Reading such a claim is harmless; ROUTING on it
+/// would be trusting a page's word about which document it is.
+pub fn delivered_messages() -> Vec<Value> {
+    DELIVERED
+        .lock()
+        .map(|held| held.clone())
+        .unwrap_or_default()
+}
+
+/// Register one channel on a manager and wire its receiver. Engine thread only.
+fn register_channel(content: &UserContentManager, channel: &MessageChannel) -> Value {
+    let registered = match channel.world {
+        // The page's OWN world: `window.webkit.messageHandlers.<name>` exists
+        // for the page's scripts, which is right for a channel a page is meant
+        // to use and wrong for a reply path.
+        ScriptWorld::Main => content.register_script_message_handler(&channel.name),
+        // A NAMED world — the engine's own, the same one `attach_script` puts
+        // isolated userscripts in, or our scripts would find no handler.
+        ScriptWorld::Isolated => {
+            content.register_script_message_handler_in_world(&channel.name, ISOLATED_WORLD)
+        }
+    };
+    if registered {
+        let name = channel.name.clone();
+        let world = channel.world.as_str();
+        content.connect_script_message_received(Some(&channel.name), move |_manager, result| {
+            // `to_json` is the decoder `/engine/eval` already uses, so a payload
+            // reads here exactly as the same value would read there.
+            let payload = result
+                .js_value()
+                .and_then(|value| value.to_json(0))
+                .and_then(|text: glib::GString| serde_json::from_str::<Value>(text.as_str()).ok())
+                .unwrap_or(Value::Null);
+            if let Ok(mut held) = DELIVERED.lock() {
+                held.push(json!({ "channel": name, "world": world, "payload": payload }));
+            }
+        });
+    }
+    let detail = json!({
+        "name": channel.name,
+        "world": channel.world.as_str(),
+        "registered": registered,
+    });
+    if let Ok(mut held) = REGISTERED.lock() {
+        held.push(detail.clone());
+    }
+    detail
 }
 
 /// Build (or reuse) a profile's identity. Engine thread only.
@@ -158,6 +282,16 @@ fn build(profile: &str) -> Result<ProfileIdentity> {
     let policy = crate::webpolicy::policy(profile);
     let content = UserContentManager::new();
 
+    // The message channels FIRST, because "before the page loads" is the whole
+    // requirement and nothing below opens a page.
+    let channel_detail: Vec<Value> = match CHANNELS.lock() {
+        Ok(channels) => channels
+            .iter()
+            .map(|channel| register_channel(&content, channel))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+
     let mut scripts_attached = 0;
     let mut script_detail = Vec::new();
     for script in &policy.userscripts {
@@ -193,6 +327,7 @@ fn build(profile: &str) -> Result<ProfileIdentity> {
             "user_agent": policy.user_agent,
             "userscripts": scripts_attached,
             "userscript_detail": script_detail,
+            "message_channels": channel_detail,
             "adblock": filter,
             "build_ms": started.elapsed().as_millis(),
         }),
@@ -533,6 +668,84 @@ mod tests {
         );
         // wry writes `<profile>/cookies`. One browser, one file.
         assert_eq!(super::COOKIE_JAR_FILE, "cookies");
+    }
+
+    /// ⭐ A MESSAGE CHANNEL MUST BE REGISTERED IN THE WORLD IT ASKED FOR.
+    ///
+    /// The same failure `attach_script` documents, one layer along and with a
+    /// worse consequence. A channel meant to be the engine's private reply path
+    /// but registered without a world is one the PAGE can call — the handler
+    /// appears on `window.webkit.messageHandlers` in the page's own world, and
+    /// every reply the engine sends becomes forgeable by the document it was
+    /// asking about. Nothing at runtime says so: the channel still works, the
+    /// replies still arrive, and only the security property is gone.
+    ///
+    /// Source-level for exactly that reason, like the two tests below it.
+    #[test]
+    fn a_message_channel_is_registered_in_the_world_it_asked_for() {
+        let source = include_str!("identity.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the module body precedes its tests");
+        let arm = source
+            .split("fn register_channel(")
+            .nth(1)
+            .expect("register_channel must exist");
+        let body = &arm[..arm.find("\n}").unwrap_or(arm.len())];
+        let isolated = body
+            .split("ScriptWorld::Isolated =>")
+            .nth(1)
+            .expect("the isolated arm must exist");
+        assert!(
+            isolated.contains("register_script_message_handler_in_world")
+                && isolated.contains("ISOLATED_WORLD"),
+            "an isolated channel must name the engine's own world, or our own \
+             isolated userscripts find no handler and the page finds one"
+        );
+        let main = body
+            .split("ScriptWorld::Main =>")
+            .nth(1)
+            .expect("the main arm must exist");
+        let main = &main[..main.find("ScriptWorld::Isolated").unwrap_or(main.len())];
+        assert!(
+            !main.contains("_in_world"),
+            "the main-world arm must use the plain registration — a world NAME \
+             is what makes a world isolated"
+        );
+    }
+
+    /// ⭐ THE REGISTRATION READBACK, NOT THE REQUEST.
+    ///
+    /// `register_script_message_handler*` returns false for a name already
+    /// taken. A channel reported as armed because somebody ASKED for it, while
+    /// WebKit refused the name, is silent in precisely the way a channel that
+    /// cannot reach the UI process is — and a probe would then report a
+    /// substrate limit that was really a duplicate name.
+    #[test]
+    fn a_channel_reports_what_the_registration_call_answered() {
+        let source = include_str!("identity.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the module body precedes its tests");
+        let arm = source
+            .split("fn register_channel(")
+            .nth(1)
+            .expect("register_channel must exist");
+        assert!(
+            arm.contains("let registered = match channel.world"),
+            "the reported flag must come from the register call itself"
+        );
+        assert!(
+            arm.contains("\"registered\": registered,"),
+            "the reported flag must be the call's own answer, not a constant"
+        );
+        // And a receiver is only wired for a registration that was accepted:
+        // connecting `script-message-received::<name>` for a name WebKit
+        // refused would be a listener on a signal detail nothing can emit.
+        assert!(
+            arm.contains("if registered {"),
+            "the receiver must hang off the accepted registration"
+        );
     }
 
     /// ⭐ THE HTTP DISK CACHE MUST LAND WHERE THE VISIBLE SURFACE'S DOES.
