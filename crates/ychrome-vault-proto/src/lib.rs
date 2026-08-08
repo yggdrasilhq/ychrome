@@ -36,6 +36,10 @@ use serde_json::{Value, json};
 ///
 /// A login is also the only type whose login fields this client can edit.
 pub const CIPHER_TYPE_LOGIN: u8 = 1;
+/// A secure note: no fields of its own at all — its whole content is the
+/// cipher's `notes`, which every type carries. The cheapest type to create and
+/// the one the vault pane could not make until 2026-08-08.
+pub const CIPHER_TYPE_NOTE: u8 = 2;
 /// A payment card: no password at all, which is why `get` refuses it and the
 /// sidebar must offer a different fill.
 pub const CIPHER_TYPE_CARD: u8 = 3;
