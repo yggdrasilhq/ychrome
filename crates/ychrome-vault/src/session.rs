@@ -420,13 +420,13 @@ impl VaultManager {
         Ok(())
     }
 
-    /// Create a login in the vault and re-sync so the new item is immediately
-    /// visible. Encryption happens locally under the user key; the server only
+    /// Create an item — a login, a secure note or a card — in the vault and
+    /// re-sync so it is immediately visible. Encryption happens locally under the user key; the server only
     /// ever sees EncStrings. Returns the new cipher's id.
-    pub fn add_login(&mut self, login: &crate::model::NewLogin) -> Result<String, VaultError> {
+    pub fn add_item(&mut self, item: &crate::model::NewItem) -> Result<String, VaultError> {
         let body = {
             let vault = self.vault.as_ref().ok_or(VaultError::Locked)?;
-            vault.new_login_body(login)?
+            vault.new_item_body(item)?
         };
         let id = self.authenticated(|client, token| client.create_cipher(token, &body))?;
         self.resync()?;

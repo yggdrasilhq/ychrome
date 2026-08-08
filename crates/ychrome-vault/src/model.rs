@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 
 use crate::crypto::{CryptoError, EncString, SymmetricKey};
 use crate::totp::Totp;
-use ychrome_vault_proto::{CIPHER_TYPE_CARD, CIPHER_TYPE_LOGIN};
+use ychrome_vault_proto::{CIPHER_TYPE_CARD, CIPHER_TYPE_LOGIN, CIPHER_TYPE_NOTE};
 
 /// A cipher as it arrives from `sync`, with its fields still encrypted.
 #[derive(Debug, Clone, Default)]
@@ -618,18 +618,83 @@ pub struct PasskeyMatch {
     pub item_name: Option<String>,
 }
 
-/// A login to create. Plaintext — it is encrypted by [`Vault::new_login_body`]
-/// and never leaves this process in the clear.
+/// An item to create, of any type this client can also READ BACK. Plaintext —
+/// it is encrypted by [`Vault::new_item_body`] and never leaves this process in
+/// the clear.
+///
+/// The three fields every cipher type carries live here; everything else hangs
+/// off [`NewItemBody`], which is what makes "a note has no password" and "a
+/// card has no uri" structural instead of a promise. `item_type` is DERIVED
+/// from the body ([`NewItemBody::cipher_type`]) rather than stored beside it,
+/// so a card can never be filed as a login.
 #[derive(Debug, Clone, Default)]
-pub struct NewLogin {
+pub struct NewItem {
     pub name: String,
+    pub notes: Option<String>,
+    pub folder_id: Option<String>,
+    pub body: NewItemBody,
+}
+
+/// The type-specific half of a new item — one variant per Bitwarden cipher
+/// type this client models end to end.
+///
+/// ⛔ A variant belongs here only once the item it creates can be READ BACK by
+/// this client. A create for a type nothing can decrypt or display writes an
+/// item the user can see the name of and nothing else, which is worse than not
+/// offering it: they would believe the data is stored and reachable. That is
+/// why `Identity` (Bitwarden type 4) is absent — see ychrome
+/// `docs/pending-bugs.md`.
+#[derive(Debug, Clone)]
+pub enum NewItemBody {
+    Login(NewLoginFields),
+    /// A secure note. The content IS [`NewItem::notes`] — Bitwarden's `type 2`
+    /// carries no fields of its own beyond a sub-type discriminant, which is
+    /// why this variant is empty rather than holding a `text`.
+    Note,
+    Card(NewCardFields),
+}
+
+impl NewItemBody {
+    /// The Bitwarden cipher `type` this body creates. THE one place the mapping
+    /// lives, read by the create body and by anything reporting what was made.
+    pub fn cipher_type(&self) -> u8 {
+        match self {
+            Self::Login(_) => CIPHER_TYPE_LOGIN,
+            Self::Note => CIPHER_TYPE_NOTE,
+            Self::Card(_) => CIPHER_TYPE_CARD,
+        }
+    }
+}
+
+/// A login with nothing filled in — the default an untyped caller gets, and the
+/// shape `..Default::default()` fills around in the tests.
+impl Default for NewItemBody {
+    fn default() -> Self {
+        Self::Login(NewLoginFields::default())
+    }
+}
+
+/// A login's own fields.
+#[derive(Debug, Clone, Default)]
+pub struct NewLoginFields {
     pub username: Option<String>,
     pub password: Option<String>,
     /// An authenticator secret (base32) or a full `otpauth://` URI.
     pub totp: Option<String>,
     pub uri: Option<String>,
-    pub notes: Option<String>,
-    pub folder_id: Option<String>,
+}
+
+/// A payment card's own fields, named exactly as [`Vault::card`] and
+/// [`Vault::card_secret`] read them back, so a create and the read that proves
+/// it landed cannot drift.
+#[derive(Debug, Clone, Default)]
+pub struct NewCardFields {
+    pub cardholder: Option<String>,
+    pub brand: Option<String>,
+    pub number: Option<String>,
+    pub exp_month: Option<String>,
+    pub exp_year: Option<String>,
+    pub code: Option<String>,
 }
 
 /// A passkey to store as a new vault login — the `create()` result. The private
@@ -1002,18 +1067,27 @@ impl Vault {
         matches
     }
 
-    /// Build the `POST /api/ciphers` body for a new login, encrypting every
-    /// field under the user key. A newly created cipher carries no item key,
-    /// so the user key is the cipher key — exactly what [`cipher_key`] will
-    /// resolve when the item comes back on the next sync.
+    /// Build the `POST /api/ciphers` body for a new item of ANY type this
+    /// client models, encrypting every field under the user key. A newly
+    /// created cipher carries no item key, so the user key is the cipher key —
+    /// exactly what [`cipher_key`] will resolve when the item comes back on the
+    /// next sync.
     ///
     /// Only the fields we model are emitted. That is safe for CREATE (there is
     /// nothing to lose) and is why there is no `update` counterpart: a PUT
     /// rebuilt from this struct would silently drop the notes, custom fields,
     /// favorite flag and password history that `sync` does not parse.
     ///
+    /// ⛔ The type-specific sub-object is emitted for the item's OWN type and
+    /// for no other. A `card` object on a type-1 cipher is invisible to every
+    /// reader afterwards — [`card_object`] refuses to look at a non-card — so
+    /// writing one would be data the user can never see again. The `match` on
+    /// [`NewItemBody`] is what makes that impossible rather than merely
+    /// avoided.
+    ///
     /// [`cipher_key`]: Vault::cipher_key
-    pub fn new_login_body(&self, login: &NewLogin) -> Result<serde_json::Value, CryptoError> {
+    /// [`card_object`]: Vault::card_object
+    pub fn new_item_body(&self, item: &NewItem) -> Result<serde_json::Value, CryptoError> {
         let enc = |value: &str| -> Result<String, CryptoError> {
             Ok(self.user_key.encrypt_string(value)?.to_string())
         };
@@ -1023,27 +1097,58 @@ impl Vault {
                 None => Ok(serde_json::Value::Null),
             }
         };
-        let uris = match login.uri.as_deref().filter(|uri| !uri.is_empty()) {
-            Some(uri) => {
-                serde_json::json!([{ "uri": enc(uri)?, "match": serde_json::Value::Null }])
-            }
-            None => serde_json::json!([]),
-        };
-        Ok(serde_json::json!({
-            "type": 1,
-            "name": enc(&login.name)?,
-            "notes": enc_opt(&login.notes)?,
+        let mut body = serde_json::json!({
+            "type": item.body.cipher_type(),
+            "name": enc(&item.name)?,
+            "notes": enc_opt(&item.notes)?,
             "favorite": false,
-            "folderId": login.folder_id,
+            "folderId": item.folder_id,
             "reprompt": 0,
             "fields": [],
-            "login": {
-                "username": enc_opt(&login.username)?,
-                "password": enc_opt(&login.password)?,
-                "totp": enc_opt(&login.totp)?,
-                "uris": uris,
-            },
-        }))
+        });
+        let map = body
+            .as_object_mut()
+            .expect("the body above is a JSON object");
+        match &item.body {
+            NewItemBody::Login(login) => {
+                let uris = match login.uri.as_deref().filter(|uri| !uri.is_empty()) {
+                    Some(uri) => {
+                        serde_json::json!([{ "uri": enc(uri)?, "match": serde_json::Value::Null }])
+                    }
+                    None => serde_json::json!([]),
+                };
+                map.insert(
+                    "login".to_string(),
+                    serde_json::json!({
+                        "username": enc_opt(&login.username)?,
+                        "password": enc_opt(&login.password)?,
+                        "totp": enc_opt(&login.totp)?,
+                        "uris": uris,
+                    }),
+                );
+            }
+            // A secure note's whole content is `notes`, already emitted above.
+            // The sub-object exists only to carry Bitwarden's note sub-type,
+            // and 0 ("generic") is the only one it defines. It is PLAINTEXT: a
+            // discriminant, not user data, exactly like `type` itself.
+            NewItemBody::Note => {
+                map.insert("secureNote".to_string(), serde_json::json!({ "type": 0 }));
+            }
+            NewItemBody::Card(card) => {
+                map.insert(
+                    "card".to_string(),
+                    serde_json::json!({
+                        "cardholderName": enc_opt(&card.cardholder)?,
+                        "brand": enc_opt(&card.brand)?,
+                        "number": enc_opt(&card.number)?,
+                        "expMonth": enc_opt(&card.exp_month)?,
+                        "expYear": enc_opt(&card.exp_year)?,
+                        "code": enc_opt(&card.code)?,
+                    }),
+                );
+            }
+        }
+        Ok(body)
     }
 
     /// Build the `POST /api/ciphers` body for a NEW login that carries a passkey
@@ -2298,7 +2403,7 @@ mod tests {
     // an EncString under the user key, no plaintext leaks into the JSON, and
     // an absent field is null rather than an EncString of "".
     #[test]
-    fn new_login_body_encrypts_every_field_and_reads_back() {
+    fn new_item_body_encrypts_every_field_and_reads_back() {
         let key_bytes = [0x5au8; 64];
         let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
         let vault = Vault::new(
@@ -2310,14 +2415,16 @@ mod tests {
         );
 
         let body = vault
-            .new_login_body(&NewLogin {
+            .new_item_body(&NewItem {
                 name: "example.com".to_string(),
-                username: Some("alice".to_string()),
-                password: Some("hunter2".to_string()),
-                uri: Some("https://example.com".to_string()),
-                totp: None,
                 notes: None,
                 folder_id: None,
+                body: NewItemBody::Login(NewLoginFields {
+                    username: Some("alice".to_string()),
+                    password: Some("hunter2".to_string()),
+                    uri: Some("https://example.com".to_string()),
+                    totp: None,
+                }),
             })
             .unwrap();
 
@@ -2349,17 +2456,136 @@ mod tests {
 
     // An empty uri must not produce a uris entry at all.
     #[test]
-    fn new_login_body_omits_an_empty_uri() {
+    fn new_item_body_omits_an_empty_uri() {
         let user_key = SymmetricKey::from_bytes(&[0x11u8; 64]).unwrap();
         let vault = Vault::new(user_key, HashMap::new(), vec![], vec![], HashMap::new());
         let body = vault
-            .new_login_body(&NewLogin {
+            .new_item_body(&NewItem {
                 name: "bare".to_string(),
-                uri: Some(String::new()),
+                body: NewItemBody::Login(NewLoginFields {
+                    uri: Some(String::new()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             })
             .unwrap();
         assert_eq!(body["login"]["uris"].as_array().unwrap().len(), 0);
+    }
+
+    /// A SECURE NOTE is a real cipher type, not a login with the boxes left
+    /// blank. Filed as type 1 it would show a Fill button that fills nothing,
+    /// and `card_object`'s twin refusal is what makes the type load-bearing.
+    ///
+    /// User-reported 2026-08-08: the vault pane could only ever create a
+    /// login, discovered while trying to save a note.
+    #[test]
+    fn a_secure_note_is_created_as_its_own_type_with_its_text_encrypted() {
+        let key_bytes = [0x77u8; 64];
+        let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
+        let vault = Vault::new(
+            user_key.clone(),
+            HashMap::new(),
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+        let body = vault
+            .new_item_body(&NewItem {
+                name: "Boiler service code".to_string(),
+                notes: Some("engineer said 4417".to_string()),
+                folder_id: None,
+                body: NewItemBody::Note,
+            })
+            .unwrap();
+
+        assert_eq!(body["type"], 2, "a note filed as a login is the bug");
+        // The sub-object carries Bitwarden's note sub-type and nothing else —
+        // and it is the ONLY plaintext in the body besides the discriminants.
+        assert_eq!(body["secureNote"]["type"], 0);
+        // ⛔ No login object at all: a `login` key on a type-2 cipher is a
+        // password box every reader would then offer to fill from nothing.
+        assert!(
+            body.get("login").is_none(),
+            "a note must not carry a login object: {body}"
+        );
+        assert!(body.get("card").is_none());
+
+        let enc = EncString::parse(body["notes"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            user_key.decrypt_to_string(&enc).unwrap(),
+            "engineer said 4417"
+        );
+        let wire = body.to_string();
+        for secret in ["engineer said 4417", "Boiler service code"] {
+            assert!(!wire.contains(secret), "{secret} leaked into the body");
+        }
+    }
+
+    /// A CARD, written with the field names [`Vault::card`] and
+    /// [`Vault::card_secret`] read back — the round trip is the point, so the
+    /// assertion is the READ, not the spelling of the JSON.
+    #[test]
+    fn a_card_is_created_with_the_field_names_the_card_reader_looks_for() {
+        let key_bytes = [0x3cu8; 64];
+        let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
+        let vault = Vault::new(
+            user_key.clone(),
+            HashMap::new(),
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+        let body = vault
+            .new_item_body(&NewItem {
+                name: "Bank of Invention".to_string(),
+                notes: None,
+                folder_id: None,
+                body: NewItemBody::Card(NewCardFields {
+                    cardholder: Some("A Reader".to_string()),
+                    brand: Some("Visa".to_string()),
+                    number: Some("4111111111111111".to_string()),
+                    exp_month: Some("11".to_string()),
+                    exp_year: Some("2031".to_string()),
+                    code: Some("737".to_string()),
+                }),
+            })
+            .unwrap();
+
+        assert_eq!(body["type"], 3);
+        assert!(body.get("login").is_none(), "a card has no password");
+
+        // THE ROUND TRIP: feed the created body back through the reader as a
+        // synced cipher and ask the vault what it holds. A create whose field
+        // names drift from `card_object`'s produces an item that decrypts to
+        // nothing — the failure that has no symptom until the user looks.
+        let mut raw = body.clone();
+        raw["id"] = serde_json::json!("new-card");
+        raw["object"] = serde_json::json!("cipherDetails");
+        let cipher = RawCipher {
+            raw,
+            id: "new-card".into(),
+            item_type: CIPHER_TYPE_CARD,
+            ..Default::default()
+        };
+        let vault = Vault::new(
+            user_key,
+            HashMap::new(),
+            vec![cipher],
+            vec![],
+            HashMap::new(),
+        );
+        let card = vault.card("new-card").expect("the created card reads back");
+        assert_eq!(card.cardholder.as_deref(), Some("A Reader"));
+        assert_eq!(card.brand.as_deref(), Some("Visa"));
+        assert_eq!(card.exp_month.as_deref(), Some("11"));
+        assert_eq!(card.exp_year.as_deref(), Some("2031"));
+        assert_eq!(card.last4.as_deref(), Some("1111"));
+        let secret = vault.card_secret("new-card").expect("the PAN reads back");
+        assert_eq!(
+            secret.number.as_deref().map(String::as_str),
+            Some("4111111111111111")
+        );
+        assert_eq!(secret.code.as_deref().map(String::as_str), Some("737"));
     }
 
     /// A cipher as the server really sends it: the fields we model, plus the

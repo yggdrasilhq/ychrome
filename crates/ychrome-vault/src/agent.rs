@@ -1142,19 +1142,30 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             state.touch();
             Ok(json!({ "items": items }))
         }
-        // Create a login. The plaintext arrives over the 0600 socket, is
-        // encrypted under the user key here, and only EncStrings reach the
-        // server. A `generate` flag rolls the password locally so it never has
-        // to cross a shell's argv.
+        // Create an item — a login, a secure note or a card. The plaintext
+        // arrives over the 0600 socket, is encrypted under the user key here,
+        // and only EncStrings reach the server. A `generate` flag rolls the
+        // password locally so it never has to cross a shell's argv.
+        //
+        // `item_type` names the Bitwarden cipher type; ABSENT means login, so
+        // every caller written before this op grew types keeps working
+        // unchanged. Password generation belongs to the login body alone — a
+        // note or a card has nowhere to put a password, and rolling one for
+        // them would mint a secret the user can never reach.
         "add" => {
             // Same refusal wording the read ops give, rather than the raw
             // VaultError text.
             unlocked(&state)?;
             let name = string("name").ok_or_else(|| anyhow!("add needs a name"))?;
+            let item_type = request
+                .get("item_type")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::from(ychrome_vault_proto::CIPHER_TYPE_LOGIN));
             let generate = request
                 .get("generate")
                 .and_then(Value::as_bool)
-                .unwrap_or(false);
+                .unwrap_or(false)
+                && item_type == u64::from(ychrome_vault_proto::CIPHER_TYPE_LOGIN);
             let password = if generate {
                 let length = request
                     .get("length")
@@ -1179,18 +1190,43 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
                 ),
                 None => None,
             };
-            let login = crate::model::NewLogin {
+            // ⛔ REFUSE an unknown type rather than filing it as a login. A
+            // silently-retyped item is indistinguishable from a working one
+            // until the user looks for the fields they typed.
+            let body = match u8::try_from(item_type).unwrap_or(0) {
+                ychrome_vault_proto::CIPHER_TYPE_LOGIN => {
+                    crate::model::NewItemBody::Login(crate::model::NewLoginFields {
+                        username: string("user"),
+                        password: password.clone(),
+                        totp: string("totp"),
+                        uri: string("uri"),
+                    })
+                }
+                ychrome_vault_proto::CIPHER_TYPE_NOTE => crate::model::NewItemBody::Note,
+                ychrome_vault_proto::CIPHER_TYPE_CARD => {
+                    crate::model::NewItemBody::Card(crate::model::NewCardFields {
+                        cardholder: string("card_holder"),
+                        brand: string("card_brand"),
+                        number: string("card_number"),
+                        exp_month: string("card_exp_month"),
+                        exp_year: string("card_exp_year"),
+                        code: string("card_code"),
+                    })
+                }
+                other => bail!(
+                    "this client cannot create item type {other} — it creates \
+                     logins (1), secure notes (2) and cards (3)"
+                ),
+            };
+            let item = crate::model::NewItem {
                 name: name.clone(),
-                username: string("user"),
-                password: password.clone(),
-                totp: string("totp"),
-                uri: string("uri"),
                 notes: string("notes"),
                 folder_id,
+                body,
             };
             let id = state
                 .manager
-                .add_login(&login)
+                .add_item(&item)
                 .map_err(|error| anyhow!(error.to_string()))?;
             state.touch();
             // The generated password comes back so the caller can show it once;
@@ -1198,6 +1234,7 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             Ok(json!({
                 "id": id,
                 "name": name,
+                "item_type": item_type,
                 "generated_password": generate.then_some(password).flatten(),
             }))
         }
@@ -1902,6 +1939,20 @@ pub fn status_json(manager: &VaultManager) -> Value {
     status["auto_lock"] = json!(lock_timeout_secs != 0);
     status["version"] = json!(env!("CARGO_PKG_VERSION"));
     status["exe_stamp"] = json!(exe_stamp());
+    // WHICH cipher types this agent's `add` op can actually build.
+    //
+    // ⛔ A CAPABILITY, NEVER A VERSION COMPARE. The agent is host-resident and
+    // outlives the browser binary that talks to it, so "can you make a note?"
+    // is a real question a client must be able to ask. An agent that predates
+    // typed creates has no such key at all — which is the honest answer, and
+    // the only one a version string could not give without every client
+    // learning which release grew which op (`finding-version-string-as-
+    // rendezvous-key`). Absent ⇒ logins only.
+    status["creates_item_types"] = json!([
+        ychrome_vault_proto::CIPHER_TYPE_LOGIN,
+        ychrome_vault_proto::CIPHER_TYPE_NOTE,
+        ychrome_vault_proto::CIPHER_TYPE_CARD,
+    ]);
     // WHEN the ciphers were last pulled. Reported as an epoch second and not as
     // "3 hours ago": the age is a presentation of this fact, and a client that
     // renders it must not be able to disagree with the vault about what the

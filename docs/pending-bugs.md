@@ -33,7 +33,15 @@ in the list.
    two duplicated delete switches while scrolling and were reported as such. Bitwarden removes
    a value where the value lives.
 5. **Cards and identities have no real editor.** `item_type` 3 and 4 render, and a card fills,
-   but neither can be edited — and 130 of ~1125 items in this vault are not logins.
+   but neither can be edited — and 130 of ~1125 items in this vault are not logins. ⚠ CREATE is
+   no longer part of this gap: the Add tab makes logins, secure notes and cards as of
+   2026-08-08 (`add_tab_widgets`). The EDIT form is still login-shaped.
+7. **An IDENTITY (`item_type` 4) can be neither created nor read.** The create path refuses it
+   deliberately — nothing in this client decrypts an identity, so an item written from a form
+   would store fields the user could never see again, and the save would report success. The
+   two halves must land together: a reader (`Vault::identity`, the twin of `Vault::card`) and
+   then the form. Until then the pane offers Login / Note / Card and says so by offering
+   nothing else.
 6. **The GUI's modal state is unobservable.** `server app state` exposes no `pending_fido2`, so
    neither an agent nor a test can tell whether a ceremony is actually in front of the user or
    was dropped. That is what made the presence-request bug take a full session to corner.
