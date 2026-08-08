@@ -1143,6 +1143,200 @@ pub fn run_worlds() -> Result<Value> {
     Ok(report)
 }
 
+// ---------------------------------------------------------------------------
+// Probe 3: the SHIPPED verb (`ychrome engine frame-verb`)
+// ---------------------------------------------------------------------------
+
+/// Drive `/engine/frame` and `/engine/input frame=` against the same fixture the
+/// two probes above measured the substrate with.
+///
+/// ⭐ **This installs NO probe script.** That is the point: the bridge under test
+/// is the one `identity::build` attaches to every engine profile, and the reply
+/// channel is the one it arms. If either were missing, every read below would
+/// time out — so a green run is evidence about the SHIPPED path and not about an
+/// instrument set up beside it.
+///
+/// The same fixture, deliberately. Its geometry is load-bearing twice over: the
+/// `border:0` iframe makes the coordinate translation exact, and the `#decoy`
+/// band occupies precisely where an UNTRANSLATED point would land — so step 4
+/// can state, from measured rects rather than from assumed layout, that
+/// forgetting the frame's own offset would click the wrong element.
+pub fn run_verb() -> Result<Value> {
+    let started = Instant::now();
+
+    // A probe script left behind by a killed run is an `@all-frames` bridge with
+    // an `eval` in it, and it would be live in the very frames this drives. The
+    // guard's whole job is to clear every stem it knows; running it up front
+    // means this proof starts from a page carrying our SHIPPED code and nothing
+    // else.
+    drop(InstalledProbe);
+
+    let fixture = open_fixture()?;
+    let page = fixture.page.clone();
+    let mut steps: Vec<Step> = Vec::new();
+
+    let frame_read = |selector: &str| -> (u16, Value) {
+        call(
+            "frame",
+            json!({ "page_id": page, "frame": "#pay", "selector": selector }),
+        )
+    };
+
+    // ---- 1. INSTRUMENT: the child really is cross-origin -------------------
+    let reach = read(
+        &page,
+        "(() => { try { return String(window.frames[0].document.title); } \
+         catch (e) { return 'THREW:' + e.name; } })()",
+    );
+    steps.push(Step {
+        name: "INSTRUMENT: the child frame is genuinely cross-origin, so every read below is one \
+               the top document could not have made",
+        pass: reach.as_str().unwrap_or("").starts_with("THREW:"),
+        detail: json!({ "top_frame_reach": reach }),
+    });
+
+    // ---- 2. INSTRUMENT: the page cannot see the reply channel --------------
+    //
+    // ⛔ THE SECURITY PROPERTY, MEASURED ON THE SHIPPED CHANNEL RATHER THAN ON
+    // A PROBE'S. `/engine/eval` runs in the page's own world; if the handler
+    // were visible there, a forged read would get its answer and the whole
+    // read-only design would be decoration.
+    let page_sees_channel = read(
+        &page,
+        &format!(
+            "(() => {{ const h = window.webkit && window.webkit.messageHandlers; \
+             return typeof (h && h.{channel}); }})()",
+            channel = super::frame::CHANNEL
+        ),
+    );
+    steps.push(Step {
+        name: "INSTRUMENT: the PAGE's own world cannot see the reply channel",
+        pass: page_sees_channel == json!("undefined"),
+        detail: json!({ "typeof_from_page_world": page_sees_channel,
+                        "channel": super::frame::CHANNEL }),
+    });
+
+    // ---- 3. the verb READS the child's own DOM ----------------------------
+    let (who_status, who) = frame_read("#who");
+    steps.push(Step {
+        name: "/engine/frame READS the cross-origin child's own DOM",
+        pass: who_status == 200 && who["text"] == json!("BANK OF FIXTURE"),
+        detail: who.clone(),
+    });
+
+    // ---- 4. the verb MEASURES, and the DECOY control ----------------------
+    let (otp_status, otp) = frame_read("#otp");
+    let (_, decoy) = frame_read("#decoy");
+    let frame_top = otp["frame"]["box"]["top"].as_f64().unwrap_or(0.0);
+    let frame_left = otp["frame"]["box"]["left"].as_f64().unwrap_or(0.0);
+    let otp_centre_x = otp["rect"]["left"].as_f64().unwrap_or(0.0)
+        + otp["rect"]["w"].as_f64().unwrap_or(0.0) / 2.0;
+    let otp_centre_y =
+        otp["rect"]["top"].as_f64().unwrap_or(0.0) + otp["rect"]["h"].as_f64().unwrap_or(0.0) / 2.0;
+    let translated = otp["point"]["x"].as_f64().unwrap_or(-1.0) == frame_left + otp_centre_x
+        && otp["point"]["y"].as_f64().unwrap_or(-1.0) == frame_top + otp_centre_y;
+    // ⭐ Where an UNTRANSLATED point would land, expressed in the CHILD's own
+    // coordinates: a top-document click at `otp_centre_y` corresponds to child
+    // `otp_centre_y - frame_top`. The decoy band is there to catch it.
+    let untranslated_in_child = otp_centre_y - frame_top;
+    let decoy_top = decoy["rect"]["top"].as_f64().unwrap_or(0.0);
+    let decoy_bottom = decoy_top + decoy["rect"]["h"].as_f64().unwrap_or(0.0);
+    let decoy_catches = untranslated_in_child >= decoy_top && untranslated_in_child <= decoy_bottom;
+    steps.push(Step {
+        name: "the point is the child's rect PLUS the frame's own box — and an untranslated one \
+               would land on the decoy",
+        pass: otp_status == 200 && otp["on_target"] == json!(true) && translated && decoy_catches,
+        detail: json!({ "otp": otp, "decoy_band": { "top": decoy_top, "bottom": decoy_bottom },
+                        "untranslated_point_in_child_coords": untranslated_in_child,
+                        "decoy_catches_an_untranslated_click": decoy_catches }),
+    });
+
+    // ---- 5. /engine/eval REFUSES frame=, by name --------------------------
+    let (eval_status, eval_body) = call(
+        "eval",
+        json!({ "page_id": page, "frame": "#pay", "js": "document.title" }),
+    );
+    let refusal = eval_body["error"].as_str().unwrap_or("");
+    steps.push(Step {
+        name: "/engine/eval REFUSES frame= and names the read verb to use instead",
+        pass: eval_status == 400 && refusal.contains("/engine/frame"),
+        detail: eval_body.clone(),
+    });
+
+    // ---- 6. a frame nobody can address is refused by name ------------------
+    let (missing_status, missing) = call(
+        "frame",
+        json!({ "page_id": page, "frame": "#no-such-frame", "selector": "#otp" }),
+    );
+    steps.push(Step {
+        name: "a frame address that matches nothing is refused by name, not defaulted to frame 0",
+        pass: missing_status == 400
+            && missing["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no frame matches"),
+        detail: missing.clone(),
+    });
+
+    // ---- 7. frame= on /engine/input lands a REAL click inside the child ----
+    //
+    // `#otp:focus` is the readback, and it is a selector rather than an
+    // `activeElement` read on purpose: the frame verb resolves selectors, so
+    // asking for one that only matches when focused proves the click landed
+    // using the verb's own vocabulary — no second instrument to keep honest.
+    let (click_status, click_body) = call(
+        "input",
+        json!({ "page_id": page,
+                "events": [{ "type": "click", "frame": "#pay", "selector": "#otp" }] }),
+    );
+    let (_, focused) = frame_read("#otp:focus");
+    steps.push(Step {
+        name: "frame= on /engine/input lands a REAL click on the child's own field",
+        pass: click_status == 200 && focused["exists"] == json!(true),
+        detail: json!({ "input": click_body, "otp_is_focused": focused }),
+    });
+
+    // ---- 8. typed text arrives in the child's input ------------------------
+    let (type_status, type_body) = call(
+        "input",
+        json!({ "page_id": page, "events": [{ "type": "type", "text": "424242" }] }),
+    );
+    let mut typed = json!(null);
+    let mut typed_ok = false;
+    for _ in 0..READ_TRIES {
+        let (_, value) = frame_read("#otp");
+        typed = value;
+        if typed["value"] == json!("424242") {
+            typed_ok = true;
+            break;
+        }
+        std::thread::sleep(READ_SETTLE);
+    }
+    steps.push(Step {
+        name: "typed text reads back FROM INSIDE the child, through the shipped verb",
+        pass: type_status == 200 && typed_ok,
+        detail: json!({ "input": type_body, "child_value": typed }),
+    });
+
+    let _ = dispatch(&request("close", json!({ "page_id": page })));
+
+    let pass = steps.iter().all(|step| step.pass);
+    for step in &steps {
+        crate::daemon::journal("engine.frameverb.step", step.to_json());
+    }
+    let report = json!({
+        "pass": pass,
+        "verb": "/engine/frame + /engine/input frame=",
+        "channel": super::frame::CHANNEL,
+        "merchant": fixture.merchant_base,
+        "bank": fixture.bank_base,
+        "steps": steps.iter().map(Step::to_json).collect::<Vec<_>>(),
+        "elapsed_ms": started.elapsed().as_millis(),
+    });
+    crate::daemon::journal("engine.frameverb.report", report.clone());
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

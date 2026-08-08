@@ -688,13 +688,28 @@ impl Engine {
     /// serialiser, so `/eval` hands back a typed value instead of a string a
     /// caller has to guess the shape of.
     pub fn eval(&self, id: &str, js: &str) -> Result<Value> {
+        self.eval_in_world(id, js, None)
+    }
+
+    /// Evaluate JS in a NAMED world — the engine's own — instead of the page's.
+    ///
+    /// ⭐ **A world has its own intrinsics, and that is the whole point here.**
+    /// The frame verb reaches a child through `iframe.contentWindow`,
+    /// `getBoundingClientRect` and `postMessage`, every one of which a top
+    /// document can replace on the prototype IN ITS OWN WORLD. Run in
+    /// `identity::ISOLATED_WORLD`, the same code reads the real getters: the
+    /// page shares the DOM with us, never the prototypes. Ordinary `/engine/eval`
+    /// stays main-world, because a caller evaluating their own script wants the
+    /// page's globals — that is what they are asking about.
+    pub fn eval_in_world(&self, id: &str, js: &str, world: Option<&str>) -> Result<Value> {
         let id = id.to_string();
         let js = js.to_string();
+        let world = world.map(str::to_string);
         let raw = on_engine(Duration::from_secs(30), move |responder| {
             with_page(&id, responder, move |page, responder| {
                 page.view.evaluate_javascript(
                     &js,
-                    None,
+                    world.as_deref(),
                     None,
                     None::<&gio::Cancellable>,
                     move |result| match result {

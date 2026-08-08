@@ -86,9 +86,22 @@ pub fn run() -> Result<Value> {
     let (status, identity) = call("identity", json!({ "profile": "default" }));
     let expected_jar = crate::profile_dir("default")?.display().to_string();
     let expected_ua = crate::useragent::effective();
-    let expected_scripts = crate::webpolicy::policy("default").userscripts.len();
+    // ⭐ THE POLICY'S SCRIPTS, PLUS EXACTLY ONE THE ENGINE OWNS.
+    //
+    // This used to assert equality with the policy's count, as a proxy for "the
+    // engine adds nothing of its own". That proxy stopped being true the day
+    // `/engine/frame` shipped: the frame bridge is engine-owned by necessity —
+    // it answers on a channel `identity` registers, so no other plane could own
+    // it — and the check caught the change honestly. The claim it makes now is
+    // the precise one, and it is STRICTER than the old equality: every policy
+    // script must be attached AND the engine's own additions must number
+    // exactly the one we can name. A second smuggled-in script fails here.
+    let engine_owned = [crate::engine::frame::bridge()];
+    let expected_scripts =
+        crate::webpolicy::policy("default").userscripts.len() + engine_owned.len();
     record(Check {
-        name: "identity comes from profile_dir / useragent / webpolicy, not from the engine",
+        name: "identity comes from profile_dir / useragent / webpolicy, plus only the engine's \
+               own named scripts",
         pass: status == 200
             && identity["jar"] == json!(expected_jar)
             && identity["user_agent"] == json!(expected_ua)
@@ -98,6 +111,8 @@ pub fn run() -> Result<Value> {
             "jar": identity["jar"], "expected_jar": expected_jar,
             "user_agent": identity["user_agent"], "expected_user_agent": expected_ua,
             "userscripts": identity["userscripts"], "expected_userscripts": expected_scripts,
+            "policy_userscripts": crate::webpolicy::policy("default").userscripts.len(),
+            "engine_owned_userscripts": engine_owned.len(),
             "adblock": identity["adblock"],
         }),
     });
