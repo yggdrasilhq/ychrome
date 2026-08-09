@@ -7,6 +7,37 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ⭐ THE `ctl` SURFACE MAKES AGENTS HAND-ASSEMBLE CHORES FROM PRIMITIVES — seven deficiencies, measured while driving live exam consoles
+
+**Status:** OPEN
+
+**Reported by the `practice` campaign row 2026-08-09**, from three successive
+sessions driving the PREPEXAM/CFA exam consoles. Filed here because ychrome is owned
+by the yggterm campaign row; the reporter touched no repo of ours.
+
+⭐ **The test that selected these is the fleet's own dream test — *did an agent
+hand-assemble this chore from primitives and get it wrong?*** Every item below is
+something three different rows rebuilt by hand. That is the argument for making
+each one a verb: **an agent's discipline resets every session, a verb's does
+not.** ⛔ So the fix for the starred items is NOT better documentation.
+
+| # | deficiency | the verb it wants |
+|---|---|---|
+| 1 ⭐⭐ | **`ctl input` has no `mousedown`/`mouseup`, so EVERY drag is hand-assembled.** Types are `click\|move\|scroll\|type\|key`. A jQuery-UI drag needs `mousedown` on the handle, then `mousemove`/`mouseup` **dispatched on `document`** (not the handle), `buttons:1` on all but the mouseup. Any one detail wrong ⇒ the drag silently does nothing. | `ctl input --type drag --from X,Y --to X,Y`, plus a `--selector` form. **Highest value item here.** |
+| 2 | **One `ctl input` click dispatches THREE events**, so a toggle can land back where it started. A working control was nearly filed as broken until the flag was read back and the click repeated. | coalesce to ONE synthetic click, or name the multiplicity in the error surface |
+| 3 ⛔ | **`ctl eval` shares ONE global scope across calls.** A second call declaring `const h` dies with a duplicate-variable `SyntaxError` **that reads like a page defect** — so the agent starts debugging the wrong system. | auto-wrap each eval body in an IIFE, or run it in a fresh realm |
+| 4 | **`ctl eval` takes `page_id=` while sibling verbs take `page=`.** | accept both, or normalise |
+| 5 | **`ctl wait` takes `load=finished`, not `until=load:finished`** — the natural guess is wrong and the error does not suggest the right form. | suggest the correct form in the error |
+| 6 ⛔ | **Coordinate clicks do not reach inside iframes.** Top-level footer buttons fire correctly; nothing reaches into `ElementDisplayFrame` or `wbFrame`. The only working route is the frame's own event constructors plus an explicit `view`. | `ctl input --frame <selector\|url-substring>` |
+| 7 | **Engine-opened windows are never surfaced as pages.** A `window.open`-style control opens a window the engine never lists; the working recipe is to read the anchor's `url` attribute and `goto` it by hand. | surface engine-opened windows as pages, or `ctl click --follow-target` |
+
+⚠ **Items 3 and 5 are the same shape as this repo's own instrument findings: the
+error names what the driver HELD, not what was WRONG.** A `SyntaxError` from a
+shared eval realm is indistinguishable, at the agent's eye, from a broken page —
+which is the most expensive kind of wrong answer an instrument can give.
+
+**Falsifier, per row:** the chore is one `ctl` invocation with no `eval` in it.
+
 ## ⛔ OWNER-REPORTED: AN OTP LOGIN VERIFIES INTO NOTHING — bakingo.com, works in Firefox and Chromium
 
 **Status:** OPEN
