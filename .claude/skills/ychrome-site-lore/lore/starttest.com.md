@@ -74,3 +74,62 @@ nobody is driving. Pause first, then close the page.
   already-discarded take on Exam 1 is measurable.
 - No exam content leaves the session: measure geometry, tokens and control vocabulary, never
   items, and never commit a screenshot with an item in it.
+
+
+## prepexam-console-read-the-client-not-the-screen · WORKS
+task: Measure the whiteboard, the low-time alert, the minimise controls and the keyboard map
+model: claude-opus-5
+date: 2026-08-09
+tags: measurement, jquery, iframes
+
+⭐⭐ **The single biggest lever on this site: the delivery client's own function bodies are
+readable, and they are a better measurement than the screen.** `String(window.someFn)` returns
+the source. That turned three separate "we would have to reproduce the condition" problems into
+one eval each:
+
+- **A timed alert you would otherwise wait for.** `timeRemainingWarning()` contains its own
+  message, title and button list as literals — *and* you can then **call it** to render and
+  measure the real dialog. No need to drain 15 minutes of section clock to see a 5-minute
+  warning.
+- **State machines.** `displayWhiteboard()` / `closeWhiteboard()` / `toggleTimeCell()` state
+  their guards outright (`if(vPopUpOpen || vAlertOpen || clockwarning == 1) return;`), which is
+  the behaviour you would otherwise infer from failed clicks.
+- **`Object.keys(window).filter(k=>/…/i.test(k))` is the index.** One regex over the globals
+  found the whiteboard, the calculator, the minimise pair and every timer verb.
+
+⛔ **DO NOT TRUST THE SITE'S OWN HELP TEXT AS A MEASUREMENT.** Two of four behaviours documented
+in this client's Help are wrong about the client. Help says the timer minimises "by clicking on
+them"; `$._data(el,"events")` shows **no handler on the timer at all** — only on the icon
+button beside it. Help says "Alt + underlined shortcut letter"; there is **no `accesskey`
+attribute in the document**, the underline is a `<span class="underline">`, and the shortcut is
+a `keyCode` comparison inside the client's own handler.
+
+⭐ **`$._data(element,"events")` is the instrument that settles "what is actually clickable".**
+jQuery keeps its bindings off-DOM, so `onclick`, `[accesskey]` and inline attributes all read
+empty on a page that is fully wired. Enumerate candidates and ask jQuery, rather than clicking
+around to find out.
+
+⭐ **A hidden control's markup is readable while it is hidden.** Zero-size buttons keep their
+`innerHTML`, so one `document.querySelectorAll(".underline")` sweep yielded the shortcut letters
+for **fifteen** controls across screens this session never visited (break, score report, section
+review). Harvest the whole vocabulary from one screen.
+
+## Driving notes that cost time this session
+
+- ⛔ **`ychrome ctl input` has no `mousedown`/`mouseup`** — the types are `click|move|scroll|
+  type|key`. A jQuery-UI **drag** therefore cannot be done with `ctl input`; dispatch
+  `new MouseEvent("mousedown"…)` on the handle and then `mousemove`/`mouseup` **on `document`**
+  (that is where jQuery UI listens), with `buttons:1` on everything but the mouseup.
+- ⚠ **A `ctl input` click dispatches three events**, so a control whose handler is a TOGGLE can
+  end up back where it started. Seen once on `#Whiteboard`: the click after a close reported
+  `isWhiteboardToggled:false`. Re-clicking worked. **Read the toggle flag back and re-click**
+  rather than concluding the button is broken.
+- **Inside `wbFrame`, use the frame's own `PointerEvent`/`MouseEvent` and `view`** — the same
+  rule as `ElementDisplayFrame`. Sending `pointerdown`+`mousedown` to the canvas, then
+  `pointermove`/`pointerup` to the frame's `document`, drew a real stroke (Undo and Clear went
+  from `disabled` to enabled, which is the cheap proof it registered).
+- **jQuery-UI handles can exist and still be unreachable.** `#whiteboardContainer` gets
+  `.ui-resizable-e/s/se` children, yet each computes to `800x0` with `cursor:auto` because the
+  resizable stylesheet is not loaded. ⇒ **measure a handle's computed box before reporting a
+  feature as present.** The same trap in a different shape as Help's `ui-resizable` class with
+  no handles at all.
