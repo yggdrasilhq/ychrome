@@ -133,3 +133,51 @@ review). Harvest the whole vocabulary from one screen.
   resizable stylesheet is not loaded. ⇒ **measure a handle's computed box before reporting a
   feature as present.** The same trap in a different shape as Help's `ui-resizable` class with
   no handles at all.
+
+
+## prepexam-score-report-is-inside-the-delivery-client · WORKS
+task: Reach and measure GMAC's post-exam score report for 1:1 replication
+model: claude-opus-5
+date: 2026-08-09
+tags: measurement, iframes, score-report
+
+⭐ **The score report is NOT a web page — it is an ITD delivery-client session.** From the
+HomePage, a completed take offers *View score report* with the same `class="launchitdwindow"`
+shape as *Resume Test*: `href="#OnClickHandledByScript"` and the real target in the **`url`
+attribute** (`router?…&resultid=<n>&cmd=ScoreReportHTML`). `goto` that attribute and you land
+in `ITDStart.aspx`, with the whole report inside **`ElementDisplayFrame`**. Document title is
+`Score Report 2 of 2`.
+
+⇒ Two consequences that save a session:
+- **Read the frame's `contentDocument`, not the page.** The page's own `body.innerText` is empty.
+- **`resultid` distinguishes takes.** A completed take and a paused take are different
+  `resultid`s on the same product, so opening a score report does **not** touch a paused take —
+  verified by re-reading the HomePage afterwards (it still offered *Resume Test*).
+
+⭐⭐ **The entire stylesheet is inline in that frame — 4 `<style>` blocks, ~70KB.** For a
+measurement task this is far better than `getComputedStyle` sampling: you get the authored
+constants (`body{max-width:70%}`, `@media(max-width:960px)`, `@media print`, every colour token)
+in one `eval` that returns `documentElement.outerHTML`. Split CSS/JS/markup offline and work from
+the file. Geometry is then used only to *confirm* the CSS, which is the right order.
+
+⭐ **Hidden tab panels keep full markup and measurable-once-shown geometry.** All four tabs'
+content is in the DOM at once; `getBoundingClientRect().width>0` is the visibility test. One
+walk over `.heading-gray-bar-text` yielded the complete panel inventory of every tab without
+clicking anything. Switch tabs by dispatching `mousedown/mouseup/click` built from the **frame's
+own** `MouseEvent` + `view` (the standing rule for `ElementDisplayFrame`).
+
+⭐⭐ **Charts that are `<img src="itd.aspx?cmd=imgscript&…&urid=…/someChart.js">` are
+server-rendered rasters** — nothing to read in the DOM. But this report pairs **every** chart
+with an exact tabular equivalent already in the DOM (`.chart-table` vs `.table-table`, toggled by
+a `data-view` attribute on the `<details>`). ⇒ **Take the numbers from the table twin and use the
+screenshot only for the visual form.** Do not try to OCR a raster you can read as a table.
+
+⚠ **A control that documents a feature can be dead.** The report's `button.download` is present,
+styled, and both `disabled` and `display:none`. Its function is served instead by `@media print`,
+which hides the tab bar and forces all four tab panels visible with `break-before: page`.
+⇒ **check `disabled`/computed display before recording a control as a feature.**
+
+⛔ **Do not click the per-question `a.navigate` links.** They call
+`itd.navigateTD("REVIEW-ALL", …, "name=Item Review/Q…")` and jump into an Item Review delivery
+section rendering the real item. Recording the mechanism is the measurement; opening it pulls
+exam content into the session.
