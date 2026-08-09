@@ -53,6 +53,17 @@ take the wider one):
     /usr/local/bin/ychrome-vault                    the ONLY live inode
     588 MB resident across the deleted-exe set
 
+⚠ **Measure start time with `ps -o lstart=`, never `stat -c %y /proc/<pid>`.**
+The directory's mtime tracks kernel bookkeeping, not exec, and it fails in the
+most misleading direction available: for four of these it returned the SAME
+value to the second (`2026-07-30 11:15:31`) for processes that actually started
+Jul 26 13:53, Jul 27 09:27, Jul 27 20:17 and Jul 28 00:04 — while agreeing with
+`ps` for every process started after that date. So it is correct on recent
+processes and silently collapses old ones onto one timestamp, which is exactly
+the population you point it at when hunting stale daemons. An obviously-broken
+instrument costs one round; one that returns plausible, self-consistent,
+CLUSTERED values costs a wrong conclusion. Verified on both rows independently.
+
 ⇒ **Any of these can answer a `ctl` call from a build nobody can name**, and the
 oldest predates the installed CLI by a wide margin, so `frame` is unlikely to be
 the only verb that 404s. A fix that restarts "the engine" fixes one of eleven.
@@ -76,9 +87,16 @@ host outage — say so plainly rather than borrowing the older incident's urgenc
    poll `/proc/self/exe` for the `(deleted)` marker and retire once no page is
    mid-navigation. ⚠ It must PRESERVE live pages or it is worse than the bug —
    this engine was holding two live exam sessions when it was measured.
-   ⚠ And it must **sweep a set, not a singleton**: eleven instances, of which the
-   seven `.local/bin` ones include three sharing a start second and so look like
-   one supervised group. A retire that assumes "the engine" leaves ten behind.
+   ⚠ And it must **sweep a set, not a singleton**: eleven instances, started on
+   at least five different days between Jul 26 and Aug 8. A retire that assumes
+   "the engine" leaves ten behind.
+   ⛔ **CORRECTION to this entry's own first version:** it said several of them
+   "share a start second and so look like one supervised group". They do not —
+   that came from `stat -c %y /proc/<pid>`, which reads the DIRECTORY's mtime and
+   collapsed four processes started across Jul 26–27 onto one fake timestamp
+   (`2026-07-30 11:15:31`, identical to the second). There is no supervised
+   group; they are eleven independent strays. Use `ps -o lstart=` — see the
+   ⚠ note under the audit above.
 
 **Falsifier:** rebuild ychrome without restarting the engine, then run any verb.
 The reply names both builds and tells you which one is stale.
