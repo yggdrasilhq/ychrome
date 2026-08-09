@@ -7,6 +7,46 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ⛔⛔ `ctl eval` IS SYNCHRONOUS-ONLY, SO EVERY rAF-DRIVEN CANVAS SILENTLY RECORDS A DEGENERATE RESULT AND REPORTS SUCCESS
+
+**Status:** OPEN
+
+**Reported by the `practice` campaign row 2026-08-09**, driving GMAC's exam
+whiteboard (literallycanvas, inside an iframe). ⛔ **Filed separately from the
+`ctl input` entry below on the reporter's explicit instruction — it is a
+different failure**, and merging them would hide it.
+
+**What happens.** A full drag dispatched inside ONE `ctl eval` — mousedown, 3×
+mousemove, mouseup, correct `buttons`, the frame's own `MouseEvent` constructor
+and `view` — returns success, and the board's shape count goes up by one. The
+shape is `x1=y1=x2=y2`: a zero-length line.
+
+**Cause, and it is general.** `lc.pointerMove()` defers through
+`requestAnimationFrame`. A synchronous event sequence never yields to a frame,
+so every queued move runs **after** the mouseup that already committed the
+shape. This is not literallycanvas-specific: it is every canvas or drawing
+library that batches on rAF, and most modern drag implementations.
+
+⭐ **Why this outranks an ergonomics gap: the failure is silent AND positively
+misleading.** Nothing errors, the count increments, and only reading the shape's
+own coordinates back reveals it. The reporter found a pre-existing degenerate
+`Line(100,100,100,100)` on that same board left by an EARLIER agent that hit
+this and evidently believed its drag had worked. ⇒ this defect has already
+written a false result into a real workspace and been believed at least once.
+
+**Either fix is accepted; the reporter would use (2) immediately:**
+1. `ctl eval` supports `await` / a returned Promise, so a script can
+   `await new Promise(r => requestAnimationFrame(r))` between events; or
+2. **a `ctl input drag` verb taking a point list**, dispatching
+   mousedown/move…/mouseup with a real frame boundary between each — which also
+   subsumes item 1 of the entry below.
+
+**Working around it costs 5 round-trips instead of 1:** one event per `ctl eval`
+call, because each round-trip happens to cross several frames.
+
+**Falsifier:** a drag driven in one call across an rAF-batched canvas produces a
+shape whose end coordinates differ from its start.
+
 ## ⭐ THE `ctl` SURFACE MAKES AGENTS HAND-ASSEMBLE CHORES FROM PRIMITIVES — seven deficiencies, measured while driving live exam consoles
 
 **Status:** OPEN
