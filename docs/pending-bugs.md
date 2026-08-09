@@ -42,6 +42,29 @@ remedy that would have deleted the feature. A 404 that cannot distinguish *"this
 verb does not exist"* from *"this build predates it"* sends the reader to the
 wrong system every time.
 
+⚠ **AND IT IS NOT ONE ENGINE — IT IS A FLEET.** Reported by the `practice` row
+and re-audited independently on `dev` 2026-08-09 (their count and mine differ, so
+take the wider one):
+
+    11 ychrome-family processes; 10 running a binary that no longer exists
+    $HOME/.local/bin/ychrome (deleted)        x 7   oldest Jul 27 09:27  — 13 DAYS
+    $REPO/target/release/ychrome (deleted)    x 1   Aug  8 01:16         — the 404 above
+    $REPO/target/debug/ychrome-vault (deleted) x 1  Aug  2
+    /usr/local/bin/ychrome-vault                    the ONLY live inode
+    588 MB resident across the deleted-exe set
+
+⇒ **Any of these can answer a `ctl` call from a build nobody can name**, and the
+oldest predates the installed CLI by a wide margin, so `frame` is unlikely to be
+the only verb that 404s. A fix that restarts "the engine" fixes one of eleven.
+
+⛔ **What this is NOT, checked because the obvious next thought is wrong.** This
+is not the 2026-07-20 zombie fork-bomb re-arming
+([[finding-ychrome-zombie-fork-bomb-dev]], whose SIGCHLD reaper is still owed).
+Measured at the same moment: **0 zombies on the whole host**, 0 children on every
+one of the long-lived instances, 398 processes against a `pid_max` of 4,194,304.
+These are idle, not breeding. The cost today is memory and a wrong answer, not a
+host outage — say so plainly rather than borrowing the older incident's urgency.
+
 **The fix, and it is two things:**
 
 1. **A version handshake.** Every `ctl` reply carries the engine's build
@@ -53,6 +76,9 @@ wrong system every time.
    poll `/proc/self/exe` for the `(deleted)` marker and retire once no page is
    mid-navigation. ⚠ It must PRESERVE live pages or it is worse than the bug —
    this engine was holding two live exam sessions when it was measured.
+   ⚠ And it must **sweep a set, not a singleton**: eleven instances, of which the
+   seven `.local/bin` ones include three sharing a start second and so look like
+   one supervised group. A retire that assumes "the engine" leaves ten behind.
 
 **Falsifier:** rebuild ychrome without restarting the engine, then run any verb.
 The reply names both builds and tells you which one is stale.
