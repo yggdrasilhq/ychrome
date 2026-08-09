@@ -7,6 +7,56 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ⛔⛔ THE ENGINE SERVES FROM A DELETED BINARY FOR DAYS AND 404s VERBS THE CLI ADVERTISES — and nothing says which build is answering
+
+**Status:** OPEN
+
+**Reported by the `practice` campaign row 2026-08-09** as *"`ctl frame` is
+advertised by the CLI's own help and the engine 404s it — either implement it or
+drop it from the usage line."*
+
+⛔ **DO NOT DROP IT. `ctl frame` IS IMPLEMENTED**, at `src/engine/api.rs:355`,
+shipped in `36cc027` *"a cross-origin child answers a selector, and a real click
+lands in it"* — which is also the answer to item 6 in the table below. Deleting
+it from the usage line would have removed a working feature on the strength of a
+404.
+
+**What is actually true**, measured on `dev` the same day:
+
+    $ readlink /proc/2542173/exe
+    $REPO/target/release/ychrome (deleted)
+    engine started   Sat Aug  8 01:16:32   (43 h earlier)
+    frame commit     Sat Aug  8 13:42      (12 h AFTER the engine started)
+    installed CLI    Sat Aug  8 14:52
+
+⇒ The help text comes from the **CLI binary**, which has the verb. The 404 comes
+from the **daemon**, a 43-hour-old process still serving from an inode that was
+replaced on disk. They are not two components disagreeing about what exists —
+they are **two builds**, and nothing in the protocol says so.
+[[finding-the-gui-daemon-is-not-your-cli-daemon]],
+[[finding-identity-by-reference-decays]].
+
+⭐ **The report's cost is the point.** The reporter *"spent a round believing
+frame traversal was supported and only my arguments were wrong"*, then filed a
+remedy that would have deleted the feature. A 404 that cannot distinguish *"this
+verb does not exist"* from *"this build predates it"* sends the reader to the
+wrong system every time.
+
+**The fix, and it is two things:**
+
+1. **A version handshake.** Every `ctl` reply carries the engine's build
+   identity, and an unknown verb whose CLI is NEWER than the engine says so:
+   `unknown engine verb "frame" — this engine is build X (started <t>), your CLI
+   is build Y; restart the engine`. ⛔ Not `--version`: that reads the binary on
+   disk, which is exactly the file this engine is no longer running.
+2. **Stale-binary self-retire**, the same shape yggterm's daemon already has:
+   poll `/proc/self/exe` for the `(deleted)` marker and retire once no page is
+   mid-navigation. ⚠ It must PRESERVE live pages or it is worse than the bug —
+   this engine was holding two live exam sessions when it was measured.
+
+**Falsifier:** rebuild ychrome without restarting the engine, then run any verb.
+The reply names both builds and tells you which one is stale.
+
 ## ⛔⛔ `ctl eval` IS SYNCHRONOUS-ONLY, SO EVERY rAF-DRIVEN CANVAS SILENTLY RECORDS A DEGENERATE RESULT AND REPORTS SUCCESS
 
 **Status:** OPEN
@@ -67,8 +117,9 @@ not.** ⛔ So the fix for the starred items is NOT better documentation.
 | 2 | **One `ctl input` click dispatches THREE events**, so a toggle can land back where it started. A working control was nearly filed as broken until the flag was read back and the click repeated. | coalesce to ONE synthetic click, or name the multiplicity in the error surface |
 | 3 ⛔ | **`ctl eval` shares ONE global scope across calls.** A second call declaring `const h` dies with a duplicate-variable `SyntaxError` **that reads like a page defect** — so the agent starts debugging the wrong system. | auto-wrap each eval body in an IIFE, or run it in a fresh realm |
 | 4 | **`ctl eval` takes `page_id=` while sibling verbs take `page=`.** | accept both, or normalise |
-| 5 | **`ctl wait` takes `load=finished`, not `until=load:finished`** — the natural guess is wrong and the error does not suggest the right form. | suggest the correct form in the error |
+| 5 ⚠ | **`ctl wait`'s error names a shape that does not work, which costs MORE rounds than naming nothing.** The true form is `until='{"load":"finished"}'` — `until` takes an OBJECT (verified live 2026-08-09: `met:true, elapsed_ms:0`). The engine's error prints ``wait needs an `until`: {load}, {idle_ms}, {selector,state} or {js}``, whose `{load}` is JSON-shape notation and reads as the literal token `load`; `until=load` then 400s. This row's own earlier text (`load=finished`) was a third abbreviation of the same JSON. **Three sources disagreed because two were abbreviating a JSON shape in prose.** | print a form that can be pasted: ``until='{"load":"finished"}'`` |
 | 6 ⛔ | **Coordinate clicks do not reach inside iframes.** Top-level footer buttons fire correctly; nothing reaches into `ElementDisplayFrame` or `wbFrame`. The only working route is the frame's own event constructors plus an explicit `view`. | `ctl input --frame <selector\|url-substring>` |
+| 8 | **`ctl eval` cannot take its JS from a file.** Args are strictly `key=value`, so `--js-file` is rejected outright (`arguments are key=value pairs`), and the only route is the whole program through argv — multi-KB of newline-stripped JavaScript on the command line for any real `getBoundingClientRect`/`getComputedStyle` sweep. Reported by the `practice` row 2026-08-09; confirmed by grep — no `js_file`, no `js=@`, anywhere in `src/`. | `js_file=PATH` (stays inside the key=value grammar), or `js=@PATH` |
 | 7 | **Engine-opened windows are never surfaced as pages.** A `window.open`-style control opens a window the engine never lists; the working recipe is to read the anchor's `url` attribute and `goto` it by hand. | surface engine-opened windows as pages, or `ctl click --follow-target` |
 
 ⚠ **Items 3 and 5 are the same shape as this repo's own instrument findings: the
