@@ -7,6 +7,23 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ⛔⛔ `ctl fill` WRITES THE SECRET INTO A HIDDEN DECOY INPUT AND THEN VERIFIES THE DECOY
+
+Measured on a live Indian bank login (`netbank.examplebank-a.example`), which sandwiches the real password box
+between two `display:none` `autocomplete="new-password"` honeypots. `/fill` takes the first
+`input[type=password]`, writes there, and answers `{"filled":"filled","ok":true}` with its own
+length readback passing (`want:14, got:14`) — while the field the form will submit is **empty**.
+The 2026-08-07 `unverified` hardening cannot catch it: it reads back *the field it wrote*.
+
+**Cost: a submit in that state spends a bank login attempt with an empty password**, on a bank that
+locks after repeated failures, and points the diagnosis at the credential instead of the tool.
+Plus **D2** (`type`'s `landed` is a false negative on every masked input) and **D3** (`lore.py`'s
+private-data lock caught a phone number and passed a bank customer ID into a public lore file).
+
+⇒ Full report with exact commands, exact responses, suggested fixes and one ranked feature ask
+(`/fill` needs a target selector — its absence forces the plaintext into the agent's argv):
+**`docs/agent-cobrowse-gaps-2026-08-10.md`** (a peer campaign row, 2026-08-10).
+
 ## ⛔⛔ THE ENGINE SERVES FROM A DELETED BINARY FOR DAYS AND 404s VERBS THE CLI ADVERTISES — and nothing says which build is answering
 
 **Status:** OPEN
