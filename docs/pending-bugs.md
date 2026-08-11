@@ -7,6 +7,110 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ⛔⛔ `ychrome-vault match <host>` RESOLVES TO AN ITEM WHOSE USERNAME IS CORRUPTED BINARY
+
+**Status:** OPEN. Measured 2026-08-11 while driving a Meta login.
+
+`match` is documented as "resolve a page host to the ONE entry an auto-fill may use (strict
+rule)" — so it is the verb an auto-fill trusts. For a host with several stored entries it
+returned, with `ok` and no warning:
+
+```
+$ ychrome-vault match <host>
+{"id":"…","name":"<host>","password":"<40 chars, correct>",
+ "username":"!Ñ'P_°S\fÎ k/ÏTæjDGW0Õ…"}
+```
+
+The password decrypts correctly; **the username field is binary garbage.** The same corrupted
+string is echoed verbatim into `list` output and into the disambiguation error
+(`vault: "<host>" matches 6 accounts — name one: !Ñ'P…, <real>, <real>…`), so it is a stored or
+decode-layer corruption, not a display bug in one verb.
+
+**Cost.** An agent that trusts `match` (which is exactly what "strict rule, for auto-fill" invites)
+types binary into a login field and spends an attempt. On a site that checkpoints or locks after
+repeated failures, that is expensive, and the diagnosis points at the site rather than the vault.
+It also makes the "name one" error unreadable and un-copy-pasteable for the caller trying to
+recover.
+
+⇒ **Two things wanted, and they are separable.** (1) `diagnose` should count and name ciphers whose
+*fields* fail to decode, not only whole ciphers — this item decrypts "successfully" today. (2)
+`match` should refuse, or at minimum flag, an entry whose username is not valid UTF-8, rather than
+returning it as the one entry an auto-fill may use.
+
+⚠ Sitting next to the known `/fill` decoy defect below, these compound: one picks the wrong field,
+the other supplies a wrong value, and both report success.
+
+## ⚠ `lore.py scan`'s PRIVATE-DATA GATE FIRES ON URL PATHS, BURYING A REAL LEAK IN FALSE POSITIVES
+
+**Status:** OPEN. Measured 2026-08-11 on a clean checkout, before any local edit.
+
+`scan` reports 5 hits across the committed lore. **Four are false positives and one is real:**
+
+| file | hit | verdict |
+|---|---|---|
+| `pay.google.com.md` | `/home/activity`, `/home/paymentmethods`, `/home/reauthprompt`, `/home/settings` | ⛔ FALSE. These are Google Pay **URL routes**, not home directories |
+| `rtionline.gov.in.md` | `guihost` | ✅ REAL. A fleet hostname in a public repo |
+
+The `/home/<word>` pattern cannot tell a filesystem path from a URL path, and any site with a
+`/home/...` route trips it.
+
+**Cost, and it is the specific failure a gate like this dies of.** A scan that is 80% noise trains
+the reader to skim it, and the one genuine hostname leak is the row that gets skimmed past. Worse,
+it pushes agents toward habitual `--allow-private`, which is precisely the reflex the write-time
+gate exists to prevent. The tool is currently arguing against its own purpose.
+
+⇒ Anchor the path pattern so it requires a path start or a `~`/quote boundary rather than matching
+mid-URL, or exempt a `/home/` that is preceded by a scheme+host. Then fix the `guihost` leak, which is
+a one-word edit nobody has made because it is item five of five.
+
+## ⚠ `ctl input`'s `nth` INDEXES THE HITTABLE POOL, NOT DOM ORDER — and nothing says so
+
+**Status:** OPEN. Measured 2026-08-11 driving a React dialog.
+
+`docs/agent-engine.md` documents `{"type":"click","selector":"css","nth":k}` without saying what
+`k` counts, and the natural reading (DOM order, matching `querySelectorAll`) is wrong. `nth` is an
+index into the **hittable** subset. With a modal open, `[role=button]` had **4 DOM matches and 3
+hittable**, so the control at DOM index 3 was at hittable index 2, and `nth:3` was refused:
+
+```
+no element matches "[role=button]" at hittable index 3 — it has 3 hittable match(es) of 4
+```
+
+**Cost.** The refusal is honest and recoverable, which is the good case. The bad case is silent: if
+the non-hittable elements sit *after* the target rather than before it, `nth` computed from the DOM
+resolves to a **different, real, hittable control** and clicks the wrong thing with `ok:true`. That
+is unfalsifiable from the response alone.
+
+⇒ Say it in `--help` and in the `/input` contract, and consider echoing `dom_nth` alongside `nth`
+in `resolved[]` so a caller can see the two disagree. The `resolved[]` block already reports
+`matches` and `hittable` separately, so the information is there and simply is not connected.
+
+⭐ Working mitigation, now in `facebook.com` site-lore as `tag-and-click-nested-react`: tag the
+element by exact visible text with a `data-agent-target` attribute in an `eval`, then click that
+unique selector. It needs no index arithmetic and survives re-render.
+
+## ⚠ `ctl fill` TAKES AN UNDOCUMENTED `user=`, WITHOUT WHICH A MULTI-ACCOUNT VAULT ENTRY IS UNUSABLE
+
+**Status:** OPEN (documentation). Measured 2026-08-11.
+
+`ctl fill page_id=… entry=…` fails on any vault entry holding more than one account
+(`vault: "<name>" matches 6 accounts`), and neither `ctl --help` nor the error names the way out.
+It is `user=<account>`, which works and is in no usage string:
+
+```
+ychrome ctl fill page_id=$P entry="<entry>" user="<account>"
+```
+
+**Cost.** Low per incident, but it lands exactly when an agent is mid-login and reaching for the
+plaintext fallback — which is the moment the credential ends up in argv, the failure the ranked
+feature ask under the `/fill` decoy item is already about. The error message is the right place to
+say it: it already enumerates the candidate accounts, so it should name the flag that selects one.
+
+⚠ Same shape, same file: the engine's `wait` grammar is `until=load`, while the surface plane's is
+`--until load:finished`. Passing the surface form to the engine answers
+`wait needs an 'until': {load}, {idle_ms}, {selector,state} or {js}`, which is a good refusal, but
+the two planes using different grammars for the same concept is a trap worth one line of docs.
+
 ## ⛔⛔ `ctl fill` WRITES THE SECRET INTO A HIDDEN DECOY INPUT AND THEN VERIFIES THE DECOY
 
 Measured on a live Indian bank login (`netbank.examplebank-a.example`), which sandwiches the real password box
