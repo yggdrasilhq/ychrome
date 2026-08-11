@@ -240,3 +240,63 @@ state back after clicking it. Radios verified with:
 FOR RADIOS SPECIFICALLY, the plain selector form is fine and needs no tagging, because
 radios are all hittable so hittable index equals DOM index:
     events='[{"type":"click","selector":"[role=dialog] input[type=radio]","nth":6}]'
+
+## export-submit-reauth-and-status · WORKS
+task: actually submit the export: the re-auth overlay, and reading the queue back
+model: claude-opus-5
+date: 2026-08-11
+tags: dyi, export, reauth, dialog, click, meta
+
+Completes the `accounts-centre-export-dyi` entry above, which stopped at the confirm button.
+Both a Facebook and an Instagram export were submitted and are queued. Two mechanisms only
+show up once you actually press the button, and one of them wasted a diagnosis.
+
+⭐⭐ PRESSING "Start export" OPENS A PASSWORD RE-AUTH OVERLAY, AND IT LOOKS LIKE A NO-OP.
+A SECOND `[role=dialog]` is appended on top of the confirm dialog:
+    "Please re-enter your password. For your security, please re-enter your password to
+     continue."  [Password] [Continue] [Forgotten password?]
+⛔ THE TRAP: the FIRST dialog still reads "Confirm your export ... Start export", unchanged.
+So a caller that re-reads `document.querySelector("[role=dialog]")` (the FIRST match) sees the
+identical screen and concludes the click silently failed. It did not. Always read the LAST
+dialog:
+    const ds=[...document.querySelectorAll("[role=dialog]")]; ds[ds.length-1]
+The overlay has exactly ONE `input[type=password]` and no username field, so `ctl fill` is safe
+here despite the known decoy defect. It reports `username: {ok:false, present:false, got:-1}`
+for the absent field and fills the secret correctly; that mixed response is success, not
+failure. Then click "Continue" in the LAST dialog.
+⚠ The re-auth is asked ONCE per session. The second export submitted straight through with no
+password prompt, so do not wait for an overlay that will not come; branch on
+`document.querySelectorAll("input[type=password]").length`.
+
+⛔ CORRECTION TO `tag-and-click-nested-react`: TAKE THE ROLE-BEARING ELEMENT, NOT `c[0]`.
+That entry says to take the outermost match. **For ROWS that is right; for BUTTONS it is
+wrong.** "Start export" resolved to 10 nested elements, of which THREE shared the exact
+button geometry (560x44 at the same y). Only ONE carried `role="button"` `tabindex="0"`, and
+the outermost same-size match was an inert wrapper. Clicking the wrapper dispatches happily
+(`ok:true, dispatched:3`) and nothing happens.
+⇒ For a control, filter to `[role=button],button` FIRST and match text within that set:
+    const el=[...d.querySelectorAll("[role=button],button")]
+             .find(b=>(b.innerText||"").replace(/\s+/g," ").trim()===want);
+
+⭐ HOW TO TELL "CLICK DID NOTHING" FROM "SOMETHING OPENED ON TOP", in one eval. Ask what is
+actually at the button's own centre point:
+    const r=el.getBoundingClientRect();
+    const top=document.elementFromPoint(r.left+r.width/2, r.top+r.height/2);
+    ({occluded: !el.contains(top) && top!==el, topText:(top.innerText||"").slice(0,40)})
+That returned `"Please re-enter your pass..."` and settled it immediately. Relatedly, the
+engine's own refusal is a real signal here: re-clicking answered
+`no_hittable_match (... 1 hidden ...)` for an element that is plainly visible, which means
+OCCLUDED, not absent. Read a `hidden` count on a visible element as "something is covering it".
+
+AFTER SUBMIT, the panel becomes a status list worth reading back as proof:
+    "Requested — Your information is being prepared for export."
+    <profile> (<platform>) · Available information · Export to device · Once · JSON
+    · Requested on DD/MM/YYYY · [Cancel]
+⭐ Each queued export carries its own **Cancel**, and there are "Current activity" and "Past
+activity" tabs. So a request is reversible until it completes, and past exports are
+enumerable, which is the cheap way to answer "has this account ever been exported before"
+without going to the mailbox.
+
+⚠ SCOPE, stated by the page itself and worth quoting to anyone expecting a full social graph:
+"Your export won't include information that someone else shared, such as another person's
+photos that you're tagged in."
