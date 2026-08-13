@@ -243,3 +243,89 @@ own message list is readable directly, and a fresh export can be requested at an
 ⇒ **Do not reset a live credential to beat the clock.** "Forgot password?" is sitting right there in
 the overlay and it is the wrong door: it changes a working credential, may sign the owner's other
 devices out, and buys a file that could have been re-requested for free.
+
+## direct-api-read-and-the-limit-100-truncation · WORKS
+task: read the whole DM corpus from a logged-in session when the DYI archive is gated, and the silent truncation that nearly halved it
+model: claude-opus-5
+date: 2026-08-14
+tags: direct, api, messages, pagination, truncation, encoding, session
+
+When a DYI archive is gated behind a credential you do not have, **the logged-in session can still
+give you the message corpus**, through the site's own private API rather than its DOM. This is rung 1
+work dressed as rung 3: no scrolling, no virtualised list, no screenshots.
+
+## The route
+
+The web app's own API answers a same-origin `fetch` from inside the page, because the session cookies
+ride along automatically. It needs exactly one header.
+
+    // the app id is in the page's own HTML; scrape it rather than hardcoding
+    document.documentElement.innerHTML.match(/"X-IG-App-ID":"(\d+)"/)
+
+    GET /api/v1/direct_v2/inbox/?persistentBadging=true&thread_message_limit=20&limit=25
+    GET /api/v1/direct_v2/threads/<thread_id>/?limit=20[&cursor=<oldest_cursor>]
+        headers: { "X-IG-App-ID": "<the id from the page>" }
+
+The inbox reply carries `viewer.pk` (your own user id, which is how you tell your messages from
+theirs) and one entry per thread. Page a thread with `oldest_cursor` while `has_older` is true.
+
+⚠ **Take the thread id as a STRING.** The numeric `thread_id` exceeds JavaScript's safe integer
+range, so `JSON.stringify` of it silently collapses distinct threads to the same value and every
+thread looks identical. Use `thread_v2_id`, or `String(x.thread_id)` taken before any serialisation.
+This is not a subtle failure once you see it, and it is invisible until you notice every row printing
+the same id.
+
+⚠ An engine `eval` cannot return a promise. Kick the async work off, stash the result on `window`,
+poll with `wait`/`eval` until it is set, then read it out in slices.
+
+## ⛔⛔ THE FINDING: `limit=100` SILENTLY TRUNCATES AT 75 AND THEN LIES ABOUT IT
+
+Measured on two independent threads, and this is the whole reason this entry exists.
+
+    GET .../threads/<id>/?limit=100
+      -> 75 items, has_older: FALSE, oldest_cursor present
+    GET .../threads/<id>/?limit=20   (paged on oldest_cursor)
+      -> 273 items across 14 pages
+
+**The same thread is 75 messages long or 273 messages long depending on the page size you asked
+for.** The large request does not error, does not warn, and does not set `has_older`. It returns a
+plausible number and declares the thread finished.
+
+⇒ Across a twelve-thread mailbox the first extraction reported **231 messages** and the corrected one
+**473**. A run that trusted `limit=100` would have written an archive **missing 51% of the corpus,
+with every internal consistency check passing**, because nothing inside the result is wrong. Only its
+completeness is.
+
+⭐ **What caught it was not suspicion of the API.** It was that **two independent threads both came
+back at exactly 75**. A round number appearing twice is the kind of coincidence worth one probe, and
+the probe is cheap: re-request the same thread at a smaller page size and compare totals.
+
+⇒ **PAGE AT `limit=20` AND VERIFY BY RE-COUNTING AT A DIFFERENT PAGE SIZE.** Treat `has_older: false`
+as advisory rather than authoritative on this endpoint. The general law it belongs to: **a pagination
+flag is a claim by the server, and a server that truncates has already demonstrated it will make
+false claims.**
+
+⚠ Pace the requests. 400 to 600 ms between pages and threads was accepted without a single non-200
+across ~30 requests; there is no reason to find the rate limit.
+
+## Encoding, which differs from the export path
+
+⭐ **The live API returns clean UTF-8.** A mojibake scan over 473 messages found **zero** mangled
+runs. ⛔ **Do NOT apply the latin1/utf8 round-trip repair to API output** — that repair is an artefact
+of the DYI *export* pipeline, and applying it here corrupts correct text. Same rule as the HTML
+exports.
+
+## Timestamps
+
+Message timestamps are **microseconds**, not milliseconds. Branch on magnitude rather than assuming,
+and render in the account's own local zone: rendering as UTC from a positive-offset corpus moves
+every boundary message backwards and can delete the last day of a span.
+
+## When this is the right tool
+
+- The archive is gated, expired, or still building, and the content is wanted now.
+- You need a diff against an older export rather than the whole history.
+- ⛔ **It is not a replacement for an export.** It returns the account's CURRENT state: nothing
+  deleted, nothing from a disabled account beyond what the thread still holds, and no media files.
+  A thread whose counterparty account no longer exists comes back with an **empty user list**, so it
+  has no name and can only be identified by its thread id.
