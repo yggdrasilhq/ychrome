@@ -300,3 +300,171 @@ without going to the mailbox.
 ⚠ SCOPE, stated by the page itself and worth quoting to anyone expecting a full social graph:
 "Your export won't include information that someone else shared, such as another person's
 photos that you're tagged in."
+
+## dyi-download-the-archive · WORKS
+task: download a ready DYI archive headlessly: the signed URL, the two-dialog flow, the 0x0 background trap
+model: claude-opus-5
+date: 2026-08-13
+tags: dyi, export, download, curl, engine, ctl
+
+Downloading a finished Download Your Information archive, driven headlessly end to end on
+`ychrome ctl`. Completes the pair `accounts-centre-export-dyi` (request) and
+`export-submit-reauth-and-status` (submit); this one is the collection step, and it has three
+mechanisms none of the earlier entries could see because the archive did not exist yet.
+
+⭐⭐ THE ARCHIVE URL IS SELF-AUTHENTICATING. FETCH IT WITH curl, NOT THE BROWSER.
+Pressing the final Download hands the page a signed URL on `bigzipfiles.<host>` carrying
+`file_secret=` and `hash=` query parameters. **It needs no cookies at all.** Verified with a
+cold range request from a process with no session:
+
+    curl -r 0-2047 -o probe.bin -D headers.txt "<signed url>"
+    HTTP/2 206
+    accept-ranges: bytes
+    content-range: bytes 0-2047/<total>
+    content-disposition: attachment;filename=<platform>-<name>-DD-MM-YYYY-<token>.zip
+    content-type: application/zip
+
+⇒ Capture the URL, then download with `curl -C - --retry 5`. That buys resume, a byte count you
+can assert against `content-length`, and no 500 MB round trip through a headless WebKit whose
+download handling is not part of the engine contract. A multi-hundred-MB browser download with
+no progress surface and no landing path is the fragile option, not the safe one.
+⚠ The signed link carries its OWN expiry in an `ext=<epoch>` parameter, and it was LATER than
+the archive's advertised expiry date. So once you hold the link it outlives the page's deadline.
+Decode it rather than assuming: `ext` is a plain unix timestamp.
+
+HOW TO CAPTURE THE URL: hook XHR/fetch RESPONSE BODIES, not navigation.
+Nothing navigates and no `<a href>` is ever created, so a `window.open` / anchor-click hook alone
+catches nothing. The URL arrives inside a GraphQL response. Install before clicking:
+
+    const oo=XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open=function(){
+      this.addEventListener("load",function(){
+        const m=(this.responseText||"").match(/https?:[^"\\ ,)]{20,}/g)||[];
+        m.filter(u=>/bigzipfiles|\.zip/i.test(u))
+         .forEach(u=>window.__cap.push(u.replace(/\\\//g,"/")));});
+      return oo.apply(this,arguments);};
+
+⛔ Escape the JSON backslashes: the URL comes back JSON-encoded, so `\/` must be unescaped or the
+link is malformed in a way curl reports as a DNS failure.
+
+THE FLOW IS TWO DIALOGS DEEP, NOT ONE BUTTON.
+  1. The panel lists each ready archive with `Download` and `Cancel` side by side.
+     ⛔ They are ADJACENT and identically sized. Resolve which is which by walking UP from the
+     button to an ancestor carrying the profile label, never by index.
+  2. Clicking `Download` opens a file chooser dialog: "Download your files ... File 1 of N".
+     Read N. A large archive CAN be split, and a partial download looks exactly like a complete
+     one. A ~500 MB archive came down as File 1 of 1, so splitting is not automatic at that size.
+  3. The `Download` INSIDE that dialog is the one that mints the signed URL.
+  4. A password re-auth overlay guards it, exactly as it guards the submit.
+
+⛔⛔ NEW TRAP, AND IT COSTS A CYCLE: WHEN THE MODAL OPENS, THE PAGE BEHIND IT COLLAPSES TO 0x0
+BUT STAYS INSIDE THE SAME `[role=dialog]`.
+The advice in `tag-and-click-nested-react` to scope to the last `[role=dialog]` does NOT
+disambiguate here, because there is only ONE dialog element and it contains both the modal and
+the whole collapsed page. A naive `.find(text==="Download")` inside it returns a BACKGROUND
+button measuring 0x0, and the engine then refuses:
+
+    no_hittable_match ("[data-agent-target]" matched 1 element(s) and NONE could receive a
+    click: 0 zero_size_element, 1 hidden)
+
+That refusal is correct and is telling you that you tagged a collapsed element, NOT that your
+selector is wrong. ⇒ **FILTER ON GEOMETRY, ALWAYS.** Add `r.width>0 && r.height>0` to every
+candidate filter on this site. It is one clause and it makes the whole family of nested-React
+selector problems disappear on this panel:
+
+    [...document.querySelectorAll("[role=button],button")].filter(x=>{
+      const t=(x.innerText||"").replace(/\s+/g," ").trim();
+      const r=x.getBoundingClientRect();
+      return t==="Download" && r.width>0 && r.height>0;})
+
+Diagnostic that names it in one call: dump every button with its rect. A screen showing one
+visible Download that reports five matches, four of them 0x0, is this trap and nothing else.
+
+THE RE-AUTH IS PER PROPERTY, NOT PER LOGIN SESSION.
+`export-submit-reauth-and-status` says the overlay is asked once per session. That holds WITHIN
+one property. The download re-auth fired again on a later day in the same profile jar, so treat
+"once per session" as "expect it, branch on it", never as "it will not come":
+
+    document.querySelectorAll("input[type=password]").length
+
+The overlay still has exactly one password field and no username, so `ctl fill` is safe and its
+`username: {ok:false, present:false, got:-1}` line remains success rather than failure.
+
+⚠ THE EXPIRY IN THE EMAIL AND THE EXPIRY ON THE PAGE DISAGREE. BELIEVE THE PAGE.
+The notification mail says a flat "4 days from this email". The panel states a **per-archive**
+expiry date, and two archives requested minutes apart on the same day expired on DIFFERENT days.
+Read `Expires on DD/MM/YYYY` off each row; do not compute it from the mail.
+
+VERIFY WHAT LANDED, three cheap assertions and all three are worth it:
+  bytes == the `content-length` from the probe (a truncated zip is the failure mode here)
+  `unzip -l` returns a central directory and a plausible file count
+  the first four bytes are `PK\x03\x04`
+Download to a `.part` name and rename only after those pass, so an interrupted transfer can never
+be mistaken for a finished archive by the next session.
+
+## export-archive-layout-and-parsing · WORKS
+task: what a JSON DYI archive contains, and the three findings that produce wrong answers
+model: claude-opus-5
+date: 2026-08-13
+tags: dyi, export, parsing, encoding, archive
+
+What a JSON Download Your Information archive actually contains, measured on one ~500 MB export
+of a long-lived account. This is the parsing counterpart to the request/submit/download entries.
+Three of the four findings below each produce a CONFIDENTLY WRONG answer if you do not know them.
+
+⛔⛔ THE INBOX IS NOT THE CORPUS. ENUMERATE `messages/*/` BEFORE COUNTING ANYTHING.
+Threads are split across FIVE sibling containers under `your_facebook_activity/messages/`, and
+the inbox held only 58% of them on the archive measured:
+
+    inbox              186 threads   20,197 messages
+    archived_threads   121 threads    6,577 messages
+    e2ee_cutover        41 threads    4,276 messages
+    filtered_threads     7 threads        7 messages
+    message_requests     2 threads        2 messages
+
+⇒ A scan of `messages/inbox/` alone reported a specific, known-to-exist conversation as ABSENT.
+It was in `archived_threads`. **An archived thread is invisible to an inbox scan and is
+indistinguishable from a deleted one**, so the failure mode is not a shortfall in the count, it
+is a false negative on a named thread. `e2ee_cutover` is the other one people miss: it holds real
+conversations migrated at the end-to-end encryption switchover, and nothing in the name says so.
+
+    unzip -Z1 archive.zip | grep -oE 'messages/[a-z_]+/' | sort -u   # do this FIRST
+
+⛔ READ TIMESTAMPS IN THE ACCOUNT HOLDER'S LOCAL ZONE, NOT UTC.
+`timestamp_ms` is epoch milliseconds. Rendered in UTC, a thread's last message landed one day
+EARLIER than an independent screenshot of the same conversation, which reads exactly like a
+truncated export. In the account's own zone the two matched to the second. A late-evening message
+crosses the date line in UTC and silently costs you a day at each end of every span you report.
+⇒ Convert once, explicitly, to the zone the human lived in. Then compare.
+
+⛔ THE MOJIBAKE REPAIR IS A CONDITIONAL, NOT A PROPERTY OF THE FORMAT.
+Standing folklore says Meta ships latin1/utf8 double-encoded text so non-Latin scripts arrive
+mangled and need `s.encode('latin1').decode('utf8')`. Prior work here predicted the JSON export
+would finally be the case where it bites. **It did not.** Across 31,059 messages: 0 non-Latin
+codepoints and 1 mojibake pair. The reason was not an encoder fix, it was that the account holder
+wrote their second language in LATIN TRANSLITERATION, so there was nothing to mangle.
+⇒ MEASURE, do not assume by format. Applying the repair to clean text corrupts it. Two HTML
+exports and one JSON export have now all been clean, for two different reasons. Cheap probe:
+
+    non_latin = len(re.findall(SCRIPT_RANGE, text))
+    mojibake  = len(re.findall("[Â-Ã][-¿]", text))
+    # both near zero -> nothing to repair. mojibake high and non_latin zero -> repair applies.
+
+MEDIA: JSON + "Higher quality" DOES deliver it, and it is most of the archive.
+1,011 media files totalling 383 MB of a 474 MB archive. That is the opposite of the same
+platform's HTML exports, which shipped exactly ONE media file each (the profile photo) in a
+~1 MB tree. ⇒ If media matters, the format and quality settings are the whole difference, and the
+archive size on the panel tells you before you download whether media is in it. An archive
+advertised as "less than 1 MB" contains no media no matter what was requested.
+
+THREAD JSON SHAPE, and the one field that is not what you expect:
+    <container>/<handle>_<threadid>/message_1.json
+    { "participants":[{"name":...}], "title":..., "messages":[
+        {"sender_name":..., "timestamp_ms":..., "content":...,
+         "photos":[], "videos":[], "audio_files":[], "files":[], "share":{}, "sticker":{}} ] }
+⚠ The directory name is `<handle>_<threadid>` and is NOT a stable identity: a group thread's
+handle segment is a slugged title, and a thread can outlive the display name it was filed under.
+Resolve people by `participants[].name`, and expect a deactivated account to appear as a generic
+placeholder name with its real identity surviving only in the message text.
+⚠ `message_1.json` implies siblings. Glob `message_*.json` per thread directory and concatenate,
+or you silently read only the newest slice of a long conversation.
