@@ -63,6 +63,56 @@ gate exists to prevent. The tool is currently arguing against its own purpose.
 mid-URL, or exempt a `/home/` that is preceded by a scheme+host. Then fix the `guihost` leak, which is
 a one-word edit nobody has made because it is item five of five.
 
+## ⛔⛔ `ctl input` CANNOT DELIVER NAMED KEYS OR PUNCTUATION, AND THE FAILURE IS SILENT
+
+**Status:** OPEN. Measured 2026-08-13 driving a vendor exam console's calculator.
+
+```
+ctl input page_id=$P events='[{"type":"key","key":"+"}]'
+  → {"dispatched":2,"ok":true,"resolved":[]}      and NOTHING ARRIVES AT THE PAGE
+```
+
+**Measured, not inferred.** With a document-level capture-phase `keydown` recorder installed, nine
+keys were sent — `+ * / % _ Enter Backspace 7 x`. **Only `7` and `x` were ever received.** The other
+seven were dropped, each reporting `dispatched:2` and `ok:true`. **Alphanumerics work; everything
+else vanishes.**
+
+⚠ **The second failure mode contradicts the first.** Adding a `code` field turns the silent drop
+into a 400:
+
+```
+events='[{"type":"key","key":"Enter","code":"Enter"}]'
+  → {"error":"unknown key name \"Enter\"","ok":false}   HTTP 400
+```
+
+⛔ **And `Enter` is the example the verb's own error message recommends.** Send a malformed key
+event and it answers *a key event needs a key name, e.g. "Enter"*. Supply exactly that and it
+answers *unknown key name "Enter"*. **The verb documents an input it rejects.**
+
+⇒ **Why this is a verb change and not a docs note.** It fails in the direction that manufactures
+**false negatives**. The reporter was verifying a keyboard map it had just shipped — 23 bindings
+from a vendor key table — and the first driven battery returned an unchanging display on every row,
+which reads exactly like *the feature does not work*. It was one report away from filing a
+regression against correct code. ⭐ **What separated instrument from defect was a control with
+nothing to do with keys:** mouse-clicking the calculator's `7` button updated the display, proving
+the render path live, so the fault had to be in key DELIVERY.
+
+**The ask:**
+1. **Accept the standard `KeyboardEvent.key` vocabulary** — `Enter`, `Backspace`, `Escape`, `Tab`,
+   arrows, and printable punctuation (`+ - * / % _ . =`). CDP takes `windowsVirtualKeyCode`/`text`/
+   `code`; the mapping is mechanical and belongs **in the verb, not in every caller**.
+2. ⛔ **Never report `dispatched:N, ok:true` for an event that was not delivered.** An unresolvable
+   key is a 400 — the same answer the `code` path already gives. **The two paths disagreeing is the
+   actual bug, and the silent one is the dangerous one**, because `dispatched:2` is indistinguishable
+   from success and a caller then measures a null and believes it.
+3. Reconcile the error text with what is accepted, or stop naming `Enter` in it.
+
+**Falsifier:** install a capture-phase `keydown` recorder, send one printable punctuation key and one
+alphanumeric in the same batch, and compare what the recorder saw against what the reply claimed.
+
+⚖ Nothing is blocked on it — the undeliverable keys were verified by synthetic dispatch instead and
+labelled synthetic in the record — but any row driving a keyboard hits this.
+
 ## ⚠ `ctl input`'s `nth` INDEXES THE HITTABLE POOL, NOT DOM ORDER — and nothing says so
 
 **Status:** OPEN. Measured 2026-08-11 driving a React dialog.
