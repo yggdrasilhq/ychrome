@@ -522,3 +522,100 @@ writes their second language in Latin transliteration). That cause was even part
 is what made the wrong answer survive. It was caught only because an unrelated extraction step
 counted emoji before and after a repair it applied defensively, and the two numbers disagreed.
 ⇒ When you conclude "the data is clean", assert it against a control you know is dirty first.
+
+## meta-export-pipeline-end-to-end · WORKS
+task: run a Meta DYI export as one pipeline: request, detect readiness, download, verify the span, repair, extract
+model: claude-opus-5
+date: 2026-08-14
+tags: dyi, export, pipeline, mail, timezone, verification, archive
+
+THE SPINE, six stages. Five of them already have a slug of their own on this domain and are not
+repeated here. This entry exists because running them as ONE SEQUENCE surfaces three facts that no
+single-stage slug can see: how readiness is actually detected, why a complete archive can read as
+truncated, and what "verified" has to mean before an archive is trusted.
+
+    1 REQUEST            -> slug `accounts-centre-export-dyi`
+    2 SUBMIT + RE-AUTH   -> slug `export-submit-reauth-and-status`
+    3 DETECT READINESS   -> GAP, filled below
+    4 DOWNLOAD           -> slug `dyi-download-the-archive`
+    5 VERIFY THE SPAN    -> GAP, filled below
+    6 REPAIR + EXTRACT   -> slug `export-encoding-detector-was-wrong`, then parse
+
+⛔ ONE PROFILE PER EXPORT. The Accounts Centre covers several profiles behind one login, but a
+request is per profile. Two profiles means two requests, two build waits and two expiry clocks that
+do NOT fall on the same day.
+
+## STAGE 3, detecting readiness, and the two traps in it
+
+The platform sends a notification when an archive finishes building. Match on the SUBJECT, which is
+stable, rather than the sender, which is a per-platform security address that varies:
+
+    "... information download is ready"        -> built, downloadable
+    "... download request is in progress"      -> accepted, still building
+
+⛔ **THE IN-PROGRESS NOTICE AND THE READY NOTICE CAN LAND IN DIFFERENT MAILBOXES.** Measured across
+three requests on one account: the in-progress notice for the newest request arrived at the address
+the account currently uses, while the ready notices for two older requests had gone to the address
+the account used at the time. An account whose registered email has ever changed will scatter its
+export notifications across every address it has held.
+⇒ Search the whole MAIL STORE for the subject, never one mailbox, and never assume the account's
+current address is where an older notice went. A per-mailbox search returns a confident nothing.
+
+⛔⛔ **AND DO NOT GATE THE DOWNLOAD ON THE MAIL ARRIVING.** On one run the ready notice was not in
+the store at all, while the panel was showing that archive with a live Download control and an
+expiry date. The mail is a convenience signal; **the panel is the authority on whether an archive
+exists.** An agent that polls the mailbox and reports "not ready yet" can be standing in front of a
+finished archive burning its expiry clock.
+
+⇒ So the cheap order is: read the panel first, and use mail only to answer "has anything finished
+since I last looked" without driving a browser.
+
+## STAGE 5, verify the SPAN, not just the file
+
+The three zip assertions in `dyi-download-the-archive` (byte count against content-length, a
+readable central directory, the `PK\x03\x04` magic) prove **the file arrived intact**. They prove
+nothing about **what is inside it**, and the two failures look identical from the outside: a
+complete archive and an archive missing its most recent day both unzip perfectly.
+
+⛔⛔ **READ SPANS IN THE ACCOUNT'S OWN LOCAL TIME, NOT IN THE HOST'S UTC.** Message timestamps in a
+JSON export are epoch milliseconds. Rendering them as UTC on a host whose correspondence was
+authored at a positive offset moves every boundary message BACKWARDS, so the final day of the
+archive vanishes from the computed span and the export reads as truncated by a day. Nothing is
+missing; the clock is wrong. This costs a re-request if believed.
+
+    # wrong: silently reports the export ending a day early
+    datetime.utcfromtimestamp(ms / 1000)
+    # right: render in the zone the messages were written in
+    datetime.fromtimestamp(ms / 1000, ZoneInfo("<the account's zone>"))
+
+**Verify against ground truth you already hold.** Pick one thread whose first and last message you
+know from an artefact made independently of this export: a screenshot taken before the request, or
+an older archive of the same account. Assert both endpoints and the message count. A span check
+against the archive's own contents is circular and will agree with any archive.
+
+⭐ **AND PROVE THE CHECK CAN FAIL BEFORE TRUSTING IT WHEN IT PASSES.** Run the same assertion against
+a deliberately wrong span and confirm it reports a mismatch. A verifier that cannot express a
+failure returns a clean answer that means nothing. This is the same law that caught a mojibake
+detector on this domain returning a confident zero because its pattern only matched two-byte
+sequences while the corpus was three and four byte; see `export-encoding-detector-was-wrong`.
+
+## STAGE 6 and the coverage trap that outranks all of it
+
+⚠ **THE INBOX IS NOT THE CORPUS.** On one archive the inbox directory held 58% of threads and the
+rest sat under a separate archived-threads directory. A sweep that walks only the inbox returns a
+confident partial answer, and a thread that was archived years ago reads as never having existed.
+Enumerate every thread directory the export ships before concluding anything is absent.
+
+## The expiry is a convenience deadline, not a data deadline
+
+The panel gives each archive a short expiry and the clock is real, but what expires is **the built
+file, not the data behind it**. A fresh export can be requested at any time and the account keeps
+serving its own content in the meantime. So an archive lost to its expiry costs a few days of
+waiting.
+⇒ Never take an irreversible step against this clock: rotating a live credential, cancelling
+another archive, or clicking anything next to a Cancel control to collect a file that can simply be
+requested again.
+⚠ `Download` and `Cancel` sit SIDE BY SIDE on each row and Cancel destroys the archive. To leave a
+half-driven dialog, re-navigate to the panel URL. Never reach for a nearby control to dismiss
+something, and re-read the panel afterwards to confirm the row is still listed, which is the only
+proof nothing was cancelled.

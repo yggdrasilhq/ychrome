@@ -136,3 +136,110 @@ codes is still the authoritative account record. Report the drift against the FI
 destroys the archive. To leave a refused or half-driven dialog, re-`goto` the panel URL. Never
 reach for a nearby control to dismiss something. Re-read the panel afterwards and confirm the
 archive is still listed, which is the only proof nothing was cancelled.
+
+## identify-the-account-before-spending-a-credential · WORKS
+task: get past the Instagram download re-auth, and establish which account you are on before guessing a password
+model: claude-opus-5
+date: 2026-08-14
+tags: dyi, download, reauth, credential, identity, totp, archive
+
+Collecting an Instagram archive after the request has already been made. The request side is in
+`export-via-accounts-centre`; the session and two-factor side is in
+`dyi-download-needs-instagram-side-session`. This entry is about the LAST gate, and about the move
+that should be made BEFORE touching it.
+
+## The asymmetry, stated plainly because it is not guessable
+
+Both archives are listed on the same Accounts Centre panel, in the same shape, with the same
+controls. They do not behave the same way at the last click:
+
+| | Facebook-side archive | Instagram-side archive |
+|---|---|---|
+| download from the Facebook-side panel | works | **refused**, "Switch to Instagram to continue" |
+| download from the Instagram-side panel | n/a | reaches the file dialog |
+| password re-auth at the final Download | **none** | **always** |
+
+⇒ An agent that has just downloaded the Facebook archive with no credential prompt will assume the
+Instagram one behaves the same way. It does not. Budget a credential for it, and read the next
+section before spending one.
+
+## ⭐ LOOK AT THE RE-AUTH BEFORE YOU TYPE INTO IT. The read costs nothing.
+
+The overlay reads *"Please re-enter your password"* and, measured, contains exactly:
+
+    one input[type=password]      (no name, no placeholder, no aria-label)
+    a Continue button
+    a "Forgot password?" link
+
+**and nothing else.** In particular there is **no send-a-code-to-email alternative**, which is the
+route that solves most re-auth walls on other properties without any stored secret. Enumerate the
+overlay's inputs and links first:
+
+    document.querySelectorAll("input")     // types, names, labels
+    document.querySelectorAll("a")         // is there a code route at all
+
+That one read decides whether a credential is required or merely offered, and it spends nothing. An
+agent that types first learns the same thing at the cost of an attempt it cannot get back.
+
+⛔ **STOP AT TWO FAILED ATTEMPTS.** A security checkpoint on a two-factor protected account costs
+the archive outright and is not recoverable inside the expiry window. Two is the budget.
+
+## ⭐⭐ THE MOVE THAT MAKES THE STOP RULE AFFORDABLE: date the account before guessing
+
+When a stored password is refused, the reflex conclusion is "the entry is stale, try the next one".
+That conclusion is usually **untested**, and on a host where several entries exist for the same
+domain it invites exactly the brute-force the stop rule forbids.
+
+**There is a rung-1 answer.** If any archive of this account already exists on disk, it carries its
+own identity papers and they settle the question for free:
+
+    personal_information/personal_information/personal_information.html
+        -> current handle, registered email, date of birth, private flag
+    personal_information/personal_information/profile_changes.html
+        -> every handle and email change, with dates
+    security_and_login_information/login_and_profile_creation/signup_details.html
+        -> WHEN THE PROFILE WAS CREATED
+
+`signup_details.html` is the decisive file. It is **absent from older exports**, and that absence is
+itself evidence that the account predates the format.
+
+**The inference that saved an attempt:** if the account was **created after** the credential record
+was written, then the password for it was **never stored**, rather than stored and later rotated.
+Those are different facts with different fixes, and only one of them is repaired by trying another
+entry. Cross-check the handle: if no entry on the host names the account's handle, and the account
+has never been renamed (read `profile_changes.html` to confirm), then no entry holds its password
+and every further attempt is a guess.
+
+⚠ Do not read a handle as an account identity on its own. `profile_changes.html` can show a handle
+set LATER than the earliest message in the same archive, which means the account predates its own
+current name.
+
+## ⭐ A credential record binds to an account by its TOTP SEED, not by its username field
+
+This is the reason a refused password must not be read as "wrong record". Seeds do not rotate when
+passwords do. An entry whose stored TOTP clears a **live** two-factor challenge on the account is
+that account's record, even when:
+
+- its username field names something the account no longer uses, and
+- its password is refused at the same session, minutes apart.
+
+⇒ Report the drift against the **field**, not the item. Saying "this entry is wrong" sends the next
+session hunting for a better entry that does not exist; saying "this entry's password field is
+empty of anything current, its seed is correct" tells them exactly what to fix.
+
+## The profile chooser lists more accounts than the two you came for
+
+The Accounts Centre change-password chooser enumerates every profile the login administers, and on
+a linked pair that is **three** rows, not two: the per-app profile for each property, plus a
+**platform-level account** that owns them both. That third account is easy to miss because no
+per-app surface ever mentions it, and it may have no credential record anywhere.
+⭐ This chooser is also the cheapest authoritative answer to "which profiles does this login
+actually own today", which beats inferring it from archives on disk.
+
+## What is NOT lost when this gate holds
+
+The archive expiry kills the built file, not the data. With the session established, the account's
+own message list is readable directly, and a fresh export can be requested at any time.
+⇒ **Do not reset a live credential to beat the clock.** "Forgot password?" is sitting right there in
+the overlay and it is the wrong door: it changes a working credential, may sign the owner's other
+devices out, and buys a file that could have been re-requested for free.
