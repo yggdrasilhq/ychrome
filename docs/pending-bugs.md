@@ -262,6 +262,44 @@ call, because each round-trip happens to cross several frames.
 **Falsifier:** a drag driven in one call across an rAF-batched canvas produces a
 shape whose end coordinates differ from its start.
 
+## ⛔ A BATCHED `ctl input` LOSES AND REORDERS EVENTS, AND REPORTS SUCCESS
+
+**Reported by the `practice` campaign row 2026-08-13**, driving a vendor exam
+console's on-screen calculator. **Same family as the rAF drag entry above, but a
+different verb and a different surface** — this one needs no canvas and no
+drawing library.
+
+**What happens.** Thirteen key-clicks dispatched in ONE `ctl input` batch **lost
+three and reordered the rest**. The call reports success. Paced one per call at
+roughly 350 ms, the identical sequence is exact.
+
+⭐ **Why it outranks a throughput complaint: the output is plausible.** A
+calculator fed a mangled key sequence returns *a number* — not an error, not a
+blank, a wrong answer that looks like a right one. Anything reading that result
+downstream inherits a fabricated measurement with nothing marking it.
+
+**Falsifier:** dispatch a known key sequence in one batch and read the field back
+character by character; a batch that is correct at n=13 has not been tested, so
+increase the count until it diverges.
+
+**Workaround, and it is expensive:** one event per call, ~350 ms apart — 13
+round-trips instead of 1.
+
+## ⭐ `ctl console` IS THE CAUSE-NAMING VERB AND IT READS LIKE A CAPTURE UTILITY
+
+**Reported 2026-08-13 by a row that wrote three wrong causal stories with this
+command one call away, across a long session of diagnosing broken pages, and
+never reached for it once.** ⛔ Filed as a **discoverability** defect, not a
+documentation nicety: every other `ctl` verb answers *what is the state*;
+`console` is the only one that answers *what went wrong*. Sitting in a verb list
+that reads as capture/inspection, it is passed over exactly when it is most
+needed — while an agent is forming a causal story from indirect evidence.
+
+⇒ **Fix: name it as the diagnostic entry point in `ctl` help and in the agent
+docs** — "start here when a page misbehaves" — rather than listing it beside the
+capture verbs. **Falsifier:** ask an agent unfamiliar with `ctl` how it would
+find out why a page is failing, and see whether it names `console` unprompted.
+
 ## ⭐ THE `ctl` SURFACE MAKES AGENTS HAND-ASSEMBLE CHORES FROM PRIMITIVES — seven deficiencies, measured while driving live exam consoles
 
 **Status:** OPEN
@@ -281,7 +319,7 @@ not.** ⛔ So the fix for the starred items is NOT better documentation.
 | 1 ⭐⭐ | **`ctl input` has no `mousedown`/`mouseup`, so EVERY drag is hand-assembled.** Types are `click\|move\|scroll\|type\|key`. A jQuery-UI drag needs `mousedown` on the handle, then `mousemove`/`mouseup` **dispatched on `document`** (not the handle), `buttons:1` on all but the mouseup. Any one detail wrong ⇒ the drag silently does nothing. | `ctl input --type drag --from X,Y --to X,Y`, plus a `--selector` form. **Highest value item here.** |
 | 2 ⚠ | ⛔ **RETRACTED AS WRITTEN — `dispatched: 3` IS ONE LOGICAL CLICK** (`mousedown` / `mouseup` / `click`), not three clicks, and the old wording invited the wrong diagnosis in at least two sessions. **Disproof, driven repeatedly on a real keypad: a click on a calculator's `7` reads `7.`; three clicks would read `777.`** The real defect this row was born from is recorded in `src/engine/hit.rs`'s own header — a selector resolving to a **hidden duplicate** answered `{"dispatched":3,"ok":true}` while the true control's handler never fired, which cost a reporting agent three wrong conclusions in one session. **The count was never the fault; a dispatch onto the wrong element reporting success was.** | nothing to coalesce. **Say `press/release/click` in the field, or drop the number** — a bare `3` reads as a multiplicity hazard and sends the caller after a confound that does not exist |
 | 2b ⭐ | **BATCHED `ctl input` EVENTS ARE DROPPED AND REORDERED, AND THE RESULT IS A BELIEVABLE NUMBER.** 13 key-clicks in one batch lost three and reordered the rest; **paced one-per-call (~350 ms) the identical sequence is exact.** ⇒ For any target that consumes input on a timer, a batch is **not** equivalent to the same events paced. ⛔ The failure surfaces as plausible wrong data rather than an error, so a caller has no reason to suspect it. | pace internally, or refuse a batch above N; **at minimum document it** — this one is worth a line even if no code changes |
-| 2c ⛔⛔ | **`window.open` IS DECLINED SILENTLY, AND IT COSTS A WHOLE DRIVEN SURFACE.** A commercial exam-delivery client launches itself with `testWindow = window.open(…)` and branches on `if (testWindow === null)`. In the headless view the call yields **no page, no error, and nothing that trips that branch** — so from inside the page the launch looks successful and from outside the click looks missed. ⚠ A probe reading `typeof testWindow === "object"` cannot tell the states apart, because that is also what `null` answers. Opening the launch URL in a plain tab instead put the client into a **restart loop — six launch tokens in 37 s** — because it checks for the window it believes it opened (`window.opener`, `window.name`). | make `window.open` produce a real page with the opener relationship and `window.name` intact — **or, at minimum, return `null`** so the site's own popup-blocker branch fires. ⭐ **A silent decline costs the caller a wrong diagnosis; a loud one costs them a retry** |
+| 2c ⛔⛔ | **`window.open` IS DECLINED SILENTLY, AND IT COSTS A WHOLE DRIVEN SURFACE.** A commercial exam-delivery client launches itself with `testWindow = window.open(…)` and branches on `if (testWindow === null)`. In the headless view the call yields **no page, no error, and nothing that trips that branch** — so from inside the page the launch looks successful and from outside the click looks missed. ⚠ A probe reading `typeof testWindow === "object"` cannot tell the states apart, because that is also what `null` answers. ⛔⛔ **THE RESTART-LOOP EVIDENCE IS WITHDRAWN BY ITS OWN REPORTER (2026-08-13).** This entry previously read that opening the launch URL in a plain tab put the client into a *restart loop — six launch tokens in 37 s* — *because* it checks for the window it believes it opened. **That causal link was never tested**: the reporter read the launcher's source, saw the popup checks, observed a loop, and joined the two. The console shows a different error repeating every cycle (`TypeError: vFrame.$ is not a function`), **and that is not offered as the cause either** — the experiment that would establish it never ran, because the client re-navigates the top window and wipes the instrumentation. ⇒ **The loop's cause is openly unestablished, and this entry must not be sized on it.** ⭐ **What survives is the whole of the defect and it needs no loop:** a call that yields no page, no error, and nothing that trips the site's own `=== null` branch. | make `window.open` produce a real page with the opener relationship and `window.name` intact — **or, at minimum, return `null`** so the site's own popup-blocker branch fires. ⭐ **A silent decline costs the caller a wrong diagnosis; a loud one costs them a retry** |
 | 3 ⛔ | **`ctl eval` shares ONE global scope across calls.** A second call declaring `const h` dies with a duplicate-variable `SyntaxError` **that reads like a page defect** — so the agent starts debugging the wrong system. | auto-wrap each eval body in an IIFE, or run it in a fresh realm |
 | 4 | **`ctl eval` takes `page_id=` while sibling verbs take `page=`.** | accept both, or normalise |
 | 5 ⚠ | **`ctl wait`'s error names a shape that does not work, which costs MORE rounds than naming nothing.** The true form is `until='{"load":"finished"}'` — `until` takes an OBJECT (verified live 2026-08-09: `met:true, elapsed_ms:0`). The engine's error prints ``wait needs an `until`: {load}, {idle_ms}, {selector,state} or {js}``, whose `{load}` is JSON-shape notation and reads as the literal token `load`; `until=load` then 400s. This row's own earlier text (`load=finished`) was a third abbreviation of the same JSON. **Three sources disagreed because two were abbreviating a JSON shape in prose.** | print a form that can be pasted: ``until='{"load":"finished"}'`` |
