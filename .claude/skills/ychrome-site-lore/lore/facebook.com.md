@@ -468,3 +468,57 @@ Resolve people by `participants[].name`, and expect a deactivated account to app
 placeholder name with its real identity surviving only in the message text.
 ⚠ `message_1.json` implies siblings. Glob `message_*.json` per thread directory and concatenate,
 or you silently read only the newest slice of a long conversation.
+
+## export-encoding-detector-was-wrong · WORKS
+task: correction: the mojibake repair DOES apply to JSON archives, and why the earlier detector missed it
+model: claude-opus-5
+date: 2026-08-13
+tags: dyi, export, parsing, encoding, correction
+
+⛔⛔ A CORRECTION TO `export-archive-layout-and-parsing`, LOGGED THE SAME DAY BY ITS OWN AUTHOR.
+
+That entry states the mojibake repair did NOT apply to a JSON archive, on a measurement of
+"0 non-Latin codepoints and 1 mojibake pair". **That measurement was wrong and the conclusion
+built on it was wrong. The archive IS double-encoded and the repair IS required.**
+
+THE BUG WAS IN THE DETECTOR, NOT THE DATA. The probe it recommended,
+
+    mojibake = len(re.findall("[Â-Ã][-¿]", text))
+
+only matches mojibake produced from **two-byte** UTF-8, i.e. the Latin-1 supplement. Mis-decoded
+as latin1, a **three-byte** codepoint (most Indic and CJK scripts) leads with a byte in the
+`à`-`ï` range, and a **four-byte** one (all emoji) leads with `ð`. The pattern above can see
+neither. It is blind to precisely the two things anyone runs this check to find, and it returns a
+confident, clean-looking zero while it does it.
+
+Re-measured on the same archive, 1,028,180 characters of message text:
+
+    4-byte mojibake leads ("ð")        1,687
+    characters above U+2100, raw           0   <- what made it look clean
+    characters above U+2100, repaired  2,053   <- emoji, recovered
+    non-Latin script codepoints, raw       0
+    non-Latin script codepoints, repaired 443  <- recovered
+
+⇒ USE A DETECTOR THAT CAN SEE THE LEAD BYTES YOU CARE ABOUT:
+
+    raw.count("ð")                                # 4-byte lead: emoji
+    len(re.findall("[à-ã][-¿]{2}", raw))  # 3-byte lead: Indic/CJK
+    len(re.findall("[Â-Ã][-¿]", raw))      # 2-byte lead: accents
+
+⭐ THE SAFE FORM IS PER-STRING WITH A FALLBACK, and it needs no detector at all:
+
+    def fix(s):
+        try:    return s.encode("latin1").decode("utf8")
+        except (UnicodeEncodeError, UnicodeDecodeError): return s
+
+Identity on pure ASCII, correct on double-encoded text, and it leaves anything that does not
+round-trip alone. Applying this blindly is safer than deciding with a detector you have not
+tested against a 3-byte and a 4-byte sample.
+
+⚠ THE GENERAL LESSON, which is why this is a lore entry and not a silent edit: **a
+negative result from a pattern you did not test against a positive control is not evidence.**
+The earlier entry reported "clean" and reasoned a plausible cause for it (the account holder
+writes their second language in Latin transliteration). That cause was even partly true, which
+is what made the wrong answer survive. It was caught only because an unrelated extraction step
+counted emoji before and after a repair it applied defensively, and the two numbers disagreed.
+⇒ When you conclude "the data is clean", assert it against a control you know is dirty first.
