@@ -1021,3 +1021,69 @@ already has both: **`web read --frame <url-substring>` reaches INTO cross-origin
 not on the pathway** — wrong plane, wrong host, wrong verb — not that the pathway is broken.
 **Load the `data-fabric` skill before driving any co-browse surface; a "NO research" preamble does
 not forbid it.**
+
+## request-form-hidden-captcha-and-submit-field · WORKS
+task: Re-drive the RTI application legs; resolve MHA; find why a correct form is silently rejected
+model: claude-opus-5
+date: 2026-08-14
+tags: 
+
+Re-drove the application legs end to end on 2026-08-14 for a Ministry of Home Affairs RTI. The
+existing `submit-rti-request-curl-plus-browser-payment` entry is still correct and still the right
+recipe — **but its field map is missing two fields, and each one costs a silent rejection plus a
+burnt captcha.**
+
+## ⛔ Gap 1 — the email/mobile leg needs `Submit=Submit`
+
+`POST /request/request_email_check.php` with `Email`, `cell` and `6_letters_code` alone returns
+**HTTP 200 and re-renders the same form**. No error text, no validation message — it simply looks
+like the captcha was wrong. Adding the submit button's own field fixes it:
+
+    --data-urlencode 'Submit=Submit'
+
+⇒ then it answers **302** to `Request_Check_Otp.php?emailchk=…&&cellchk=…&&urletoken=…`.
+
+## ⛔ Gap 2 — THE REQUEST FORM HAS ITS OWN CAPTCHA
+
+The documented field map for `frmRequest` does not list one, so the first POST of a correctly
+filled form re-rendered with **every value retained** and no visible complaint. The form carries a
+`6_letters_code` field exactly like the email page:
+
+    -F '6_letters_code=<fresh read>'
+
+⚠ **And `hndSessionFromId` is regenerated on that re-render.** Re-read it from the page you are
+POSTing from — reusing the first one fails again and looks identical. With both fixed the form
+answers **302 → `payment.php?requestFromId=<64 hex>`**.
+
+## ⭐ The captcha reader that works, refined
+
+The band-split method in the earlier entry is right and stays. One addition: when a band boundary
+cuts a wide glyph (`W`, `M`) the split can read as two characters — a `W` showed as `V` + `WH`
+across bands 2 and 3. **When a band looks like two letters, re-render the WHOLE image at ~10x and
+read it as one strip**; that disambiguated it immediately. Keep both views.
+
+Six reads, six correct, using bands first and the whole strip only on doubt.
+
+## Ministry of Home Affairs, resolved
+
+| Public authority | MinistryId | DepartmentId |
+|---|---|---|
+| Ministry of Home Affairs | **53** | **53** |
+
+`getdepartment.php?ministryId=53&&type=ministry` returns 27 children (CBI 3565, Delhi Police 1079,
+NCRB 888, IB 325 …) **plus MHA itself at 53** — so a top-level ministry is its own department,
+matching the Posts 28/28 and DARPG 76/76 pattern. **There is no I4C entry**, which is why an RTI
+aimed at the cybercrime helpline should be addressed to MHA and left to s.6(3) transfer rather than
+hunting a CPIO that the portal does not model.
+
+⚠ `allpa.php` is a **table of `<tr data-level data-id data-parent>` rows, not `<option>`s** — an
+option-based parse of it silently returns zero rows and reads like an empty list.
+
+## Where this run stopped
+
+Application ACCEPTED and sitting at `payment.php` with a `requestFromId`; the Rs 10 is unpaid, so
+no registration number exists and no s.7(1) clock has started. The gateway hand-off form `frmSBI`
+(`encdata` + `merchant_code=RTI_GOI` → `merchant.sbi.bank.in/merchant/merchantprelogin.htm`) was
+extracted and rebuilt as a self-submitting local page, which is a clean way to carry the hand-off
+into a browser. Payment was deliberately NOT attempted: it needs a driver with `fill-card`, and
+starting a gateway leg without room to finish it risks a half-paid transaction.
