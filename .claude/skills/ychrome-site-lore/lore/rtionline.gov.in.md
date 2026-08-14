@@ -1274,3 +1274,71 @@ their state.
 `View Status OTP` naming the registration number; that message is the page-side effect.
 An early attempt here also returned 302 with an empty jar and **no OTP ever arrived** —
 so the redirect alone is not proof.
+
+## view-status-cookie-claim-RETRACTED · BROKEN
+task: 
+model: claude-opus-5
+date: 2026-08-14
+tags: 
+
+⛔⛔ **RETRACTION OF `view-status-curl-session-cookie`, BY ITS OWN AUTHOR, SAME DAY.**
+**The mechanism in that entry is FALSE. Do not act on it.** The half that is real is
+kept below, because it is genuinely useful and was separately measured.
+
+### What that entry claimed, and why it is wrong
+
+It said the portal's malformed second `Set-Cookie` (name literally `Path`) makes curl
+write an **empty jar**, so `PHPSESSID` never persists and every captcha POST answers
+`Security code does not match`. **That is not what happens.** Measured directly:
+
+```
+$ cat jar.txt
+#HttpOnly_rtionline.gov.in  FALSE  /request  TRUE  0  Path      /tmp/NGINX_cache
+#HttpOnly_rtionline.gov.in  FALSE  /         FALSE 0  PHPSESSID bsh9h1okppl7eo5pi40aikjkbf
+```
+
+**The jar is fine.** `PHPSESSID` is written on both HTTP/2 and `--http1.1`, and the
+malformed `Path` cookie is stored harmlessly beside it.
+
+⇒ **The "empty jar" was an artefact of my own diagnostic.** I inspected the jar with
+`grep -v '^#'`, and curl writes HttpOnly cookies with a **`#HttpOnly_` prefix** — so my
+filter stripped exactly the line I was looking for and printed nothing. I then read that
+blank output as "no session cookie" and built a mechanism on it.
+
+⇒ **The three rejected captchas were simply misread** (`WC3B4K`, `ND17Z5`, `39B1UY`).
+The fourth (`3MWCJF`) was read correctly and was accepted. Carrying `PHPSESSID` by hand
+"fixing" it was a coincidence of the same request also carrying a correct code.
+
+⚠ **The trap worth keeping from this is about the debugging, not the site:** a comment
+filter over a cookie jar hides HttpOnly cookies, which are the only ones that matter for
+a session. **Read a jar with `cat`, never with `grep -v '^#'`.** And a mechanism that
+explains your symptom is not thereby the cause — I had a plausible story, one confirming
+run, and no negative control.
+
+### ✅ WHAT IS STILL TRUE AND WAS MEASURED DIRECTLY — `status.php` is a clean captcha oracle
+
+This half stands. Both responses were observed several times:
+
+| outcome | signature |
+|---|---|
+| **wrong captcha** | **HTTP 200**, ~19.7 KB, body contains **`Security code does not match`** |
+| **accepted** | **HTTP 302**, that string absent |
+
+That is a real capability, because existing lore records that **`status_history.php`
+answers byte-identically** to a right and a wrong code, so it can tell you nothing.
+`status.php` can. It gives a captcha check that costs no filing.
+
+Form fields: `registration_no`, `Email`, `6_letters_code`, `Submit`. The page states the
+code is **case-insensitive**, so an `I`/`l`/`1` misread matters and case never does.
+
+⚠ **`status.php` needs a registration number you already hold** — useless for discovery,
+ideal for follow-up, and the only route to an s.6(3) `/R/T/` registration, which never
+generates a "filed successfully" mail.
+
+⚠ **Verify acceptance by the OTP mail, not by the 302.** The portal mails a
+`View Status OTP` naming the registration; that is the page-side effect. A 302 tells you
+the *code* was accepted and nothing about whether the rest of the flow proceeded.
+
+⭐ **And `scripts/rti_portal.py` was never affected by any of this** — it already imports
+both `Path` and `PHPSESSID`, and its `-b JAR -c JAR` is correct. Nothing in it needs
+changing on account of the retracted entry.
