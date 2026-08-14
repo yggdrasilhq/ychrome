@@ -63,6 +63,43 @@ gate exists to prevent. The tool is currently arguing against its own purpose.
 mid-URL, or exempt a `/home/` that is preceded by a scheme+host. Then fix the `guihost` leak, which is
 a one-word edit nobody has made because it is item five of five.
 
+## ⛔⛔ `ctl input` HAS NO `mousedown`/`mouseup`, SO A DRAG CANNOT USE TRUSTED INPUT AT ALL
+
+**Status:** OPEN. Reported 2026-08-14, after it had already caused a public retraction.
+
+`input` accepts `click | move | scroll | type | key`. **`click` is a full press-and-release**, so a
+button cannot be held across intervening moves. ⇒ **every drag has to be driven page-side** as
+`dispatchEvent(new MouseEvent(...))` — events the harness manufactures itself.
+
+### ⛔ WHY THAT IS A CORRECTNESS PROBLEM AND NOT A MISSING CONVENIENCE
+
+With page-side dispatch **the author chooses the target element**, so if the author's model of the
+stacking is wrong the probe silently measures a path no real pointer could walk.
+
+⇒ **That is exactly what happened.** Two independent rows each "proved" a window drag worked, at
+two different viewports, and **their results agreed exactly**. Both were dispatching at an overlay
+that sat *below* the window, where no pointer could ever have reached. **The feature had never
+worked at all.** The same class was then found on a second console the following day.
+
+⭐⭐ **THE LAW THIS PRODUCED, and it generalises far past this verb: AGREEMENT BETWEEN TWO
+INSTRUMENTS THAT SHARE A FLAW IS NOT INDEPENDENCE.** Two probes built on the same wrong assumption
+will corroborate each other perfectly, and their agreement reads as confirmation. Independence is a
+property of the *method*, not of the number of people who ran it.
+
+⚖ **The positive half, worth stating because it names the remedy:** the *existing* trusted
+`click`/`move` is what corrected the record — with those, the browser both routes and generates the
+event, which is strictly stronger than `elementFromPoint` + `dispatchEvent`. The gap is only that
+drags cannot use them.
+
+**The ask:** either raw `mousePressed` / `mouseReleased` event types with a `button`, or a composite
+`drag` (from `x,y` → to `x,y`, with intermediate steps). **CDP's `Input.dispatchMouseEvent` already
+supports both** — this is surfacing what is underneath, not new machinery. With it a drag becomes
+browser-routed end to end and the whole class of error above becomes unreachable.
+
+**Falsifier:** drive a drag through the new verb against a target deliberately covered by a
+transparent overlay. Trusted input must hit the overlay; a page-side dispatch aimed under it must
+not be able to reproduce the "success" it currently reports.
+
 ## ⛔⛔ `ctl input` CANNOT DELIVER NAMED KEYS OR PUNCTUATION, AND THE FAILURE IS SILENT
 
 **Status:** OPEN. Measured 2026-08-13 driving a vendor exam console's calculator.
@@ -112,6 +149,33 @@ alphanumeric in the same batch, and compare what the recorder saw against what t
 
 ⚖ Nothing is blocked on it — the undeliverable keys were verified by synthetic dispatch instead and
 labelled synthetic in the record — but any row driving a keyboard hits this.
+
+### ⚠ THE SAME SILENT DROP, ONE FIELD OVER: MODIFIERS (reported 2026-08-14)
+
+```
+events='[{"type":"key","key":"n","alt":true}]'
+  → {"dispatched":2,"ok":true}      and the page's Alt handler never fires
+```
+
+**The application side is not at fault** — the same shortcut works when driven by a page-side
+`KeyboardEvent` with `altKey: true`, which opens the expected dialog. So the modifier is being lost
+between the verb and the page.
+
+⚠ **Filed as "spelling unknown", not "modifiers broken"**, on the reporter's own insistence: it is
+not established whether `alt` is the wrong field name, whether modifiers need CDP's numeric
+`modifiers` bitmask, or whether they are unsupported entirely. **That distinction is the fix, so it
+should be settled before anything is changed.**
+
+⇒ **But the reporting behaviour is a defect either way, and it is the same one as above.** An
+unrecognised *event type* gives a genuinely good error (`unknown input event type "bogus"
+(click|move|scroll|type|key)`); an unrecognised *field* appears to be dropped in silence while the
+reply still says `dispatched:2, ok:true`. **A silently-ignored modifier produces a plain keypress,
+which is indistinguishable from the application ignoring the shortcut** — so the caller measures a
+null and blames the app.
+
+⭐ **Ask 2 above already covers it once generalised:** an event carrying a field the verb does not
+understand should 400, exactly as an unknown type does. Rejecting an unknown *type* while ignoring
+an unknown *field* is the same disagreement between two paths that this entry is already about.
 
 ## ⚠ `ctl input`'s `nth` INDEXES THE HITTABLE POOL, NOT DOM ORDER — and nothing says so
 
