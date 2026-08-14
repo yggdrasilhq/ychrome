@@ -7,6 +7,46 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ⛔ A THIRD-PARTY FORM CAN RESHAPE A VALUE UNTIL EVERY LITERAL IN A SCANNER'S TERM LIST BREAKS
+
+**Status:** OPEN on the host side only. Detected, purged and requested 2026-08-14; the
+local half is finished and the remaining wait is on the hosting provider.
+
+A value typed into a third-party signup form was **reformatted by that form into another
+country's convention** before it was ever read back: the digits were regrouped, punctuation
+was inserted, and **the tail was truncated**. What got written down afterwards was that
+reformatted string, in good faith, as an illustrative example.
+
+⇒ **Every literal in the pre-push scanner's term list therefore failed to match**, and the
+scan reported no private data found. A sanitisation pass by eye missed it for the same
+reason: the string no longer looks like the thing it came from.
+
+**Two properties made it survive, and only the second is obvious.**
+
+1. Punctuation and grouping differ ⇒ a literal comparison cannot fire.
+2. ⛔ **The tail was truncated.** So the natural fix — normalise both sides to digits and
+   compare the *end* of the value — **still does not match**, and it fails in the reassuring
+   direction: it looks like a stronger check while being blind to exactly this case. The
+   scanner has to normalise and then search **any interior window**, which is what it now
+   does. Verified against number-dense real content with no false positives.
+
+⚠ **The transferable half is not about phone numbers.** Any value a remote form is free to
+re-render — an address, a date, an account identifier, a name with diacritics — arrives back
+in a shape the term list never described. **A scanner built on literals is only as good as
+the assumption that nobody reformatted the value in between**, and a form is entitled to.
+
+⇒ **The standing rule stands and is the cheaper defence: invent every example.** The slip
+here was not a rule that was unknown, it was a value that no longer *looked* real, so the
+rule did not feel like it applied. ⭐ **A reformatted secret reads as an invented one** —
+that resemblance is the whole trap, and it is why the guard and not the author has to be the
+thing that catches it.
+
+**Decision, already taken:** the history was rewritten and force-pushed, and a removal
+request was raised with the hosting provider, because **a force-push reduces discoverability
+and revokes nothing** — unreferenced objects stay retrievable by identifier until the host
+collects them. ⛔ **Every identifier for this incident is deliberately kept out of this
+repository**, since naming them here would be a finding aid for the objects being removed.
+
 ## ⛔⛔ `ychrome-vault match <host>` RESOLVES TO AN ITEM WHOSE USERNAME IS CORRUPTED BINARY
 
 **Status:** OPEN. Measured 2026-08-11 while driving a Meta login.
