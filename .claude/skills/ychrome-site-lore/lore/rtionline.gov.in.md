@@ -1202,3 +1202,75 @@ the value out of `search`'s newest-first snippet. **Then cross-check an identifi
 captured independently** — here the gateway reference number seen on-screen appeared in
 the mail body, which is what proved the mail was this filing and not the old one. A
 registration number with no second witness is not confirmed.
+
+## view-status-curl-session-cookie · WORKS
+task: 
+model: claude-opus-5
+date: 2026-08-14
+tags: 
+
+**`/request/status.php` works from plain curl — and the reason three correct captcha
+readings in a row get rejected is NOT the captcha.**
+
+### ⛔ THE TRAP: the malformed `Path` pseudo-cookie silently EMPTIES curl's cookie jar
+
+The server answers every page with two `Set-Cookie` headers:
+
+```
+set-cookie: PHPSESSID=di7mbel5k5q3thle0f4734rvnt; path=/; HttpOnly
+set-cookie: Path=/tmp/NGINX_cache; HttpOnly; Secure
+```
+
+The second is malformed — it is a cookie whose NAME is literally `Path`. With
+`-c <jar>`, curl writes **an empty jar**: no `PHPSESSID` is persisted at all. So
+every subsequent request is a NEW session, the captcha the server issued belongs to
+a session you are no longer in, and the POST comes back
+**`Security code does not match`** — no matter how correctly you read the image.
+
+⇒ **This is a session bug wearing a captcha bug's clothes**, and it is expensive
+because the visible error names the one thing that is not wrong. It cost three
+re-reads and two regenerated captchas before the jar was inspected and found empty.
+
+⭐ Existing lore mentioned this pseudo-cookie only under *payment session hand-off*
+("strip the malformed `Path` pseudo-cookie first" when transplanting into a browser).
+It is not a payment-only quirk — **it breaks the cookie jar on every page of this
+site**, so it belongs on any curl flow here.
+
+### The fix: carry the session by hand, never via `-c/-b <jar>`
+
+```bash
+SID=$(curl -sS -D - -o form.html "${CHROME_HEADERS[@]}" \
+        'https://rtionline.gov.in/request/status.php' \
+      | grep -oiE 'PHPSESSID=[a-z0-9]+' | head -1 | cut -d= -f2)
+R=$(grep -oiE 'captcha_code_file\.php\?rand=[0-9]+' form.html | head -1)
+curl -sS -b "PHPSESSID=$SID" -o c.png "${CHROME_HEADERS[@]}" \
+     -H 'Referer: https://rtionline.gov.in/request/status.php' "https://rtionline.gov.in/$R"
+# read c.png, then POST with the SAME -b "PHPSESSID=$SID"
+```
+
+Fields: `registration_no`, `Email`, `6_letters_code`, `Submit`. The security code is
+**case-insensitive** (the page says so) — so an I/l/1 misread matters, but case never does.
+
+### ⭐ `status.php` DOES distinguish a wrong captcha — unlike `status_history.php`
+
+Existing lore records that `status_history.php` answers **byte-identically** to a right
+and a wrong captcha, so nothing can be concluded from it. **`status.php` is different
+and is therefore the usable probe:**
+
+| outcome | signature |
+|---|---|
+| wrong captcha | **HTTP 200**, ~19.7 KB, page text contains **`Security code does not match`** |
+| accepted | **HTTP 302**, and the mismatch string is absent |
+
+That gives a clean, cheap oracle — which is what lets you tell a misread image from a
+broken session in one request instead of guessing.
+
+⚠ **`status.php` needs a registration number you already hold**, so it is useless for
+discovery and ideal for follow-up. The `/R/T/` transfer registrations issued under
+s.6(3) never generate a "filed successfully" mail, so this page is the only route to
+their state.
+
+⚠ **Verify acceptance by the OTP that arrives, not by the 302.** The portal mails a
+`View Status OTP` naming the registration number; that message is the page-side effect.
+An early attempt here also returned 302 with an empty jar and **no OTP ever arrived** —
+so the redirect alone is not proof.
