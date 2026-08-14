@@ -42,7 +42,8 @@ subdomain -> a marketing survey (has a Skip) -> a plan wall.
 
 4. **The phone field is `react-international-phone` and it FIGHTS a typed country code.** It is
    seeded with `+1 `, Ctrl+A does not clear it, and typing `+<cc><national-number>` is reformatted into
-   `+1 (912) 345-6789` — a plausible-looking wrong number. ⇒ Click the flag button (the only
+   `+1 (912) 345-6789` — the country code is swallowed into the US area code and you are left with a
+   plausible-looking wrong number (example digits invented). ⇒ Click the flag button (the only
    non-submit `<button>`), `scrollIntoView` the `li[data-country="<iso2>"]` in the 218-row list, click
    it, THEN type the national digits. Verify the field reads `+<cc> <formatted national number>` before submitting.
 
@@ -127,3 +128,56 @@ The first written procedure said "Posts → Start writing", because the author h
 editor via the direct URL and then narrated the visible button without following it. ⇒ **If an
 instruction will be executed by a human, walk the path you are about to write, in the order you
 are about to write it.**
+
+## load-an-article-into-the-post-editor · WORKS
+task: Load a finished article into the beehiiv post editor with its quotes and code blocks intact
+model: claude-opus-5
+date: 2026-08-14
+tags: 
+
+Loading a finished article into the post editor. The route works, but pasting HTML LOSES
+STRUCTURE SILENTLY, and the loss is invisible to every obvious check.
+
+## ⛔ The editor's schema has no `blockquote`
+
+Pasting `<blockquote><p>…</p></blockquote>` into the TipTap surface keeps the words and throws
+away the quote. No error, no warning. The schema (read live off the editor instance) has no
+`blockquote` node at all — it carries a custom trio instead:
+
+    blockquoteFigure   content = "quote quoteCaption"     (BOTH required, in that order)
+    quote              content = "(paragraph|bulletList|orderedList)+"
+    quoteCaption       content = "text*"                  (may be empty)
+
+`<hr>` is dropped the same way; the node exists but is called `horizontalRule`.
+Code blocks, headings and inline `code`/bold/italic DO survive an HTML paste.
+
+⚠ **The check that misses it:** `innerText.length` was **9346 before the fix and 9346 after** —
+identical, because only the containers were lost. Word count, a text diff and reading the prose
+all pass. **Count the structural nodes you sent**, not the characters.
+
+## ✅ The route that works: build the document as ProseMirror JSON
+
+Reach the editor instance by walking the React fiber up from `.tiptap.ProseMirror`, looking for
+`memoizedProps.editor` with a `.schema`. Stash it (`window.__ed`), read
+`Object.keys(editor.schema.nodes)` to learn what the platform actually supports, build the doc
+against those names, then `editor.commands.setContent(doc, true)`. Verify by counting
+`[data-type=blockquoteFigure]` in the DOM afterwards.
+
+Carry long content in as **base64** and decode page-side — it removes every shell/JSON quoting
+hazard from prose containing quotes, em dashes and apostrophes.
+
+## ⚠ A React field readback in the same tick reports a failure that did not happen
+
+Setting the title via the native setter + `input`/`change` and reading `t.value` in the SAME
+eval returned the seeded `"New post"`. Read again two seconds later and it was the real title —
+the write had landed and React simply had not committed when the readback ran. The usual law
+here is "never trust a verb's own success field"; this is the inverse and it costs a pointless
+re-run. **Re-read after a tick before concluding a React write failed.**
+
+## Navigation and state
+
+- `/posts/new` opens `/posts/<uuid>/edit` and CREATES THE DRAFT IMMEDIATELY.
+- The editor header reports save state as `Draft | Synced <n> words` — that string is the
+  honest indicator; confirm persistence with a reload before walking away.
+- Session persists in the profile jar across runs: reopening `app.beehiiv.com` on a profile that
+  logged in earlier raised NO device-confirmation challenge.
