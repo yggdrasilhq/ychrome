@@ -210,3 +210,61 @@ Long multi-line comments cannot be typed (`type` drops everything after the firs
 Set them with the `HTMLTextAreaElement.prototype` value setter plus `input`+`change`; the
 comment box is a plain named textarea, so the posted body is the DOM value. Verify by length
 and by head/tail slices before clicking.
+
+## a-closed-ticket-can-be-closed-with-THEIR-question-unanswered · WORKS
+task: Continue an existing support request rather than opening a duplicate
+model: claude-opus-5
+date: 2026-08-14
+tags: github, support, ticket, reopen, triage, stale-claim
+
+## ⛔⛔ THE FINDING: `Closed` DOES NOT MEAN ANSWERED, AND IT DOES NOT MEAN DEFLECTED
+
+A ticket in the list rendering as **closed** was carried in two separate notes as *"bounced
+with a form reply, nothing happened"*. Opening it showed **seven comments**, of which one is
+a **named support engineer** who had already run the reference check, reported exactly which
+pull requests still held references, and **asked which of two remedies was preferred.**
+
+⇒ **The request had not been refused. It had been answered with a question, and the question
+was never answered, so it aged into `closed`.** Everything downstream — "already filed", "do
+not re-file", "nothing was ever actioned" — was written by readers who trusted the status
+word and the first automated reply, and never opened the thread.
+
+⭐ **So: read the whole thread before concluding anything about a ticket, and especially
+before filing a second one.** The list view shows a status; the status is a summary of the
+last event, not of the state. Cheap: one `goto` + `document.body.innerText` is the entire
+thread including every comment.
+
+⭐ **And the same page proves whether a past request WORKED.** A SHA named in an older ticket
+now answering `422` instead of `200` is the receipt that a clearance actually ran. Check that
+before claiming the route does not work.
+
+## Reopening is one action and preserves the thread
+
+`Closed` tickets render a single control, `Reopen and comment`, over the textarea
+`#js-comment-<ticketid>` (name `message`). Posting flips the ticket to **Open** and adds the
+comment. ⚠ Once open, the controls become `Close ticket` and `Comment` — the prefix trap
+named further up this file is only present in that state, not on the closed one.
+
+⇒ Answering the engineer's outstanding question inside the existing thread is strictly better
+than a new ticket: it keeps their own reference-check work, and a duplicate re-enters triage
+from zero.
+
+## ⛔ EMAILED REQUESTS ARE DECLINED OUTRIGHT — the portal is the only door
+
+Replying by email, or mailing support directly, returns **"IMPORTANT: Support Ticket
+Declined"** with the text *"we now require that new support requests be created using our
+Support website"*. ⚠ Nothing is created. **A decline mail in the inbox is easy to mistake for
+a filed-then-rejected request**, and one was: it is evidence that **no ticket exists at all**.
+⇒ Confirm a ticket exists by finding it in `/tickets`, never by finding mail about it.
+
+## Two engine facts that had drifted in this file
+
+- ✅ **`ychrome ctl fill` EXISTS** and does vault autofill on the engine plane —
+  `fill page_id=<id> entry=<name> user=<account>`. It reports per-field `want`/`got`
+  **lengths** and never the value, which is the readback you want anyway. With several stored
+  accounts it refuses and names them (`matches 4 accounts — name one: …`). The note further
+  up saying `/fill` does not exist is **superseded**; the socket-POST recipe is still the way
+  to deliver a **TOTP**, which `fill` does not handle.
+- **`ctl eval` takes `js=`, not `expr=`** — `expr` returns `eval needs a page_id and js`.
+  For a body too large or too quote-heavy for argv, POST `{"page_id":…,"js":…}` to
+  `/engine/eval` on the daemon socket, same shape as `/engine/input`.
