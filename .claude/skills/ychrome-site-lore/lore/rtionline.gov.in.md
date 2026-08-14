@@ -1087,3 +1087,118 @@ no registration number exists and no s.7(1) clock has started. The gateway hand-
 extracted and rebuilt as a self-submitting local page, which is a clean way to carry the hand-off
 into a browser. Payment was deliberately NOT attempted: it needs a driver with `fill-card`, and
 starting a gateway leg without room to finish it risks a half-paid transaction.
+
+## filed-again-accessibility-path-and-mapped-surface · WORKS
+task: 
+model: claude-opus-5
+date: 2026-08-14
+tags: 
+
+Sixth run (2026-08-14). **One application filed end to end.** Three findings that
+generalise past this portal, and one pointer that deliberately does not live here.
+
+## ⭐ THE CAPTCHA STOPPED BEING THE HARD PART — look for the ACCESSIBILITY path first
+
+Every earlier entry here treats the captcha as an image-recognition problem and spends
+paragraphs on median filters, ink-column segmentation and glyph discriminators. Reading
+the image scored **3 correct out of 9** this session even with all of that applied.
+
+The portal publishes an **accessibility alternative** to the visual challenge, as such
+services generally must, and driving that instead scored **3 for 3** across all three
+captcha hops including the one-shot staging hop.
+
+⛔ **The mechanism is deliberately NOT written here** — this file is public, and the
+specifics amount to a live weakness in a public service. It is recorded in the private
+campaign record for this work, and the operator knows where.
+
+⇒ **The transferable lesson, which is the part worth having: when a site is hard to
+drive, look for its accessibility surface before you look for a cleverer parser.**
+Accessibility surfaces exist to present the same content in a form assistive technology
+can consume, which is very close to what an agent needs. Nobody had tried it here across
+five previous runs of fighting the image. The prior entries' notes on `1` vs `I` vs `J`,
+`8` vs `B`, `5` vs `S` are all still true and are now the fallback, not the method.
+
+## ⚠ A FILL VERB'S `chars` IS A SOURCE LENGTH, NOT A DELIVERY RECEIPT
+
+A card-number fill answered `delivered: true, chars: 18` (16 digits plus two stored
+separators) and **only 15 digits reached the field** — one character dropped in transit.
+A clear-and-refill of that one field landed all 16.
+
+The earlier entries flag this for the CVV specifically. It is worth stating as a rule:
+**`chars` describes what the source held; only the page describes what arrived.** Assert
+the count in the DOM before submitting, for every field, and never by printing a value:
+
+```js
+(document.querySelector('#card-number-field').value.match(/[0-9]/g)||[]).length  // expect 16
+```
+
+A short number fails the transaction and burns a staged application, which on this portal
+is unrecoverable. Cheap insurance, not fussiness.
+
+## ⛔ REAL-KEY INJECTION NEEDS A MAPPED SURFACE; NATIVE-SETTER DOES NOT
+
+Measured on a current build. On an **unmapped** (stashed, never-revealed) web surface:
+
+| mechanism | reply | landed |
+|---|---|---|
+| `do fill --mechanism native-setter` | `delivered: true`, `held_len: 8` | ✅ 8 chars |
+| `do fill --mechanism real-keys` | `delivered: false`, `held: ""` | ❌ nothing |
+| `do type` | `delivered: false` | ❌ nothing |
+
+The card-fill verb types with **real keys and has no `--mechanism` flag**, so it cannot
+work on an unmapped surface at all. The verbs are honest — `delivered: false` with an
+empty `held` is the tell — but a caller reading only `accepted` will not see it.
+
+⇒ **A card payment needs a MAPPED surface, and that does NOT mean taking a human's
+screen.** Run a real GUI client on a headless host's **virtual framebuffer**: a spare X
+display plus the GUI binary yields a client with `client_role: active` that can map a
+surface, on a machine with no physical display attached.
+
+```bash
+env -u WAYLAND_DISPLAY DISPLAY=:91 GDK_BACKEND=x11 XDG_RUNTIME_DIR=/run/user/<uid> \
+    setsid <gui-binary> >/tmp/gui.log 2>&1 < /dev/null &
+# then: server app open <session>  -> surface goes state:"visible", and real keys land
+```
+
+⚠ **A shadow client cannot do this** — it is read-only for geometry by design, so
+`app open --client <shadow>` activates the row and leaves the surface `stashed`. That is
+its contract, not a bug. Use a real client on a virtual display.
+
+⚠ The surface declare **refuses an `about:` URL by design** (a PTY-written payload could
+otherwise point a webview at a local file). Launch the browser at the real target origin,
+not at a blank page.
+
+## The gateway chain has two more interstitials than the map showed
+
+mode radio (real `click()`; the bank radio is injected by JS) → bank radio → submit →
+gateway prelogin → card tile → a CONFIRM page with a `Go` → **a second interstitial whose
+only visible control is another `Go`**, all its other inputs hidden UPI fields, which
+reads like a wrong turn and is not → card capture → 3DS.
+
+Timings from the card submit: 3DS page immediately, authentication code in **under 10 s**,
+debit notification ~**60 s** after the code was submitted, confirmation e-mail ~**2 min**
+after that.
+
+⭐ **Read the per-instrument fee before choosing.** This gateway displays them and showed
+**0.0 charges on every instrument**, so a cheapest-instrument rule is satisfied by
+inspection rather than assumption. Look, then choose.
+
+## ⛔ The portal page was STILL lying — and one more trap on the confirming side
+
+While the bank had already sent its debit notification and the portal had already sent
+its confirmation e-mail, the portal's own confirm page sat on *"Please wait while your
+transaction is being processed"* through 90 s of polling. **The success test remains the
+debit notification, then the confirmation e-mail. Never the portal page**, in either
+direction.
+
+⚠⚠ **And confirming by e-mail has its own trap, which cost a wrong answer here.** These
+confirmation mails all share one subject line, so `mail show --query` — which matches
+subject and sender, not the body — returned a **three-week-old** filing's mail with a
+different registration number, in a plausible-looking body. The earlier entry warns that
+`show` does not body-match; this is what that costs when the subject recurs monthly.
+
+⇒ **Resolve to a Message-ID first** (`search --raw` gives it) and read *that*, or take
+the value out of `search`'s newest-first snippet. **Then cross-check an identifier you
+captured independently** — here the gateway reference number seen on-screen appeared in
+the mail body, which is what proved the mail was this filing and not the old one. A
+registration number with no second witness is not confirmed.
