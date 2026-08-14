@@ -82,3 +82,48 @@ This fires on EVERY new browser profile, so it will fire for the human's own fir
 - **An auto-submitting code field makes a SUCCESSFUL `input` report 409** ("the page kept none of
   them") because the readback happens after the navigation the typing caused. Check
   `location.href` before believing it.
+
+## post-editor-navigation-and-publish-gate · WORKS
+task: Find the reliable route to a blank post editor, and establish whether the free tier can publish with no payment account connected
+model: claude-opus-5
+date: 2026-08-14
+tags: 
+
+Navigation traps found while driving a fresh account. Both cost a wrong instruction that would
+have stranded a human mid-task.
+
+## ⛔ "Start writing" on the Posts page does NOT open an editor
+
+On a new publication the empty Posts page offers a single **Start writing** button. It routes to
+`/posts/template-library` — the template *manager*. On a new account that page has **no templates
+and no start-from-scratch control**, so it is a dead end. Measured twice.
+
+**The controls that DO open a blank post editor:**
+
+- **`New`** in the top-left of the dashboard — opens `/posts/<uuid>/edit` directly. This is the
+  one to put in any human-facing instruction.
+- `/posts/new` as a direct URL — same result.
+
+⚠ Both *create a draft immediately*, before you type anything. There is no "unsaved" state to
+back out of, so a navigation probe leaves an artefact. Delete it via the row's overflow button on
+the Posts list → `Delete` → confirm; the confirm dialog's own wording is "This is a permanent
+action that cannot be undone."
+
+## The editor is a five-step wizard, and Publish lives at the end
+
+`Compose → Audience → Email → Web → Review`. Useful facts for anyone automating up to a gate:
+
+- **Audience** offers `Email and web` / `Email only` / `Web only`, plus tier and segment selection.
+- **Review** renders `Publish to Email and Web` and `Schedule`. ⛔ On a free-tier account with **no
+  payment account connected**, both are **enabled** — a payment account gates monetisation
+  (paid recommendations, ads, payouts), not publishing. Confirmed against the platform's own
+  Payment accounts page, which describes itself in exactly those terms.
+- ⚠ So a saved draft parks one enabled click away from a public post plus an email send. If you
+  stage a draft for a human to approve, know that nothing further protects it.
+
+## Reaching the editor by URL then describing a button is how the instruction went wrong
+
+The first written procedure said "Posts → Start writing", because the author had reached the
+editor via the direct URL and then narrated the visible button without following it. ⇒ **If an
+instruction will be executed by a human, walk the path you are about to write, in the order you
+are about to write it.**
