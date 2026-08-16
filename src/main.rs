@@ -593,9 +593,11 @@ fn picker_html(profiles: &[String]) -> String {
             .map(|c| c.to_uppercase().to_string())
             .unwrap_or_default();
         let pe = html_escape(p);
+        let lower = p.to_lowercase();
         cards.push_str(&format!(
-            "<label class=\"card\"><input type=\"radio\" name=\"profile\" value=\"{pe}\"{checked}>\
+            "<label class=\"card\" data-profile=\"{le}\"><input type=\"radio\" name=\"profile\" value=\"{pe}\"{checked}>\
              <span class=\"avatar\">{ie}</span><span class=\"pname\">{pe}</span></label>",
+            le = html_escape(&lower),
             ie = html_escape(&initial),
         ));
     }
@@ -641,20 +643,30 @@ button:hover {{ background: #3d59f0; }}
 #newprofile {{ margin-top: 12px; width: 100%; max-width: 240px; padding: 9px 12px;
   font-size: 14px; border: 1px solid #cfcfd6; border-radius: 9px; background: #fff; color: inherit; }}
 @media (prefers-color-scheme: dark) {{ #newprofile {{ background: #202024; border-color: #38383f; }} }}
+.profilesearch {{ display:flex; gap:8px; margin:0 auto 14px; max-width:460px; }}
+.profilesearch input {{ flex:1; padding:10px 13px; font-size:14px; border:1px solid #cfcfd6; border-radius:10px; background:#fff; color:inherit; }}
+@media (prefers-color-scheme: dark) {{ .profilesearch input {{ background:#202024; border-color:#38383f; }} }}
+.profilesearch input:focus {{ outline:2px solid #6c8cff; outline-offset:0; border-color:transparent; }}
+#profilecount {{ font-size:13px; opacity:.6; margin:8px 0 0; }}
+.card[hidden] {{ display:none !important; }}
 </style></head><body>
 <form class="panel" action="/open" method="get">
   <h1>Choose a profile</h1>
   <p class="sub">Each profile keeps its own cookies and logins. Type a URL, or leave it blank to start on search.</p>
   <div class="urlrow">
-    <input type="text" name="url" placeholder="URL or search — e.g. localhost:8000" autofocus autocomplete="off" spellcheck="false">
+    <input type="text" name="url" placeholder="URL or search — e.g. localhost:8000" autocomplete="off" spellcheck="false">
     <button type="submit">Open</button>
   </div>
-  <div class="grid">
+  <div class="profilesearch">
+    <input type="text" id="profilesearch" placeholder="Search profiles — filters as you type" autocomplete="off" spellcheck="false" aria-label="Search profiles">
+  </div>
+  <p id="profilecount" aria-live="polite"></p>
+  <div class="grid" id="profilegrid">
     {cards}
-    <label class="card tempcard" title="No history, cookies or storage kept — everything vanishes on close">
+    <label class="card tempcard" data-profile="__temp__" title="No history, cookies or storage kept — everything vanishes on close">
       <input type="radio" name="profile" value="temp">
       <span class="avatar">&#9202;</span><span class="pname">Temporary</span></label>
-    <label class="card newcard"><input type="radio" name="profile" value="" id="newradio">
+    <label class="card newcard" data-profile="__new__"><input type="radio" name="profile" value="" id="newradio">
       <span class="avatar">+</span><span class="pname">New profile</span></label>
   </div>
   <input type="text" name="newprofile" id="newprofile" placeholder="new profile name" autocomplete="off" spellcheck="false" hidden>
@@ -665,7 +677,38 @@ button:hover {{ background: #3d59f0; }}
     nr.addEventListener('change', function () {{ ni.hidden = false; ni.focus(); }});
     ni.addEventListener('input', function () {{ if (ni.value) nr.checked = true; }});
   }}
-</script>
+  (function() {{
+    var q = document.getElementById('profilesearch');
+    var grid = document.getElementById('profilegrid');
+    var count = document.getElementById('profilecount');
+    if (!q || !grid) return;
+    var cards = Array.prototype.slice.call(grid.querySelectorAll('.card'));
+    function norm(s) {{ return s.toLowerCase(); }}
+    function apply() {{
+      var needle = norm(q.value.trim());
+      var visible = 0;
+      var total = 0;
+      for (var i=0;i<cards.length;i++) {{
+        var c = cards[i];
+        var key = c.getAttribute('data-profile') || '';
+        var isSentinel = key === '__temp__' || key === '__new__';
+        if (isSentinel) {{ c.hidden = false; continue; }}
+        total++;
+        var hay = key + ' ' + norm(c.textContent || '');
+        var show = !needle || hay.indexOf(needle) !== -1;
+        c.hidden = !show;
+        if (show) visible++;
+      }}
+      if (count) {{
+        if (!needle) count.textContent = total + ' profile' + (total===1?'':'s');
+        else count.textContent = visible + ' of ' + total + ' match' + (visible===1?'':'es');
+      }}
+    }}
+    q.addEventListener('input', apply);
+    apply();
+    var urlInput = document.querySelector('input[name=url]');
+    if (urlInput && !urlInput.value) q.focus();
+  }})();
 </body></html>"#,
         cards = cards,
     )
