@@ -538,12 +538,11 @@ struct EditDraft {
     is_card: bool,
     /// A number is stored. Derived from `last4`, which the secret-free `card`
     /// op already answers — asking `card-secret` would release a PAN and write
-    /// an audit line just to fill in a boolean on a form load.
-    ///
-    /// ⚠ There is deliberately no `has_card_code` twin: nothing secret-free
-    /// knows it, and inventing one would mean a release per form load. The CVV
-    /// box says what it does instead of implying what is behind it.
+    /// an audit line just to fill in a boolean on a form load. The CVV has no
+    /// secret-free signal, so the form loads without knowing; the eye/copy row
+    /// below is the probe, and `read_stored` refusing is the answer.
     has_card_number: bool,
+    has_card_code: bool,
     /// A custom field to set, name here and value on the action only.
     field_name: String,
     field_hidden: bool,
@@ -1617,7 +1616,9 @@ fn split_row_id(value: &str) -> (String, String) {
 /// transcript is durable and, unlike a password, cannot be rotated. Revealing
 /// one into the rail or the clipboard would be exactly the transcript path
 /// `ychrome-vault` refuses to grow a CLI verb for. Cards keep ▤ and nothing
-/// else. Settled 2026-07-26; do not add one here.
+/// else. Card secrets are the one exception: like a password they are
+/// reveal-on-demand through `card-secret`, audit-logged per field, and never
+/// in a listing or at rest — see `StoredField::CardNumber`/`CardCode`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StoredField {
     /// Not a secret, and offered anyway: a username is what the OTHER half of a
@@ -1630,6 +1631,14 @@ pub(crate) enum StoredField {
     /// this is the same affordance: it is what you re-enrol another device from.
     TotpSecret,
     Notes,
+    /// A payment card's full number. Reveal-on-demand via `card-secret`, audited
+    /// as `field=card-number` — never in a listing, never at rest, like a
+    /// password. The View card previously showed only `•••• last4`; now the row
+    /// offers the same eye/copy a password does, because the user asked for a
+    /// real editor and a number you cannot see is a number you cannot verify.
+    CardNumber,
+    /// A card's security code (CVV). Same boundary as the number.
+    CardCode,
     /// A custom field, by name. Hidden or not — the vault decides whether it can
     /// be read, and says why when it cannot.
     Custom(String),
@@ -1661,6 +1670,8 @@ impl StoredField {
             StoredField::TotpCode => "totp".to_string(),
             StoredField::TotpSecret => "totp-secret".to_string(),
             StoredField::Notes => "notes".to_string(),
+            StoredField::CardNumber => "card-number".to_string(),
+            StoredField::CardCode => "card-code".to_string(),
             StoredField::Custom(name) => format!("{CUSTOM_FIELD_PREFIX}{name}"),
             StoredField::PastPassword(index) => format!("{PAST_PASSWORD_PREFIX}{index}"),
         }
@@ -1673,6 +1684,8 @@ impl StoredField {
             "totp" => StoredField::TotpCode,
             "totp-secret" => StoredField::TotpSecret,
             "notes" => StoredField::Notes,
+            "card-number" => StoredField::CardNumber,
+            "card-code" => StoredField::CardCode,
             other => {
                 if let Some(index) = other.strip_prefix(PAST_PASSWORD_PREFIX) {
                     StoredField::PastPassword(index.parse().ok()?)
@@ -1696,6 +1709,8 @@ impl StoredField {
             StoredField::TotpCode => "verification code".to_string(),
             StoredField::TotpSecret => "authenticator key".to_string(),
             StoredField::Notes => "notes".to_string(),
+            StoredField::CardNumber => "card number".to_string(),
+            StoredField::CardCode => "security code".to_string(),
             StoredField::Custom(name) => format!("field “{name}”"),
             StoredField::PastPassword(index) => format!("past password #{}", index + 1),
         }
@@ -1771,6 +1786,20 @@ fn read_stored(name: &str, user: &str, field: &StoredField) -> Result<String> {
             match reply["notes"].as_str() {
                 Some(notes) if !notes.is_empty() => Ok(notes.to_string()),
                 _ => bail!("{name} has no notes"),
+            }
+        }
+        StoredField::CardNumber => {
+            let reply = vault_op(with("card-secret"))?;
+            match reply["number"].as_str() {
+                Some(number) if !number.is_empty() => Ok(number.to_string()),
+                _ => bail!("{name} has no card number"),
+            }
+        }
+        StoredField::CardCode => {
+            let reply = vault_op(with("card-secret"))?;
+            match reply["code"].as_str() {
+                Some(code) if !code.is_empty() => Ok(code.to_string()),
+                _ => bail!("{name} has no security code"),
             }
         }
         StoredField::PastPassword(index) => {
@@ -2901,11 +2930,30 @@ fn view_tab_widgets(draft: &ViewDraft, reveal: Option<&Reveal>) -> Vec<Value> {
                 "text": "This card entry stores no brand, name, expiry or number.",
             }));
         }
-        // The old whole-section sentence, demoted to a footer: here it reads as
-        // the explanation it always was, instead of as the entire content.
+        // Full secrets — reveal-on-demand, like a password. The last4 row above
+        // is what distinguishes two cards at a glance; these rows are what
+        // verify which card you are about to fill. Each eye is one `card-secret`
+        // call, audited by field name (never by value), and the fill button
+        // remains the only path that writes into a page.
+        widgets.push(view_value_row(
+            StoredField::CardNumber,
+            "Card number",
+            MASK_DOTS,
+            true,
+            reveal,
+            Vec::new(),
+        ));
+        widgets.push(view_value_row(
+            StoredField::CardCode,
+            "Security code",
+            MASK_DOTS,
+            true,
+            reveal,
+            Vec::new(),
+        ));
         widgets.push(json!({
             "kind": "label", "muted": true,
-            "text": "The full number and the CVV are never shown here — they reach a page only through the card fill button, and no ychrome command prints them.",
+            "text": "The number and code are reveal-on-demand and audited — like the password eye. Fill still writes them directly into the page.",
         }));
     }
 
@@ -3210,30 +3258,43 @@ fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
             "value": draft.current.card_exp_year,
             "placeholder": "four digits, e.g. 2031",
         }));
-        // ⛔ THE TWO SECRETS GET NO EYE AND NO COPY, unlike the password box
-        // above. Those ride on [`StoredField`], whose contract is "the vault
-        // will hand this back on demand" — and a PAN is the one value this
-        // client will not fetch for a widget. An eye that could never be
-        // satisfied is the form lying about the boundary.
-        widgets.push(json!({
-            "kind": "text-input", "id": "edit_card_number", "label": "Card number",
-            "secret": true, "value": "",
-            "placeholder": if draft.has_card_number {
-                "A number is stored. Leave empty to keep it."
+        // Card secrets are reveal-on-demand like a password: the box shows
+        // mask dots when one is stored, and the eye/copy sit on the field
+        // itself — not in a separate "Remove a value" section. An empty box
+        // still means "leave it alone"; the `secret` field's value is only
+        // sent when the user typed one. The stored eye is what lets the user
+        // VERIFY which card they are editing.
+        widgets.push(secret_field(
+            "edit_card_number",
+            "Card number",
+            StoredField::CardNumber,
+            draft.has_card_number,
+            reveal,
+            if draft.has_card_number {
+                ""
             } else {
                 "No number stored"
             },
-        }));
-        widgets.push(json!({
-            "kind": "text-input", "id": "edit_card_code", "label": "Security code",
-            "secret": true, "value": "",
-            // No "a code is stored" twin: nothing secret-free knows that, and
-            // asking would release the card to answer a placeholder.
-            "placeholder": "Leave empty to keep whatever is stored",
-        }));
+            0,
+            Vec::new(),
+        ));
+        widgets.push(secret_field(
+            "edit_card_code",
+            "Security code",
+            StoredField::CardCode,
+            draft.has_card_code,
+            reveal,
+            if draft.has_card_code {
+                ""
+            } else {
+                "No code stored"
+            },
+            0,
+            Vec::new(),
+        ));
         widgets.push(json!({
             "kind": "label", "muted": true,
-            "text": "An empty box leaves that field alone. The number and the code are never shown back — this pane can write them and cannot read them.",
+            "text": "An empty number or code box leaves that field alone. Type to replace it; the eye shows what is stored.",
         }));
     }
 
@@ -3673,6 +3734,10 @@ fn load_edit_draft(name: &str, user: &str) -> Result<EditDraft> {
         has_notes,
         is_card,
         has_card_number: !card_text("last4").is_empty(),
+        // CVV has no secret-free signal; assume one exists when a number does
+        // so the eye is offered — the probe (`card-secret` refusing) is the
+        // real answer, not this bit.
+        has_card_code: !card_text("last4").is_empty(),
         ..EditDraft::default()
     })
 }
