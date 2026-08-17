@@ -1438,10 +1438,21 @@ fn parse_input(event: &Value) -> Result<PendingInput> {
             None => bail!("a type event needs text"),
         },
         "key" => {
+            // Reject unknown fields — a silently ignored `alt:true` produces a
+            // plain keypress that reads as "the app ignored the shortcut". See
+            // pending-bugs “ctl input CANNOT DELIVER NAMED KEYS...”.
+            for key in event.as_object().map(|o| o.keys()).into_iter().flatten() {
+                if !matches!(key.as_str(), "type" | "key" | "mods" | "code" | "text") {
+                    bail!("unknown field {key:?} on a key event (known: type, key, mods)");
+                }
+            }
             let Some(name) = event["key"].as_str() else {
                 bail!("a key event needs a key name, e.g. \"Enter\"");
             };
-            let mods: Vec<String> = event["mods"]
+            // `mods` is the canonical form; also accept the legacy `alt`/`ctrl`/
+            // `shift`/`meta` booleans for one release, but they must not be
+            // silent — map them into the mask.
+            let mut mods: Vec<String> = event["mods"]
                 .as_array()
                 .map(|list| {
                     list.iter()
@@ -1450,12 +1461,58 @@ fn parse_input(event: &Value) -> Result<PendingInput> {
                         .collect()
                 })
                 .unwrap_or_default();
+            for legacy in ["alt", "ctrl", "control", "shift", "meta", "super", "cmd"] {
+                if event[legacy].as_bool() == Some(true) {
+                    mods.push(legacy.to_string());
+                }
+            }
             Ok(PendingInput::Ready(InputEvent::Key {
                 keyval: super::host::keyval_from_name(name)?,
                 mods: super::host::modifier_mask(&mods)?,
             }))
         }
-        other => bail!("unknown input event type {other:?} (click|move|scroll|type|key)"),
+        "mousedown" => {
+            let (x, y) = point(event)?;
+            let button = match event["button"].as_str().unwrap_or("left") {
+                "left" => 1,
+                "middle" => 2,
+                "right" => 3,
+                other => bail!("unknown mouse button {other:?} (left|middle|right)"),
+            };
+            Ok(PendingInput::Ready(InputEvent::MouseDown { x, y, button }))
+        }
+        "mouseup" => {
+            let (x, y) = point(event)?;
+            let button = match event["button"].as_str().unwrap_or("left") {
+                "left" => 1,
+                "middle" => 2,
+                "right" => 3,
+                other => bail!("unknown mouse button {other:?} (left|middle|right)"),
+            };
+            Ok(PendingInput::Ready(InputEvent::MouseUp { x, y, button }))
+        }
+        "drag" => {
+            let from_x = event["from_x"].as_f64().or_else(|| event["x"].as_f64()).ok_or_else(|| anyhow::anyhow!("drag needs from_x/from_y or x/y"))?;
+            let from_y = event["from_y"].as_f64().or_else(|| event["y"].as_f64()).ok_or_else(|| anyhow::anyhow!("drag needs from_x/from_y or x/y"))?;
+            let to_x = event["to_x"].as_f64().ok_or_else(|| anyhow::anyhow!("drag needs to_x"))?;
+            let to_y = event["to_y"].as_f64().ok_or_else(|| anyhow::anyhow!("drag needs to_y"))?;
+            let steps = event["steps"].as_u64().unwrap_or(8) as usize;
+            let button = match event["button"].as_str().unwrap_or("left") {
+                "left" => 1,
+                "middle" => 2,
+                "right" => 3,
+                other => bail!("unknown mouse button {other:?} (left|middle|right)"),
+            };
+            Ok(PendingInput::Ready(InputEvent::Drag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+                steps,
+                button,
+            }))
+        }
+        other => bail!("unknown input event type {other:?} (click|move|scroll|type|key|mousedown|mouseup|drag)"),
     }
 }
 

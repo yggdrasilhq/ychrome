@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
-use ychrome_vault_proto::{CIPHER_TYPE_CARD, CIPHER_TYPE_LOGIN, CIPHER_TYPE_NOTE};
+use ychrome_vault_proto::{
+    CIPHER_TYPE_CARD, CIPHER_TYPE_IDENTITY, CIPHER_TYPE_LOGIN, CIPHER_TYPE_NOTE,
+};
 
 /// The pane ids ychrome declares. yggterm only ever echoes them back.
 const VAULT_PANE: &str = "vault";
@@ -536,6 +538,7 @@ struct EditDraft {
     /// actually lives in. Read off the listing's `item_type`, the same field
     /// the View pane and the fill button read.
     is_card: bool,
+    is_identity: bool,
     /// A number is stored. Derived from `last4`, which the secret-free `card`
     /// op already answers — asking `card-secret` would release a PAN and write
     /// an audit line just to fill in a boolean on a form load. The CVV has no
@@ -2478,6 +2481,15 @@ fn secret_field(
             "icon:copy",
             format!("Copy the stored {} to the clipboard", field.label()),
         ));
+        // Bitwarden parity: the delete lives ON the field where the value
+        // lives, not in a far "Remove a value" section with toggles. One
+        // press removes that one field immediately, like Custom rows do.
+        actions.push(field_action(
+            EDIT_REMOVE_FIELD_VERB,
+            &field,
+            "icon:trash",
+            format!("Remove the stored {}", field.label()),
+        ));
     }
     let mut widget = json!({
         "kind": "text-input",
@@ -2709,6 +2721,7 @@ fn add_tab_widgets(state: &PaneState, status: &Value) -> Vec<Value> {
             {"id": CIPHER_TYPE_LOGIN.to_string(), "label": "Login"},
             {"id": CIPHER_TYPE_NOTE.to_string(), "label": "Note"},
             {"id": CIPHER_TYPE_CARD.to_string(), "label": "Card"},
+            {"id": CIPHER_TYPE_IDENTITY.to_string(), "label": "Identity"},
         ],
     })];
     // Say it BEFORE the form, not after the save fails: a stale agent cannot
@@ -2722,6 +2735,7 @@ fn add_tab_widgets(state: &PaneState, status: &Value) -> Vec<Value> {
     let heading = match state.add.item_type {
         CIPHER_TYPE_NOTE => "Add a note",
         CIPHER_TYPE_CARD => "Add a card",
+        CIPHER_TYPE_IDENTITY => "Add an identity",
         _ => "Add a login",
     };
     widgets.push(json!({"kind": "section", "text": heading, "card": true}));
@@ -2729,6 +2743,7 @@ fn add_tab_widgets(state: &PaneState, status: &Value) -> Vec<Value> {
     let name_placeholder = match state.add.item_type {
         CIPHER_TYPE_NOTE => "Boiler service code",
         CIPHER_TYPE_CARD => "Bank of Invention debit",
+        CIPHER_TYPE_IDENTITY => "Personal identity",
         _ => "example.com",
     };
     widgets.push(json!({
@@ -2775,6 +2790,25 @@ fn add_tab_widgets(state: &PaneState, status: &Value) -> Vec<Value> {
             widgets.push(json!({
                 "kind": "text-input", "id": "add_card_code", "label": "Security code",
                 "placeholder": "the CVV", "secret": true, "value": "",
+            }));
+        }
+        CIPHER_TYPE_IDENTITY => {
+            widgets.push(json!({
+                "kind": "label", "muted": true,
+                "text": "An identity stores personal data — names, email, phone, address — as the Bitwarden identity does. This pane now creates and renders them; the vault's identity reader lands next.",
+            }));
+            // For now an identity is a titled note with the same login-adjacent
+            // fields a card already made first-class. The dedicated identity
+            // columns (first/last, company, SSN, passport, address) are the
+            // next wire half; the UI half is here so the type is not a dead
+            // picker entry.
+            widgets.push(json!({
+                "kind": "text-input", "id": "add_user", "label": "Full name / Username",
+                "placeholder": "Alex Doe", "value": state.add.user,
+            }));
+            widgets.push(json!({
+                "kind": "text-input", "id": "add_uri", "label": "Website (optional)",
+                "placeholder": "https://example.com", "value": state.add.uri,
             }));
         }
         _ => {
@@ -2858,6 +2892,7 @@ fn view_tab_widgets(draft: &ViewDraft, reveal: Option<&Reveal>) -> Vec<Value> {
     let flag = |key: &str| detail[key].as_bool().unwrap_or(false);
     let text = |key: &str| detail[key].as_str().unwrap_or_default().to_string();
     let is_card = detail["item_type"].as_u64() == Some(u64::from(CIPHER_TYPE_CARD));
+    let is_identity = detail["item_type"].as_u64() == Some(u64::from(CIPHER_TYPE_IDENTITY));
 
     // WHAT THE ENTRY IS. Bitwarden's header card.
     let mut widgets = vec![
@@ -2956,6 +2991,32 @@ fn view_tab_widgets(draft: &ViewDraft, reveal: Option<&Reveal>) -> Vec<Value> {
             "text": "The number and code are reveal-on-demand and audited — like the password eye. Fill still writes them directly into the page.",
         }));
     }
+    if is_identity {
+        widgets.push(json!({"kind": "section", "text": "Identity", "card": true}));
+        // An identity's primary field is the username slot repurposed as
+        // "full name" — the same field the Add form writes for this type,
+        // so view and edit cannot disagree about where the name lives.
+        let name = text("username");
+        if !name.is_empty() {
+            widgets.push(view_value_row(
+                StoredField::Username,
+                "Full name",
+                &name,
+                false,
+                reveal,
+                Vec::new(),
+            ));
+        } else {
+            widgets.push(json!({
+                "kind": "label", "muted": true,
+                "text": "This identity stores no name — the username field is empty.",
+            }));
+        }
+        widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": "Identities share the same notes and custom-field storage as logins; additional columns (address, phone, SSN) are the next vault wire half.",
+        }));
+    }
 
     // LOGIN CREDENTIALS.
     widgets.push(json!({"kind": "section", "text": "Login credentials", "card": true}));
@@ -2965,12 +3026,14 @@ fn view_tab_widgets(draft: &ViewDraft, reveal: Option<&Reveal>) -> Vec<Value> {
             "kind": "label", "muted": true,
             "text": if is_card {
                 "This card stores no login."
+            } else if is_identity {
+                "This identity stores no login."
             } else {
                 "This entry stores no credentials."
             },
         }));
     }
-    if !user.is_empty() {
+    if !user.is_empty() && !is_identity {
         widgets.push(view_value_row(
             StoredField::Username,
             "Username",
@@ -3271,7 +3334,7 @@ fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
             draft.has_card_number,
             reveal,
             if draft.has_card_number {
-                ""
+                "•••• •••• •••• •••• — eye to reveal, leave empty to keep"
             } else {
                 "No number stored"
             },
@@ -3285,7 +3348,7 @@ fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
             draft.has_card_code,
             reveal,
             if draft.has_card_code {
-                ""
+                "••• — eye to reveal"
             } else {
                 "No code stored"
             },
@@ -3296,6 +3359,76 @@ fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
             "kind": "label", "muted": true,
             "text": "An empty number or code box leaves that field alone. Type to replace it; the eye shows what is stored.",
         }));
+    }
+    if draft.is_identity {
+        widgets.push(json!({"kind": "section", "text": "Identity", "card": true}));
+        widgets.push(json!({
+            "kind": "text-input", "id": "edit_user", "label": "Full name",
+            "value": draft.current.user,
+            "placeholder": "Alex Doe",
+            "actions": if draft.current.user.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![field_action(
+                    EDIT_COPY_VERB,
+                    &StoredField::Username,
+                    "icon:copy",
+                    "Copy the name to the clipboard".to_string(),
+                )]
+            },
+        }));
+        widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": "An identity reuses the login's textual slots until the dedicated vault columns (address, phone, SSN, passport) land — the pane and the wire will move together.",
+        }));
+        // Skip the login credentials section for identities — they have no
+        // password/TOTP and showing the empty boxes would be the same lie the
+        // card's "stores no login" label fixed.
+        widgets.push(json!({"kind": "section", "text": "Additional options", "card": true}));
+        widgets.push(secret_field(
+            "edit_notes",
+            "Notes",
+            StoredField::Notes,
+            draft.has_notes,
+            reveal,
+            if draft.has_notes {
+                "Stored — press the eye to read it, or type to replace it"
+            } else {
+                "Anything to remember"
+            },
+            5,
+            Vec::new(),
+        ));
+        widgets.push(json!({"kind": "section", "text": "Custom fields", "card": true}));
+        if draft.field_names.is_empty() {
+            widgets.push(json!({
+                "kind": "label", "muted": true, "text": "This entry carries none.",
+            }));
+        } else {
+            for name in &draft.field_names {
+                widgets.extend(stored_value_row(
+                    &StoredField::Custom(name.clone()),
+                    reveal,
+                    true,
+                ));
+            }
+        }
+        widgets.push(json!({
+            "kind": "text-input", "id": "edit_field_name", "label": "New field name",
+            "value": draft.field_name, "placeholder": "API Key",
+        }));
+        widgets.push(json!({
+            "kind": "text-input", "id": "edit_field_value", "label": "New field value",
+            "secret": true, "value": "",
+            "placeholder": "Set or replace this field",
+        }));
+        widgets.push(json!({
+            "kind": "toggle", "id": "edit_field_hidden", "label": "Store it hidden",
+            "value": draft.field_hidden,
+        }));
+        // No separate "Remove a value" toggles: the trash lives ON the field
+        // where the value lives (see `secret_field`), like Bitwarden.
+        return widgets;
     }
 
     // LOGIN CREDENTIALS — the three boxes the user came for.
@@ -3320,9 +3453,8 @@ fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
         StoredField::Password,
         draft.has_password,
         reveal,
-        // Empty ⇒ yggterm draws the mask. An entry with no password says so.
         if draft.has_password {
-            ""
+            "•••••••••••• — eye to reveal, leave empty to keep"
         } else {
             "No password stored"
         },
@@ -3350,7 +3482,7 @@ fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
         draft.has_totp,
         reveal,
         if draft.has_totp {
-            ""
+            "•••••••••••• — eye to reveal"
         } else {
             "base32 or an otpauth:// URI"
         },
@@ -3451,19 +3583,7 @@ fn edit_tab_widgets(draft: &EditDraft, reveal: Option<&Reveal>) -> Vec<Value> {
         "value": draft.field_hidden,
     }));
 
-    widgets.push(json!({"kind": "section", "text": "Remove a value", "card": true}));
-    widgets.push(json!({
-        "kind": "label", "muted": true,
-        "text": "Emptying a box above keeps the old value. Removing one is this, deliberately separate.",
-    }));
-    widgets.push(json!({
-        "kind": "toggle", "id": "edit_clear_notes", "label": "Delete the notes",
-        "value": draft.clear_notes,
-    }));
-    widgets.push(json!({
-        "kind": "toggle", "id": "edit_clear_totp", "label": "Delete the authenticator secret",
-        "value": draft.clear_totp,
-    }));
+    // Delete is on the field itself (trash icon), not a distant toggle.
     widgets
 }
 
@@ -3676,6 +3796,7 @@ fn load_edit_draft(name: &str, user: &str) -> Result<EditDraft> {
     // pane read. A refusal ("is not a card") is the answer for every other item
     // type, not an error — hence `.ok()`.
     let is_card = item["item_type"].as_u64() == Some(u64::from(CIPHER_TYPE_CARD));
+    let is_identity = item["item_type"].as_u64() == Some(u64::from(CIPHER_TYPE_IDENTITY));
     let card = is_card
         .then(|| vault_op(json!({"op": "card", "name": name, "user": opt_field(user)})).ok())
         .flatten()
@@ -3733,6 +3854,7 @@ fn load_edit_draft(name: &str, user: &str) -> Result<EditDraft> {
         has_passkey: item["has_passkey"].as_bool().unwrap_or(false),
         has_notes,
         is_card,
+        is_identity,
         has_card_number: !card_text("last4").is_empty(),
         // CVV has no secret-free signal; assume one exists when a number does
         // so the eye is offered — the probe (`card-secret` refusing) is the
@@ -4265,7 +4387,9 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 "toast": format!("Copying {uri}"),
             })
         }
-        // Removing a custom field is its own request, not a blank box.
+        // Removing a field is its own request, not a blank box — and the
+        // trash lives ON the field (Bitwarden parity), so this handles every
+        // `secret_field` trash, not just Custom rows.
         _ if action.starts_with(&format!("{EDIT_REMOVE_FIELD_VERB}:")) => {
             let spec = action
                 .split_once(':')
@@ -4278,16 +4402,55 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                     state.edit.target_user.clone(),
                 )
             };
-            // The FIELD SPEC is the same one the eye and the copy read, so the
-            // three verbs on a custom-field row cannot disagree about which
-            // field they act on.
-            let Some(StoredField::Custom(value)) = StoredField::parse(spec) else {
-                return json!({ "toast": format!("{spec:?} is not a custom field.") });
+            let Some(field) = StoredField::parse(spec) else {
+                return json!({ "toast": format!("{spec:?} is not a removable field.") });
             };
-            let request = json!({
-                "op": "edit", "name": target_name, "user": opt_field(&target_user),
-                "fields": [{"name": value, "action": "remove"}],
-            });
+            let (request, toast) = match field {
+                StoredField::Custom(value) => (
+                    json!({
+                        "op": "edit", "name": target_name, "user": opt_field(&target_user),
+                        "fields": [{"name": value.clone(), "action": "remove"}],
+                    }),
+                    format!("Removed field {value}."),
+                ),
+                StoredField::Notes => (
+                    json!({
+                        "op": "edit", "name": target_name, "user": opt_field(&target_user),
+                        "clear": ["notes"],
+                    }),
+                    "Removed notes.".to_string(),
+                ),
+                StoredField::TotpSecret | StoredField::TotpCode => (
+                    json!({
+                        "op": "edit", "name": target_name, "user": opt_field(&target_user),
+                        "clear": ["totp"],
+                    }),
+                    "Removed authenticator secret.".to_string(),
+                ),
+                StoredField::CardNumber | StoredField::CardCode => {
+                    // No `clear` for card secrets yet — set empty is the wire
+                    // until the model grows a ClearField for them. Empty is still
+                    // immediate and verified like every other trash.
+                    let key = match field {
+                        StoredField::CardNumber => "card_number",
+                        StoredField::CardCode => "card_code",
+                        _ => unreachable!(),
+                    };
+                    (
+                        json!({
+                            "op": "edit", "name": target_name, "user": opt_field(&target_user),
+                            key: "",
+                        }),
+                        format!("Cleared {}.", field.label()),
+                    )
+                }
+                StoredField::Password => {
+                    return json!({ "toast": "Password is not deletable — generate a new one or set a new value." });
+                }
+                StoredField::Username | StoredField::PastPassword(_) => {
+                    return json!({ "toast": format!("{} cannot be removed this way.", field.label()) });
+                }
+            };
             match vault_op(request).and_then(require_verified) {
                 Ok(_) => {
                     // Reload, so the list the user is looking at is the list the
@@ -4295,10 +4458,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                     if let Ok(draft) = load_edit_draft(&target_name, &target_user) {
                         state.lock().unwrap().edit = draft;
                     }
-                    merge(
-                        reschema(state, host.as_deref()),
-                        json!({ "toast": format!("Removed field {value}.") }),
-                    )
+                    merge(reschema(state, host.as_deref()), json!({ "toast": toast }))
                 }
                 Err(error) => json!({ "toast": error.to_string() }),
             }
@@ -4495,6 +4655,11 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                     fields.insert("card_exp_year".into(), opt_field(&card_exp_year));
                     fields.insert("card_code".into(), opt_field(code));
                 }
+                CIPHER_TYPE_IDENTITY => {
+                    fields.insert("user".into(), opt_field(&user));
+                    fields.insert("uri".into(), opt_field(&uri));
+                    fields.insert("notes".into(), opt_field(&notes));
+                }
                 _ => {
                     fields.insert("user".into(), opt_field(&user));
                     fields.insert("uri".into(), opt_field(&uri));
@@ -4521,6 +4686,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                     let made = match item_type {
                         CIPHER_TYPE_NOTE => "note".to_string(),
                         CIPHER_TYPE_CARD => "card".to_string(),
+                        CIPHER_TYPE_IDENTITY => "identity".to_string(),
                         _ if generate => "login with a generated password".to_string(),
                         _ => "login with the password you typed".to_string(),
                     };
