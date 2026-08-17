@@ -43,6 +43,10 @@ pub const CIPHER_TYPE_NOTE: u8 = 2;
 /// A payment card: no password at all, which is why `get` refuses it and the
 /// sidebar must offer a different fill.
 pub const CIPHER_TYPE_CARD: u8 = 3;
+/// An identity: personal data (names, address, phone, email, etc.) — the type
+/// Bitwarden and Keyguard show with the most fields, and the one this pane
+/// rendered as a note with no editor until now.
+pub const CIPHER_TYPE_IDENTITY: u8 = 4;
 
 /// Default read budget for a request. Matches the agent's own client: a `sync`
 /// or `unlock` re-pulls the whole vault from the server, which is slow.
