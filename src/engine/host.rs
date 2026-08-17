@@ -1030,6 +1030,22 @@ pub enum InputEvent {
     Text {
         text: String,
     },
+    /// Raw press — held until a matching release. The `click` variant is
+    /// press+release; these are the halves that let a drag be trusted input
+    /// end-to-end instead of `dispatchEvent` on a guessed target. See
+    /// pending-bugs “ctl input HAS NO mousedown/mouseup”.
+    MouseDown { x: f64, y: f64, button: u32 },
+    MouseUp { x: f64, y: f64, button: u32 },
+    /// Composite drag: press at `from`, `steps` moves, release at `to`. Uses
+    /// GDK's button mask so moves carry `buttons:1` as a real pointer does.
+    Drag {
+        from_x: f64,
+        from_y: f64,
+        to_x: f64,
+        to_y: f64,
+        steps: usize,
+        button: u32,
+    },
 }
 
 impl Drop for Engine {
@@ -1497,6 +1513,36 @@ fn dispatch_input(view: &WebView, event: &InputEvent) -> Result<u32> {
             }
             Ok(dispatched)
         }
+        InputEvent::MouseDown { x, y, button } => {
+            let mut dispatched = dispatch_motion(view, *x, *y)?;
+            dispatched += dispatch_button_down(view, *x, *y, *button)?;
+            Ok(dispatched)
+        }
+        InputEvent::MouseUp { x, y, button } => {
+            let mut dispatched = dispatch_motion(view, *x, *y)?;
+            dispatched += dispatch_button_up(view, *x, *y, *button)?;
+            Ok(dispatched)
+        }
+        InputEvent::Drag {
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+            steps,
+            button,
+        } => {
+            let mut dispatched = dispatch_motion(view, *from_x, *from_y)?;
+            dispatched += dispatch_button_down(view, *from_x, *from_y, *button)?;
+            let n = (*steps).max(1).min(64);
+            for i in 1..=n {
+                let t = i as f64 / n as f64;
+                let x = from_x + (to_x - from_x) * t;
+                let y = from_y + (to_y - from_y) * t;
+                dispatched += dispatch_motion_with_state(view, x, y, button_mask(*button))?;
+            }
+            dispatched += dispatch_button_up(view, *to_x, *to_y, *button)?;
+            Ok(dispatched)
+        }
     }
 }
 
@@ -1674,6 +1720,72 @@ fn dispatch_button(view: &WebView, x: f64, y: f64, button: u32) -> Result<u32> {
         dispatched += 1;
     }
     Ok(dispatched)
+}
+
+fn button_mask(button: u32) -> u32 {
+    match button {
+        1 => gdk::ModifierType::BUTTON1_MASK.bits(),
+        2 => gdk::ModifierType::BUTTON2_MASK.bits(),
+        3 => gdk::ModifierType::BUTTON3_MASK.bits(),
+        _ => 0,
+    }
+}
+
+fn dispatch_button_down(view: &WebView, x: f64, y: f64, button: u32) -> Result<u32> {
+    let seat = seat(view)?;
+    let mut event = gdk::Event::new(gdk::EventType::ButtonPress);
+    unsafe {
+        let raw = fill_common(&mut event, &seat) as *mut gdk::ffi::GdkEventButton;
+        (*raw).time = seat.time;
+        (*raw).x = x;
+        (*raw).y = y;
+        (*raw).axes = std::ptr::null_mut();
+        (*raw).state = 0;
+        (*raw).button = button;
+        (*raw).x_root = x;
+        (*raw).y_root = y;
+    }
+    event.set_device(Some(&seat.pointer));
+    gtk::main_do_event(&mut event);
+    Ok(1)
+}
+
+fn dispatch_button_up(view: &WebView, x: f64, y: f64, button: u32) -> Result<u32> {
+    let seat = seat(view)?;
+    let mut event = gdk::Event::new(gdk::EventType::ButtonRelease);
+    unsafe {
+        let raw = fill_common(&mut event, &seat) as *mut gdk::ffi::GdkEventButton;
+        (*raw).time = seat.time;
+        (*raw).x = x;
+        (*raw).y = y;
+        (*raw).axes = std::ptr::null_mut();
+        (*raw).state = button_mask(button);
+        (*raw).button = button;
+        (*raw).x_root = x;
+        (*raw).y_root = y;
+    }
+    event.set_device(Some(&seat.pointer));
+    gtk::main_do_event(&mut event);
+    Ok(1)
+}
+
+fn dispatch_motion_with_state(view: &WebView, x: f64, y: f64, state: u32) -> Result<u32> {
+    let seat = seat(view)?;
+    let mut event = gdk::Event::new(gdk::EventType::MotionNotify);
+    unsafe {
+        let raw = fill_common(&mut event, &seat) as *mut gdk::ffi::GdkEventMotion;
+        (*raw).time = seat.time;
+        (*raw).x = x;
+        (*raw).y = y;
+        (*raw).axes = std::ptr::null_mut();
+        (*raw).state = state;
+        (*raw).is_hint = 0;
+        (*raw).x_root = x;
+        (*raw).y_root = y;
+    }
+    event.set_device(Some(&seat.pointer));
+    gtk::main_do_event(&mut event);
+    Ok(1)
 }
 
 /// The Phase A gate's click, now one case of [`dispatch_input`].
