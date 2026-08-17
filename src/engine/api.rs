@@ -1441,8 +1441,24 @@ fn parse_input(event: &Value) -> Result<PendingInput> {
             // Reject unknown fields — a silently ignored `alt:true` produces a
             // plain keypress that reads as "the app ignored the shortcut". See
             // pending-bugs “ctl input CANNOT DELIVER NAMED KEYS...”.
+            // Legacy `alt`/`ctrl` booleans are accepted for one release via the
+            // mapping below, so they are not “unknown”.
             for key in event.as_object().map(|o| o.keys()).into_iter().flatten() {
-                if !matches!(key.as_str(), "type" | "key" | "mods" | "code" | "text") {
+                if !matches!(
+                    key.as_str(),
+                    "type"
+                        | "key"
+                        | "mods"
+                        | "code"
+                        | "text"
+                        | "alt"
+                        | "ctrl"
+                        | "control"
+                        | "shift"
+                        | "meta"
+                        | "super"
+                        | "cmd"
+                ) {
                     bail!("unknown field {key:?} on a key event (known: type, key, mods)");
                 }
             }
