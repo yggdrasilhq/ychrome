@@ -229,8 +229,11 @@ pub fn policy(profile: &str) -> Policy {
     Policy {
         adblock_rules,
         userscripts,
-        user_agent: crate::useragent::effective(),
-        user_agent_sites: crate::useragent::sites_json(),
+        // ⭐ PROFILE-SCOPED, not browser-wide. A profile is a browsing identity
+        // in its own right, so the UA it presents is the profile's own decision
+        // laid over the browser's — see `crate::useragent`'s profile layer.
+        user_agent: crate::useragent::effective_for_profile(profile),
+        user_agent_sites: crate::useragent::sites_json_for_profile(profile),
     }
 }
 
@@ -300,7 +303,7 @@ pub fn policy_version(profile: &str) -> String {
         adblock_profile_disabled(&config, profile)
     ));
     // Same reason: the UA is a decision, not a file the GUI could stat.
-    manifest.push_str(&crate::useragent::stamp());
+    manifest.push_str(&crate::useragent::stamp_for_profile(profile));
     // And SponsorBlock's per-category settings, which travel as an injected
     // preamble rather than a file — a stat over the directory cannot see them,
     // so a category the user just switched to auto-skip would not reach the
@@ -592,7 +595,75 @@ pub fn delete_userscript(stem: &str) -> Result<()> {
     if !removed {
         anyhow::bail!("no userscript named {stem:?} to delete");
     }
+    // ⭐ RECORD THE DELETION. "Absent" and "deleted on purpose" are the same
+    // bytes on disk — no file — and `crate::provision` has to tell them apart:
+    // it must never reinstate a script the user threw away (that would make the
+    // Delete button a lie), and it must install one that was never delivered
+    // (otherwise a host silently browses without filters it was shipped).
+    // Without a tombstone only one of those can be right at a time.
+    let _ = record_userscript_tombstone(stem);
     Ok(())
+}
+
+/// `~/.yggterm/web-userscripts/.deleted` — one stem per line, the user's own
+/// deletions. A plain text file rather than a marker per script: it is read on
+/// every launch, and a directory of `.deleted` files would be indistinguishable
+/// from userscripts to anything globbing the directory.
+fn tombstone_path() -> Result<PathBuf> {
+    Ok(shared_userscript_dir()?.join(".deleted"))
+}
+
+fn record_userscript_tombstone(stem: &str) -> Result<()> {
+    let path = tombstone_path()?;
+    let mut stems = deleted_userscripts();
+    if !stems.iter().any(|entry| entry == stem) {
+        stems.push(stem.to_string());
+    }
+    stems.sort();
+    std::fs::write(&path, format!("{}\n", stems.join("\n")))
+        .with_context(|| format!("recording the deletion of {stem:?}"))
+}
+
+/// The stems the user has deleted. Unreadable or absent ⇒ none, which is the
+/// safe reading: it can only cause a bundled asset to be re-offered, never a
+/// user's deletion to be honoured wrongly.
+pub fn deleted_userscripts() -> Vec<String> {
+    tombstone_path()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| parse_tombstone(&text))
+        .unwrap_or_default()
+}
+
+/// The tombstone file's one parse. Split out from the read so the rule is
+/// testable without a HOME: blank lines and stray whitespace are not stems, and
+/// a file that has been hand-edited must not turn into a stem named "".
+fn parse_tombstone(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// Installing a script the user had deleted RETRACTS the tombstone — otherwise
+/// a reinstall through the pane would be undone by the next provisioning pass.
+pub fn clear_userscript_tombstone(stem: &str) -> Result<()> {
+    let path = tombstone_path()?;
+    let remaining: Vec<String> = deleted_userscripts()
+        .into_iter()
+        .filter(|entry| entry != stem)
+        .collect();
+    if remaining.is_empty() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("clearing the userscript tombstone"),
+        }
+    } else {
+        std::fs::write(&path, format!("{}\n", remaining.join("\n")))
+            .context("rewriting the userscript tombstone")
+    }
 }
 
 /// Whether a shared userscript with this stem is installed (enabled or not).
@@ -632,12 +703,33 @@ pub fn install_userscript(stem: &str, body: &str) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join(format!("{stem}.js")), body)
         .with_context(|| format!("installing userscript {stem}"))?;
+    // A deliberate install outranks an older deliberate delete.
+    let _ = clear_userscript_tombstone(stem);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⭐ The distinction the provisioner could not previously make. A file that
+    /// is absent because it was never delivered and one that is absent because
+    /// the user deleted it are the same bytes on disk — nothing — and reinstating
+    /// the second makes the pane's Delete button a lie while never repairing the
+    /// first leaves a host browsing without filters it was shipped.
+    #[test]
+    fn a_tombstone_reads_back_the_stems_and_nothing_else() {
+        assert_eq!(
+            parse_tombstone("scriptlets\n\n  idcac  \n"),
+            vec!["scriptlets".to_string(), "idcac".to_string()],
+            "blank and padded lines are not stems"
+        );
+        assert!(
+            parse_tombstone("   \n\n").is_empty(),
+            "a whitespace-only file must not become a stem named \"\", which would \
+             suppress a script whose name nobody can type"
+        );
+    }
 
     #[test]
     fn adblock_defaults_on_when_the_config_is_missing_or_broken() {

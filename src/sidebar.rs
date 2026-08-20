@@ -5125,15 +5125,18 @@ fn media_permission_widgets(
 /// challenges one whose UA claims a platform the page contradicts. Presented as
 /// a row per preset rather than a free-text field: the failure mode of a
 /// hand-typed UA is a site quietly serving you the wrong code.
-fn user_agent_widgets() -> Vec<Value> {
-    let current = crate::useragent::preset();
+fn user_agent_widgets(profile: &str) -> Vec<Value> {
+    let current = crate::useragent::preset_for_profile(profile);
     let mut widgets = vec![json!({"kind": "section", "text": "Browser identity", "card": true})];
     widgets.push(json!({
         "kind": "label",
         "muted": true,
-        "text": "This is the identity every site gets. Prefer a per-site override in \
-                 “This site” above — a browser-wide spoof puts the same inconsistency in \
-                 front of every login you have.",
+        "text": format!(
+            "This is the identity every site gets in “{profile}”. A choice here is remembered \
+             for this profile alone, so another profile keeps the identity it was given. \
+             Prefer a per-site override in “This site” above — a browser-wide spoof puts the \
+             same inconsistency in front of every login you have."
+        ),
     }));
     for preset in crate::useragent::Preset::ALL {
         let selected = preset == current;
@@ -5242,8 +5245,8 @@ fn settings_schema_from(
     // `sitehost`. A user looking for either finds them in one place.
     widgets.extend(current_site_identity_widgets(
         host,
-        &crate::useragent::sites(),
-        crate::useragent::preset(),
+        &crate::useragent::sites_for_profile(profile),
+        crate::useragent::preset_for_profile(profile),
     ));
 
     // Tabs first among the browser-wide settings: it is the one that changes what
@@ -5342,7 +5345,7 @@ fn settings_schema_from(
         }
     }
 
-    widgets.extend(user_agent_widgets());
+    widgets.extend(user_agent_widgets(profile));
 
     widgets.push(json!({
         "kind": "label",
@@ -5619,7 +5622,7 @@ fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
             return json!({ "toast": "No site is open to set an identity for." });
         };
         let wanted = action.strip_prefix(SITE_IDENTITY_ACTION_PREFIX);
-        let outcome = crate::useragent::set_site(host, wanted);
+        let outcome = crate::useragent::set_site_scoped(Some(&profile), host, wanted);
         let toast = match wanted {
             // ⚠ Say the cost at the moment of the choice, not in a doc nobody
             // reads. A spoof that breaks a fingerprint-gated login fails as a
@@ -5638,14 +5641,14 @@ fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
     }
 
     if let Some(preset) = action.strip_prefix(USER_AGENT_ACTION_PREFIX) {
-        return match crate::useragent::set_preset(preset) {
+        return match crate::useragent::set_preset_scoped(Some(&profile), preset) {
             // The UA is fixed when the webview is CREATED, so an in-page reload
             // would keep the old identity. `reload_surface` destroys and recreates
             // it (refetching /policy first), which is the only thing that can
             // change what the browser says it is.
             Ok(()) => redraw(json!({
                 "reload_surface": true,
-                "toast": "Browser identity changed. Reloading the surface.",
+                "toast": format!("Browser identity for “{profile}” changed. Reloading the surface."),
             })),
             Err(error) => redraw(json!({ "toast": error.to_string() })),
         };
@@ -6297,7 +6300,7 @@ mod tests {
     // the schema had no way to say "this row is the current one".
     #[test]
     fn the_active_user_agent_row_is_marked_by_selection_not_a_glyph_in_its_title() {
-        let widgets = user_agent_widgets();
+        let widgets = user_agent_widgets("default");
         let rows: Vec<&Value> = widgets.iter().filter(|w| w["kind"] == "list-row").collect();
         assert!(
             rows.len() > 1,
