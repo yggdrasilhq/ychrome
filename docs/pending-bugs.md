@@ -1125,3 +1125,16 @@ loaded CI host cannot meet — a timing test that fails on a busy machine teache
 agents to ignore red, which is worse than the flake.
 
 ---
+
+## `ychrome --help` does not mention `ctl` — the agent surface is undiscoverable (2026-08-20)
+
+**Seen:** `ychrome ctl --help` works and is the entire agent-facing control surface, but
+top-level `ychrome --help` lists only the viewport options and never names the `ctl`
+subcommand. An agent that does not already know `ctl` exists cannot discover it from the
+binary itself — it has to arrive via a skill document or word of mouth, which is exactly the
+kind of prose dependency the help output exists to remove.
+
+**Want:** top-level help enumerates every subcommand, `ctl` included, with a one-line
+description pointing at `ychrome ctl --help`.
+
+---
