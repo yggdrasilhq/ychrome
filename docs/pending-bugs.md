@@ -7,6 +7,28 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ⭐ A BACKGROUND TAB PLAYING MEDIA MUST SAY SO — A BLINKING WORKING INDICATOR ON ITS ROW
+
+**Status:** OPEN. Owner mandate, 2026-08-20. Not started.
+
+A tab that is playing media in the BACKGROUND — video, audio, anything audible or animating —
+is invisible in the rail today. The user cannot tell which of a dozen background rows is the
+one making noise, so finding it means clicking through them.
+
+**What is wanted:** a **blinking working indicator** on the tab row of any background tab
+with live media, so the alive-with-media rows are readable at a glance.
+
+- Style it per `DESIGN.md`; do not invent a new idiom where the rail already has one for
+  activity, and reuse the existing row-chip machinery rather than adding a parallel one.
+- The signal must come from the engine's own notion of a playing tab, not from a heuristic
+  over the page. An indicator driven by guesswork is worse than none — it blinks on rows that
+  are silent and the user stops trusting it.
+- Foreground is not the interesting case: the user is already looking at it.
+
+**Falsifier:** open a real playing tab, switch away from it, and screenshot the rail — that
+row blinks and no silent row does. ⚠ A unit test cannot settle this one; it needs a live
+tab and a faithful screenshot, per the repo's "verify live, not just in code" rule.
+
 ## ⛔ A THIRD-PARTY FORM CAN RESHAPE A VALUE UNTIL EVERY LITERAL IN A SCANNER'S TERM LIST BREAKS
 
 **Status:** OPEN on the host side only. Detected, purged and requested 2026-08-14; the
