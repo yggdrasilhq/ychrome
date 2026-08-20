@@ -7,6 +7,84 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ⛔⛔ A REGENERATED BUNDLE AT AN UNCHANGED `@version` IS UNDEPLOYABLE FOREVER, AND REPORTS AS A USER EDIT
+
+**Status:** OPEN. Measured 2026-08-21 on an ordinary host, against a clean checkout.
+
+`ychrome provision --json` reported two assets as `forked:1.20260731` — the verdict whose
+meaning is *"this host's copy is modified from the bundle, so it is the user's and we leave it
+alone"*:
+
+```
+cosmetic-filters  userscript       verdict=forked:1.20260731  wrote=False
+rules.json        adblock-ruleset  verdict=forked:1.20260731  wrote=False
+```
+
+**Neither had been edited.** Hashing each host copy against every version of the bundle in git
+history matched both, exactly, to the bundle as committed on 2026-07-31. They are not forks;
+they are an OLD RELEASE that can never be replaced.
+
+The cause is the version scheme, not the reconciler's logic. The generated assets stamp
+`@version` with the **filter lists' date**, not with the bundle's own content, so a
+regeneration on a later day under the same lists ships **different bytes under an identical
+version**. `provision::verdict` then reaches its last arm — version equal, bodies differ —
+and returns `Forked`, which is `needs_write() == false`.
+
+⇒ **Two different bundled bodies sharing one version is a state the verdict table cannot
+represent.** Its five rows assume a version identifies a body. Where that breaks, the
+reconciler does not merely fail to update: it reports the staleness as a deliberate user
+choice, which is the one verdict a human reads and then leaves alone.
+
+⚠ The blast radius is the whole cosmetic plane. The bundle regenerated on 2026-08-02 opened
+the scriptlet plane; a host stuck on the 2026-07-31 body has the older cosmetic filters and
+the older ruleset, and nothing anywhere says so.
+
+### The fix this wants (not yet built)
+
+Record what the provisioner ITSELF wrote — stem → hash of the body it installed — beside the
+existing deletion tombstones. That makes the ambiguous case decidable:
+
+- bytes differ **and** match what we last wrote ⇒ ours, superseded ⇒ **write the new body**;
+- bytes differ **and** do not match ⇒ a genuine user edit ⇒ keep, and say so.
+
+It is the same distinction `.deleted` already draws between *never delivered* and *deleted on
+purpose*, applied to *stale* versus *edited*. ⛔ A version bump alone unblocks a host once and
+leaves the trap armed for the next same-day regeneration.
+
+⚠ A single content hash genuinely cannot tell an old release from a user's edit — that much of
+the existing design note is right. A hash of **what this provisioner wrote** can, because it is
+a record of our own act rather than an inference about the file.
+
+---
+
+## ⚠ A COMPANION SCRIPT STAYS MISSING WHEN THE INSTALLED BINARY PREDATES ITS REPAIR
+
+**Status:** OPEN (deploy gap, not a code gap). Measured 2026-08-21.
+
+`scriptlets.js` was absent from a host's userscript directory with **no tombstone**, so the
+2026-08-20 companion repair should have reinstated it on the next launch: the ruleset is
+present, the catalog carries the stem, and nothing recorded a deletion. It did not run, and
+`provision --json` did not list the asset at all.
+
+The reconciler's code is correct. The **installed binary predates it** — four days older than
+the fix, and the marker is absent from it:
+
+```sh
+strings -a "$(command -v ychrome)" | grep -c deleted_userscripts   # 0 => predates the repair
+```
+
+⇒ 3,341 scriptlet invocations over 5,338 domains were silently not running, on a host whose
+ad blocking otherwise looked healthy. `unblock-select.js` was absent for the same reason.
+
+⚠ **This is the stale-binary trap wearing a new coat.** The repo already knows it for the vault
+agent (`agent_stale`) and for the ychrome daemon (`exe_stamp`), and both of those report
+themselves. **Bundled-asset provisioning has no such stamp**: a fix to the reconciler is
+invisible until someone happens to rebuild, and the symptom is an asset that looks deliberately
+absent. The provisioner should report the binary it is running from, so "the repair is not
+deployed here" is distinguishable from "there is nothing to repair".
+
+---
+
 ## ⭐ A BACKGROUND TAB PLAYING MEDIA MUST SAY SO — A BLINKING WORKING INDICATOR ON ITS ROW
 
 **Status:** OPEN. Owner mandate, 2026-08-20. Not started.
