@@ -620,32 +620,33 @@ impl Engine {
                             &origin,
                             None::<&gio::Cancellable>,
                             move |result: std::result::Result<Vec<soup::Cookie>, glib::Error>| {
-                            let Some(responder) = slot.borrow_mut().take() else {
-                                return;
-                            };
-                            match result {
-                                Ok(list) => {
-                                    let visible: Vec<String> = list
-                                        .into_iter()
-                                        .map(|mut cookie| {
-                                            cookie
-                                                .name()
-                                                .map(|name| name.to_string())
-                                                .unwrap_or_default()
-                                        })
-                                        .collect();
-                                    responder.ok(json!({
-                                        "ok": true,
-                                        "imported": total,
-                                        "add_failures": add_failures.borrow().clone(),
-                                        "visible_for_origin": visible,
-                                    }));
+                                let Some(responder) = slot.borrow_mut().take() else {
+                                    return;
+                                };
+                                match result {
+                                    Ok(list) => {
+                                        let visible: Vec<String> = list
+                                            .into_iter()
+                                            .map(|mut cookie| {
+                                                cookie
+                                                    .name()
+                                                    .map(|name| name.to_string())
+                                                    .unwrap_or_default()
+                                            })
+                                            .collect();
+                                        responder.ok(json!({
+                                            "ok": true,
+                                            "imported": total,
+                                            "add_failures": add_failures.borrow().clone(),
+                                            "visible_for_origin": visible,
+                                        }));
+                                    }
+                                    Err(error) => {
+                                        responder.fail(format!("cookie readback failed: {error}"))
+                                    }
                                 }
-                                Err(error) => {
-                                    responder.fail(format!("cookie readback failed: {error}"))
-                                }
-                            }
-                        });
+                            },
+                        );
                     })
                 };
                 if total == 0 {
@@ -1047,8 +1048,16 @@ pub enum InputEvent {
     /// press+release; these are the halves that let a drag be trusted input
     /// end-to-end instead of `dispatchEvent` on a guessed target. See
     /// pending-bugs “ctl input HAS NO mousedown/mouseup”.
-    MouseDown { x: f64, y: f64, button: u32 },
-    MouseUp { x: f64, y: f64, button: u32 },
+    MouseDown {
+        x: f64,
+        y: f64,
+        button: u32,
+    },
+    MouseUp {
+        x: f64,
+        y: f64,
+        button: u32,
+    },
     /// Composite drag: press at `from`, `steps` moves, release at `to`. Uses
     /// GDK's button mask so moves carry `buttons:1` as a real pointer does.
     Drag {
@@ -1680,23 +1689,108 @@ pub fn modifier_mask(names: &[String]) -> Result<u32> {
             "shift" => gdk::ModifierType::SHIFT_MASK.bits(),
             "ctrl" | "control" => gdk::ModifierType::CONTROL_MASK.bits(),
             "alt" => gdk::ModifierType::MOD1_MASK.bits(),
-            "meta" | "super" | "cmd" => gdk::ModifierType::SUPER_MASK.bits(),
+            // ⛔ `SUPER_MASK` ALONE ARRIVES AS NO MODIFIER AT ALL. WebKit reads
+            // `metaKey` off GDK's META bit, so a mask carrying only SUPER
+            // produced a plain keypress — accepted by this function, dispatched,
+            // reported `ok:true`, and indistinguishable at the page from the
+            // application ignoring the shortcut. Both bits are set: SUPER is
+            // what the X11 keyboard map actually calls the key, META is what the
+            // engine above it reads. Measured, not reasoned: with SUPER only,
+            // a capture-phase recorder saw the key with `metaKey` false.
+            "meta" | "super" | "cmd" => {
+                gdk::ModifierType::META_MASK.bits() | gdk::ModifierType::SUPER_MASK.bits()
+            }
             other => bail!("unknown modifier {other:?} (known: shift, ctrl, alt, meta)"),
         };
     }
     Ok(mask)
 }
 
-/// A key NAME (`Enter`, `Tab`, `a`, `F5`) to its GDK keyval.
-pub fn keyval_from_name(name: &str) -> Result<u32> {
-    let c_name = std::ffi::CString::new(name).context("key name has an interior NUL")?;
+/// The DOM key names that are spelled differently as X11 keysyms.
+///
+/// ⛔ **The vocabulary an agent types is `KeyboardEvent.key`'s, and the
+/// vocabulary GDK answers in is X11's.** They agree often enough (`Tab`,
+/// `Escape`, `Home`, `F1`) to look like one vocabulary, and then they do not:
+/// `Enter` is `Return`, `ArrowLeft` is `Left`, `Backspace` is `BackSpace`,
+/// `PageUp` is `Prior`. Only the names that DIFFER are listed — anything GDK
+/// already answers to is left to GDK, so this table never has to be complete.
+const DOM_KEY_ALIASES: &[(&str, &str)] = &[
+    ("Enter", "Return"),
+    ("ArrowLeft", "Left"),
+    ("ArrowRight", "Right"),
+    ("ArrowUp", "Up"),
+    ("ArrowDown", "Down"),
+    ("Backspace", "BackSpace"),
+    ("PageUp", "Page_Up"),
+    ("PageDown", "Page_Down"),
+    ("Space", "space"),
+    ("Control", "Control_L"),
+    ("Shift", "Shift_L"),
+    ("Alt", "Alt_L"),
+    ("Meta", "Meta_L"),
+    ("OS", "Super_L"),
+    ("CapsLock", "Caps_Lock"),
+    ("NumLock", "Num_Lock"),
+    ("ScrollLock", "Scroll_Lock"),
+    ("PrintScreen", "Print"),
+    ("ContextMenu", "Menu"),
+    ("AltGraph", "ISO_Level3_Shift"),
+];
+
+/// Ask GDK for one X11 keysym name, or `None` if it does not know it.
+fn gdk_keyval(name: &str) -> Option<u32> {
+    let c_name = std::ffi::CString::new(name).ok()?;
     // SAFETY: `gdk_keyval_from_name` takes a NUL-terminated string and returns
     // a plain value; `c_name` outlives the call.
     let keyval = unsafe { gdk::ffi::gdk_keyval_from_name(c_name.as_ptr()) };
     if keyval == gdk::ffi::GDK_KEY_VoidSymbol as u32 || keyval == 0 {
-        bail!("unknown key name {name:?}");
+        return None;
     }
-    Ok(keyval)
+    Some(keyval)
+}
+
+/// A key NAME to its GDK keyval, in the vocabulary a caller actually has.
+///
+/// Three sources, in order, because a caller should not have to know which one
+/// their key lives in:
+///
+/// 1. **A DOM name that X11 spells differently** ([`DOM_KEY_ALIASES`]).
+/// 2. **Any single character**, mapped through Unicode — `+`, `/`, `£`, `5`.
+///    ⛔ This is the arm whose absence made the verb unusable for punctuation:
+///    `gdk_keyval_from_name("+")` is `VoidSymbol`, because X11 calls that key
+///    `plus`. Every symbol on the keyboard was therefore unreachable by the
+///    name a caller would ever think to type, and the failure was reported as
+///    "unknown key name" for a key that plainly exists.
+/// 3. **An X11 keysym name** (`Return`, `plus`, `KP_Add`), so anything already
+///    written against this verb keeps working.
+pub fn keyval_from_name(name: &str) -> Result<u32> {
+    if name.is_empty() {
+        bail!("a key event needs a key name, e.g. \"Enter\", \"a\" or \"+\"");
+    }
+    if let Some((_, x11)) = DOM_KEY_ALIASES.iter().find(|(dom, _)| *dom == name)
+        && let Some(keyval) = gdk_keyval(x11)
+    {
+        return Ok(keyval);
+    }
+    // A single character means itself, whatever it is. `chars().count() == 1`
+    // and not `len() == 1`, so a non-ASCII character is one character here too.
+    let mut chars = name.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next()) {
+        // SAFETY: a pure value mapping, no pointers and no display needed.
+        let keyval = unsafe { gdk::ffi::gdk_unicode_to_keyval(ch as u32) };
+        // GDK returns `ch | 0x0100_0000` for a character it has no keysym for,
+        // which is still a valid keyval to dispatch.
+        if keyval != gdk::ffi::GDK_KEY_VoidSymbol as u32 && keyval != 0 {
+            return Ok(keyval);
+        }
+    }
+    if let Some(keyval) = gdk_keyval(name) {
+        return Ok(keyval);
+    }
+    bail!(
+        "unknown key name {name:?} (a DOM name like \"Enter\" or \"ArrowLeft\", \
+         any single character like \"a\" or \"+\", or an X11 keysym name like \"KP_Add\")"
+    );
 }
 
 /// Build and deliver a press/release pair as seat input. Returns how many
@@ -1931,5 +2025,86 @@ mod tests {
         // Out-of-bounds rects clamp rather than panic: a selector can report a
         // rect that runs past the viewport and that must not kill the engine.
         assert_eq!(shot.dark_pixels(-8, -8, 64, 64, 128), 16);
+    }
+
+    // ⛔ THE VERB'S OWN ERROR MESSAGE USED TO NAME A KEY IT REJECTED. The
+    // vocabulary a caller types is `KeyboardEvent.key`'s; the vocabulary GDK
+    // answers in is X11's, and they diverge exactly where it hurts.
+    #[test]
+    fn a_key_name_is_accepted_in_the_vocabulary_a_caller_actually_has() {
+        // 1. DOM names that X11 spells differently — every one of these was a
+        //    hard error before, including the one the error text suggested.
+        for dom in [
+            "Enter",
+            "ArrowLeft",
+            "ArrowRight",
+            "ArrowUp",
+            "ArrowDown",
+            "Backspace",
+            "PageUp",
+            "PageDown",
+            "Space",
+        ] {
+            assert!(
+                keyval_from_name(dom).is_ok(),
+                "{dom} is what a caller types and it must resolve"
+            );
+        }
+        assert_eq!(
+            keyval_from_name("Enter").unwrap(),
+            keyval_from_name("Return").unwrap(),
+            "the DOM name and the X11 name are the same key, not two keys"
+        );
+
+        // 2. Punctuation, which is the arm whose absence made the verb unusable
+        //    for anything with a symbol on it.
+        for ch in ["+", "-", "/", "=", ".", ",", ":", "@", "?"] {
+            assert!(
+                keyval_from_name(ch).is_ok(),
+                "{ch:?} is a key on the keyboard and must be reachable by its own name"
+            );
+        }
+        assert_eq!(
+            keyval_from_name("+").unwrap(),
+            keyval_from_name("plus").unwrap(),
+            "a character and its X11 keysym name must land on ONE keyval"
+        );
+
+        // 3. Plain characters and X11 names both still work — this must not be
+        //    a vocabulary swap, or everything written against it breaks.
+        for name in ["a", "A", "5", "Tab", "Escape", "F1", "space", "KP_Add"] {
+            assert!(keyval_from_name(name).is_ok(), "{name} regressed");
+        }
+
+        // And a name that really is nonsense still fails, saying what IS taken.
+        let error = keyval_from_name("NotAKeyAtAll").unwrap_err().to_string();
+        assert!(error.contains("NotAKeyAtAll"), "{error}");
+        assert!(error.contains("single character"), "{error}");
+        assert!(keyval_from_name("").is_err());
+    }
+
+    // ⛔ A MODIFIER THAT IS ACCEPTED, DISPATCHED, AND THEN NOT THERE is the
+    // worst shape this verb has: the reply says ok, and the page sees a plain
+    // keypress, which reads as "the application ignored the shortcut".
+    #[test]
+    fn meta_carries_the_bit_webkit_actually_reads() {
+        let meta = modifier_mask(&["meta".to_string()]).unwrap();
+        assert!(
+            meta & gdk::ModifierType::META_MASK.bits() != 0,
+            "WebKit reads metaKey off the META bit — SUPER alone arrived as no \
+             modifier at all"
+        );
+        assert!(
+            meta & gdk::ModifierType::SUPER_MASK.bits() != 0,
+            "SUPER is what the X11 keyboard map calls the key, and it must stay"
+        );
+        for spelling in ["super", "cmd", "META", "Cmd"] {
+            assert_eq!(
+                modifier_mask(&[spelling.to_string()]).unwrap(),
+                meta,
+                "{spelling} must not be a different key from meta"
+            );
+        }
+        assert!(modifier_mask(&["hyper".to_string()]).is_err());
     }
 }
