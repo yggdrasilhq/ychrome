@@ -906,6 +906,37 @@ ychrome status --json | jq '.sessions[] | {env_id, presence_reachable, pending_c
 ceremony there refuses. Cycle that session's ychrome CLI. Explicitly false, never
 merely absent: a daemon older than the field omits it and prints `?`.
 
+### ⛔⛔ AND ARMING A HOST CHANGED THE POLICY BODY WITHOUT MOVING ITS VERSION (fixed 2026-08-22)
+
+The **second half of the owner's ask could never fire either**, for a reason one
+layer below the first. `passkey_enrol_arm` widens the shim's match patterns, but
+`policy_version`'s `passkey_shim_stamp` folded only `agent.pid` and the installed
+vault binary — neither of which an arm touches.
+
+yggterm refetches `/policy` **only when `policy_version` moves**, and it caches
+per SESSION. So arming produced a new policy body under an unchanged version: the
+GUI kept serving the pre-arm policy, and even a freshly opened tab was built
+without the shim. The widget said "reopen the tab" and reopening did not help.
+
+⇒ `sidebar::passkey_enrol_stamp()` is folded into the stamp now. In-memory, so it
+costs nothing on the ~4 s re-declare that path must not do IO on.
+
+⚠ **The stamp names the hosts, it does not count them.** A `len()` moves when the
+set grows from nothing and passes every obvious test, yet cannot tell "armed A"
+from "armed B" — exchanging one for another in a tick would leave the GUI serving
+the shim on the revoked site and withholding it from the new one.
+
+⭐ **And the armed card carries a REBUILD BUTTON, not an instruction.** A shim
+binds to a webview at creation, and the new stamp reaches the GUI on the client's
+~4 s re-declare — so "reopen the tab yourself" is a race the user loses by being
+quick. `passkey-reload` returns `reload_surface: true`, which makes the GUI
+refetch the policy and recreate the surface in one act.
+
+⇒ **The general rule this is the third instance of:** anything that changes WHICH
+sites get the shim must be in the stamp. The vault's rpIds are, SponsorBlock's
+categories are (same reason), and the armed set now is. A fourth input added
+without a stamp entry will fail exactly this way, and silently.
+
 ### The vault pane's passkey surfaces (2026-08-22)
 
 - **A waiting ceremony is drawn above the tabs** (`passkey_ceremony_widgets`) with
