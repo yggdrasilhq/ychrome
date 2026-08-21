@@ -1309,49 +1309,93 @@ const RESERVED_SUBCOMMANDS: &[&str] = &[
 /// never clears, and nothing on screen would otherwise connect the two.
 fn run_identity_verb(args: &[String]) -> Result<()> {
     let as_json = args.iter().any(|arg| arg == "--json");
-    let host = args
-        .iter()
-        .find(|arg| !arg.starts_with("--"))
-        .map(String::as_str);
     let set = args
         .iter()
         .position(|arg| arg == "--set")
         .and_then(|index| args.get(index + 1))
         .map(String::as_str);
+    // ⛔ A FLAG'S VALUE IS NOT A HOSTNAME. This used to take the first argument
+    // that did not start with `--`, so `identity --set chrome` read "chrome" as
+    // the SITE and wrote a per-site rule for a host that does not exist, while
+    // reporting success — the browser-wide preset it was asked for never moved.
+    // Every value-taking flag must be skipped along with its value, and a new
+    // one added below without touching this list would put the bug straight
+    // back, so the list lives in ONE place.
+    const VALUE_FLAGS: [&str; 2] = ["--set", "--profile"];
+    let mut positional: Vec<&str> = Vec::new();
+    let mut skip = false;
+    for arg in args {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if VALUE_FLAGS.contains(&arg.as_str()) {
+            skip = true;
+            continue;
+        }
+        if !arg.starts_with("--") {
+            positional.push(arg);
+        }
+    }
+    let host = positional.first().copied();
     let reset = args.iter().any(|arg| arg == "--reset");
+    // ⭐ `--profile P` scopes the read AND the write to one profile. Without it
+    // this verb speaks for the browser, which is the layer every profile
+    // inherits — the same division the settings pane draws, where the pane is
+    // always inside a profile and therefore always writes one.
+    let profile = args
+        .iter()
+        .position(|arg| arg == "--profile")
+        .and_then(|index| args.get(index + 1))
+        .map(String::as_str);
 
     if set.is_some() || reset {
         match host {
             Some(host) => {
-                useragent::set_site(host, set)?;
+                useragent::set_site_scoped(profile, host, set)?;
                 if set.is_some() {
                     eprintln!("ychrome: {}", useragent::OVERRIDE_WARNING);
                 }
             }
-            // No host means the browser-wide decision. `--reset` there is the
-            // engine preset, which IS the default — spelled out rather than
-            // silently doing nothing.
-            None => useragent::set_preset(set.unwrap_or("engine"))?,
+            // No host means the whole-browser decision for whatever scope was
+            // named. `--reset` there is the engine preset, which IS the default
+            // — spelled out rather than silently doing nothing.
+            None => useragent::set_preset_scoped(profile, set.unwrap_or("engine"))?,
         }
     }
 
-    let global = useragent::preset();
-    let sites = useragent::sites();
+    let (global, sites) = match profile {
+        Some(profile) => (
+            useragent::preset_for_profile(profile),
+            useragent::sites_for_profile(profile),
+        ),
+        None => (useragent::preset(), useragent::sites()),
+    };
     if as_json {
         let effective = host.map(|host| {
             serde_json::json!({
                 "host": host,
                 "preset": useragent::preset_for_host(&sites, global, host).id(),
-                "user_agent": useragent::effective_for_host(host),
+                "user_agent": match profile {
+                    Some(profile) => useragent::effective_for_profile_host(profile, host),
+                    None => useragent::effective_for_host(host),
+                },
             })
         });
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "ok": true,
+                "profile": profile,
                 "preset": global.id(),
-                "user_agent": useragent::effective(),
-                "sites": useragent::sites_json(),
+                "user_agent": match profile {
+                    Some(profile) => useragent::effective_for_profile(profile),
+                    None => useragent::effective(),
+                },
+                "sites": match profile {
+                    Some(profile) => useragent::sites_json_for_profile(profile),
+                    None => useragent::sites_json(),
+                },
                 "site": effective,
             }))?
         );
@@ -1361,9 +1405,16 @@ fn run_identity_verb(args: &[String]) -> Result<()> {
     // UA, and printing a copy here is how a stale constant gets born.
     let show = |ua: Option<String>| ua.unwrap_or_else(|| "(engine default)".to_string());
     println!(
-        "browser-wide: {} — {}",
+        "{}: {} — {}",
+        match profile {
+            Some(profile) => format!("profile “{profile}”"),
+            None => "browser-wide".to_string(),
+        },
         global.label(),
-        show(useragent::effective())
+        show(match profile {
+            Some(profile) => useragent::effective_for_profile(profile),
+            None => useragent::effective(),
+        })
     );
     if sites.is_empty() {
         println!("per-site overrides: none");
@@ -1377,7 +1428,10 @@ fn run_identity_verb(args: &[String]) -> Result<()> {
         println!(
             "\n{host}: {} — {}",
             useragent::preset_for_host(&sites, global, host).label(),
-            show(useragent::effective_for_host(host))
+            show(match profile {
+                Some(profile) => useragent::effective_for_profile_host(profile, host),
+                None => useragent::effective_for_host(host),
+            })
         );
     }
     Ok(())

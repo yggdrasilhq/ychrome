@@ -442,18 +442,31 @@ impl Engine {
     /// afterwards would identify the browser correctly only from the SECOND load
     /// onwards, which is the load a bot check has already scored.
     ///
-    /// A host with no override falls back to the profile's identity, and with no
-    /// global preset either that is `None` — WebKitGTK's own UA, which is the
-    /// coherent one. Setting `None` explicitly matters: without it a page would
-    /// keep whatever the previous navigation set, so one visit to an
+    /// A host with no override falls back to the PROFILE's identity, and with no
+    /// browser-wide preset either that is `None` — WebKitGTK's own UA, which is
+    /// the coherent one. Setting `None` explicitly matters: without it a page
+    /// would keep whatever the previous navigation set, so one visit to an
     /// override-marked site would leak that identity onto every site after it.
+    ///
+    /// ⚠ The profile part of that sentence was documentation before it was code:
+    /// this resolved the BROWSER-WIDE identity and called it the profile's, so an
+    /// engine page in one profile sent the identity another profile had chosen.
+    /// The visible surface and the engine must agree about what a profile is —
+    /// they share the jar, the ruleset and the userscripts, and an identity that
+    /// disagreed would be visible to any site that compares them.
     pub fn apply_identity(&self, id: &str, url: &str) -> Result<Option<String>> {
         let host = url::Url::parse(url)
             .ok()
             .and_then(|parsed| parsed.host_str().map(str::to_string));
-        let agent = match host.as_deref() {
-            Some(host) => crate::useragent::effective_for_host(host),
-            None => crate::useragent::effective(),
+        // The page's own profile, read from the page rather than passed in: a
+        // caller that had to remember it would eventually forget, and the wrong
+        // identity is invisible until a site tells you about it.
+        let profile = self.page_profile(id).unwrap_or_default();
+        let agent = match (profile.is_empty(), host.as_deref()) {
+            (false, Some(host)) => crate::useragent::effective_for_profile_host(&profile, host),
+            (false, None) => crate::useragent::effective_for_profile(&profile),
+            (true, Some(host)) => crate::useragent::effective_for_host(host),
+            (true, None) => crate::useragent::effective(),
         };
         let id = id.to_string();
         let applied = agent.clone();

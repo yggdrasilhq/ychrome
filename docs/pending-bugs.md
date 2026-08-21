@@ -7,6 +7,359 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ⛔⛔ YOUTUBE VIDEO PLAYBACK SEGFAULTS THE ENGINE (the crash is open; the silence around it is fixed)
+
+**Status:** OPEN. Measured 2026-08-21 on a current release build, reproduced **4/4**.
+
+Open a YouTube watch page, let it play, and the whole daemon dies in **1–5 seconds**.
+Timed from one run: the `open` verb returned after 3.9 s, the daemon was gone 1.1 s later.
+
+**The exit is a `SIGSEGV`**, caught by running the daemon under a supervisor instead of
+letting it be spawned:
+
+```
+supervise.sh: line 11: <pid> Segmentation fault    ychrome --daemon
+```
+
+⛔⛔ **Nothing in the product records this, by construction, and that is the reason it
+has never been diagnosed.** Three separate channels each lose it:
+
+1. **`spawn_daemon()` sets `.stderr(Stdio::null())`** (`daemon.rs`). The crash message,
+   the WebKit internal errors and the EGL warnings are all written to a discarded fd.
+   A daemon the app spawns can never say why it died.
+2. **The journal has no record.** Every earlier daemon transition in `journal.jsonl` is a
+   `daemon_stop` / `daemon_start` **pair**; the crash transitions are `daemon_start`
+   **alone**. The engine's own log therefore cannot distinguish a crash from a restart.
+3. **`engine.display.reaped` is emitted by the SUCCESSOR at startup**, not by the dying
+   daemon — so the one line that appears near a death is written by a different process
+   about a display it inherited, and reads as routine housekeeping.
+
+### What it is NOT — three controls, all negative
+
+| control | result |
+|---|---|
+| plain page (`example.com`) | daemon alive indefinitely (30 s+) |
+| YouTube **search results** page, no playback | daemon alive, 15 s+ |
+| **local 4K60 H.264 progressive clip**, 258 % CPU, 16 s | **no crash**, 3/3 |
+
+⇒ It is **not the site**, and it is **not decode load** — a locally generated 4K60 clip
+pushes the same decoder harder for longer and survives. What is left is the path YouTube
+uses and the local clip does not: **MSE / adaptive streaming**, and the codecs reached
+through it.
+
+⚠ Alongside it in the discarded stderr, repeatedly:
+`WebLoaderStrategy::internallyFailedLoadTimerFired()` — "WebKit encountered an internal
+error" — and `ctl console` shows two `failed to load` entries against the watch URL
+itself. Whether the failed loads cause the segfault or share a cause with it is not settled.
+
+### ⛔ FOUR WORKAROUNDS TRIED, ALL NEGATIVE — do not spend the session re-trying these
+
+| tried | result |
+|---|---|
+| `WEBKIT_DISABLE_DMABUF_RENDERER=1` | still crashes |
+| `+ GST_GL_DISABLED=1 + LIBGL_ALWAYS_SOFTWARE=1` | still crashes |
+| a **320x240** viewport, so the site picks a low resolution | still crashes |
+| `WEBKIT_DISABLE_COMPOSITING_MODE=1` | already set by the substrate, and insufficient |
+
+⇒ It is **not resolution-dependent** and it is **not the GL/DMA-BUF path**, which is where the
+EGL warnings invite you to look first.
+
+**Where it actually faults** (gdb, release build so the frames are unsymbolised):
+
+```
+Thread "ychrome-engine" received signal SIGSEGV
+#0  libwebkit2gtk-4.1.so.0        <- fault here
+#1-#9  libwebkit2gtk-4.1.so.0
+#10-#12 libjavascriptcoregtk-4.1.so.0
+#13-#15 libglib-2.0.so.0 (g_main_loop_run)
+#16  gtk_main()
+```
+
+⇒ The crash is in the **UI process**, on the engine thread, dispatched from the GTK main
+loop — **not in the web content process**. That distinction is the load-bearing one: a web
+process crash is survivable and WebKit reports it, which is why the engine has no handler that
+could have caught this. Reaching a cause below this needs debug symbols for
+`libwebkit2gtk-4.1`, which are not installed and have no repo configured here.
+
+⭐⭐ **THE MOST LIKELY REMEDY, AND IT NEEDS AN OWNER DECISION: UPGRADE WebKitGTK.**
+Installed **2.52.5-1**; the distribution offers **2.52.6-1**.
+
+⚠ **This entry first said 2.52.5 was the newest available. That was wrong, and the instrument
+lied in this lane's favourite way — it was STALE.** `apt-cache policy` answers from cached
+package lists, so it reported "no newer version" while a newer one had been published. One
+`apt-get update` changed the answer. ⇒ Before concluding a version is the ceiling, refresh the
+lists; a cache reports the last time you looked, not the world.
+
+⇒ **Not done here, deliberately.** `libwebkit2gtk` is shared system infrastructure that every
+GTK web app on the host links, including other live sessions, and **2.52.5-1 is no longer
+downloadable** — not in the apt cache and gone from the archive — so a rollback means
+snapshot archaeology plus dependency juggling rather than one command. That is a
+system-administration call for the host's owner, not a browser-lane one.
+
+⇒ **Two things converge on this single action**, which is what makes it the recommendation:
+1. a crash in a library at `n-1` is worth retrying at `n` before any deeper work;
+2. **symbolised debugging is blocked without it** — the only `-dbgsym` package published is
+   **2.52.6**, and symbols must match the binary exactly, so there is no way to symbolise a
+   2.52.5 crash at all. Upgrading either fixes the crash or makes it debuggable.
+
+```sh
+sudo apt-get update && sudo apt-get install libwebkit2gtk-4.1-0     # then re-run the repro
+# if it still crashes, add the debug source and get a named frame:
+echo 'deb http://debug.mirrors.debian.org/debian-debug/ sid-debug main' \
+  | sudo tee /etc/apt/sources.list.d/debug.list
+sudo apt-get update && sudo apt-get install libwebkit2gtk-4.1-0-dbgsym
+```
+
+⚠⚠ **NOT MEASURED, AND IT CHANGES WHAT THIS ENTRY MEANS: does the GUI substrate crash too?**
+Every measurement here is on the **headless** substrate (Xvfb, no DRI3). The owner's reports
+describe degraded picture, **not** a browser that dies — so the crash may well be
+headless-only, and the thing he actually experiences may be the dead-counter entry above and
+nothing else. ⇒ **Do not report this as "his browser crashes" until it is measured there.**
+
+⛔ **And do NOT measure it by opening a window on the operator's display.** `substrate.rs`
+records what that costs: GTK ignored the engine's Xvfb, connected to the operator's compositor,
+and put real ychrome toplevels on the human's desktop — including a filled-in brokerage login
+over the video he was watching. Use a dedicated display or the remote-desktop plane.
+
+### Reproduce
+
+```sh
+ychrome ctl open url='https://www.youtube.com/watch?v=<any-video>'   # a 4K60 one dies fastest
+# then watch from OUTSIDE — the engine cannot report its own death:
+while :; do pgrep -x ychrome >/dev/null || echo DEAD; sleep 0.3; done
+```
+
+### ✅ THE RECORDING HALF IS FIXED THIS COMMIT — the crash itself is still open
+
+`spawn_daemon()` no longer sends stderr to `/dev/null`. It goes to
+`<state-dir>/daemon.stderr.log` (0600, rolled once past 4 MB), so the diagnostics that used
+to require running the daemon under a supervisor by hand are now kept by default.
+**Live-proven:** after the change, one ordinary reproduction left this on disk with no
+special tooling —
+
+```
+libEGL warning: DRI3 error: Could not get DRI3 device
+(WebKitWebProcess:…): GStreamer-Audio-WARNING **: Invalid channel positions
+ERROR: WebKit encountered an internal error. This is a WebKit bug.
+Source/WebKit/WebProcess/Network/WebLoaderStrategy.cpp(640) : …internallyFailedLoadTimerFired()
+```
+
+The reaping thread also journals `daemon_exit` with the signal when it observes one.
+⚠ **That line will usually NOT appear, and the code says so**: the waiter lives in whichever
+process spawned the daemon, and a CLI invocation exits long before the daemon dies. The kept
+stderr log is the channel that does not depend on who is still watching. ⇒ A `daemon_exit`
+line is a bonus, never the thing to look for. Measured after the change: 0 such lines across
+several real crashes, exactly as predicted.
+
+⛔ **The segfault is NOT fixed** — only made visible. It still reproduces on every attempt.
+
+### What is still wanted
+
+A `daemon_exit` written by something that outlives the daemon, so the journal can answer for
+daemon lifetime on its own rather than by the absence of a `daemon_stop`.
+
+---
+
+## ⛔ THE FRAME-HEALTH COUNTERS UNDER-REPORT BY ~30x, AND `requestVideoFrameCallback` NEVER FIRES
+
+**Status:** OPEN. Measured 2026-08-21 with locally generated clips — no network, no site.
+
+⚠⚠ **THIS ENTRY WAS FILED WRONG EARLIER THE SAME DAY AND IS CORRECTED HERE.** It claimed
+`droppedVideoFrames` was *"a constant 0"* and that **every** in-page instrument was dead. Both
+overstated. The counter does move, and one of the four instruments is fine. Kept visible rather
+than quietly rewritten, because the wrong version was pushed and someone may have read it.
+
+### What is solid
+
+⛔ **`requestVideoFrameCallback` is advertised and never fires.** `v.requestVideoFrameCallback`
+is present, a self-rearming callback was registered, and after 10 s of playback it had fired
+**0 times** — while `requestAnimationFrame`, registered in the same eval as a control, fired
+232 times. Verified twice, the second time on a clip playing at very near its full rate, so
+"nothing was playing" does not explain it. A player that paces on rVFC gets nothing at all.
+
+⛔ **`droppedVideoFrames` under-reports by around thirty to one.** On a 60 fps clip over 10.2 s:
+465 frames delivered against ~612 expected — **~147 missing — and `droppedVideoFrames` reported
+5.** At 720p60 over 16.7 s: 327 missing, **4 reported**. The counter is not dead; it is
+unusable for the one question anyone asks of it. ⇒ A page cannot tell healthy playback from
+playback missing a quarter of its frames, which is exactly why *"nerdview reports no dropped
+frames"* is not evidence of health.
+
+### ⛔⛔ What is NOT established — the confound I did not check before publishing
+
+**Every one of these measurements was taken on a host at load average 42–49, on 32 cores.**
+Dozens of unrelated agent sessions were running their own WebKit processes throughout. So:
+
+- ⛔ **The absolute frame rates here are NOT clean engine numbers** and must not be quoted as
+  "the engine caps at 43 fps". Repeat runs of the *same* clip disagreed sharply — 360p60
+  measured 37.0 fps once and 59.3 fps on a careful rerun — which is the signature of
+  contention, not of a stable engine ceiling.
+- ⛔ **The earlier claim that the engine cannot sustain 60 fps is FALSE.** 360p60 delivered
+  **59.3 fps**. It sustains 60 fps when it has the machine to do it in.
+- ⚠ The shortfall does grow with resolution (720p60 and 4K60 both fell short while 360p60 did
+  not), which is what a software decode/paint path under contention looks like. Whether any
+  shortfall survives on an idle host is **unmeasured**.
+
+⇒ **The instrument findings above do not depend on load** — a counter reporting 5 of 147, and a
+callback firing 0 of anything, are wrong at any load. Those are the findings to build on. The
+frame-rate table is not.
+
+### The measurement this wants next
+
+Re-run the ladder on an **idle** host, and on the GUI substrate rather than the headless one.
+Until then the honest statement to the owner is: *the counters cannot be trusted to report a
+shortfall, and how large the real shortfall is has not been measured cleanly.*
+
+**Context that bounds it:** the headless substrate gets no GPU —
+`libEGL warning: DRI3 error: Could not get DRI3 device` — so decode and composite are entirely
+software here. A render node exists on the host; Xvfb does not expose DRI3 to reach it.
+
+---
+
+## ⛔⛔ A REGENERATED BUNDLE AT AN UNCHANGED `@version` IS UNDEPLOYABLE FOREVER, AND REPORTS AS A USER EDIT
+
+**Status:** OPEN. Measured 2026-08-21 on an ordinary host, against a clean checkout.
+
+`ychrome provision --json` reported two assets as `forked:1.20260731` — the verdict whose
+meaning is *"this host's copy is modified from the bundle, so it is the user's and we leave it
+alone"*:
+
+```
+cosmetic-filters  userscript       verdict=forked:1.20260731  wrote=False
+rules.json        adblock-ruleset  verdict=forked:1.20260731  wrote=False
+```
+
+**Neither had been edited.** Hashing each host copy against every version of the bundle in git
+history matched both, exactly, to the bundle as committed on 2026-07-31. They are not forks;
+they are an OLD RELEASE that can never be replaced.
+
+The cause is the version scheme, not the reconciler's logic. The generated assets stamp
+`@version` with a **date**, not with the bundle's own content, so a regeneration that lands on
+the same stamp ships **different bytes under an identical version**.
+
+⚠ **Precision, measured 2026-08-21 — the date is the GENERATION RUN's, not the lists'.**
+`ruleset_version()` is `RULESET_FORMAT_VERSION` joined to `today_stamp()`, and `today_stamp()`
+reads the wall clock at generation time. It has nothing to do with when the filter lists were
+published. ⇒ The collision window is a **same-day re-regeneration**, and a regeneration on any
+later day mints a new version and deploys normally. That matters for whoever fixes this: the
+trap is narrower than the opening sentence implies, and it is also why the checked-in bundle
+can be safely regenerated on a day it has not already been regenerated. `provision::verdict` then reaches its last arm — version equal, bodies differ —
+and returns `Forked`, which is `needs_write() == false`.
+
+⇒ **Two different bundled bodies sharing one version is a state the verdict table cannot
+represent.** Its five rows assume a version identifies a body. Where that breaks, the
+reconciler does not merely fail to update: it reports the staleness as a deliberate user
+choice, which is the one verdict a human reads and then leaves alone.
+
+⚠ The blast radius is the whole cosmetic plane. The bundle regenerated on 2026-08-02 opened
+the scriptlet plane; a host stuck on the 2026-07-31 body has the older cosmetic filters and
+the older ruleset, and nothing anywhere says so.
+
+### The fix this wants (not yet built)
+
+Record what the provisioner ITSELF wrote — stem → hash of the body it installed — beside the
+existing deletion tombstones. That makes the ambiguous case decidable:
+
+- bytes differ **and** match what we last wrote ⇒ ours, superseded ⇒ **write the new body**;
+- bytes differ **and** do not match ⇒ a genuine user edit ⇒ keep, and say so.
+
+It is the same distinction `.deleted` already draws between *never delivered* and *deleted on
+purpose*, applied to *stale* versus *edited*. ⛔ A version bump alone unblocks a host once and
+leaves the trap armed for the next same-day regeneration.
+
+⚠ A single content hash genuinely cannot tell an old release from a user's edit — that much of
+the existing design note is right. A hash of **what this provisioner wrote** can, because it is
+a record of our own act rather than an inference about the file.
+
+### ⛔ IT HAS NOW BITTEN THIS REPO'S OWN SHIPPED WORK (2026-08-21)
+
+Commit `5aa909f` changed `assets/web-userscripts/sponsorblock.js` — the custom-site-access
+feature — **without changing its `@version`**, which stayed `2.0.0`. On a host carrying the
+older 2.0.0 body, provisioning compared version-equal / bytes-different and returned
+`forked:2.0.0`:
+
+```
+sponsorblock   userscript   verdict=forked:2.0.0   wrote=False
+```
+
+Host copy 31,675 bytes, bundled copy 33,561 bytes, same version. ⇒ **The feature could not
+reach any host**, and the queue recorded it as delivered. It was live only after the host copy
+was removed and reinstalled by hand.
+
+⚠ **This is worse than the stale-cosmetic-filters case it was filed for.** There the drifting
+`@version` at least came from an upstream list's date. Here **a hand-edited asset kept a
+hand-written version**, so the failure needs no regeneration and no same-day collision — any
+edit that forgets the bump is enough, and the reporting calls the result a user's own edit.
+
+⚠ **An opt-in extension cannot be repaired by provisioning at all.** Provisioning refreshes
+only extensions already installed, so a `forked` opt-in asset is stuck until someone removes
+the file or reinstalls from the pane. `sponsorblock` is opt-in.
+
+---
+
+## ⚠ A COMPANION SCRIPT STAYS MISSING WHEN THE INSTALLED BINARY PREDATES ITS REPAIR
+
+**Status:** ⇒ **CONFIRMED AND CLEARED on one host 2026-08-21** by deploying a current
+binary; the underlying gap stays OPEN because nothing reports it. ⛔ **The falsifier this
+entry gave is broken — see the correction at the end before you use it.**
+
+`scriptlets.js` was absent from a host's userscript directory with **no tombstone**, so the
+2026-08-20 companion repair should have reinstated it on the next launch: the ruleset is
+present, the catalog carries the stem, and nothing recorded a deletion. It did not run, and
+`provision --json` did not list the asset at all.
+
+The reconciler's code is correct. The **installed binary predates it** — four days older than
+the fix, and the marker is absent from it:
+
+```sh
+strings -a "$(command -v ychrome)" | grep -c deleted_userscripts   # ⛔ ALWAYS 0 — see below
+```
+
+⇒ 3,341 scriptlet invocations over 5,338 domains were silently not running, on a host whose
+ad blocking otherwise looked healthy. `unblock-select.js` was absent for the same reason.
+
+⚠ **This is the stale-binary trap wearing a new coat.** The repo already knows it for the vault
+agent (`agent_stale`) and for the ychrome daemon (`exe_stamp`), and both of those report
+themselves. **Bundled-asset provisioning has no such stamp**: a fix to the reconciler is
+invisible until someone happens to rebuild, and the symptom is an asset that looks deliberately
+absent. The provisioner should report the binary it is running from, so "the repair is not
+deployed here" is distinguishable from "there is nothing to repair".
+
+### ⛔⛔ CORRECTION 2026-08-21 — THE FALSIFIER ABOVE FIRES ON EVERY BINARY, REPAIRED OR NOT
+
+`strings -a "$(command -v ychrome)" | grep -c deleted_userscripts` returns **0 for a binary
+freshly built from a tree that contains the repair.** Verified both ways: the source has
+`webpolicy::deleted_userscripts()` and `provision.rs` calls it, and a release build of that
+same tree still counts 0.
+
+**`deleted_userscripts` is a Rust function name, not a string literal, and the release profile
+sets `strip = true`.** The symbol is gone from the binary by design, so the grep can only ever
+return 0. It cannot distinguish a repaired binary from an unrepaired one — the one thing it
+was written to do.
+
+⚠ The conclusion it was offered in support of happened to be **true** (that binary was four
+days older than the fix), which is exactly why this survived: a test that always passes agrees
+with you whenever you are right, and the next reader inherits it as proof.
+
+⇒ **The real falsifier is behavioural.** Install the binary under test, run provisioning, and
+look at what it did:
+
+```sh
+ychrome provision --json | grep -A2 '"id": "scriptlets"'
+#   a repaired binary:  verdict "absent" -> wrote true, and says
+#     ychrome: installed scriptlets (was missing on this host)
+#   an unrepaired one:  the asset is not listed at all
+```
+
+**Live result on one host, 2026-08-21:** binary rebuilt from HEAD and installed ⇒ `scriptlets`
+went `absent` → `wrote: true`, 579 KB written, and the scriptlet plane came back. The repair
+works; only the deploy was missing, as this entry said.
+
+⚠ `unblock-select.js` is still **not** provisioned. It is in the catalog and in the bundled
+assets, but it is an **opt-in** extension, and provisioning only refreshes extensions already
+installed — so it is absent by design, not by this fault. Do not chase it here.
+
+---
+
 ## ⛔ A THIRD-PARTY FORM CAN RESHAPE A VALUE UNTIL EVERY LITERAL IN A SCANNER'S TERM LIST BREAKS
 
 **Status:** OPEN on the host side only. Detected, purged and requested 2026-08-14; the
@@ -537,6 +890,139 @@ gate — park it rather than burning his codes.
 **Falsifier:** the same flow in ychrome with the console open. A named JS error
 identifies the gap; a clean console with no outbound verify request means the
 click never reached the handler and the engine is not implicated.
+
+## ⛔ [11.2] MEDIA QUALITY (owner item 5): DIAGNOSED — the counters are dead and the engine crashes
+
+**Status:** OPEN, but no longer undiagnosed. Worked 2026-08-21 from outside the engine.
+
+The two owner reports and what the measurements say about each:
+
+1. **Front-end video starts high and falls back to prehistoric quality.** Consistent with a
+   player that measures frames itself and reacts to a real shortfall. ⚠ **Not confirmed** —
+   against a front-end instance or on an idle host.
+2. **YouTube shows frame overlaps while nerdview reports no dropped frames.** ⇒ **Partly
+   explained.** `droppedVideoFrames` under-reports by roughly thirty to one, so nerdview
+   reporting nothing is consistent with a large shortfall and is not evidence of health.
+   ⛔ It does **not** follow that the counter is dead — it moves; see the corrected entry
+   *THE FRAME-HEALTH COUNTERS UNDER-REPORT…* above, including the load confound that makes
+   the absolute frame rates unusable.
+
+⇒ Both entries above carry the measurements. This entry stays open for the part not done:
+**the same measurements on the GUI substrate**, which is the one the owner watches through
+and the only place the frame shortfall may differ (the headless substrate has no GPU at all).
+
+⛔⛔ **THE TRAP HELD — but it also caught me, in the other direction.** *An instrument running
+on the thing it measures reads zero* is what sent me looking, and it found a real defect:
+`requestVideoFrameCallback` never fires, and `droppedVideoFrames` under-reports ~30:1. ⚠ **It
+also made an overstatement feel like a confirmation.** The first version of these entries said
+every instrument was dead and the engine could not reach 60 fps. Neither was true, and the
+check that would have caught both — repeat the measurement, and look at the host's load — is
+the cheap one I skipped because the result already agreed with the trap I had been handed.
+⇒ **A trap you are told to expect is itself a prior.** Measure it as sceptically as anything
+else, and repeat a measurement before it becomes a queue entry.
+
+⚠⚠ **CORRECTION TO THIS ENTRY AS PREVIOUSLY FILED.** It said: *"Wire `ytrace` (the probe bus
+already in the workspace, pinned in the top-level `Cargo.toml`)"*. **That is false and cost a
+detour.** There is no `ytrace` dependency in the workspace manifest and no reference to it
+anywhere in the tree. `ytrace` is a **fleet CLI** that queries a probe bus, and the bus
+carries no ychrome producer — only the terminal's. It is not something ychrome can be
+"wired" to by adding a crate.
+
+⭐ **What actually works as an outside instrument, and needs no new code:** sample
+`/proc/<pid>/stat` and `/proc/<pid>/status` for the WebKit processes on a timer from a
+separate script. It keeps reporting after the engine dies, which is the whole property that
+was wanted, and it is what caught the segfault and the RSS ramp.
+
+## ⚠ [11.2] EXTENSIONS (owner item 4): MODALS ARE A HOST CHANGE; THE ADBLOCK FAILURE WAS A DEPLOY GAP
+
+**Status:** PARTLY CLOSED 2026-08-21. Both halves measured; one is fixed and live-proven.
+
+### ✅ SPONSORBLOCK CUSTOM SITE ACCESS — delivered (unchanged), but see the deploy trap below
+`sponsorblock::sites()` / `add_site` / `remove_site`, a settings control, and
+`match_patterns()` as the ONE owner of where SponsorBlock runs. ⛔ No host ships, anywhere.
+
+### ✅ THE YOUTUBE ADBLOCK FAILURE — ROOT-CAUSED, AND IT WAS NEVER `extensions.rs`
+⭐ **Two previous rounds edited the code because the code is what a code-reading session can
+see. The assets could not reach the machine.** Measured state before any change:
+
+| asset | verdict | on disk |
+|---|---|---|
+| `rules.json` (the network ruleset) | `forked:1.20260731` | **3 weeks stale** |
+| `cosmetic-filters.js` | `forked:1.20260731` | **3 weeks stale** |
+| `scriptlets.js` | not listed at all | **absent** |
+| `sponsorblock.js` | `forked:2.0.0` | **pre-`5aa909f`** |
+
+⇒ The ad blocker was running a three-week-old ruleset with its scriptlet companion missing
+entirely. **The fix was to deploy, not to edit.** After installing a current binary and
+clearing the stuck copies, all six assets read `current` and the plane works:
+
+- `static.doubleclick.net/instream/ad_status.js` → **`failed to load`** (blocked by the ruleset)
+- no ad DOM on the watch page: `.ad-showing` / `.video-ads` / `.ytp-ad-overlay-container` all absent
+- SponsorBlock bound and answering: `data-ysb` reports `bound:true`, a real segment returned
+- screenshot of the player, clean, no pre-roll
+
+⛔ **AND THE TRAP THAT CAUSED IT CAUGHT THIS REPO'S OWN WORK.** `sponsorblock.js` was
+`forked:2.0.0` — same `@version`, 1,886 bytes different, because commit `5aa909f` changed the
+asset without changing its version. **The custom-site feature filed above as "delivered" could
+not reach any host**, and provisioning reported that as the user's own edit. See the
+`@version` entry at the top of this file: it is not a hypothetical, it has now bitten twice.
+
+⚠ **An opt-in extension is doubly stuck**: provisioning only refreshes extensions that are
+already installed, so a `forked` opt-in asset cannot be repaired by provisioning at all — the
+only routes are the pane's install action or removing the file.
+
+⛔ **STILL OPEN — `cosmetic-filters.js` REPORTS ITS STATE INTO A WORLD NOTHING CAN READ.**
+
+⚠ **Corrected the same session it was written.** This entry first claimed that
+`youtube-adblock.js` and `cosmetic-filters.js` "publish nothing at all". **That is false**,
+and testing it took one `ctl eval`. What is actually true, measured on a live YouTube page:
+
+| script | `@world` | what it publishes | readable by `ctl eval`? |
+|---|---|---|---|
+| `youtube-adblock.js` | `main` | `__yga_state` — pruned/skipped/forwarded + per-hook counts | ✅ **yes** |
+| `scriptlets.js` | `main` | `__yggScriptlets` | ✅ **yes** |
+| `sponsorblock.js` | `isolated` | `data-ysb` **on the DOM** | ✅ **yes** |
+| `cosmetic-filters.js` | `isolated` | `__yggCosmetic` / `__yggCosmeticState` | ⛔ **NO — always `undefined`** |
+
+⇒ Three of the four are already diagnosable, and `youtube-adblock.js` — the one this mandate
+is about — carries the richest state of any of them and has all along.
+
+⛔ **The one real gap is `cosmetic-filters.js`, and its failure mode is worse than silence.**
+It runs in the ISOLATED world and reports itself through `window` globals, which a page-world
+`eval` can never see. So the variables exist, they are the obvious thing to reach for, and they
+read `undefined` on a perfectly healthy script — **which is exactly the misread `docs/adblock.md`
+already warns about for `window.__ysb`, and the reason SponsorBlock publishes to the DOM
+instead.** The lesson was learned once and never applied to the script beside it.
+
+⇒ **Fix:** the generated cosmetic script should set a `data-*` attribute on
+`document.documentElement`, in the same shape as `data-ysb`. It is generated, so the change
+belongs in the generator, not in the asset. ⚠ And document the four names together — an agent
+currently has to read four scripts to learn four different conventions.
+
+### ⛔ STILL OPEN — PER-EXTENSION MODALS ARE NOT A YCHROME JOB FIRST
+**Measured, as the mandate asked, before designing anything: a contributed pane CANNOT raise
+a modal.** The surface protocol is explicit that this is the dividing line:
+
+> an app "informs and cannot ask; anything needing an answer is a modal the shell owns
+> (the `fido2` dialog is the worked example of that split)"
+
+Every modal that exists — the FIDO2 presence dialog, the media-capture prompt — is a native
+shell construct, added by changing the shell. There is no modal widget kind in the contract.
+
+⇒ **This is a Tier C change: one new declarative widget kind, and the vocabulary is the
+shell's, not ychrome's.** Admission needs both of the spec's rules to hold:
+
+1. **at least two apps want it** — one app's need is a feature request, two is a vocabulary gap;
+2. **it is declarative** — data in, events out, never an imperative drawing API.
+
+⚠ A modal kind plausibly clears rule 2 and **has not been shown to clear rule 1** — SponsorBlock
+is one app wanting it. ⇒ The honest next step is to find the second caller or to accept that the
+settings pane stays the place, **not** to open a native surface for it: jumping A→B to get one
+widget "serves one app and charges every app the native-surface tax forever".
+
+⇒ **Routing:** this belongs to the shell's queue, not this one. It is recorded here because
+this is where the mandate landed, and it should be raised with the shell's owner rather than
+built here.
 
 ## ⭐ OWNER-REPORTED: TABS CANNOT BE SHIFT-SELECTED, SO THEY MUST BE FILED ONE AT A TIME
 
