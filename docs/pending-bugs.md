@@ -84,10 +84,17 @@ IS proven: the round trip through the real dispatcher
 `run_settings_action`, not a pure builder), and every guard verified by
 reintroducing its regression on purpose.
 
-⇒ Until yggterm is rebuilt, every host takes the **inline fallback** — the same
-controls, drawn in the pane, because `app_modals` is absent. That is the gate
-working, not a bug. **The falsifier for "live" is a screenshot of an extension
-dialog, and it has not been taken.**
+⇒ Until yggterm is rebuilt, every host takes the **inline fallback**: the row
+and its button are still drawn, and pressing it unfolds THAT extension in the
+pane while folding the last one away. That is the gate working, not a bug.
+**The falsifier for "live" is a screenshot of an extension dialog, and it has
+not been taken.**
+
+⚠ The first cut of the fallback inlined every extension's full options at once,
+which is **longer than the pane this change exists to shorten** — the fix for
+clutter shipping more of it to every host whose shell was not rebuilt.
+`without_a_dialog_the_same_button_unfolds_one_extension_at_a_time` holds the
+line.
 
 ### ⛔ ONE THING WAS DELIBERATELY NOT BUILT — PER-SITE AD BLOCKING
 
