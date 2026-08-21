@@ -39,7 +39,7 @@ documented law: *the verb reports the request, not the effect*.
 
 **RECOMMENDATION: leave it for a sweep.** Re-removing an already-removed row files a second
 DELETION against someone's row files, which is worse than a stale entry. The live successor is
-`9eb57932…`, seat 11.25.
+`9eb57932…`, seat 11.24.1.
 
 **What was done meanwhile.** The cause is recorded in the fleet skill's §11 register on
 `lane/dev/11.24-omnibox`: `--no-activate` parks a queued `remote-cc` resume on *"Daemon PTY:
