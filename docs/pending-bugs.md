@@ -1017,8 +1017,11 @@ first. 1 and 3 closed with it; 2 (removal) is independent and still open.
 ## ✅ CLOSED 2026-08-22: A FILL-PASSKEY BUTTON AND AN ADD-PASSKEY MECHANISM IN THE VAULT PANE
 
 **Status:** SHIPPED. Requested 2026-08-22: a fill-passkey button and an add-passkey mechanism
-in the ychrome vault pane. Both landed, together with the presence-routing defect below that
-would have made either one dead on arrival.
+in the ychrome vault pane. Both landed, together with the two routing defects below that
+would have made them dead on arrival: the presence request went to the daemon's `/dev/null`
+stdout (the FILL half), and arming changed the policy body without moving its version (the ADD
+half). Neither button could have worked without its fix, and neither fix is visible from the
+pane code.
 
 ### What is there now
 
@@ -1030,6 +1033,7 @@ would have made either one dead on arrival.
 | the per-row Fill-passkey button | `sidebar::item_row`, action `passkey-fill` |
 | "Saved a new passkey for X" / "Signed in to X" | `sidebar::passkey_outcome_widgets` |
 | enrolling on a site with no passkey yet | `sidebar::passkey_enrol_widgets` (already in this pane) |
+| rebuilding the page so an armed site gets the shim | `passkey-reload` on the armed card |
 
 ⚠ **A correction to the earlier version of this entry**, which said the enrol affordance
 "lives on the HOST/settings surface". It does not and never did: `unlocked_schema` draws it,
@@ -1170,6 +1174,51 @@ A `ychrome daemon restart` leaves live surfaces pointing at the retired daemon's
 (`connect 127.0.0.1:<port>: Connection refused`, GUI toast "Web policy unavailable … Its
 surfaces open unprotected"), which additionally strips the userscripts and therefore the shim.
 Not fixed here, and not the same bug — but it lands on the same feature.
+
+## ✅ FIXED 2026-08-22: arming a host for passkey enrolment changed the policy body under an unchanged version
+
+**Status:** FIXED, same day it was found. This is the ADD half of the owner's ask, and it
+could no more fire than the fill half could.
+
+`sidebar::passkey_enrol_arm` widens the shim's match patterns so a site the vault has never
+seen can call `navigator.credentials.create()`. But `webpolicy::passkey_shim_stamp` folded only
+two things — `agent.pid` and the installed vault binary — and an arm touches neither.
+
+yggterm refetches `GET /policy` **only when `policy_version` moves**, and caches the result per
+SESSION (`only_a_changed_policy_version_refetches`, and the cache is keyed by session, not by
+surface). So:
+
+1. The user clicks "Enrol a passkey here".
+2. `/policy`'s BODY now carries the shim for that host.
+3. `policy_version` does not move.
+4. The GUI never refetches, and a newly opened tab is built from the cached, pre-arm policy.
+5. `create()` is still unavailable on the armed site — the one thing arming exists to enable.
+
+Measured, not inferred: two `policy_version("default")` calls either side of an arm returned
+the identical `43afb95d89035199`.
+
+**The fix.** `sidebar::passkey_enrol_stamp()` is folded into `passkey_shim_stamp`. It is
+in-memory, so it costs nothing on the ~4 s re-declare, which is the one hard constraint on that
+path (a socket round trip there was already measured to wreck the surface tests).
+
+⚠ **It names the hosts; it does not count them.** A `len()` moves when the set grows from
+nothing and would pass the obvious test, while being unable to distinguish "armed A" from
+"armed B" — swapping one for another in a single tick would leave the GUI serving the shim on
+the revoked site and withholding it from the new one.
+
+⭐ **The armed card now carries a rebuild BUTTON.** A shim binds to a webview at creation, and
+the new stamp only reaches the GUI on the client's next re-declare, so telling the user to
+reopen the tab is a race they lose by being quick. `passkey-reload` returns
+`reload_surface: true` — the GUI refetches the policy and recreates the surface in one act.
+
+### ⇒ THE RULE, WHICH THIS IS THE THIRD INSTANCE OF
+
+**Anything that changes WHICH sites get the shim must be in the stamp.** The vault's rpIds are
+(added 2026-08-01, after a user met it as "your browser does not support WebAuthn").
+SponsorBlock's categories are, for the identical reason, and the stamp's own doc says so. The
+armed set was the third input and had no entry. A fourth added without one will fail exactly
+this way, and it will fail silently — the body is right, the version is stale, and nothing
+anywhere reports a mismatch.
 
 ## ⚠ THE AGENT ENGINE CANNOT DO PASSKEYS AT ALL, and nothing says so
 
@@ -1510,15 +1559,14 @@ passkey?"*
    over a locked vault still needs REOPENING. The pane says so in words. A
    vault-published scope stamp would close it properly.
 
-### ⚠ ENROLMENT ON A SITE WITH NO PASSKEY — THE ARM IS BUILT, THE PROOF IS OWED
+### ✅ ENROLMENT ON A SITE WITH NO PASSKEY — THE ARM IS BUILT, AND IT CAN NOW ACTUALLY FIRE
 
 The shim's match patterns come only from rpIds the vault ALREADY holds
 credentials for, so a site you have no passkey for sees a pristine `navigator`
 — exactly right for the fingerprinting fix, and it also meant
 `navigator.credentials.create()` could never be called there. Every passkey in
-this vault was enrolled in some other browser. The user hit this on a Google
-sign-in: *"I cannot enter the passkey when anyone requests me … there is no
-clicking to give passkey or save a passkey."*
+this vault was enrolled in some other browser. It was reported as being unable to
+save a passkey when a site offered one.
 
 ⛔ The fix is NOT to widen the scope back, and it was not: **the user arms one
 host from the vault pane** ("Enrol a passkey here"), the anomaly exists only on
@@ -1527,10 +1575,19 @@ restart forgets it. Built 2026-08-02, unit-locked and mutation-proven (an armed
 host must reach the shim's real match patterns; a wildcard or empty host is
 refused at the door).
 
-**Owed:** the end-to-end proof on a real page — arm a site, reopen the tab,
-and watch `navigator.credentials.create()` succeed. ⚠ The pane says the tab must
-be REOPENED, because the shim is installed when a surface is built; if that
-turns out to be wrong on this path, the notice is what needs correcting.
+⛔ **AND UNTIL 2026-08-22 IT COULD NOT FIRE ANYWAY.** The note below used to say
+"reopen the tab, and if that turns out to be wrong on this path, the notice is
+what needs correcting". It WAS wrong. Arming changed the policy BODY without
+moving `policy_version`, and the GUI refetches only when that moves — so
+reopening the tab rebuilt the surface from the cached pre-arm policy and the shim
+was still absent. Fixed by folding the armed set into the stamp, plus a rebuild
+button on the armed card so the user is not racing the ~4 s re-declare. Full
+entry above.
+
+**Owed:** the end-to-end proof on a real page — arm a site, rebuild, and watch
+`navigator.credentials.create()` succeed against a real relying party. Everything
+between the button and the vault write is now unit-locked and the delivery path
+is live-proven; what is unproven is the RP's acceptance.
 
 ### IMPLEMENTED 2026-08-01, NOT YET PROVEN ON A REAL PAGE
 

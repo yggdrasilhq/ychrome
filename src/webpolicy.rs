@@ -387,6 +387,17 @@ fn passkey_shim_stamp() -> String {
         "vault_exe:{}\n",
         ychrome_vault_proto::installed_vault_exe_stamp()
     ));
+    // ⛔ THE THIRD INPUT TO THE SHIM'S SCOPE, AND IT WAS MISSED. The two stats
+    // above cover what the VAULT decides; a host the user ARMED for enrolment
+    // widens the scope without touching either — same class as SponsorBlock's
+    // categories above, which are folded in for exactly this reason. Without it
+    // the "Enrol a passkey here" button changed the policy body under an
+    // unchanged version, so the GUI never refetched and `create()` could never
+    // be called on the armed site. That is the one thing arming exists to do.
+    //
+    // In-memory, so it costs nothing on the ~4 s re-declare this path must not
+    // do IO on.
+    manifest.push_str(&crate::sidebar::passkey_enrol_stamp());
     manifest
 }
 

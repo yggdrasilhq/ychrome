@@ -222,10 +222,22 @@ fn passkey_enrol_widgets(host: Option<&str>, shim: &PasskeyShimState) -> Vec<Val
             json!({
                 "kind": "label", "muted": true,
                 "text": format!(
-                    "{host} may now ask this browser to create a passkey. \
-                     ⚠ REOPEN THE TAB first — the shim is installed when a surface is \
-                     built, so a page that is already open was built without it.",
+                    "{host} may now ask this browser to create a passkey, but the page \
+                     on screen was built without one — a shim is installed when a \
+                     surface is created, never afterwards. Rebuild the page, then use \
+                     the site's own button for adding a passkey.",
                 ),
+            }),
+            // ⛔ A BUTTON, NOT AN INSTRUCTION TO REOPEN THE TAB BY HAND. Arming
+            // moves `policy_version`, but that reaches the GUI on the client's
+            // ~4s re-declare — so a user who reopens the tab straight away
+            // reopens it under the PRE-ARM policy, finds no shim, and concludes
+            // the button does not work. This reply makes the GUI refetch the
+            // policy and recreate the surface in one act, with no race to lose.
+            json!({
+                "kind": "button", "id": "passkey_enrol_reload", "action": "passkey-reload",
+                "primary": true, "label": "Rebuild this page with the shim",
+                "title": format!("Recreate the surface so {host} can offer a passkey"),
             }),
             json!({
                 "kind": "button", "id": "passkey_disarm", "action": "passkey-disarm",
@@ -409,6 +421,25 @@ fn passkey_enrol_armed_store() -> &'static Mutex<std::collections::BTreeSet<Stri
 
 fn passkey_enrol_armed() -> std::collections::BTreeSet<String> {
     passkey_enrol_armed_store().lock().unwrap().clone()
+}
+
+/// The armed set, for [`crate::webpolicy::policy_version`].
+///
+/// ⛔ **ARMING CHANGES WHICH SITES GET THE SHIM, SO IT MUST MOVE THE STAMP.**
+/// `/policy`'s body changing is not enough: yggterm refetches only when
+/// `policy_version` moves, and it caches the policy per SESSION — so an
+/// unchanged stamp means even a newly opened tab is built from the pre-arm
+/// policy. The pane would say "reopen the tab" and reopening would not help.
+///
+/// A `BTreeSet`, so the order is the set's own and two identical arms cannot
+/// produce two different stamps. In-memory only, which is what makes it safe to
+/// call from the ~4 s re-declare — the one hard constraint on that path is no IO.
+pub(crate) fn passkey_enrol_stamp() -> String {
+    let armed = passkey_enrol_armed_store().lock().unwrap();
+    format!(
+        "passkey_enrol:{}\n",
+        armed.iter().cloned().collect::<Vec<_>>().join(",")
+    )
 }
 
 /// Returns true when the host was newly armed, false when it was already.
@@ -5034,13 +5065,24 @@ fn run_action(state: &Mutex<PaneState>, request: &Value, signer: &Signer) -> Val
             if passkey_enrol_arm(&value) {
                 let mut reply = reschema(state, host.as_deref(), signer);
                 reply["toast"] = json!(format!(
-                    "{value} can now ask for a passkey. Reopen the tab so the page is \
-                     built with it."
+                    "{value} can now ask for a passkey. Press Rebuild so the page is \
+                     built with the shim."
                 ));
                 reply
             } else {
                 json!({ "toast": format!("{value} is not a host a passkey can scope to.") })
             }
+        }
+        // The settings pane has its own `reload-surface`; this is deliberately a
+        // SEPARATE arm and not a shared one, because the two panes redraw
+        // differently (`reschema` here, `redraw` there) and folding them would
+        // have one pane returning the other's schema. What must not diverge is
+        // the FLAG the GUI acts on, which is locked by a test.
+        "passkey-reload" => {
+            let mut reply = reschema(state, host.as_deref(), signer);
+            reply["reload_surface"] = json!(true);
+            reply["toast"] = json!("Rebuilding this page so the site can offer a passkey.");
+            reply
         }
         "passkey-disarm" => {
             passkey_enrol_disarm(&value);
@@ -7657,6 +7699,69 @@ mod tests {
 
     /// A row's actions minus the ones every row carries, so a test about WHICH
     /// injector an item gets is not also a test of how many affordances exist.
+    /// ⛔ ARMING WITHOUT A REBUILD IS ARMING THAT LOOKS BROKEN. A shim binds to
+    /// a webview at creation, so the page on screen when the user armed will
+    /// never have one. Arming does move `policy_version` now, but that reaches
+    /// the GUI on the client's ~4s re-declare — so "reopen the tab yourself" is
+    /// a race the user loses by being quick. The armed card carries a button
+    /// that refetches and recreates in one act.
+    #[test]
+    fn the_armed_card_offers_a_rebuild_rather_than_a_race() {
+        let host = "arm-reload.example";
+        assert!(passkey_enrol_arm(host));
+        let armed = passkey_enrol_widgets(
+            Some(host),
+            &PasskeyShimState::ScopedTo(vec!["other.example".into()]),
+        );
+        let actions: Vec<&str> = armed
+            .iter()
+            .filter_map(|widget| widget["action"].as_str())
+            .collect();
+        assert!(
+            actions.contains(&"passkey-reload"),
+            "the armed card leaves the user to reopen the tab by hand, which \
+             races the re-declare that carries the new policy version"
+        );
+        assert!(
+            actions.contains(&"passkey-disarm"),
+            "an arm must be revocable"
+        );
+        passkey_enrol_disarm(host);
+    }
+
+    /// The two panes own separate reload arms on purpose (they redraw
+    /// differently), but the GUI acts on ONE field. If those two spellings ever
+    /// diverge, one pane's rebuild silently becomes a no-op — and a no-op
+    /// rebuild is indistinguishable from a shim that failed to install.
+    #[test]
+    fn both_panes_spell_the_surface_recreate_flag_the_same_way() {
+        let production = include_str!("sidebar.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source before the test module");
+        let arm_body = |name: &str| -> String {
+            production
+                .split(name)
+                .nth(1)
+                .and_then(|rest| rest.split("\n        \"").next())
+                .expect("the arm body")
+                .lines()
+                .map(|line| match line.find("//") {
+                    Some(at) => &line[..at],
+                    None => line,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for name in ["\"passkey-reload\" => {", "\"reload-surface\" => {"] {
+            assert!(
+                arm_body(name).contains("\"reload_surface\""),
+                "{name} stopped asking the GUI to recreate the surface, so its \
+                 policy change reaches the page only by accident"
+            );
+        }
+    }
+
     /// ⛔ THE OTHER HALF OF THE 2026-08-02 REPORT: *"I cannot enter the passkey
     /// when anyone requests me … there is no clicking to give passkey or save a
     /// passkey."* Per-origin scoping made enrolment impossible on any site the
@@ -7678,9 +7783,23 @@ mod tests {
             "no way to arm enrolment on a site the vault has never seen"
         );
 
+        // ⛔ AND THE STAMP MUST MOVE WITH IT. `/policy`'s BODY changing is not
+        // enough: yggterm refetches only when `policy_version` moves, and it
+        // caches per SESSION, so an unchanged stamp means even a freshly opened
+        // tab is built from the pre-arm policy. The widget would then say
+        // "reopen the tab" and reopening would not help — arming that reaches
+        // the pattern but not the stamp is the same theatre one layer down.
+        let before = crate::webpolicy::policy_version("default");
         assert!(passkey_enrol_arm(host), "arming a good host must take");
         assert!(!passkey_enrol_arm(host), "arming twice must not re-report");
         assert!(passkey_enrol_armed().contains(host));
+        assert_ne!(
+            before,
+            crate::webpolicy::policy_version("default"),
+            "arming changed WHICH sites get the shim without moving \
+             policy_version, so the GUI never refetches and the armed \
+             site is never built with the shim"
+        );
 
         // ...and an armed host must actually reach the shim's match patterns,
         // which is the whole point: the widget without the pattern is theatre.
@@ -7707,11 +7826,43 @@ mod tests {
         );
         assert!(!passkey_enrol_arm(""), "empty is not a host");
 
+        // ⛔ AND DISARMING MUST REACH THE GUI TOO, which is the direction that
+        // matters more: an armed host is a deliberate exception to the
+        // fingerprinting scope, and an exception the user revoked while the
+        // surface keeps the shim is exactly the exception outliving the
+        // intention behind it.
+        let armed_version = crate::webpolicy::policy_version("default");
         passkey_enrol_disarm(host);
         assert!(
             !passkey_enrol_armed().contains(host),
             "disarm must actually clear it"
         );
+        assert_ne!(
+            armed_version,
+            crate::webpolicy::policy_version("default"),
+            "disarming did not move policy_version, so the GUI keeps \
+             serving the shim on a host the user just revoked"
+        );
+
+        // ⛔ THE STAMP MUST CARRY WHICH HOST, NOT HOW MANY. A count moves
+        // when the set grows from nothing, so a stamp built on `len()` passes
+        // every assertion above and still cannot tell "armed A" from "armed B" —
+        // exchanging one for another in a single tick would leave the GUI
+        // serving the shim on the revoked site and withholding it from the new
+        // one, with nothing to refetch on.
+        let one = "arm-swap-a.example";
+        let other = "arm-swap-b.example";
+        assert!(passkey_enrol_arm(one));
+        let armed_one = passkey_enrol_stamp();
+        passkey_enrol_disarm(one);
+        assert!(passkey_enrol_arm(other));
+        assert_ne!(
+            armed_one,
+            passkey_enrol_stamp(),
+            "the stamp counts armed hosts instead of naming them, so \
+             exchanging one for another moves nothing"
+        );
+        passkey_enrol_disarm(other);
     }
 
     /// ⛔ THE 2026-08-02 REPORT, IN ONE ASSERTION. The user could not finish a
@@ -10503,6 +10654,15 @@ mod tests {
             stamp.contains("pid_path") && stamp.contains("installed_vault_exe_stamp"),
             "a handover rewrites agent.pid and an install moves the binary's mtime; \
              those two stats are what make a recovered agent reach a surface"
+        );
+        // The THIRD input to the shim's scope. The vault decides two of them;
+        // the user arming a host decides this one, and it moves nothing the two
+        // stats above can see.
+        assert!(
+            stamp.contains("passkey_enrol_stamp"),
+            "an armed host widens the shim's scope without moving either stat \
+             above, so arming would change the policy body under an unchanged \
+             version and never reach a surface"
         );
     }
 
