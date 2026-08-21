@@ -469,7 +469,8 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
         // `cc-number` says which network issued it), so this is the one fill
         // whose report stops at the label.
         "fill-card" => {
-            let (Some(id), Some(item)) = (page_id, request.body.get("item").and_then(Value::as_str))
+            let (Some(id), Some(item)) =
+                (page_id, request.body.get("item").and_then(Value::as_str))
             else {
                 return Reply::bad(400, "fill-card needs a page_id and item");
             };
@@ -879,9 +880,28 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
                 "substrate": engine.substrate().id(),
                 "display": engine.display_name(),
                 "pages": engine.page_ids().unwrap_or_default(),
+                // WHICH BUILD IS ANSWERING. A long-lived engine goes on serving
+                // from an inode that was replaced on disk, so "the engine" and
+                // "the binary at that path" drift apart silently. See
+                // `crate::build`.
+                "engine": crate::build::identity_json(),
             }),
         ),
-        other => Reply::bad(404, format!("unknown engine verb {other:?}")),
+        // ⛔ AN UNKNOWN VERB IS TWO DIFFERENT FACTS AND THEY NEED DIFFERENT
+        // ANSWERS: the verb does not exist, or this engine predates it. A 404
+        // that cannot tell them apart once nearly deleted a working feature —
+        // `ctl frame` was reported as "advertised and 404s", and the fix
+        // proposed was to remove it from the usage line. So the reply names the
+        // build that is answering, and the CLI compares it with its own.
+        other => Reply::Json(
+            404,
+            json!({
+                "ok": false,
+                "error": format!("unknown engine verb {other:?}"),
+                "engine": crate::build::identity_json(),
+                "known": VERBS,
+            }),
+        ),
     }
 }
 
@@ -984,8 +1004,7 @@ fn cookie_specs(body: &Value, origin: &str) -> Result<Vec<CookieSpec>, String> {
         return Ok(specs);
     }
     if let Some(jar) = body.get("jar").and_then(Value::as_str) {
-        let text =
-            std::fs::read_to_string(jar).map_err(|error| format!("jar {jar:?}: {error}"))?;
+        let text = std::fs::read_to_string(jar).map_err(|error| format!("jar {jar:?}: {error}"))?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_secs() as i64)
@@ -1508,10 +1527,20 @@ fn parse_input(event: &Value) -> Result<PendingInput> {
             Ok(PendingInput::Ready(InputEvent::MouseUp { x, y, button }))
         }
         "drag" => {
-            let from_x = event["from_x"].as_f64().or_else(|| event["x"].as_f64()).ok_or_else(|| anyhow::anyhow!("drag needs from_x/from_y or x/y"))?;
-            let from_y = event["from_y"].as_f64().or_else(|| event["y"].as_f64()).ok_or_else(|| anyhow::anyhow!("drag needs from_x/from_y or x/y"))?;
-            let to_x = event["to_x"].as_f64().ok_or_else(|| anyhow::anyhow!("drag needs to_x"))?;
-            let to_y = event["to_y"].as_f64().ok_or_else(|| anyhow::anyhow!("drag needs to_y"))?;
+            let from_x = event["from_x"]
+                .as_f64()
+                .or_else(|| event["x"].as_f64())
+                .ok_or_else(|| anyhow::anyhow!("drag needs from_x/from_y or x/y"))?;
+            let from_y = event["from_y"]
+                .as_f64()
+                .or_else(|| event["y"].as_f64())
+                .ok_or_else(|| anyhow::anyhow!("drag needs from_x/from_y or x/y"))?;
+            let to_x = event["to_x"]
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("drag needs to_x"))?;
+            let to_y = event["to_y"]
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("drag needs to_y"))?;
             let steps = event["steps"].as_u64().unwrap_or(8) as usize;
             let button = match event["button"].as_str().unwrap_or("left") {
                 "left" => 1,
@@ -1528,7 +1557,9 @@ fn parse_input(event: &Value) -> Result<PendingInput> {
                 button,
             }))
         }
-        other => bail!("unknown input event type {other:?} (click|move|scroll|type|key|mousedown|mouseup|drag)"),
+        other => bail!(
+            "unknown input event type {other:?} (click|move|scroll|type|key|mousedown|mouseup|drag)"
+        ),
     }
 }
 
@@ -3321,10 +3352,7 @@ mod tests {
     /// unambiguous fault — no editable target at all — stops a batch.
     #[test]
     fn a_field_that_kept_the_wrong_amount_is_reported_rather_than_refused() {
-        assert!(
-            !accepts_text(None),
-            "an unreadable page is not a target"
-        );
+        assert!(!accepts_text(None), "an unreadable page is not a target");
         assert!(
             !accepts_text(Some(&json!({ "focused": false, "length": 0 }))),
             "nothing focused is not a target"
@@ -3372,7 +3400,9 @@ mod tests {
         );
         // An older readback, from before the flag existed, must not be read as
         // a frame — absence of the field is not evidence of one.
-        assert!(!focus_is_a_frame(Some(&json!({ "focused": true, "length": 3 }))));
+        assert!(!focus_is_a_frame(Some(
+            &json!({ "focused": true, "length": 3 })
+        )));
         assert!(!focus_is_a_frame(None));
     }
 
