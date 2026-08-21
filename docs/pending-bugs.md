@@ -643,6 +643,19 @@ was wanted, and it is what caught the segfault and the RSS ramp.
 `match_patterns()` as the ONE owner of where SponsorBlock runs. ⛔ No host ships, anywhere.
 
 ### ✅ THE YOUTUBE ADBLOCK FAILURE — ROOT-CAUSED, AND IT WAS NEVER `extensions.rs`
+
+⭐ **RE-CONFIRMED LIVE 2026-08-21, on a PLAYING watch page** — which was impossible until the
+compositing crash was fixed the same evening, and is why this half had never been checked while
+the video actually ran:
+
+```
+__yga_state                     {"pruned":1,"hooks":{"inline":1,...}}
+static.doubleclick.net/instream/ad_status.js   "failed to load"   (blocked by the ruleset)
+.ad-showing / .video-ads / .ytp-ad-overlay-container / .ytp-ad-module   all 0
+data-ysb                        bound:true, a real `outro` segment returned
+video                           playing, 0 dropped frames
+```
+
 ⭐ **Two previous rounds edited the code because the code is what a code-reading session can
 see. The assets could not reach the machine.** Measured state before any change:
 
@@ -672,33 +685,42 @@ not reach any host**, and provisioning reported that as the user's own edit. See
 already installed, so a `forked` opt-in asset cannot be repaired by provisioning at all — the
 only routes are the pane's install action or removing the file.
 
-⛔ **STILL OPEN — `cosmetic-filters.js` REPORTS ITS STATE INTO A WORLD NOTHING CAN READ.**
+✅ **CLOSED 2026-08-21 — `cosmetic-filters.js` IS DIAGNOSABLE, AND THE REASON IT WAS NOT IS
+WORSE THAN THE SYMPTOM.**
 
-⚠ **Corrected the same session it was written.** This entry first claimed that
-`youtube-adblock.js` and `cosmetic-filters.js` "publish nothing at all". **That is false**,
-and testing it took one `ctl eval`. What is actually true, measured on a live YouTube page:
+The entry said the generated cosmetic script should publish a `data-*` attribute like
+`sponsorblock.js` does, and that the change belonged in the generator. **The generator had
+already been changed.** `generate_cosmetic_script` publishes `data-ycf` on
+`document.documentElement`. The checked-in asset, generated on 2026-07-31, did not carry it,
+and neither did any host — so the fix existed in the repo and reached nobody.
 
-| script | `@world` | what it publishes | readable by `ctl eval`? |
-|---|---|---|---|
-| `youtube-adblock.js` | `main` | `__yga_state` — pruned/skipped/forwarded + per-hook counts | ✅ **yes** |
-| `scriptlets.js` | `main` | `__yggScriptlets` | ✅ **yes** |
-| `sponsorblock.js` | `isolated` | `data-ysb` **on the DOM** | ✅ **yes** |
-| `cosmetic-filters.js` | `isolated` | `__yggCosmetic` / `__yggCosmeticState` | ⛔ **NO — always `undefined`** |
+Two separate defects were hiding behind that, both now fixed:
 
-⇒ Three of the four are already diagnosable, and `youtube-adblock.js` — the one this mandate
-is about — carries the richest state of any of them and has all along.
+1. ⛔⛔ **`ychrome adblock update` generated the companion scripts into a directory nothing
+   injects from.** `build_into` writes `rules.json`, its sidecar, `cosmetic-filters.js` and
+   `scriptlets.js` into ONE directory — correctly, they are one conversion's output — and that
+   directory is `web-adblock/`. `webpolicy` injects userscripts from `web-userscripts/` and
+   only from there. ⇒ **Every `adblock update` since the scriptlet plane existed refreshed the
+   ruleset, said so, and left both companions exactly as stale as it found them.** Nothing
+   looked wrong because the visible half really had been updated. `update` now places them
+   through `provision::place_generated_companion`, which runs the reconciler's own verdict
+   against the generated body — a deleted script stays deleted, an edited one is kept.
+2. ⛔⛔ **Nothing compared a generated asset against its generator.** The reconciler watches
+   host-copy vs bundled-asset; the bundled-asset vs the code that emits it had no owner at all.
+   `the_committed_cosmetic_script_is_not_older_than_its_generator` closes it: generating from an
+   empty rule set yields the pure template, and every template line must appear in the committed
+   asset. Proved by reverting the asset — 18 template lines missing, test fails.
 
-⛔ **The one real gap is `cosmetic-filters.js`, and its failure mode is worse than silence.**
-It runs in the ISOLATED world and reports itself through `window` globals, which a page-world
-`eval` can never see. So the variables exist, they are the obvious thing to reach for, and they
-read `undefined` on a perfectly healthy script — **which is exactly the misread `docs/adblock.md`
-already warns about for `window.__ysb`, and the reason SponsorBlock publishes to the DOM
-instead.** The lesson was learned once and never applied to the script beside it.
+**Live-proven on a real YouTube watch page after regenerating and deploying:**
 
-⇒ **Fix:** the generated cosmetic script should set a `data-*` attribute on
-`document.documentElement`, in the same shape as `data-ysb`. It is generated, so the change
-belongs in the generator, not in the asset. ⚠ And document the four names together — an agent
-currently has to read four scripts to learn four different conventions.
+```
+data-ycf -> {"rules":1,"hidden":0,"styled":0,"passes":25}
+```
+
+⇒ The committed baseline is regenerated at `1.20260821` (141,320 rules, compiled by
+`WebKitUserContentFilterStore` in 15.0 s before committing), and the four scripts' instrument
+names are documented together in `docs/adblock.md` — the entry asked for that too, because an
+agent should not have to read four scripts to learn four conventions.
 
 ### ⛔ STILL OPEN — PER-EXTENSION MODALS ARE NOT A YCHROME JOB FIRST
 **Measured, as the mandate asked, before designing anything: a contributed pane CANNOT raise

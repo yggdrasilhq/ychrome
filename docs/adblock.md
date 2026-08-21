@@ -420,6 +420,66 @@ tell "an old release of ours" from "the user's edit"; a declared version can.
 | same version, other bytes | `Forked` | **keep it**, and say so in the pane |
 | newer than the bundle | `Ahead` | **keep it**, and say so |
 
+### ⛔⛔ GENERATING IS NOT PLACING — one conversion, two directories
+
+`ychrome adblock update` writes **four** files from one conversion: `rules.json`,
+its sidecar, and the two companion userscripts. They land in ONE directory
+because two owners of "what the filter lists say" is the divergence this repo
+forbids — and that directory is `web-adblock/`.
+
+⛔ **But `webpolicy` injects userscripts from `web-userscripts/`, and only from
+there.** So for as long as the placement step was missing, every `adblock
+update` refreshed the network ruleset, reported success, and left the cosmetic
+filters and the scriptlets exactly as stale as it found them. The visible half
+really had been updated, which is why nothing looked wrong.
+
+⇒ `update` now places both companions through `provision::place_generated_companion`,
+which runs the SAME verdict the reconciler does — against the generated body
+instead of the bundled one. It is not a copy: a script the user deleted stays
+deleted, and a script they edited is kept and said so. A regenerated body is
+newer than the bundle by construction, so an ordinary host reads `Superseded`
+and moves.
+
+⚠ `--out` skips the placement: that spelling regenerates the committed baseline
+into a scratch directory and must not reach into the operator's live profile.
+
+### ⛔⛔ A GENERATED ASSET CAN DRIFT FROM ITS OWN GENERATOR
+
+The reconciler compares the HOST's copy against the BUNDLED asset. **Nothing
+compared the bundled asset against the CODE that emits it**, and on 2026-08-21
+they had diverged: `generate_cosmetic_script` had gained a DOM-published state
+attribute — the fix for "this script reports into a world no probe can read" —
+weeks before, and the checked-in asset did not have it. Every host was injecting
+an undiagnosable script while the repo contained the fix.
+
+⇒ `the_committed_cosmetic_script_is_not_older_than_its_generator` closes the
+seam: generating from an EMPTY rule set yields the pure template, and every
+template line must appear in the committed asset. When it fails, regenerate
+(below) — never hand-edit an asset that says DO NOT EDIT.
+
+### ⭐ THE FOUR SCRIPTS AND HOW TO READ EACH ONE
+
+They publish their state four different ways, and an agent should not have to
+read four scripts to learn that. `@world` decides what a page-world `ctl eval`
+can see:
+
+| script | `@world` | published as | read it with |
+|---|---|---|---|
+| `youtube-adblock.js` | `main` | `window.__yga_state` | `ctl eval js='JSON.stringify(window.__yga_state)'` |
+| `scriptlets.js` | `main` | `window.__yggScriptlets` | `ctl eval js='typeof window.__yggScriptlets'` |
+| `cosmetic-filters.js` | **isolated** | `data-ycf` **on `<html>`** | `ctl eval js='document.documentElement.getAttribute("data-ycf")'` |
+| `sponsorblock.js` | **isolated** | `data-ysb` **on `<html>`** | `ctl eval js='document.documentElement.getAttribute("data-ysb")'` |
+
+⛔ **An isolated-world global is invisible to a page-world `eval`.** Reading
+`window.__yggCosmeticState` or `window.__ysb` returns `undefined` on a perfectly
+healthy script. That misread has cost two investigations. The two isolated
+scripts publish to the DOM because it is the one thing both worlds share.
+
+⚠ **`rules: 0` is a RESULT, not an absence.** The cosmetic script publishes
+before its early return, so a host with no rules for it reads `rules:0,passes:0`
+— *it ran and had nothing to do*. A script that never loaded has no attribute at
+all, and the two readings must never collapse into one.
+
 ### ⛔ The declared version was not enough: the delivery ledger
 
 A version only decides this if **a version identifies a body**, and twice it did
@@ -698,8 +758,13 @@ ychrome adblock update --from-dir /tmp/lists --out /tmp/gen
 gzip -9 -c /tmp/gen/rules.json > assets/web-adblock/rules.json.gz
 cp /tmp/gen/rules.meta.json     assets/web-adblock/rules.meta.json
 cp /tmp/gen/cosmetic-filters.js assets/web-userscripts/cosmetic-filters.js
+cp /tmp/gen/scriptlets.js       assets/web-userscripts/scriptlets.js   # BOTH companions
 cargo test
 ```
+
+⚠ **Copy BOTH companion scripts.** They are one conversion's output; shipping a
+regenerated cosmetic script beside a stale scriptlet script splits the pair that
+`build_into` writes together for exactly that reason.
 
 The ruleset is committed **gzipped** (19 MB → 1.9 MB): the raw form would add
 19 MB to a repository whose entire history is about 4 MB, on every regeneration.

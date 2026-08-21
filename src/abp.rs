@@ -2768,4 +2768,58 @@ mod tests {
             assert!(!selector_ok(bad), "{bad} must be refused");
         }
     }
+
+    // ⛔⛔ A GENERATED ASSET CAN DRIFT FROM ITS OWN GENERATOR, AND NOTHING WAS
+    // WATCHING THAT SEAM. The reconciler compares the HOST's copy against the
+    // BUNDLED asset; no one compared the BUNDLED asset against the CODE that
+    // emits it. So `generate_cosmetic_script` gained a DOM-published state
+    // attribute — the fix for "this script reports into a world no probe can
+    // read" — and the checked-in asset, generated weeks earlier, did not have
+    // it. Every host was therefore injecting a script that could not be
+    // diagnosed, while the repo contained the fix. Measured 2026-08-21.
+    //
+    // The template is everything the generator emits that is NOT data, so
+    // generating from an EMPTY rule set yields it exactly. Every line of it
+    // must appear in the committed asset; if it does not, the asset predates
+    // the code and `docs/adblock.md` §"Regenerating the committed baseline"
+    // is the fix — never editing the asset, which says DO NOT EDIT.
+    #[test]
+    fn the_committed_cosmetic_script_is_not_older_than_its_generator() {
+        let empty: BTreeMap<String, BTreeSet<ProceduralRule>> = BTreeMap::new();
+        let template = generate_cosmetic_script(&empty, "1.0");
+        let committed = include_str!("../assets/web-userscripts/cosmetic-filters.js");
+
+        let mut missing = Vec::new();
+        for line in template.lines() {
+            let line = line.trim_end();
+            // Skip the parts that are DATA rather than template: the version
+            // stamp, the @match roster, the payload, and the counts.
+            if line.is_empty()
+                || line.contains("@version")
+                || line.starts_with("// @match")
+                || line.contains("var RULES =")
+                || line.contains("procedural cosmetic rules over")
+                || line.contains("domains.")
+            {
+                continue;
+            }
+            if !committed.contains(line) {
+                missing.push(line.to_string());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "the committed cosmetic-filters.js is OLDER than the generator that \
+             emits it — {} template line(s) are missing, starting with:\n  {}\n\
+             Regenerate it (docs/adblock.md, \"Regenerating the committed \
+             baseline\"); do NOT hand-edit the asset.",
+            missing.len(),
+            missing
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        );
+    }
 }
