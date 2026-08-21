@@ -76,8 +76,24 @@ Thread "ychrome-engine" received signal SIGSEGV
 ```
 
 ⇒ The crash is in the **UI process**, on the engine thread, dispatched from the GTK main
-loop — not in the web content process. WebKitGTK 2.52.5. Reaching a cause below this needs
-debug symbols for `libwebkit2gtk-4.1`, which are not installed.
+loop — **not in the web content process**. That distinction is the load-bearing one: a web
+process crash is survivable and WebKit reports it, which is why the engine has no handler that
+could have caught this. Reaching a cause below this needs debug symbols for
+`libwebkit2gtk-4.1`, which are not installed and have no repo configured here.
+
+⛔ **"Just upgrade WebKit" is not available.** Installed **2.52.5-1**, and that is also the
+newest candidate the distribution offers — there is no newer package to move to.
+
+⚠⚠ **NOT MEASURED, AND IT CHANGES WHAT THIS ENTRY MEANS: does the GUI substrate crash too?**
+Every measurement here is on the **headless** substrate (Xvfb, no DRI3). The owner's reports
+describe degraded picture, **not** a browser that dies — so the crash may well be
+headless-only, and the thing he actually experiences may be the dead-counter entry above and
+nothing else. ⇒ **Do not report this as "his browser crashes" until it is measured there.**
+
+⛔ **And do NOT measure it by opening a window on the operator's display.** `substrate.rs`
+records what that costs: GTK ignored the engine's Xvfb, connected to the operator's compositor,
+and put real ychrome toplevels on the human's desktop — including a filled-in brokerage login
+over the video he was watching. Use a dedicated display or the remote-desktop plane.
 
 ### Reproduce
 
