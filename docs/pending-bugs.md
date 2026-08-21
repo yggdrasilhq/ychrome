@@ -134,49 +134,58 @@ daemon lifetime on its own rather than by the absence of a `daemon_stop`.
 
 ---
 
-## ⛔⛔ EVERY IN-PAGE FRAME-HEALTH INSTRUMENT READS HEALTHY WHILE A THIRD OF THE FRAMES NEVER ARRIVE
+## ⛔ THE FRAME-HEALTH COUNTERS UNDER-REPORT BY ~30x, AND `requestVideoFrameCallback` NEVER FIRES
 
-**Status:** OPEN. Measured 2026-08-21 with locally generated clips — **no network, no
-site involved**, so this is the engine and nothing else.
+**Status:** OPEN. Measured 2026-08-21 with locally generated clips — no network, no site.
 
-Three clips, each played 16 s in the headless substrate, sampled from outside:
+⚠⚠ **THIS ENTRY WAS FILED WRONG EARLIER THE SAME DAY AND IS CORRECTED HERE.** It claimed
+`droppedVideoFrames` was *"a constant 0"* and that **every** in-page instrument was dead. Both
+overstated. The counter does move, and one of the four instruments is fine. Kept visible rather
+than quietly rewritten, because the wrong version was pushed and someone may have read it.
 
-| clip | source rate | frames actually counted | CPU | `droppedVideoFrames` |
-|---|---|---|---|---|
-| 360p30 | 30 fps | **30.0 fps** ✓ | 38 % | 0 |
-| 1080p30 | 30 fps | **30.0 fps** ✓ | 62 % | 0 |
-| **4K60** | **60 fps** | **42.8 fps** ✗ | **258 %** | **0** |
-
-At 4K60 roughly **276 of 963 frames — 29 % — never arrive**, and the counter a page would
-use to notice reads **zero** throughout. `corruptedVideoFrames` is 0 as well.
+### What is solid
 
 ⛔ **`requestVideoFrameCallback` is advertised and never fires.** `v.requestVideoFrameCallback`
-is present (`true`), a self-rearming callback was registered, and after 10 s of playback —
-media time advanced 10.12 s, `totalVideoFrames` advanced to 450 — it had fired **0 times**.
+is present, a self-rearming callback was registered, and after 10 s of playback it had fired
+**0 times** — while `requestAnimationFrame`, registered in the same eval as a control, fired
+232 times. Verified twice, the second time on a clip playing at very near its full rate, so
+"nothing was playing" does not explain it. A player that paces on rVFC gets nothing at all.
 
-⛔ `webkitDecodedFrameCount` / `webkitDroppedFrameCount` are absent entirely.
+⛔ **`droppedVideoFrames` under-reports by around thirty to one.** On a 60 fps clip over 10.2 s:
+465 frames delivered against ~612 expected — **~147 missing — and `droppedVideoFrames` reported
+5.** At 720p60 over 16.7 s: 327 missing, **4 reported**. The counter is not dead; it is
+unusable for the one question anyone asks of it. ⇒ A page cannot tell healthy playback from
+playback missing a quarter of its frames, which is exactly why *"nerdview reports no dropped
+frames"* is not evidence of health.
 
-⇒ **There is no signal, anywhere in the page-visible API surface, that distinguishes healthy
-60 fps playback from playback missing a third of its frames.** This is the 11.4 trap in its
-sharpest form, and it is not confined to one panel: *every* instrument a page could consult
-is dead, so any player's health logic built on them is reading a constant.
+### ⛔⛔ What is NOT established — the confound I did not check before publishing
 
-⚠ **This is what makes the owner's two reports look unrelated when they are not.** A player
-that trusts `droppedVideoFrames` sees 0 and never steps down — so the picture degrades
-visibly while the stats panel says nothing is wrong. A player that measures frames itself
-sees the shortfall and steps the ladder down hard. Same engine, same fault, opposite
-symptom, decided only by which signal the front-end happens to trust. ⚠ Stated as the
-reading the measurements support, not as a proven chain: the two front-ends' internals were
-not instrumented.
+**Every one of these measurements was taken on a host at load average 42–49, on 32 cores.**
+Dozens of unrelated agent sessions were running their own WebKit processes throughout. So:
 
-**Context that is not the fault but bounds it:** the headless substrate gets **no GPU**.
-`libEGL warning: DRI3 error: Could not get DRI3 device` — so decode and composite are
-entirely software, which is why 4K60 costs 2.6 cores. A render node exists on the host;
-Xvfb does not expose DRI3 to reach it.
+- ⛔ **The absolute frame rates here are NOT clean engine numbers** and must not be quoted as
+  "the engine caps at 43 fps". Repeat runs of the *same* clip disagreed sharply — 360p60
+  measured 37.0 fps once and 59.3 fps on a careful rerun — which is the signature of
+  contention, not of a stable engine ceiling.
+- ⛔ **The earlier claim that the engine cannot sustain 60 fps is FALSE.** 360p60 delivered
+  **59.3 fps**. It sustains 60 fps when it has the machine to do it in.
+- ⚠ The shortfall does grow with resolution (720p60 and 4K60 both fell short while 360p60 did
+  not), which is what a software decode/paint path under contention looks like. Whether any
+  shortfall survives on an idle host is **unmeasured**.
 
-⚠ **Not yet measured on the GUI substrate**, which is what the owner actually watches
-through. The dead counters are engine-level and will not differ; the frame shortfall may,
-because a GPU path may be available there. That measurement needs a GUI session.
+⇒ **The instrument findings above do not depend on load** — a counter reporting 5 of 147, and a
+callback firing 0 of anything, are wrong at any load. Those are the findings to build on. The
+frame-rate table is not.
+
+### The measurement this wants next
+
+Re-run the ladder on an **idle** host, and on the GUI substrate rather than the headless one.
+Until then the honest statement to the owner is: *the counters cannot be trusted to report a
+shortfall, and how large the real shortfall is has not been measured cleanly.*
+
+**Context that bounds it:** the headless substrate gets no GPU —
+`libEGL warning: DRI3 error: Could not get DRI3 device` — so decode and composite are entirely
+software here. A render node exists on the host; Xvfb does not expose DRI3 to reach it.
 
 ---
 
@@ -863,23 +872,28 @@ click never reached the handler and the engine is not implicated.
 The two owner reports and what the measurements say about each:
 
 1. **Front-end video starts high and falls back to prehistoric quality.** Consistent with a
-   player that measures frames itself, sees the real shortfall (4K60 delivers 42.8 of 60 fps
-   in this engine) and steps the ladder down. Not yet confirmed against a front-end instance.
-2. **YouTube shows frame overlaps while nerdview reports no dropped frames.** ⇒ **Explained.**
-   `droppedVideoFrames` is a constant 0 in this engine even when 29 % of frames are provably
-   missing. Nerdview is not wrong about its input; **its input is dead.** See
-   *EVERY IN-PAGE FRAME-HEALTH INSTRUMENT READS HEALTHY…* above for the numbers.
+   player that measures frames itself and reacts to a real shortfall. ⚠ **Not confirmed** —
+   against a front-end instance or on an idle host.
+2. **YouTube shows frame overlaps while nerdview reports no dropped frames.** ⇒ **Partly
+   explained.** `droppedVideoFrames` under-reports by roughly thirty to one, so nerdview
+   reporting nothing is consistent with a large shortfall and is not evidence of health.
+   ⛔ It does **not** follow that the counter is dead — it moves; see the corrected entry
+   *THE FRAME-HEALTH COUNTERS UNDER-REPORT…* above, including the load confound that makes
+   the absolute frame rates unusable.
 
 ⇒ Both entries above carry the measurements. This entry stays open for the part not done:
 **the same measurements on the GUI substrate**, which is the one the owner watches through
 and the only place the frame shortfall may differ (the headless substrate has no GPU at all).
 
-⛔⛔ **THE TRAP HELD, and generalised.** *An instrument running on the thing it measures reads
-zero.* It was stated for nerdview; it turned out to be true of `droppedVideoFrames`,
-`corruptedVideoFrames`, `requestVideoFrameCallback` and the legacy WebKit counters —
-**every one of them**. The instruction to *ask what STOPS CHANGING* is what found it: the
-frame counter kept advancing, so the question became "advancing at what rate against the
-source rate", and the answer was 71 %.
+⛔⛔ **THE TRAP HELD — but it also caught me, in the other direction.** *An instrument running
+on the thing it measures reads zero* is what sent me looking, and it found a real defect:
+`requestVideoFrameCallback` never fires, and `droppedVideoFrames` under-reports ~30:1. ⚠ **It
+also made an overstatement feel like a confirmation.** The first version of these entries said
+every instrument was dead and the engine could not reach 60 fps. Neither was true, and the
+check that would have caught both — repeat the measurement, and look at the host's load — is
+the cheap one I skipped because the result already agreed with the trap I had been handed.
+⇒ **A trap you are told to expect is itself a prior.** Measure it as sceptically as anything
+else, and repeat a measurement before it becomes a queue entry.
 
 ⚠⚠ **CORRECTION TO THIS ENTRY AS PREVIOUSLY FILED.** It said: *"Wire `ytrace` (the probe bus
 already in the workspace, pinned in the top-level `Cargo.toml`)"*. **That is false and cost a
