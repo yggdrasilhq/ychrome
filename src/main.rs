@@ -23,6 +23,7 @@ use anyhow::{Context, Result, bail};
 
 mod abp;
 mod adblock;
+mod build;
 mod daemon;
 mod engine;
 mod extensions;
