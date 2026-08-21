@@ -860,8 +860,7 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
         // ONE past password, by index. Never the list — see `Vault::past_password`
         // for why a page gets dates and a press gets a value.
         "password-history" => {
-            let name =
-                string("name").ok_or_else(|| anyhow!("password-history needs a name"))?;
+            let name = string("name").ok_or_else(|| anyhow!("password-history needs a name"))?;
             let index = request
                 .get("index")
                 .and_then(Value::as_u64)
@@ -1120,6 +1119,23 @@ fn dispatch(request: &Value, state: &Arc<Mutex<AgentState>>) -> Result<Value> {
             let password = vault
                 .password(&item.id)
                 .ok_or_else(|| anyhow!("{} has no password", item.name))?;
+            // ⛔ THIS VERB'S CONTRACT IS "the ONE entry an auto-fill MAY use",
+            // so an entry whose username cannot be typed is not a match — it is
+            // a refusal. Returning it with `ok` is what once made an auto-fill
+            // type a run of control bytes into a login form and spend an
+            // attempt, on a site that locks after a few. The refusal names the
+            // item and the remedy, because the caller cannot see the value.
+            if let Some(username) = item.username.as_deref()
+                && let Some(reason) = crate::matching::unusable_reason(username)
+            {
+                return Err(anyhow!(
+                    "vault: {} matches {host}, but its stored username is unusable — {reason}. \
+                     Auto-fill refuses rather than typing it. Fix the item \
+                     (`ychrome-vault edit \"{}\" --set-user …`) or name a different account.",
+                    item.name,
+                    item.name
+                ));
+            }
             let entry = json!({
                 "id": item.id,
                 "name": item.name,
@@ -2153,7 +2169,11 @@ mod tests {
 
         let items = dispatch(&json!({"op": "list"}), &state).unwrap();
         let items = items["items"].as_array().unwrap();
-        assert_eq!(items.len(), 4, "three logins (one password-less) and a card");
+        assert_eq!(
+            items.len(),
+            4,
+            "three logins (one password-less) and a card"
+        );
         assert_eq!(items[0]["name"], "GitHub", "sorted by lowercased name");
         assert!(items[0]["has_totp"].as_bool().unwrap());
         // Metadata must never carry the secret itself.

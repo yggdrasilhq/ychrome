@@ -175,38 +175,67 @@ and revokes nothing** — unreferenced objects stay retrievable by identifier un
 collects them. ⛔ **Every identifier for this incident is deliberately kept out of this
 repository**, since naming them here would be a finding aid for the objects being removed.
 
-## ⛔⛔ `ychrome-vault match <host>` RESOLVES TO AN ITEM WHOSE USERNAME IS CORRUPTED BINARY
+## ⚠ THREE VAULT ITEMS HOLD AN UNTYPEABLE USERNAME — `match` now refuses them; the DATA is still wrong
 
-**Status:** OPEN. Measured 2026-08-11 while driving a Meta login.
+**Status:** ⇒ **The defect is FIXED 2026-08-21** (auto-fill can no longer be handed an untypeable
+value, and `diagnose` can find them). What stays open is not code: **three items in the vault
+still hold a bad username**, and only the owner can say what they should be.
 
-`match` is documented as "resolve a page host to the ONE entry an auto-fill may use (strict
-rule)" — so it is the verb an auto-fill trusts. For a host with several stored entries it
-returned, with `ok` and no warning:
+### ⚠ THE ORIGINAL DIAGNOSIS WAS WRONG, AND THE CORRECTION IS THE USEFUL PART
 
+The entry said the username was *"binary garbage"* and asked `match` to refuse an entry whose
+username **"is not valid UTF-8"**. ⛔ **That cannot be what it is.** `EncString` decryption uses a
+strict `String::from_utf8` and returns `CryptoError::NotUtf8` rather than converting lossily
+(`crypto.rs`), so a field that decodes at all is already valid UTF-8. A predicate written against
+that premise would have matched **nothing** and closed the entry while the bug survived.
+
+**Measured on the real vault instead** (1,129 items, values never printed — character classes
+only):
+
+| | |
+|---|---|
+| items with control characters in the username | **3** |
+| codepoints | all at or below `U+00FF` |
+| length | 49 characters to **68–74 UTF-8 bytes** |
+| distinct-character ratio | ~0.86–0.94 (random-like) |
+
+⇒ 49 characters that encode to 68–74 bytes, none above `U+00FF`, is the signature of **random
+bytes decoded as Latin-1** — almost certainly a generated secret written into the username field
+by some client. The bytes are authentic, the MAC is good, the UTF-8 is valid. **They are simply
+not a username.**
+
+⇒ **So the predicate is not "is this valid UTF-8" but "could a human have typed this".** A
+control character cannot be entered into an HTML input or survive a form post.
+
+### ✅ WHAT IS BUILT
+
+- `matching::unusable_reason` — one owner of the question, next to the host rules. It is
+  deliberately NOT "is it ASCII": accented and non-Latin usernames are ordinary and must pass,
+  and the test says so.
+- **`match` REFUSES** such an entry, naming the item and the remedy. Its documented contract is
+  *the ONE entry an auto-fill may use*; an entry that cannot be typed is not one, so returning it
+  with `ok` was the bug. Live-proven: both host-shaped items refuse with a named reason.
+- **`diagnose` counts them** (`username_untypeable`), so the question "why did auto-fill refuse on
+  that host" is answerable without anyone dumping a username to look at it. Live: reports **3**,
+  matching an independent classification of `list --json`.
+- ⚠ **Control:** ordinary auto-fill is untouched — 8/8 sampled host-shaped items with clean
+  usernames still resolve, out of 790 candidates.
+
+### ⇒ WHAT IS LEFT, AND IT IS THE OWNER'S
+
+Three items still hold the bad value. Two are host-shaped and will now refuse auto-fill loudly
+instead of typing junk; the third is not host-shaped and `match` never reaches it. Fixing the
+DATA needs someone who knows what those usernames should be:
+
+```sh
+ychrome-vault diagnose | jq .username_untypeable      # how many remain
+ychrome-vault edit "<item>" --set-user "<the real one>"
 ```
-$ ychrome-vault match <host>
-{"id":"…","name":"<host>","password":"<40 chars, correct>",
- "username":"!Ñ'P_°S\fÎ k/ÏTæjDGW0Õ…"}
-```
 
-The password decrypts correctly; **the username field is binary garbage.** The same corrupted
-string is echoed verbatim into `list` output and into the disambiguation error
-(`vault: "<host>" matches 6 accounts — name one: !Ñ'P…, <real>, <real>…`), so it is a stored or
-decode-layer corruption, not a display bug in one verb.
+⛔ Not done here: it is a WRITE to the real vault against items whose correct value this lane
+cannot know, and the standing rule is to say what a vault write will do before doing it.
 
-**Cost.** An agent that trusts `match` (which is exactly what "strict rule, for auto-fill" invites)
-types binary into a login field and spends an attempt. On a site that checkpoints or locks after
-repeated failures, that is expensive, and the diagnosis points at the site rather than the vault.
-It also makes the "name one" error unreadable and un-copy-pasteable for the caller trying to
-recover.
-
-⇒ **Two things wanted, and they are separable.** (1) `diagnose` should count and name ciphers whose
-*fields* fail to decode, not only whole ciphers — this item decrypts "successfully" today. (2)
-`match` should refuse, or at minimum flag, an entry whose username is not valid UTF-8, rather than
-returning it as the one entry an auto-fill may use.
-
-⚠ Sitting next to the known `/fill` decoy defect below, these compound: one picks the wrong field,
-the other supplies a wrong value, and both report success.
+---
 
 ## ⚠ `ygg-privacy-guard`'s AADHAAR PATTERN FIRES ON A NIL UUID, AND THE ONLY ESCAPE WAIVES THE WHOLE SCAN
 
