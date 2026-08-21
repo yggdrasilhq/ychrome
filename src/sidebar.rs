@@ -6917,6 +6917,97 @@ mod tests {
         );
     }
 
+    /// ⭐ THE ROUND TRIP, end to end through the real dispatcher: the button in
+    /// the pane, the reply that raises the dialog, and a click made inside it.
+    ///
+    /// Every other test here drives a pure builder. This one goes through
+    /// `run_settings_action`, which is what the control endpoint actually calls,
+    /// because the wiring is where a working builder and a working handler still
+    /// add up to a button that does nothing.
+    #[test]
+    fn the_options_button_raises_a_dialog_and_a_click_inside_it_comes_back() {
+        let state = Arc::new(Mutex::new(PaneState::new("default")));
+
+        // 1. The pane's button.
+        let reply = run_settings_action(
+            &state,
+            &json!({
+                "pane": SETTINGS_PANE,
+                "action": format!("{}{}", crate::extmodal::OPEN_ACTION_PREFIX, crate::extmodal::ADBLOCK_STEM),
+                "values": {"app_modals": true},
+            }),
+        );
+        let modal = &reply["modal"];
+        assert!(!modal.is_null(), "the button raised no dialog: {reply}");
+        assert_eq!(modal["title"], "Ad blocking");
+        assert!(
+            modal["subtitle"].as_str().is_some_and(|line| !line.is_empty()),
+            "the dialog has no subtitle"
+        );
+        let widgets = modal["widgets"].as_array().expect("the dialog has widgets");
+        assert!(!widgets.is_empty());
+        // ⛔ Every action inside must carry the envelope, or the click lands and
+        // the dialog it was made in never redraws — the user sees a control
+        // that appears to do nothing.
+        for action in dialog_actions(widgets) {
+            assert!(
+                action.starts_with(&format!(
+                    "{}{}:",
+                    crate::extmodal::MODAL_ACTION_PREFIX,
+                    crate::extmodal::ADBLOCK_STEM
+                )),
+                "{action:?} inside the dialog is not addressed back to it"
+            );
+        }
+
+        // 2. A click inside it. `reload-surface` is chosen because it changes
+        //    nothing on disk — this test must not rewrite the operator's own
+        //    config to prove the wiring works.
+        let reply = run_settings_action(
+            &state,
+            &json!({
+                "pane": SETTINGS_PANE,
+                "action": format!(
+                    "{}{}:reload-surface",
+                    crate::extmodal::MODAL_ACTION_PREFIX,
+                    crate::extmodal::ADBLOCK_STEM
+                ),
+                "values": {"app_modals": true},
+            }),
+        );
+        // The inner action ran…
+        assert_eq!(reply["reload_surface"], true);
+        // …the dialog came back, so it does not blink shut on every click…
+        assert_eq!(reply["modal"]["title"], "Ad blocking");
+        // …and the pane behind it was redrawn too, because its row carries that
+        // extension's state line.
+        assert!(
+            reply["schema"]["widgets"].is_array(),
+            "the pane behind the dialog was not redrawn: {reply}"
+        );
+    }
+
+    /// A malformed envelope is answered, not swallowed. An action id that lost
+    /// its stem would otherwise fall through to the unknown-action arm and
+    /// report the whole envelope as the unknown verb, which points the reader at
+    /// the wrong half.
+    #[test]
+    fn a_malformed_dialog_envelope_says_so() {
+        let state = Arc::new(Mutex::new(PaneState::new("default")));
+        let reply = run_settings_action(
+            &state,
+            &json!({
+                "pane": SETTINGS_PANE,
+                "action": crate::extmodal::MODAL_ACTION_PREFIX.trim_end_matches(':').to_string() + ":nostem",
+                "values": {},
+            }),
+        );
+        assert!(
+            reply["toast"].as_str().is_some_and(|t| t.contains("malformed")),
+            "expected a malformed-envelope toast, got {reply}"
+        );
+    }
+
     // A policy change needs the WEBVIEW recreated, not the document reloaded: a
     // content filter and its userscripts are attached at creation, so
     // `location.reload()` would leave ad blocking exactly as it was. Asking for

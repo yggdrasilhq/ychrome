@@ -53,73 +53,113 @@ indicator that blinks on quiet rows is worse than none, because he stops trustin
 
 ---
 
-## ⭐⭐ OWNER-REQUESTED: EVERY EXTENSION GETS A MODAL BUTTON, AND THE EXTENSIONS GO FULL-FLEDGED
+## ⭐ THE EXTENSION DIALOGS ARE BUILT AND LOCKED — AND NOT LIVE ON ANY HOST YET
 
-**Status:** OPEN, requested 2026-08-22. Handed to seat 11.24.3.
+**Status:** code complete on two branches, **not deployed**. Requested
+2026-08-22, built by seat 11.24.3 the same night.
 
-*"I want our extension features in ychrome to be full fledged and not a half hearted
-implementation. Make each extension a modal producing button like yggterm settings and
-implement the extensions with all features; specially adblock and sponsorblock."*
+*"I want our extension features in ychrome to be full fledged and not a half
+hearted implementation. Make each extension a modal producing button like
+yggterm settings and implement the extensions with all features; specially
+adblock and sponsorblock."*
 
-### ⛔⛔ THIS OVERRULES THE EARLIER ROUTING — READ IT BEFORE RE-DERIVING THE REFUSAL
+### What landed
 
-An earlier lane measured per-extension modals and routed them AWAY, correctly at the time: a
-contributed pane **cannot raise a modal**, because the surface protocol says an app *"informs
-and cannot ask; anything needing an answer is a modal the shell owns"*. Admitting a new widget
-kind needs two rules to hold, and rule 1 is **at least two apps want it** — one app's need is
-a feature request. Only ychrome wanted it, so the honest answer was "raise it with the shell's
-owner".
+**yggterm `lane/dev/11.27-app-modal`** — the widget kind. An action reply may
+carry `modal` / `close_modal`; ONE renderer draws a rail pane and a dialog; the
+shell owns the wash, the card, the ✕, Escape and the stacking. `app_modals` is
+advertised on the schema GET and the action POST as a capability marker. Full
+`yggterm-shell` suite green (2006 passed).
 
-⇒ **The shell's owner has now asked for it directly.** Rule 1 is satisfied by decision rather
-than by a second caller. **Do not re-file this as a Tier C admission question.**
+**ychrome `lane/dev/11.24-ychrome`** — `src/extmodal.rs`, the one owner of every
+extension's options, plus SponsorBlock v2.1.0 (see below) and
+`adblock::provenance`.
 
-⭐ **There is a worked example to copy rather than invent:** the **`fido2` dialog** is the
-documented shell-owned modal — an OSC request (`fido2 ; request`, payload
-`{session, request_id, rp_id, account, kind, origin}`) and an approve/deny round trip back over
-the app's own control channel (`/fido2/grant`, `/fido2/deny`), with the app parked on its own
-endpoint matching by `request_id`. A per-extension options modal is that same split with a
-different payload. See `yggterm/.agents/skills/libyggterm-surfaces/SKILL.md`.
+### ⛔ WHAT "NOT LIVE" MEANS HERE, PRECISELY
 
-⚠ **"like yggterm settings"** names the model he wants — read how the shell's own settings
-modal is built before designing a second vocabulary beside it.
+The dialog needs a **yggterm rebuild and a GUI restart**. The GUI host is in
+use, so nothing was restarted and **no screenshot of a dialog exists.** What
+IS proven: the round trip through the real dispatcher
+(`the_options_button_raises_a_dialog_and_a_click_inside_it_comes_back` drives
+`run_settings_action`, not a pure builder), and every guard verified by
+reintroducing its regression on purpose.
 
-### THE CATALOG AS IT STANDS (`src/extensions.rs`)
+⇒ Until yggterm is rebuilt, every host takes the **inline fallback** — the same
+controls, drawn in the pane, because `app_modals` is absent. That is the gate
+working, not a bug. **The falsifier for "live" is a screenshot of an extension
+dialog, and it has not been taken.**
 
-`cosmetic-filters`, `scriptlets` (both GENERATED — the adblock ruleset's other halves),
-`sponsorblock`, `youtube-adblock`, `idcac`, `unblock-select`. Today they are configured through
-**19 buttons flattened into the settings pane**, which is exactly the clogging he objected to.
+### ⛔ ONE THING WAS DELIBERATELY NOT BUILT — PER-SITE AD BLOCKING
 
-### WHAT "FULL FLEDGED" MEANS, NAMED SO IT IS NOT GUESSED
+It is the most-wanted adblock feature and it is **not reachable from ychrome's
+side alone**, so no switch was shipped: a control that stores a preference
+nothing enforces is worse than its absence.
 
-**SponsorBlock** (`src/sponsorblock.rs`) already has the category catalog, per-category
-behaviour (`set_behaviour`), custom site access (`sites`/`add_site`/`remove_site`, with
-`match_patterns` as the ONE owner of where it runs), and a synthetic-userscript config channel.
-`docs/adblock.md` names what is deliberately absent:
-- **segment submission and voting** — ⛔ they WRITE to a shared public database and need a
-  persistent pseudonymous id. If added they must be **explicit, off by default, and the privacy
-  consequence stated where the user turns them on.** That constraint is the owner's own and
-  survives this request.
-- the unsubmitted-segment queue; chapter renaming (community chapters are drawn as markers
-  beside YouTube's own list, never merged into it).
+The network ruleset is added to the user-content manager **when the webview is
+created**, deep in vendored `dioxus-desktop/web_surface.rs`. Per-site means
+detaching and re-attaching it as the host on screen changes.
 
-**Adblock** — the ruleset pipeline, provisioning and per-site plumbing exist. Absent: a per-site
-enable/disable surface, an element picker, a "what did this page block" report, and any
-user-facing view of the ruleset's provenance beyond `adblock status`.
+⇒ **The design, so the next lane does not re-derive it:** `/policy` already
+carries `user_agent_sites` (host → value), and the GUI already re-applies THAT
+when the host on screen enters or leaves an override. An `adblock_sites` field
+in the same shape, consumed by the same reconciler, is the whole app-side
+contract. The GUI half is the new part: a runtime attach/detach of the compiled
+filter, which nothing in the vendored layer does today.
 
-### ⛔ TRAPS THAT WILL BITE THIS WORK SPECIFICALLY
+⚠ **The rejected alternatives, so they are not re-proposed.** Compiling
+`ignore-previous-rules` exemptions into the ruleset works (order is semantics,
+§3, and there is headroom under the 150,000 ceiling) but costs a WebKit
+recompile and a GUI restart per change, and the rewritten `rules.json` then
+disagrees with its sidecar — which `provision` reads as `Forked`, the verdict
+that makes an asset undeployable forever. Gating only the in-page layers is
+half a feature that reads as a whole one.
 
-1. **A generated asset drifts from its generator.** `cosmetic-filters` and `scriptlets` are
-   GENERATED — never hand-edit them; regenerate per `docs/adblock.md`. A test guards this now.
-2. **`adblock update` places its companions through `provision::place_generated_companion`.**
-   Generated output added by this work needs the same placement, or it refreshes into a
-   directory nothing injects from.
-3. **Four scripts publish state four different ways**, two into an ISOLATED world a page-world
-   `eval` cannot see (`data-ycf`, `data-ysb` on `<html>`). Table in `docs/adblock.md`.
-4. **An opt-in extension cannot be repaired by provisioning** — it only refreshes what is
-   already installed.
+### Also not built, and smaller
 
-**Falsifier:** every extension in the catalog opens its own options modal from its own button,
-and the settings pane no longer carries per-extension controls.
+- **An element picker** for user cosmetic filters. ⛔ Do NOT add it to the
+  generated `cosmetic-filters.js` — that asset must stay byte-identical to its
+  generator. It wants its own hand-written bundled script with its own synthetic
+  config preamble, the same shape SponsorBlock's settings already use.
+- **A "what did this page block" report.** The two generated scripts already
+  publish per-page counts to the DOM (`data-ycf`, `__yggScriptlets`), but a PANE
+  cannot read them: an action reply's `eval` runs in the page and returns
+  nothing to the app. It needs a channel back — the `yggterm-appctl://` bridge
+  the passkey shim uses is the existing shape. WebKit's own network layer
+  reports nothing at all, so any report is honest only about our two layers.
+
+**Falsifier for what is claimed done:** `cargo test --bin ychrome` shows
+`extmodal::*` and the extension tests green (it does; the only failures are the
+four trunk ones below), and the pane draws no per-extension control of its own
+(`the_pane_itself_carries_no_per_extension_controls`).
+
+---
+
+## ⚠ A CONCURRENT SESSION SHARES THIS WORKING DIRECTORY, AND `git add -A` SWEEPS IT
+
+**Status:** OPEN, and it has already happened once — 2026-08-22.
+
+`eedd179` is a **docs** commit. Its message describes a finding about the
+orchestrator standing down. Its diff also contains **1,044 lines of another
+lane's in-progress work**: `src/sponsorblock.rs`, `src/adblock.rs`,
+`assets/web-userscripts/sponsorblock.js` and a new test fixture, none of which
+the message mentions.
+
+Nothing was lost, and the history is deliberately NOT being rewritten — the
+branch is pushed and other seats are committing to it, so a rewrite would cost
+far more than the misattribution does.
+
+⇒ **The rule this produces: in a shared checkout, stage BY PATH.** `git add -A`
+and `git commit -a` do not mean "my changes", they mean "everything in this
+directory", and in a directory two live sessions are editing that is somebody
+else's work with your message on it.
+
+⚠ It is the commit-side twin of a known stash hazard, and it is worse in one
+way: a stash announces itself when the tree goes clean under you, while this
+leaves the tree clean *because the work is committed* and looks like nothing
+happened at all. The tell is `git log -- <your file>` naming a commit you did
+not write.
+
+**Falsifier:** a commit on this branch whose message describes its whole diff.
 
 ---
 
