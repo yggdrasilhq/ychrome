@@ -927,6 +927,48 @@ answers with the count actually dispatched and the index that stopped it.
 
 Locked by `ychrome engine hit` (15 steps, fixture-backed).
 
+### ⭐ KEYS AND DRAGS — the vocabulary, and what used to be silently undeliverable
+
+`input` takes `click | move | scroll | type | key | mousedown | mouseup | drag`.
+
+```sh
+# a drag the BROWSER routes, so it cannot walk a path a real pointer could not
+ychrome ctl input page_id=$p events='[{"type":"drag","from_x":100,"from_y":100,
+                                       "to_x":300,"to_y":200,"steps":6}]'
+# keys, in KeyboardEvent.key's vocabulary, with modifiers
+ychrome ctl input page_id=$p events='[{"type":"key","key":"+"},
+                                      {"type":"key","key":"Backspace"},
+                                      {"type":"key","key":"s","mods":["ctrl"]}]'
+```
+
+**A key name is accepted in three vocabularies, so you never have to know which
+one a key lives in:** a DOM name (`Enter`, `ArrowLeft`, `Backspace`, `PageUp`),
+**any single character** (`+`, `/`, `£`, `5`), or an X11 keysym name (`Return`,
+`plus`, `KP_Add`). Modifiers go in `mods` (`shift`, `ctrl`, `alt`, `meta`);
+the legacy `{"alt": true}` booleans still work.
+
+⛔ **Three traps here were REAL, are FIXED (2026-08-21), and are worth knowing
+because they all failed in the same direction — a reply that said `ok`:**
+
+- **`gdk_keyval_from_name` speaks X11, and the verb documented itself in DOM.**
+  `Enter`, `ArrowLeft`, `Backspace` and every punctuation key were rejected —
+  including `Enter`, which the verb's own error message recommended. Now
+  aliased, and any single character resolves through Unicode.
+- **`meta` set only GDK's SUPER bit, and WebKit reads `metaKey` off META.** The
+  modifier was accepted, dispatched, reported `ok:true`, and **arrived as a
+  plain keypress** — indistinguishable at the page from the app ignoring the
+  shortcut. Both bits are set now.
+- **A drag had to be driven page-side**, so the author chose the target and
+  could aim at an element no pointer could reach. Two independent rows once
+  "proved" a drag worked by dispatching under an overlay, and agreed exactly.
+  ⭐⭐ **Agreement between two instruments that share a flaw is not
+  independence.** With `drag` the browser routes it, and the class is gone.
+
+⚠ **The one still open:** an unknown key name is a `400`, but this verb's
+general habit of reporting `dispatched:N, ok:true` means you should still
+**verify against the page**, not the reply — a capture-phase `keydown` recorder
+costs one `eval` and settles it.
+
 ### ⚠ THE RULE: after input, WAIT for the state you expect. Never read straight after.
 
 WebKitGTK acknowledges key events **one at a time** while `eval` is sent
