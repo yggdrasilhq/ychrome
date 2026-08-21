@@ -83,3 +83,29 @@ work; do not build it before the `note` convention has been tried and found want
 **What was done meanwhile.** This row's booter `note` names its assigned work, both spawned
 successors, and its exit condition, so a sweeper reading only that file knows what dropping
 this row would cost.
+
+### ⇒ WHAT HE ACTUALLY MEANT, AND IT IS SIMPLER THAN THE MECHANISM QUESTION
+
+*"I meant since you are part of 11.0 orchestrator let us preserve it while you do more tasks.
+I do not know the right vocabulary to say that."*
+
+⛔ **He was not asking about subscription mechanics — he was asking for the row to be KEPT
+ALIVE and IN THE CAMPAIGN while he keeps handing it work.** The first answer to this
+explained three mechanisms and did not do the one thing being asked for, which is a failure
+mode worth naming: *a question phrased in the wrong vocabulary still has a concrete request
+inside it, and answering the vocabulary is not answering the request.*
+
+The concrete thing was a number. The row's coverage was `max_hours: 12.0` with **7.8 hours
+left** — it would have lapsed mid-session while he was still assigning work. Re-subscribing
+with `--max-hours 48` and a `--note` naming the owner-assigned tasks fixed it in one call, and
+the read-back confirms 48 h coverage with the watcher armed.
+
+⇒ **The `note` recommendation above is no longer untried.** It was exercised here and it
+works: one call carries the extension, the campaign, the kind and the task list together, and
+`ygg-booter.py status <row>` reads it back. Prefer it to building a task file until something
+it cannot express actually turns up.
+
+⭐ **The vocabulary he was looking for:** *"extend my booter coverage and keep my seat in
+campaign 11"* — or, in the fleet's own terms, *"re-subscribe me under campaign 11 with a
+longer max-hours."* There is no verb for "subscribe to 11.0" because 11.0 is a row, and the
+thing that keeps a row alive is the booter, not the orchestrator.
