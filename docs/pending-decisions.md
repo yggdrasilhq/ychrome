@@ -162,3 +162,27 @@ evidence rather than from rebuilding the instrument.
 **Recommendation:** install the WebKitGTK debug symbols and re-run the same gdb recipe. It is
 one package and the reproduction is 5 seconds, so the next session should get a named frame
 cheaply. ⚠ Do not re-try the four workarounds in the queue entry; they are measured negatives.
+
+## 11. Not upgrading the system WebKit, though it is the most likely fix
+
+**The fork.** The engine segfaults inside `libwebkit2gtk` 2.52.5-1, and 2.52.6-1 is published.
+Upgrading is both the obvious remedy to try and the only route to a symbolised backtrace — the
+only `-dbgsym` published is 2.52.6, and symbols must match the binary exactly.
+
+**Decided: do not upgrade; recommend it instead.** Two reasons, and neither is caution for its
+own sake. It is shared system infrastructure that every GTK web app on the host links,
+including other live sessions. And **2.52.5-1 is no longer downloadable** — absent from the apt
+cache and gone from the archive — so rollback is snapshot archaeology and dependency juggling,
+not one command. An unrollbackable change to shared infrastructure is the owner's call.
+
+⚠ **I also added and then removed a Debian debug apt source while establishing this.** The
+system is left exactly as found; the recipe to re-add it is in the queue entry.
+
+**Recommendation:** upgrade, then re-run the reproduction, which takes five seconds. If it
+still crashes, install the matching `-dbgsym` and re-run the gdb recipe for a named frame.
+
+⚠ **And the reason this entry exists at all:** the first version of the queue entry said
+2.52.5 was the newest available. `apt-cache policy` had answered from stale package lists. One
+`apt-get update` produced a different answer and a different conclusion. ⇒ A cache reports the
+last time you looked, not the world — which is the same failure as the stale asset plane in
+entry 6 and the always-zero falsifier, three times in one session.

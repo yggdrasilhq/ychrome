@@ -81,8 +81,34 @@ process crash is survivable and WebKit reports it, which is why the engine has n
 could have caught this. Reaching a cause below this needs debug symbols for
 `libwebkit2gtk-4.1`, which are not installed and have no repo configured here.
 
-⛔ **"Just upgrade WebKit" is not available.** Installed **2.52.5-1**, and that is also the
-newest candidate the distribution offers — there is no newer package to move to.
+⭐⭐ **THE MOST LIKELY REMEDY, AND IT NEEDS AN OWNER DECISION: UPGRADE WebKitGTK.**
+Installed **2.52.5-1**; the distribution offers **2.52.6-1**.
+
+⚠ **This entry first said 2.52.5 was the newest available. That was wrong, and the instrument
+lied in this lane's favourite way — it was STALE.** `apt-cache policy` answers from cached
+package lists, so it reported "no newer version" while a newer one had been published. One
+`apt-get update` changed the answer. ⇒ Before concluding a version is the ceiling, refresh the
+lists; a cache reports the last time you looked, not the world.
+
+⇒ **Not done here, deliberately.** `libwebkit2gtk` is shared system infrastructure that every
+GTK web app on the host links, including other live sessions, and **2.52.5-1 is no longer
+downloadable** — not in the apt cache and gone from the archive — so a rollback means
+snapshot archaeology plus dependency juggling rather than one command. That is a
+system-administration call for the host's owner, not a browser-lane one.
+
+⇒ **Two things converge on this single action**, which is what makes it the recommendation:
+1. a crash in a library at `n-1` is worth retrying at `n` before any deeper work;
+2. **symbolised debugging is blocked without it** — the only `-dbgsym` package published is
+   **2.52.6**, and symbols must match the binary exactly, so there is no way to symbolise a
+   2.52.5 crash at all. Upgrading either fixes the crash or makes it debuggable.
+
+```sh
+sudo apt-get update && sudo apt-get install libwebkit2gtk-4.1-0     # then re-run the repro
+# if it still crashes, add the debug source and get a named frame:
+echo 'deb http://debug.mirrors.debian.org/debian-debug/ sid-debug main' \
+  | sudo tee /etc/apt/sources.list.d/debug.list
+sudo apt-get update && sudo apt-get install libwebkit2gtk-4.1-0-dbgsym
+```
 
 ⚠⚠ **NOT MEASURED, AND IT CHANGES WHAT THIS ENTRY MEANS: does the GUI substrate crash too?**
 Every measurement here is on the **headless** substrate (Xvfb, no DRI3). The owner's reports
