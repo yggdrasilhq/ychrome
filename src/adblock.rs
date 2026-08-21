@@ -436,6 +436,37 @@ pub fn run(verb: Option<&str>, args: &[String]) -> Result<()> {
                 }
             };
             let conversion = build_into(&out, loaded)?;
+            // ⛔⛔ GENERATING IS NOT PLACING, AND ONLY THE FIRST HAD AN OWNER.
+            // `build_into` writes the two companion userscripts beside the
+            // ruleset because they are one conversion's output. But userscripts
+            // are injected from `web-userscripts/` and only from there, so for
+            // as long as this step was missing every `adblock update` refreshed
+            // the ruleset, said so, and left the cosmetic filters and the
+            // scriptlets exactly as stale as it found them.
+            //
+            // ⚠ Skipped when `--out` was given: that spelling regenerates the
+            // COMMITTED BASELINE into a scratch directory, and it must not
+            // reach into the operator's live profile.
+            if flag("--out").is_none() {
+                for stem in [
+                    crate::abp::COSMETIC_SCRIPT_STEM,
+                    crate::abp::SCRIPTLET_SCRIPT_STEM,
+                ] {
+                    let body = std::fs::read_to_string(out.join(format!("{stem}.js")))
+                        .with_context(|| format!("reading the generated {stem}.js"))?;
+                    match crate::provision::place_generated_companion(stem, &body) {
+                        Some(status) => {
+                            if let Some(line) = status.report_line() {
+                                eprintln!("{line}");
+                            }
+                        }
+                        None => eprintln!(
+                            "ychrome adblock: {stem} stays deleted on this host — \
+                             the refreshed copy was NOT installed"
+                        ),
+                    }
+                }
+            }
             let report = conversion.report.to_json();
             println!("{}", serde_json::to_string_pretty(&report)?);
             eprintln!(
