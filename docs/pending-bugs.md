@@ -7,7 +7,7 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
-## ⛔⛔ YOUTUBE VIDEO PLAYBACK SEGFAULTS THE ENGINE, AND NOTHING ANYWHERE RECORDS IT
+## ⛔⛔ YOUTUBE VIDEO PLAYBACK SEGFAULTS THE ENGINE (the crash is open; the silence around it is fixed)
 
 **Status:** OPEN. Measured 2026-08-21 on a current release build, reproduced **4/4**.
 
@@ -52,6 +52,33 @@ through it.
 error" — and `ctl console` shows two `failed to load` entries against the watch URL
 itself. Whether the failed loads cause the segfault or share a cause with it is not settled.
 
+### ⛔ FOUR WORKAROUNDS TRIED, ALL NEGATIVE — do not spend the session re-trying these
+
+| tried | result |
+|---|---|
+| `WEBKIT_DISABLE_DMABUF_RENDERER=1` | still crashes |
+| `+ GST_GL_DISABLED=1 + LIBGL_ALWAYS_SOFTWARE=1` | still crashes |
+| a **320x240** viewport, so the site picks a low resolution | still crashes |
+| `WEBKIT_DISABLE_COMPOSITING_MODE=1` | already set by the substrate, and insufficient |
+
+⇒ It is **not resolution-dependent** and it is **not the GL/DMA-BUF path**, which is where the
+EGL warnings invite you to look first.
+
+**Where it actually faults** (gdb, release build so the frames are unsymbolised):
+
+```
+Thread "ychrome-engine" received signal SIGSEGV
+#0  libwebkit2gtk-4.1.so.0        <- fault here
+#1-#9  libwebkit2gtk-4.1.so.0
+#10-#12 libjavascriptcoregtk-4.1.so.0
+#13-#15 libglib-2.0.so.0 (g_main_loop_run)
+#16  gtk_main()
+```
+
+⇒ The crash is in the **UI process**, on the engine thread, dispatched from the GTK main
+loop — not in the web content process. WebKitGTK 2.52.5. Reaching a cause below this needs
+debug symbols for `libwebkit2gtk-4.1`, which are not installed.
+
 ### Reproduce
 
 ```sh
@@ -60,12 +87,34 @@ ychrome ctl open url='https://www.youtube.com/watch?v=<any-video>'   # a 4K60 on
 while :; do pgrep -x ychrome >/dev/null || echo DEAD; sleep 0.3; done
 ```
 
-### The fix this wants
+### ✅ THE RECORDING HALF IS FIXED THIS COMMIT — the crash itself is still open
 
-**Stop discarding the daemon's stderr.** A ring-buffered file beside `journal.jsonl` costs
-nothing and would have turned four sessions of "the engine is fine" into one line. Then a
-`daemon_exit` record written by a supervising parent, so a crash and a restart are
-distinguishable in the journal that already claims to answer for daemon lifetime.
+`spawn_daemon()` no longer sends stderr to `/dev/null`. It goes to
+`<state-dir>/daemon.stderr.log` (0600, rolled once past 4 MB), so the diagnostics that used
+to require running the daemon under a supervisor by hand are now kept by default.
+**Live-proven:** after the change, one ordinary reproduction left this on disk with no
+special tooling —
+
+```
+libEGL warning: DRI3 error: Could not get DRI3 device
+(WebKitWebProcess:…): GStreamer-Audio-WARNING **: Invalid channel positions
+ERROR: WebKit encountered an internal error. This is a WebKit bug.
+Source/WebKit/WebProcess/Network/WebLoaderStrategy.cpp(640) : …internallyFailedLoadTimerFired()
+```
+
+The reaping thread also journals `daemon_exit` with the signal when it observes one.
+⚠ **That line will usually NOT appear, and the code says so**: the waiter lives in whichever
+process spawned the daemon, and a CLI invocation exits long before the daemon dies. The kept
+stderr log is the channel that does not depend on who is still watching. ⇒ A `daemon_exit`
+line is a bonus, never the thing to look for. Measured after the change: 0 such lines across
+several real crashes, exactly as predicted.
+
+⛔ **The segfault is NOT fixed** — only made visible. It still reproduces on every attempt.
+
+### What is still wanted
+
+A `daemon_exit` written by something that outlives the daemon, so the journal can answer for
+daemon lifetime on its own rather than by the absence of a `daemon_stop`.
 
 ---
 
@@ -115,26 +164,6 @@ because a GPU path may be available there. That measurement needs a GUI session.
 
 ---
 
-## ⚠ THE ENGINE JOURNAL SHREDS ~10 % OF ITS OWN RECORDS BY INTERLEAVED WRITES
-
-**Status:** OPEN. Measured 2026-08-21: **2,428 of 24,087 lines (10.08 %) do not parse.**
-
-The corrupt lines are two records written into each other, byte by byte:
-
-```
-{"data":{"method":"POST",{""path"data:"":/some-route{"",method"":reason""POST:"",...
-```
-
-Concurrent appenders are not writing atomically, so records interleave. It is not a cosmetic
-loss: **the journal is the only durable account of what the engine did**, and it fails
-precisely when several things happen at once — which is when an incident is being recorded.
-Any tool that parses it strictly sees a 10 % hole and any tool that parses it loosely invents
-records that were never written.
-
-⇒ One `O_APPEND` write of a single pre-formatted buffer per record, or a writer mutex.
-
----
-
 ## ⛔⛔ A REGENERATED BUNDLE AT AN UNCHANGED `@version` IS UNDEPLOYABLE FOREVER, AND REPORTS AS A USER EDIT
 
 **Status:** OPEN. Measured 2026-08-21 on an ordinary host, against a clean checkout.
@@ -153,9 +182,16 @@ history matched both, exactly, to the bundle as committed on 2026-07-31. They ar
 they are an OLD RELEASE that can never be replaced.
 
 The cause is the version scheme, not the reconciler's logic. The generated assets stamp
-`@version` with the **filter lists' date**, not with the bundle's own content, so a
-regeneration on a later day under the same lists ships **different bytes under an identical
-version**. `provision::verdict` then reaches its last arm — version equal, bodies differ —
+`@version` with a **date**, not with the bundle's own content, so a regeneration that lands on
+the same stamp ships **different bytes under an identical version**.
+
+⚠ **Precision, measured 2026-08-21 — the date is the GENERATION RUN's, not the lists'.**
+`ruleset_version()` is `RULESET_FORMAT_VERSION` joined to `today_stamp()`, and `today_stamp()`
+reads the wall clock at generation time. It has nothing to do with when the filter lists were
+published. ⇒ The collision window is a **same-day re-regeneration**, and a regeneration on any
+later day mints a new version and deploys normally. That matters for whoever fixes this: the
+trap is narrower than the opening sentence implies, and it is also why the checked-in bundle
+can be safely regenerated on a day it has not already been regenerated. `provision::verdict` then reaches its last arm — version equal, bodies differ —
 and returns `Forked`, which is `needs_write() == false`.
 
 ⇒ **Two different bundled bodies sharing one version is a state the verdict table cannot
@@ -879,12 +915,33 @@ not reach any host**, and provisioning reported that as the user's own edit. See
 already installed, so a `forked` opt-in asset cannot be repaired by provisioning at all — the
 only routes are the pane's install action or removing the file.
 
-⛔ **STILL OPEN — nothing says whether these scripts ran.** `sponsorblock.js` publishes
-`data-ysb` to the DOM and is therefore diagnosable in one `ctl eval`. **`youtube-adblock.js`
-and `cosmetic-filters.js` publish nothing at all.** That is why three rounds could not tell a
-broken script from a script that was never delivered. ⇒ Give both a `data-*` state marker in
-the same shape as `data-ysb`; it is the cheapest fix in this entry and it retires the whole
-class of question.
+⛔ **STILL OPEN — `cosmetic-filters.js` REPORTS ITS STATE INTO A WORLD NOTHING CAN READ.**
+
+⚠ **Corrected the same session it was written.** This entry first claimed that
+`youtube-adblock.js` and `cosmetic-filters.js` "publish nothing at all". **That is false**,
+and testing it took one `ctl eval`. What is actually true, measured on a live YouTube page:
+
+| script | `@world` | what it publishes | readable by `ctl eval`? |
+|---|---|---|---|
+| `youtube-adblock.js` | `main` | `__yga_state` — pruned/skipped/forwarded + per-hook counts | ✅ **yes** |
+| `scriptlets.js` | `main` | `__yggScriptlets` | ✅ **yes** |
+| `sponsorblock.js` | `isolated` | `data-ysb` **on the DOM** | ✅ **yes** |
+| `cosmetic-filters.js` | `isolated` | `__yggCosmetic` / `__yggCosmeticState` | ⛔ **NO — always `undefined`** |
+
+⇒ Three of the four are already diagnosable, and `youtube-adblock.js` — the one this mandate
+is about — carries the richest state of any of them and has all along.
+
+⛔ **The one real gap is `cosmetic-filters.js`, and its failure mode is worse than silence.**
+It runs in the ISOLATED world and reports itself through `window` globals, which a page-world
+`eval` can never see. So the variables exist, they are the obvious thing to reach for, and they
+read `undefined` on a perfectly healthy script — **which is exactly the misread `docs/adblock.md`
+already warns about for `window.__ysb`, and the reason SponsorBlock publishes to the DOM
+instead.** The lesson was learned once and never applied to the script beside it.
+
+⇒ **Fix:** the generated cosmetic script should set a `data-*` attribute on
+`document.documentElement`, in the same shape as `data-ysb`. It is generated, so the change
+belongs in the generator, not in the asset. ⚠ And document the four names together — an agent
+currently has to read four scripts to learn four different conventions.
 
 ### ⛔ STILL OPEN — PER-EXTENSION MODALS ARE NOT A YCHROME JOB FIRST
 **Measured, as the mandate asked, before designing anything: a contributed pane CANNOT raise
