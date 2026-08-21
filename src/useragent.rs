@@ -317,6 +317,241 @@ pub fn set_site(host: &str, id: Option<&str>) -> Result<()> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// The PROFILE layer
+// ---------------------------------------------------------------------------
+//
+// A profile is a browsing identity in its own right — its own jar, its own
+// logins, its own userscript directory. Before this, the UA was the one piece
+// of browsing identity that ignored the profile: a portal that needed Chrome
+// forced Chrome on every OTHER profile too, and a user who fixed one profile
+// found the fix applied where they never asked for it.
+//
+// The store stays ONE file (AGENTS.md forbids a second store for one concept).
+// It grows a `profiles` branch that OVERLAYS the browser-wide layer key by key:
+//
+// ```json
+// {
+//   "preset": "engine",
+//   "sites":  { "someportal.example": "chrome" },
+//   "profiles": {
+//     "work": { "preset": "chrome", "sites": { "intranet.example": "safari" } }
+//   }
+// }
+// ```
+//
+// Resolution for (profile, host), most specific first:
+//   1. the profile's own entry for that host (longest-suffix walk)
+//   2. the browser-wide entry for that host (same walk)
+//   3. the profile's own preset
+//   4. the browser-wide preset
+//   5. `Preset::Engine`
+//
+// A site rule beats a browser-wide preset because it is the more SPECIFIC
+// statement, and a profile beats the browser at the same specificity because it
+// is the narrower SCOPE. Both are one sentence: a profile overrides the browser
+// key by key, and a site overrides a whole-browser choice.
+//
+// ⭐ WHAT GETS WRITTEN DOWN, and why the default is not: a choice that MATCHES
+// the browser's default identity leaves no trace, so an unconfigured profile
+// stays unconfigured and inherits later changes. A NON-DEFAULT choice is
+// written and stays written — it never silently follows a later change to the
+// browser-wide setting, because the user made that choice about this profile.
+// The one case where the default IS persisted is when it has work to do:
+// choosing the engine identity inside a profile whose inherited value is a
+// spoof records the opt-out, exactly as an explicit `engine` site entry does.
+
+/// The profile's own layer: its preset (if it declared one) and its own site
+/// map. Absent, malformed or unknown entries are simply not there.
+fn profile_layer(config: &Value, profile: &str) -> (Option<Preset>, BTreeMap<String, Preset>) {
+    let Some(object) = config
+        .get("profiles")
+        .and_then(Value::as_object)
+        .and_then(|profiles| profiles.get(profile))
+    else {
+        return (None, BTreeMap::new());
+    };
+    (
+        object["preset"].as_str().and_then(Preset::from_id),
+        parse_sites(object),
+    )
+}
+
+/// The preset a profile falls back to for a host nothing overrides.
+pub fn preset_for_profile(profile: &str) -> Preset {
+    let config = config();
+    profile_preset_from(&config, profile)
+}
+
+fn profile_preset_from(config: &Value, profile: &str) -> Preset {
+    profile_layer(config, profile)
+        .0
+        .unwrap_or_else(|| preset_from(config))
+}
+
+/// The site map in force for a profile: the browser-wide map with the profile's
+/// own entries laid over it, host by host.
+pub fn sites_for_profile(profile: &str) -> BTreeMap<String, Preset> {
+    sites_for_profile_from(&config(), profile)
+}
+
+fn sites_for_profile_from(config: &Value, profile: &str) -> BTreeMap<String, Preset> {
+    let mut sites = parse_sites(config);
+    sites.extend(profile_layer(config, profile).1);
+    sites
+}
+
+/// What the GUI should hand a surface opened in `profile` before it has a page:
+/// the profile's whole-browser decision. `None` = the engine's own.
+pub fn effective_for_profile(profile: &str) -> Option<String> {
+    preset_for_profile(profile).user_agent().map(str::to_string)
+}
+
+/// The UA for one page's host inside one profile — the full resolution.
+pub fn effective_for_profile_host(profile: &str, host: &str) -> Option<String> {
+    let config = config();
+    preset_for_host(
+        &sites_for_profile_from(&config, profile),
+        profile_preset_from(&config, profile),
+        host,
+    )
+    .user_agent()
+    .map(str::to_string)
+}
+
+/// The wire map for one profile: host -> UA string, `null` for the engine's own.
+pub fn sites_json_for_profile(profile: &str) -> Value {
+    let mut map = serde_json::Map::new();
+    for (host, preset) in sites_for_profile(profile) {
+        map.insert(
+            host,
+            match preset.user_agent() {
+                Some(ua) => Value::String(ua.to_string()),
+                None => Value::Null,
+            },
+        );
+    }
+    Value::Object(map)
+}
+
+/// Rewrite one profile's branch, dropping it entirely when nothing is left in
+/// it. An empty `{}` for a profile nobody configured is state that means
+/// nothing and would still have to be read, merged and explained forever.
+fn edit_profile(profile: &str, mutate: impl FnOnce(&mut serde_json::Map<String, Value>)) -> Result<()> {
+    if profile.trim().is_empty() {
+        anyhow::bail!("cannot set a browser identity for an empty profile");
+    }
+    edit(|object| {
+        let mut profiles = object
+            .get("profiles")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut branch = profiles
+            .get(profile)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        mutate(&mut branch);
+        branch.retain(|_, value| !matches!(value, Value::Object(map) if map.is_empty()));
+        if branch.is_empty() {
+            profiles.remove(profile);
+        } else {
+            profiles.insert(profile.to_string(), Value::Object(branch));
+        }
+        if profiles.is_empty() {
+            object.remove("profiles");
+        } else {
+            object.insert("profiles".to_string(), Value::Object(profiles));
+        }
+    })
+}
+
+/// Set the whole-browser identity for ONE profile, or (`None`) for the browser.
+///
+/// The profile form persists only what carries information: a non-default
+/// preset always, and the engine preset only when the profile would otherwise
+/// inherit a spoof. Choosing the default where the default already applies
+/// REMOVES the entry rather than writing it down.
+pub fn set_preset_scoped(profile: Option<&str>, id: &str) -> Result<()> {
+    let preset = Preset::from_id(id).with_context(|| format!("unknown user-agent preset: {id}"))?;
+    let Some(profile) = profile else {
+        return set_preset(id);
+    };
+    let inherited = preset_from(&config());
+    edit_profile(profile, |branch| {
+        if preset == Preset::Engine && inherited == Preset::Engine {
+            branch.remove("preset");
+        } else {
+            branch.insert("preset".to_string(), Value::String(preset.id().to_string()));
+        }
+    })
+}
+
+/// Set (or, with `None`, clear) one host's identity inside one profile — or,
+/// with no profile, browser-wide.
+pub fn set_site_scoped(profile: Option<&str>, host: &str, id: Option<&str>) -> Result<()> {
+    let Some(profile) = profile else {
+        return set_site(host, id);
+    };
+    let host = crate::sitehost::normalize(host);
+    if host.is_empty() {
+        anyhow::bail!("cannot set a browser identity for an empty host");
+    }
+    let preset = match id {
+        Some(id) => {
+            Some(Preset::from_id(id).with_context(|| format!("unknown user-agent preset: {id}"))?)
+        }
+        None => None,
+    };
+    // What this host would resolve to with no entry of its own in this profile:
+    // the browser-wide map, then the profile's preset, then the browser's.
+    let config = config();
+    let mut inherited_sites = parse_sites(&config);
+    let (profile_preset, profile_sites) = profile_layer(&config, profile);
+    inherited_sites.extend(
+        profile_sites
+            .into_iter()
+            .filter(|(entry, _)| entry != &host),
+    );
+    let inherited = preset_for_host(
+        &inherited_sites,
+        profile_preset.unwrap_or_else(|| preset_from(&config)),
+        &host,
+    );
+    edit_profile(profile, |branch| {
+        let mut sites = branch
+            .get("sites")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        match preset {
+            Some(preset) if preset == Preset::Engine && inherited == Preset::Engine => {
+                sites.remove(&host);
+            }
+            Some(preset) => {
+                sites.insert(host.clone(), Value::String(preset.id().to_string()));
+            }
+            None => {
+                sites.remove(&host);
+            }
+        }
+        branch.insert("sites".to_string(), Value::Object(sites));
+    })
+}
+
+/// One profile's contribution to `policy_version`. A surface must re-fetch when
+/// the decision IT is governed by moves, and a profile's decision is not the
+/// browser's — stamping the browser-wide one would leave a profile's own change
+/// invisible to the GUI until something else moved the stamp.
+pub fn stamp_for_profile(profile: &str) -> String {
+    let mut stamp = format!("user-agent:{}\n", preset_for_profile(profile).id());
+    for (host, preset) in sites_for_profile(profile) {
+        stamp.push_str(&format!("user-agent-site:{host}={}\n", preset.id()));
+    }
+    stamp
+}
+
 /// The warning shown wherever a user picks a per-site identity, and printed by
 /// the CLI. One string, so the pane and the terminal cannot disagree about what
 /// the cost is.
@@ -458,6 +693,73 @@ mod tests {
             sites.get("b.com"),
             Some(&Preset::Chrome),
             "hosts are normalized on read"
+        );
+    }
+
+    /// ⭐ THE PROFILE LOCK. A profile is a browsing identity, so the identity it
+    /// presents is its own. Before this, one portal that needed Chrome made
+    /// every OTHER profile claim Chrome too.
+    #[test]
+    fn a_profile_overrides_the_browser_key_by_key() {
+        let config = json!({
+            "preset": "safari",
+            "sites": { "portal.example": "chrome" },
+            "profiles": {
+                "work": { "preset": "engine", "sites": { "intranet.example": "chrome" } }
+            }
+        });
+        // The profile's own preset beats the browser's...
+        assert_eq!(profile_preset_from(&config, "work"), Preset::Engine);
+        // ...and a profile that declared none inherits it.
+        assert_eq!(profile_preset_from(&config, "play"), Preset::Safari);
+
+        let work = sites_for_profile_from(&config, "work");
+        // A browser-wide site rule still applies inside the profile...
+        assert_eq!(
+            preset_for_host(&work, Preset::Engine, "portal.example"),
+            Preset::Chrome
+        );
+        // ...and the profile's own rule is there beside it.
+        assert_eq!(
+            preset_for_host(&work, Preset::Engine, "intranet.example"),
+            Preset::Chrome
+        );
+        // The profile's rule is NOT visible to another profile.
+        let play = sites_for_profile_from(&config, "play");
+        assert_eq!(
+            preset_for_host(&play, Preset::Safari, "intranet.example"),
+            Preset::Safari
+        );
+    }
+
+    /// A profile entry wins over the browser-wide entry for the SAME host —
+    /// otherwise "this profile behaves differently here" would be unsayable.
+    #[test]
+    fn a_profiles_site_rule_beats_the_browsers_for_that_host() {
+        let config = json!({
+            "sites": { "portal.example": "chrome" },
+            "profiles": { "work": { "sites": { "portal.example": "safari" } } }
+        });
+        let work = sites_for_profile_from(&config, "work");
+        assert_eq!(work.get("portal.example"), Some(&Preset::Safari));
+        assert_eq!(
+            parse_sites(&config).get("portal.example"),
+            Some(&Preset::Chrome),
+            "the browser-wide layer is untouched by the overlay"
+        );
+    }
+
+    /// An unconfigured profile is INVISIBLE in the store: no branch, no empty
+    /// object. It inherits every later browser-wide change, which is what
+    /// "the default is not persisted" has to mean to be worth anything.
+    #[test]
+    fn an_unconfigured_profile_holds_no_state_at_all() {
+        let config = json!({ "preset": "chrome" });
+        assert_eq!(profile_layer(&config, "play"), (None, BTreeMap::new()));
+        assert_eq!(
+            profile_preset_from(&config, "play"),
+            Preset::Chrome,
+            "a profile that chose nothing follows the browser"
         );
     }
 
