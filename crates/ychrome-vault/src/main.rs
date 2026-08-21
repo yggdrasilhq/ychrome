@@ -395,12 +395,45 @@ fn main() -> Result<()> {
             // is now. A connection that lands mid-exec is queued on the
             // inherited listener rather than refused, which is the whole reason
             // the listener fd crosses the boundary.
-            let accepted = agent::request(&dir, &json!({"op": "handover"}))?;
+            // ⛔ A HANDOVER THAT SUCCEEDS CAN LOSE ITS OWN REPLY, AND THE `?`
+            // HERE USED TO TURN THAT INTO A FAILED DEPLOY. The agent replies
+            // and then `execve`s itself; if the exec wins the race the socket
+            // is reset with the reply still in flight, and this call returns
+            // `Connection reset by peer` for an operation that WORKED. Measured
+            // 2026-08-21 on a live agent: the command printed `Error:` and
+            // exited non-zero while the agent had in fact handed over
+            // perfectly — same pid, new exe, still unlocked, 1129 items intact.
+            //
+            // ⇒ A lost reply is EXPECTED here and is not evidence of anything.
+            // The proof was always the second round trip, so take it either
+            // way and let the evidence decide.
+            let accepted = match agent::request(&dir, &json!({"op": "handover"})) {
+                Ok(reply) => reply,
+                // Any transport failure is treated as "the reply may have been
+                // lost to the exec". If the agent is genuinely gone the status
+                // call below fails and the error surfaces there, describing the
+                // real state rather than a race.
+                Err(_) => json!({ "reply_lost": true }),
+            };
             let after = agent::request(&dir, &json!({"op": "status"}))?;
             let now = after["exe_stamp"].as_str().unwrap_or_default();
-            let handed_over = !now.is_empty() && Some(now) == accepted["successor_stamp"].as_str();
+            // Two independent proofs, because only one of them is available
+            // when the reply is lost:
+            //   * the successor stamp the agent PROMISED matches what answers now;
+            //   * or the agent that answers is not stale — it is running the
+            //     binary that is on disk, which is what the handover was for.
+            let promised = !now.is_empty() && Some(now) == accepted["successor_stamp"].as_str();
+            // ⚠ NOT `after["agent_stale"]` — the agent's `status` op does not
+            // carry that field. It is computed CLIENT-side by `Command::Status`,
+            // so reading it off the raw op reply yields `null` and silently
+            // proves nothing. Make the same comparison here, directly: the
+            // agent answering must name the binary THIS CLI is running.
+            let fresh = !now.is_empty() && now == agent::exe_stamp();
+            let handed_over = promised || fresh;
             print_json(&json!({
                 "handed_over": handed_over,
+                "reply_lost": accepted["reply_lost"].as_bool().unwrap_or(false),
+                "proved_by": if promised { "successor_stamp" } else if fresh { "agent_not_stale" } else { "nothing" },
                 "successor": accepted["successor"],
                 "pid": accepted["pid"],
                 "exe_stamp": now,

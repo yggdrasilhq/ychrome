@@ -355,7 +355,12 @@ for an unlock**, or you will ask twice. Deploy the host with **no agent running*
 first (it costs nothing and rehearses the install), then the others.
 
 `ychrome-vault handover` execs the newly installed binary in place — same pid,
-same socket, unlock intact. An agent that predates the op cannot perform it, so
+same socket, unlock intact. ⚠ **A handover that SUCCEEDS can lose its own
+reply**: the agent answers and then `execve`s itself, and when the exec wins the
+race the socket resets with the reply in flight. Until 2026-08-21 that printed
+`Error: Connection reset by peer` and exited non-zero for an operation that had
+worked perfectly — enough to abort a deploy script. A lost reply is expected now
+and the second round trip decides, reporting `reply_lost` and `proved_by`. An agent that predates the op cannot perform it, so
 the deploy that first installs `handover` still costs one `stop-agent` per host;
 every deploy after that is free. Verify with `ychrome-vault status`:
 `agent_stale` must be `false` and `exe_stamp` must name the binary you just
@@ -391,6 +396,22 @@ ychrome-vault list --json | jq -r '.[] | select(.item_type == 3) | .name' | head
 ychrome-vault card "<that name>"            # brand/holder/expiry/last4 only
 ychrome-vault card "<that name>" | grep -cE '[0-9]{13,}'   # MUST print 0
 ```
+
+⛔⛔ **`match` REFUSES AN ENTRY WHOSE USERNAME CANNOT BE TYPED (2026-08-21).** Its
+contract is *the ONE entry an auto-fill may use*, so an entry carrying control
+characters is not a match — it is a refusal, naming the item and the remedy.
+Before this, an auto-fill typed a run of Latin-1 bytes into a login form and
+spent an attempt on a site that locks after a few, and the diagnosis pointed at
+the site rather than the vault. `diagnose` counts them as `username_untypeable`
+(3 on this fleet's vault), so the question is answerable without dumping a
+username to look at it.
+⚠ **The original report called it "not valid UTF-8" and that was impossible** —
+`EncString` decryption is a strict `from_utf8` that errors rather than converting
+lossily, so anything that decodes is already valid UTF-8. The real shape: 49
+characters, 68-74 UTF-8 bytes, every codepoint under `U+0100` — random bytes
+decoded as Latin-1, i.e. a generated secret stored in the wrong field. ⇒ The
+predicate is **"could a human have typed this"**, and it must not quietly become
+"is it ASCII": accented and non-Latin usernames are ordinary.
 
 **Proving a `handover` really happened.** The reply says "accepted"; only a
 second round trip proves it, and the signature below is one that no other
