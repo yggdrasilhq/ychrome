@@ -581,6 +581,28 @@ GUI's webview, so we serve the *effective* policy and yggterm applies it:
   **and reads to a human as the user's own deliberate edit**, so nobody touches
   it. It bit this repo's own shipped work: `sponsorblock.js` at an unchanged
   `2.0.0`, 1,886 bytes different, unable to reach any host.
+  ⛔⛔ **AND GENERATING IS NOT PLACING.** `ychrome adblock update` writes the
+  ruleset, its sidecar and BOTH companion userscripts into one directory — they
+  are one conversion's output — and that directory is `web-adblock/`. Userscripts
+  are injected from `web-userscripts/`, and only from there. ⇒ **Every update
+  refreshed the ruleset, said so, and left the cosmetic filters and scriptlets as
+  stale as it found them.** Fixed 2026-08-21: `update` places both through
+  `provision::place_generated_companion`, running the reconciler's own verdict
+  against the generated body (a deleted script stays deleted, an edited one is
+  kept). ⚠ `--out` skips placement — that spelling regenerates the committed
+  baseline and must not touch a live profile.
+  ⛔⛔ **AND A GENERATED ASSET CAN DRIFT FROM ITS OWN GENERATOR.** The reconciler
+  watches host-copy vs bundled-asset; bundled-asset vs the CODE that emits it had
+  no owner, and they had diverged for weeks — the fix for "cosmetic-filters
+  reports into an unreadable world" was in the generator while every host
+  injected a script without it. `the_committed_cosmetic_script_is_not_older_than
+  _its_generator` closes that seam.
+  ⭐ **The four scripts publish four different ways** and two are in the ISOLATED
+  world where a page-world `eval` sees nothing: `youtube-adblock` →
+  `window.__yga_state`, `scriptlets` → `window.__yggScriptlets`,
+  `cosmetic-filters` → **`data-ycf`** on `<html>`, `sponsorblock` → **`data-ysb`**
+  on `<html>`. Table in `docs/adblock.md`. ⚠ `rules:0` is a RESULT (ran, nothing
+  to do here); no attribute at all is a script that never loaded.
   ⇒ **FIXED 2026-08-21 by a DELIVERY LEDGER.** A hash of what the provisioner
   ITSELF wrote breaks the tie, because it records our act instead of inferring
   about the file: `<id> <sha256>` in a `.delivered` dotfile beside the asset (not
