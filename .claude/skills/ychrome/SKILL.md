@@ -732,27 +732,59 @@ profiles — zoom is readability, not identity).
 
 `settings_schema_from` draws, in order: **This site** (per-site zoom + an honest
 HTTPS connection line from `values.secure`; full cert detail is future, needs
-WebKit's TLS cert), **Ad blocking**, **SponsorBlock** (the `sponsorblock`
-userscript promoted to its own friendly toggle, plus one `list-row` per
-category from `src/sponsorblock.rs` whose buttons are the states it is NOT
-in), **Userscripts** (every OTHER
-script as a `list-row` with Enable/Disable + Delete actions), and **Add an
-extension** (the `extensions.rs` catalog, filtered to what is not installed).
+WebKit's TLS cert), **Tabs**, **Extensions**, **Camera & microphone**, and
+**Browser identity**.
 
-- The catalog's "installed" test reads the SAME `PolicyState` the rest of the
-  pane draws from — one source per render, so the catalog never disagrees with
-  the list above it. Do NOT re-read the disk for it.
-- A list-row Enable/Disable button carries no checkbox value, so the
-  `userscript:` action FLIPS `webpolicy::userscript_enabled` when `values.value`
-  is absent; a real toggle (SponsorBlock, adblock) posts its state.
+### ⭐⭐ EVERY EXTENSION IS ONE ROW WITH ONE BUTTON (2026-08-22, owner-requested)
+
+The pane used to carry **nineteen controls in one column** — ad blocking's two
+toggles, SponsorBlock's eleven category rows and its site list, a row per
+userscript, and a catalogue of what was left. The owner's word was
+"half-hearted", and the SHAPE was the cause: an extension's settings had nowhere
+of their own to live.
+
+Now: one `list-row` per extension, ONE action (`Options…`), state in the
+subtitle. **`src/extmodal.rs` is the one owner of what is behind that button**
+— ad blocking, SponsorBlock, the annoyance scripts, the generated companions,
+and a generic page for a script the user dropped in themselves.
+
+- ⚠ **ONE action per row.** A rail `list-row` gives its actions their width
+  FIRST and the title takes what is left under `overflow:hidden`; a three-action
+  row has been measured at a **0px title** on this rail. The subtitle is what
+  the single action buys back.
+- ⛔ **THE CAPABILITY GATE, and it is the whole reason this is safe to ship.**
+  The dialog is a yggterm feature (`modal` on an action reply, lane
+  `lane/dev/11.27-app-modal`). A shell without it drops the reply silently, so
+  an `Options…` button there is a control that LOOKS like the feature and does
+  nothing. The pane reads **`app_modals`** off the schema GET / action POST and
+  draws **the same widgets inline** when it is absent.
+  ⛔ The fallback is NOT a second implementation — the same `Vec<Value>` in a
+  different place, with only the action envelope differing, and
+  `the_inline_fallback_draws_the_same_controls_as_the_dialog` walks every
+  catalogue entry to keep it that way.
+- **The action grammar is unchanged inside a dialog.** `ext-options:<stem>`
+  raises one; `ext-in:<stem>:<inner action>` wraps a click made inside it, and
+  the dispatcher strips the envelope and runs the SAME handler the pane uses. A
+  second grammar for dialogs would be a second place every verb has to be added.
+  A stem is a bare filename stem, so it carries no `:` and the split is
+  unambiguous.
+- **A dialog action redraws BOTH** — the dialog (from disk, after the write, so
+  a refused write snaps its controls back) and the pane behind it, whose row
+  carries that extension's state line.
+- ⛔ **A refusal outranks everything** in the row's subtitle and again in the
+  dialog: a refused script is injected NOWHERE whatever its filename says, and
+  the toggle reads the filename.
+- The "installed" test reads the SAME `PolicyState` the rest of the pane draws
+  from — one source per render. Do NOT re-read the disk for it.
 - `install` embeds the bundled body via `include_str!` and refuses to clobber an
-  existing script; `delete` removes both `.js` and `.js.disabled`. Both redraw +
-  toast "reload to apply" (a userscript binds at surface creation) — the user
-  hits "Reload surface now".
-- E2E-proven against the real control server 2026-07-11: install writes
-  `sponsorblock.js` and promotes it; `/policy` then serves its body; zoom-in
-  persists `web-zoom.json` and returns `refetch_zoom`; a list-row toggle renames
-  the file; delete removes it.
+  existing script; `ext-reinstall:` is the separate verb that gets past that
+  refusal, and it is offered ONLY for a script ychrome ships — on a user's own
+  file it would destroy it and put nothing back.
+- E2E-proven against the real control server 2026-07-11 (install, zoom,
+  toggle, delete) and 2026-08-22 for the dialog round trip
+  (`the_options_button_raises_a_dialog_and_a_click_inside_it_comes_back` drives
+  `run_settings_action`, not a pure builder — the wiring is where a working
+  builder and a working handler still add up to a dead button).
 
 ### The bundled catalog (`src/extensions.rs` + `assets/web-userscripts/`)
 
@@ -822,6 +854,22 @@ ones are `@match`-scoped instead, so WebKit does the matching in the engine.
   of `SHA-256(videoID)`, matched in the browser. There is deliberately no
   fallback to the by-id endpoint — without `crypto.subtle` it makes no request.
   Do not "fix" that by restoring `?videoID=`.
+- ⛔⛔ **v2.0.0's PER-CATEGORY SETTINGS NEVER REACHED THE PAGE (fixed 2026-08-22,
+  v2.1.0).** ychrome writes `{categories:{…}, hosts:[…]}`; the script read
+  `injected[id]`, one level too high, so it fell back to its own `DEFAULTS`
+  table and every choice made in the pane was silently discarded. ⚠ **The test
+  could not catch it**: it asserted the ids and colours APPEARED in the preamble
+  text, true of the nested shape too. A substring proves a value was WRITTEN;
+  only running both halves proves it was READ.
+  `the_script_reads_the_behaviour_ychrome_writes` drives the production encoder
+  and the catalog's own body through `tests/fixtures/sponsorblock-harness.js`.
+- **v2.1.0 adds the contributing plane — voting and submission — OFF by
+  default.** They are the only things in ychrome that WRITE to somebody else's
+  database and the only ones needing a persistent pseudonymous id. ⛔ The id is
+  a WRITE CREDENTIAL: 128 bits from `/dev/urandom`, it rides the preamble only
+  while a switch is on, and the pane shows a **fingerprint**, never the id.
+  `Contributing::WARNING` lives beside the setting and a test requires it to be
+  drawn above both switches. Details: `docs/adblock.md` §7.
 - **`sponsorblock` v2.0.0 asks for all ELEVEN categories and all five action
   types.** v1 asked for three categories and took the API's default
   `actionTypes` — measured over 881 videos with segments, **48.7% had nothing in

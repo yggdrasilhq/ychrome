@@ -626,7 +626,7 @@ six languages too.
 the 36 shapes it knows; a consent dialog inside a cross-origin iframe; a
 per-purpose preference form.
 
-### `sponsorblock` (v2.0.0)
+### `sponsorblock` (v2.1.0)
 
 Asks by **hash prefix**, never by video id: `SHA-256(videoID)` truncated to four
 hex characters, which returns every video sharing that prefix and the match
@@ -705,6 +705,80 @@ Beyond the category set:
   a cache on disk turns that into a TTL knob. The licence permits either (see
   `THIRD-PARTY-NOTICES.md`); this is a correctness choice.
 
+#### ⛔⛔ v2.0.0's SETTINGS NEVER REACHED THE PAGE, AND THE TEST AGREED THEY DID
+
+**Found and fixed 2026-08-22.** ychrome has always written the preamble as
+`window.__ysbConfig = {categories:{…}, hosts:[…]}`. The script read
+`injected[id]` — one level too high. So `config()` found nothing for any
+category, fell back to its own `DEFAULTS` table, and **every per-category
+choice made in the settings pane was silently discarded.** The pane stored it,
+the preamble carried it, the script read past it. Nothing anywhere reported a
+mismatch.
+
+Measured, not inferred: the production encoder's output plus the script's own
+reader, under node — user asked for `manual`, script resolved `auto`.
+
+⚠ **The test that was supposed to cover this could not.** It asserted that
+every category id and colour APPEARED somewhere in the preamble text, which is
+true of the nested shape too. **A substring proves a value was WRITTEN; only
+running both halves together proves it was READ.**
+`the_script_reads_the_behaviour_ychrome_writes` now drives
+`config_script_body_from` (the production encoder, split out from the disk read
+for exactly this) and the catalog's own script body through
+`tests/fixtures/sponsorblock-harness.js`, then reads back what the script
+RESOLVED — with every category moved OFF its default, so nothing can pass by
+accidentally agreeing with the fallback table.
+
+#### The settings that are not per-category (v2.1.0)
+
+| setting | default | why |
+|---|---|---|
+| `skip_notice` | **on** | ⛔ the notice carries the ONLY Undo there is — off means silent and final |
+| `seek_bar_markers` | on | the recognisable half of SponsorBlock |
+| `min_duration_secs` | 0, capped at 30 | upstream's own knob for sub-second submissions; ⛔ label categories (`poi`, `full`) are exempt, they have no length to measure |
+
+#### ⛔⛔ Contributing: submission and voting (v2.1.0, OFF by default)
+
+These are the only two things in ychrome that **WRITE to somebody else's
+database**, and the only ones that need a **persistent pseudonymous identity** —
+the server counts votes per user and publishes a submitter's record, so the
+moment either is on this browser carries a stable id linking everything it
+contributes into one public trail. Reading segments needs no id at all, which
+is what the hash-prefix query is for.
+
+The owner's standing constraint, and it survived this work unchanged:
+**explicit, off by default, and the privacy consequence stated where they are
+turned on.** How each half is held:
+
+- **Explicit + off by default** — `preferences()` defaults both to `false`, and
+  the SCRIPT defaults them to `false` too (`injected.voting === true`, not
+  `!== false`), so a copy of the file deployed by hand with nothing to configure
+  it cannot start contributing on its own. Locked by
+  `the_script_preference_defaults_match_this_module`.
+- **The consequence beside the switch** — `sponsorblock::Contributing::WARNING`
+  lives with the setting, not in this document, and
+  `the_contributing_switches_state_their_cost_where_they_are_offered` requires
+  it to be drawn ABOVE both switches. A dialog that scrolled the warning out of
+  sight of what it warns about would pass a weaker test.
+- **The id is a WRITE CREDENTIAL, not a name.** Anyone holding it can vote and
+  submit as this user. So: 128 bits from `/dev/urandom` (never a clock, never a
+  counter); it rides the preamble **only while a switch is on**; and the pane
+  shows a **fingerprint** (`SHA-256(id)[..4]`, the same derivation the server
+  publishes a submitter under), never the id — a schema is re-fetched on every
+  open and re-sent on every action.
+- **Minted on the first enable, kept until forgotten.** Re-minting on every
+  toggle would scatter one person across several pseudonyms without telling
+  them; `Forget` is the explicit way to start a fresh one.
+- ⚠ **A submission sends the video id in the clear.** It has to — the point is
+  to say which video has the segment. The submit button says so at the moment of
+  pressing, which is the one place the cost can still be declined.
+
+In the page: a vote pair on the segment the playhead is inside; mark-start /
+mark-end, a category chooser, and a submit for the queue. ⛔ The queue is
+cleared on every SPA navigation — a range marked in one video submitted against
+another video's id is a wrong submission the user would never see themselves
+make.
+
 #### Settings, and how they reach the page
 
 `src/sponsorblock.rs` is the single owner of the catalogue, the defaults and the
@@ -732,12 +806,11 @@ ychrome ctl eval page_id=<id> js='document.documentElement.getAttribute("data-ys
 
 #### Not built, named rather than implied
 
-**Segment submission and voting.** They need a persistent pseudonymous user id
-and they WRITE to a shared public database. If they are added they must be
-explicit, off by default, and the privacy consequence stated where the user
-turns them on. Also absent: the unsubmitted-segment queue, and renaming
-YouTube's own chapter list (community chapters are drawn as markers beside it,
-not merged into it).
+**Renaming YouTube's own chapter list.** Community chapters are drawn as markers
+beside it, never merged into it.
+
+**Voting on a segment the playhead is not inside.** You can only judge a segment
+you have seen, so the vote pair appears while one is playing and not from a list.
 
 ## 8. Commands
 
