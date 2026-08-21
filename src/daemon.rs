@@ -925,8 +925,24 @@ fn idle_verdict(held: &[String], engine_pages: usize) -> Value {
 pub(crate) fn journal(event: &str, data: Value) {
     let Ok(path) = journal_path() else { return };
     let line = json!({ "ts_ms": now_millis(), "event": event, "data": data });
+    // ⛔⛔ ONE `write` SYSCALL, RECORD AND NEWLINE TOGETHER. `writeln!` onto a
+    // `File` is NOT one write: the format machinery emits the body and the
+    // newline separately, and every daemon generation plus every engine thread
+    // holds its own append handle on this file. `O_APPEND` makes each
+    // INDIVIDUAL write atomic against the end of the file; it cannot make a
+    // record that arrives as two writes atomic. So two records interleaved
+    // *inside each other*, byte by byte, and the file stopped being JSON:
+    //
+    //   {"data":{"method":"POST",{""path"data:"":/some-route{"",method"":...
+    //
+    // Measured 2026-08-21 before this fix: 2,428 of 24,087 lines — 10.08% —
+    // did not parse. It fails worst when several things happen at once, which
+    // is exactly when an incident is being recorded, so the journal lost its
+    // records precisely in the moments it existed for.
+    let mut record = line.to_string();
+    record.push('\n');
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{line}");
+        let _ = file.write_all(record.as_bytes());
     }
 }
 
@@ -1389,18 +1405,59 @@ fn spawnable_exe(exe: PathBuf) -> PathBuf {
     }
 }
 
-/// Launch `ychrome --daemon` detached (setsid, cwd=home, stdio to /dev/null), the
-/// yedit pattern. Best-effort: a lost race just means another spawn won, and the
-/// ensure loop finds the socket answering.
+/// The daemon's stderr, kept rather than discarded. See [`daemon_stderr_sink`].
+fn daemon_stderr_path() -> Result<PathBuf> {
+    Ok(daemon_dir()?.join("daemon.stderr.log"))
+}
+
+/// Cap for [`daemon_stderr_path`]. WebKit is chatty on a bad substrate, and this
+/// file must never be the reason a host fills its disk.
+const DAEMON_STDERR_CAP: u64 = 4 * 1024 * 1024;
+
+/// An append handle on the daemon's stderr log, rolled once it passes the cap.
+///
+/// ⛔⛔ **THIS USED TO BE `/dev/null`, AND THAT IS WHY A SEGFAULT COULD RUN FOR
+/// MONTHS UNDIAGNOSED.** A daemon spawned with `.stderr(Stdio::null())` cannot
+/// report its own death by any route: the crash message, WebKit's own
+/// `ERROR: WebKit encountered an internal error` lines and the EGL warnings all
+/// go to a discarded fd, and the journal is written by the *process* — which is
+/// not running any more. Measured 2026-08-21: YouTube video playback segfaults
+/// the daemon in 1-5s, and the entire product recorded nothing anywhere. The
+/// crash was only ever seen by running the daemon under a supervisor by hand.
+///
+/// The kernel writes here whether or not the daemon is well enough to cooperate,
+/// which is the property that matters for a crash.
+fn daemon_stderr_sink() -> Option<Stdio> {
+    let path = daemon_stderr_path().ok()?;
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > DAEMON_STDERR_CAP) {
+        // One generation back is enough to explain the death we are recovering
+        // from; keeping more is how a log turns into a disk problem.
+        let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    Some(Stdio::from(file))
+}
+
+/// Launch `ychrome --daemon` detached (setsid, cwd=home, stdout to /dev/null and
+/// **stderr to a kept log**), the yedit pattern. Best-effort: a lost race just
+/// means another spawn won, and the ensure loop finds the socket answering.
 fn spawn_daemon() -> Result<()> {
     let exe = spawnable_exe(std::env::current_exe().context("locating the ychrome binary")?);
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    // Falling back to `null` keeps a host with an unwritable state dir working:
+    // losing the log is a degraded diagnostic, refusing to spawn is an outage.
+    let stderr = daemon_stderr_sink().unwrap_or_else(Stdio::null);
     let child = Command::new(&exe)
         .arg("--daemon")
         .current_dir(&home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .process_group(0)
         .spawn()
         .context("spawning the ychrome daemon")?;
@@ -1423,7 +1480,27 @@ fn spawn_daemon() -> Result<()> {
     // not steal or auto-discard WebKit's own child exit statuses.
     std::thread::spawn(move || {
         let mut child = child;
-        let _ = child.wait();
+        // The waiter ALREADY knew how the daemon died and threw it away. A
+        // non-zero status here is the only in-process witness to a crash, so it
+        // is worth a line: `daemon_start` with no matching `daemon_stop` is what
+        // a segfault looks like in the journal, and that is not readable as a
+        // crash by anyone who does not already know to look for the absence.
+        //
+        // ⚠ Only observable while THIS process outlives the daemon, which a
+        // short-lived CLI invocation does not — the kept stderr log above is the
+        // channel that does not depend on who is still around to watch.
+        if let Ok(status) = child.wait() {
+            if !status.success() {
+                journal(
+                    "daemon_exit",
+                    json!({
+                        "code": status.code(),
+                        "signal": std::os::unix::process::ExitStatusExt::signal(&status),
+                        "stderr_log": daemon_stderr_path().ok().map(|p| p.display().to_string()),
+                    }),
+                );
+            }
+        }
     });
     Ok(())
 }

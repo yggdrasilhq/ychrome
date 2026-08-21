@@ -1879,9 +1879,28 @@ pub fn generate_cosmetic_script(
          \x20           mine = mine.concat(RULES[key]);\n\
          \x20       }}\n\
          \x20   }}\n\
-         \x20   if (!mine.length) return;\n\
-         \x20   var state = {{ hidden: 0, styled: 0, passes: 0 }};\n\
+         \x20   var state = {{ rules: mine.length, hidden: 0, styled: 0, passes: 0 }};\n\
          \x20   window.__yggCosmeticState = state;\n\
+         \x20   // \u{26D4} THE GLOBAL ABOVE IS INVISIBLE TO EVERY PROBE. This script runs in\n\
+         \x20   // the ISOLATED world, so a page-world `ctl eval` reading\n\
+         \x20   // `window.__yggCosmeticState` gets `undefined` on a perfectly healthy\n\
+         \x20   // script - the same misread docs/adblock.md records for `window.__ysb`,\n\
+         \x20   // and the reason sponsorblock publishes to the DOM instead. That lesson\n\
+         \x20   // was learned once and never applied to the script beside it.\n\
+         \x20   //\n\
+         \x20   // The DOM is the one thing both worlds share:\n\
+         \x20   //     ychrome ctl eval page_id=<id> \\\n\
+         \x20   //       js='document.documentElement.getAttribute(\"data-ycf\")'\n\
+         \x20   function publish() {{\n\
+         \x20       try {{\n\
+         \x20           document.documentElement.setAttribute('data-ycf', JSON.stringify(state));\n\
+         \x20       }} catch (e) {{ /* the instrument must never be the thing that breaks */ }}\n\
+         \x20   }}\n\
+         \x20   publish();\n\
+         \x20   // \u{26A0} Published BEFORE this return, so a host with no rules reads as\n\
+         \x20   // `rules:0` - it ran and had nothing to do here. Absence is what a\n\
+         \x20   // script that never loaded looks like, and the two readings must differ.\n\
+         \x20   if (!mine.length) return;\n\
          \x20\n\
          \x20   function apply() {{\n\
          \x20       state.passes += 1;\n\
@@ -1923,6 +1942,7 @@ pub fn generate_cosmetic_script(
          \x20               }}\n\
          \x20           }}\n\
          \x20       }}\n\
+         \x20       publish();\n\
          \x20   }}\n\
          \x20\n\
          \x20   // Coalesced: a page that rewrites its DOM in a loop must not make this\n\

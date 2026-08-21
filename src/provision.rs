@@ -387,6 +387,19 @@ pub fn reconcile() -> Vec<AssetStatus> {
         let ruleset_landing = !dir.join(crate::adblock::RULESET_FILE).is_file()
             || crate::adblock::installed_ruleset_version(&dir.join(crate::adblock::RULESET_FILE))
                 .is_none_or(|installed| installed < crate::adblock::bundled_ruleset_version());
+        // ⛔ THE RULESET LANDING IS NOT THE ONLY MOMENT A COMPANION CAN BE
+        // MISSING, and treating it as one left hosts browsing without half the
+        // filters they were shipped. Measured 2026-08-20 on two hosts of this
+        // fleet: `cosmetic-filters.js` present, `scriptlets.js` ABSENT, no
+        // error anywhere — the ruleset had landed BEFORE the scriptlet plane
+        // existed, so on every launch since, the only branch that could install
+        // the companion was false. Nothing reports a script that was never
+        // delivered: it looks exactly like one the user does not want.
+        //
+        // ⇒ A companion missing while the ruleset is present is repaired on any
+        // launch, UNLESS the user deleted it — which is now recorded, so the
+        // two states are finally distinguishable (`webpolicy::deleted_userscripts`).
+        let deleted = crate::webpolicy::deleted_userscripts();
         // BOTH generated scripts, for the same reason: one `abp::convert` makes
         // the ruleset, the cosmetic script and the scriptlet script, and a host
         // with one and not the others is missing filters nothing will say are
@@ -395,7 +408,12 @@ pub fn reconcile() -> Vec<AssetStatus> {
             crate::abp::COSMETIC_SCRIPT_STEM,
             crate::abp::SCRIPTLET_SCRIPT_STEM,
         ] {
-            if ruleset_landing
+            // The ruleset landing still counts (a fresh host installs both with
+            // it); so does a companion simply not being here while the ruleset
+            // is. `deleted` is what keeps the Delete button honest.
+            let ruleset_present = dir.join(crate::adblock::RULESET_FILE).is_file();
+            if (ruleset_landing || ruleset_present)
+                && !deleted.iter().any(|entry| entry == stem)
                 && let Some(scripts) = userscript_dir()
                 && let Some(ext) = crate::extensions::find(stem)
             {

@@ -222,6 +222,124 @@ fn behaviour_from(config: &Value, category: &'static Category) -> &'static str {
         .unwrap_or(category.default)
 }
 
+/// A host the user has asked SponsorBlock to run on, beyond YouTube itself.
+///
+/// ⭐ **The point of the setting.** SponsorBlock's segments are keyed by VIDEO
+/// ID, and a front-end that serves YouTube's catalogue under its own domain
+/// serves the same ids — so the community database answers for it exactly as it
+/// does for YouTube. Without this, running your own front-end means losing the
+/// feature entirely, which is a poor trade for the privacy it was chosen for.
+///
+/// ⛔ **CONFIGURABLE, never bundled.** No such host is named anywhere in this
+/// repository, in code, defaults, docs or tests: an instance address is the
+/// user's own infrastructure, and a shipped list would both leak whoever is on
+/// it and rot. Every example here and in the tests is invented.
+///
+/// A stored entry is accepted only if it is a plausible bare HOST — no scheme,
+/// no path, no wildcard, no whitespace. The value becomes a `@match` pattern and
+/// an injected allow-list, so a junk entry is not a cosmetic problem: `*` here
+/// would run the script on every page the user visits.
+fn site_is_wellformed(host: &str) -> bool {
+    let host = host.trim();
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    // A LABEL at a time, which rejects the empty label in `a..b`, a leading or
+    // trailing dot, and anything with a scheme or a path in it — those all
+    // produce a label containing a character no hostname may hold.
+    let mut labels = 0;
+    for label in host.split('.') {
+        labels += 1;
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+        if !label
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        {
+            return false;
+        }
+    }
+    // A single label is a LAN name, not a site the user browses to over https;
+    // requiring a dot also keeps `localhost` and typos like `youtubecom` out.
+    labels >= 2
+}
+
+/// The extra hosts, de-duplicated, lower-cased, malformed entries dropped.
+///
+/// Dropped rather than refused at read time on purpose: this is called on every
+/// policy build, and a hand-edited file with one bad line must not cost the user
+/// the rest of their configuration.
+pub fn sites() -> Vec<String> {
+    let config = read_config();
+    let mut out: Vec<String> = Vec::new();
+    for value in config["sites"].as_array().into_iter().flatten() {
+        let Some(host) = value.as_str() else { continue };
+        let host = host.trim().to_ascii_lowercase();
+        if site_is_wellformed(&host) && !out.contains(&host) {
+            out.push(host);
+        }
+    }
+    out
+}
+
+/// Add a host. Idempotent, and it REFUSES a malformed one rather than dropping
+/// it silently — a user typing this into the settings pane must be told, where
+/// the file reader must carry on.
+pub fn add_site(host: &str) -> Result<()> {
+    let host = host.trim().to_ascii_lowercase();
+    if !site_is_wellformed(&host) {
+        anyhow::bail!(
+            "{host:?} is not a host name. Give the bare host of your front-end, \
+             with no scheme and no path — for example videos.example.net"
+        );
+    }
+    let mut config = read_config();
+    let mut list = sites();
+    if !list.contains(&host) {
+        list.push(host);
+    }
+    config["sites"] = json!(list);
+    write_config(&config)
+}
+
+/// Remove a host. Silent about one that was not there: the row that asked is
+/// gone either way, and that is what the user wanted.
+pub fn remove_site(host: &str) -> Result<()> {
+    let host = host.trim().to_ascii_lowercase();
+    let mut config = read_config();
+    config["sites"] = json!(
+        sites()
+            .into_iter()
+            .filter(|entry| *entry != host)
+            .collect::<Vec<_>>()
+    );
+    write_config(&config)
+}
+
+/// WHERE SponsorBlock RUNS — YouTube, plus whatever the user configured.
+///
+/// ONE owner, because three things must agree or the feature half-works in a way
+/// that is very hard to read: the `@match` patterns the engine gates injection
+/// on, the same patterns for the settings script injected beside it, and the
+/// allow-list the script itself checks at run time. Two of the three agreeing
+/// gives a script that loads and refuses to act, or one that acts on a page it
+/// was never meant to see.
+pub fn match_patterns() -> Vec<String> {
+    let mut patterns = vec![
+        "https://*.youtube.com/*".to_string(),
+        "https://youtube.com/*".to_string(),
+    ];
+    for host in sites() {
+        patterns.push(format!("https://{host}/*"));
+        patterns.push(format!("https://*.{host}/*"));
+    }
+    patterns
+}
+
 /// Every category's effective behaviour, catalogue order. One read of the file.
 pub fn effective() -> Vec<(&'static Category, &'static str)> {
     let config = read_config();
@@ -243,23 +361,23 @@ pub fn set_behaviour(id: &str, behaviour: &str) -> Result<()> {
             category.options.join(", ")
         );
     }
+    let mut config = read_config();
+    config["categories"][category.id] = json!(behaviour);
+    write_config(&config)
+}
+
+/// Write the config back, whole.
+///
+/// ONE writer, so "unknown keys survive" is a property of the file rather than a
+/// habit each caller has to remember: a setting this build never heard of — or
+/// one a NEWER build wrote — is preserved by every path that touches the file,
+/// because they all read it in full and hand it back in full.
+fn write_config(config: &Value) -> Result<()> {
     let path = config_path()?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut config = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    let mut categories = config
-        .get("categories")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    categories.insert(category.id.to_string(), json!(behaviour));
-    config.insert("categories".to_string(), Value::Object(categories));
-    std::fs::write(&path, serde_json::to_string_pretty(&Value::Object(config))?)?;
+    std::fs::write(&path, serde_json::to_string_pretty(config)?)?;
     Ok(())
 }
 
@@ -295,13 +413,20 @@ pub fn config_script_body() -> String {
             )
         })
         .collect();
+    // ⛔ The HOSTS ride along, because the script's own run-time gate has to
+    // agree with the `@match` patterns the engine gated injection on. A script
+    // injected into a page it then refuses to act on is the failure mode that is
+    // hardest to read: everything looks configured and nothing happens.
+    let config = json!({
+        "categories": Value::Object(categories),
+        "hosts": sites(),
+    });
     format!(
         "// ychrome: SponsorBlock settings, generated from \
          ~/.yggterm/web-userscripts/sponsorblock.config.json.\n\
          // Not a file on disk — injected beside sponsorblock.js so the script \
          asset stays\n// byte-identical to the bundled one. Edit it from the \
-         settings pane.\nwindow.__ysbConfig = {};\n",
-        Value::Object(categories)
+         settings pane.\nwindow.__ysbConfig = {config};\n",
     )
 }
 
@@ -309,10 +434,7 @@ pub fn config_script_body() -> String {
 /// declares, so the global is visible to it), YouTube only, document-start.
 pub fn config_userscript() -> crate::userscript::Userscript {
     let mut script = crate::userscript::Userscript::new(config_script_body());
-    script.matches = vec![
-        "https://*.youtube.com/*".to_string(),
-        "https://youtube.com/*".to_string(),
-    ];
+    script.matches = match_patterns();
     script
 }
 
@@ -631,6 +753,113 @@ mod tests {
             !body.contains("function") && !body.contains("fetch("),
             "the config preamble must be a bare assignment: {body}"
         );
+    }
+
+    /// ⛔ A stored entry becomes a `@match` pattern AND a run-time permission,
+    /// so a junk one is not cosmetic: `*` here would run the script on every
+    /// page the user visits.
+    ///
+    /// ⚠ Every host below is INVENTED. No real front-end address appears
+    /// anywhere in this repository — an instance address is the user's own
+    /// infrastructure, and a shipped example both leaks whoever is on it and
+    /// rots.
+    #[test]
+    fn only_a_plausible_bare_host_is_a_site() {
+        for good in [
+            "videos.example.net",
+            "front-end.example.co.uk",
+            "v2.watch.example.org",
+        ] {
+            assert!(site_is_wellformed(good), "{good:?} should be accepted");
+        }
+        for bad in [
+            "",
+            "   ",
+            "*",
+            "*.example.net",
+            // A scheme or a path is the shape a user pastes from the address
+            // bar, and it is the one that would silently match nothing.
+            "https://videos.example.net",
+            "videos.example.net/watch",
+            "videos.example.net:8443",
+            "videos example net",
+            // A single label is a LAN name, not a site browsed over https —
+            // and this is what keeps `localhost` and `youtubecom` out.
+            "localhost",
+            "youtubecom",
+            "-lead.example.net",
+            "trail-.example.net",
+            "double..dot",
+            ".leading.dot",
+        ] {
+            assert!(!site_is_wellformed(bad), "{bad:?} should be refused");
+        }
+    }
+
+    /// The three things that must agree, from ONE owner: what the engine gates
+    /// injection on, what the settings script is injected on, and what the
+    /// script's own run-time gate allows.
+    #[test]
+    fn youtube_is_always_matched_and_a_configured_host_is_matched_with_its_subdomains() {
+        // Pure over `sites()`, which reads the user's file — so assert on the
+        // part that is true regardless of what is configured on this host.
+        let patterns = match_patterns();
+        assert!(patterns.contains(&"https://*.youtube.com/*".to_string()));
+        assert!(patterns.contains(&"https://youtube.com/*".to_string()));
+        // …and the shape a configured host takes, which is what the script's
+        // own `endsWith('.' + host)` gate mirrors.
+        for host in sites() {
+            assert!(patterns.contains(&format!("https://{host}/*")), "{host}");
+            assert!(patterns.contains(&format!("https://*.{host}/*")), "{host}");
+        }
+        assert_eq!(
+            config_userscript().matches,
+            patterns,
+            "the settings script and the script it configures must be injected \
+             on exactly the same pages"
+        );
+    }
+
+    /// ⛔ THE GATE IS WHOLE LABELS, NEVER A SUBSTRING. The configured list is
+    /// exactly the place a typo becomes a permission, and `indexOf` would let
+    /// `notyoutube.com.evil.test` act as YouTube.
+    #[test]
+    fn the_scripts_host_gate_compares_labels_and_reads_the_injected_list() {
+        let gate = ASSET
+            .split("function ysbHostAllowed(")
+            .nth(1)
+            .expect("the script gates its host in one function");
+        let gate = &gate[..gate.find("\n}").expect("the function ends")];
+        assert!(
+            gate.contains("host === allowed[j]") && gate.contains("host.endsWith('.' + allowed[j])"),
+            "the gate must compare whole labels:\n{gate}"
+        );
+        assert!(
+            !gate.contains("indexOf(") && !gate.contains(".includes("),
+            "a substring test here turns a typo into a permission:\n{gate}"
+        );
+        assert!(
+            gate.contains("window.__ysbConfig && window.__ysbConfig.hosts"),
+            "the extra hosts come from the injected config, never from the \
+             asset:\n{gate}"
+        );
+        // …and a malformed config must not cost the user YouTube itself.
+        assert!(gate.contains("catch"), "{gate}");
+        assert!(gate.contains("var allowed = ['youtube.com'];"), "{gate}");
+    }
+
+    /// ⛔ NO REAL FRONT-END ADDRESS SHIPS. The whole feature exists so the user
+    /// can name their own instance; naming one here would defeat the reason it
+    /// is configurable.
+    #[test]
+    fn the_asset_names_no_host_but_youtube_and_the_segment_api() {
+        for line in ASSET.lines() {
+            let lowered = line.to_ascii_lowercase();
+            assert!(
+                !lowered.contains("invidious") && !lowered.contains("piped"),
+                "a front-end is named in the shipped asset: {line}"
+            );
+        }
     }
 
     #[test]

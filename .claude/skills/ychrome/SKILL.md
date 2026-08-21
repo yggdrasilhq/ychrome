@@ -559,7 +559,17 @@ GUI's webview, so we serve the *effective* policy and yggterm applies it:
 - **Nothing bundled sits dead on a host any more.** `src/provision.rs` runs at
   every launch, installs what is missing, replaces what is superseded (keeping a
   `.superseded` backup) and KEEPS what the user edited or what is newer than the
-  bundle. `ychrome provision --json` runs the same call and prints the verdicts.
+  bundle.
+  ⛔ **A DELETION IS RECORDED, and it has to be**: "never delivered" and "deleted
+  on purpose" are the same state on disk, so a provisioner that repairs the first
+  makes the pane's Delete button a lie about the second. Deletions land in
+  `web-userscripts/.deleted` (one stem per line, retracted by an explicit
+  reinstall). ⇒ 2026-08-20: `scriptlets.js` was absent on both hosts checked —
+  the generated companions were installed only on the launch where the RULESET
+  landed, and that ruleset predated the scriptlet plane, so 3,341 scriptlet
+  invocations over 5,338 domains were silently missing. A companion missing while
+  the ruleset is present is now repaired on any launch, unless a tombstone says
+  the user meant it. `ychrome provision --json` runs the same call and prints the verdicts.
   Every bundled asset declares a version (`@version`, or `ruleset_version` in
   the sidecar) — a content hash cannot tell an old release from a user's edit.
 - An adblock RULESET change needs a yggterm restart (WebKit compiles the filter
@@ -600,14 +610,37 @@ Version/60.5 Safari/605.1.15`.
 - The settings pane draws it TWICE, on purpose: a per-site row under "This site"
   (with the warning) and the browser-wide picker under "Browser identity" (which
   now says to prefer the per-site one).
-- **`/policy` carries `user_agent` (global, applied at webview creation) AND
-  `user_agent_sites` (host → resolved UA string, `null` = the engine's own).**
-  The engine already applies the per-site map on every navigation
-  (`Engine::apply_identity`, BEFORE `goto` — the UA is a request header).
-  ⚠ **yggterm does not consume `user_agent_sites` yet**, so on the visible
-  surface a per-site override still needs the GUI companion change: match the
-  live page's host the way it already does for `/zoom`, then
-  `WebKitSettings::set_user_agent`.
+- **`/policy` carries `user_agent` (the PROFILE's whole-browser decision, applied
+  at webview creation) AND `user_agent_sites` (host → resolved UA string, `null` =
+  the engine's own).** Both planes consume both now: the engine applies the map
+  before every `goto` (`Engine::apply_identity`), and yggterm applies it before a
+  surface is created and again when the host on screen enters or leaves an
+  override (2026-08-20 — it previously had no field for `user_agent_sites` at all,
+  so serde dropped it and a per-site identity was stored, reported applied, and
+  never sent by one request).
+  ⚠ **Neither plane can repaint the page already open** — a UA is a request
+  header, so what a setting governs is the NEXT request.
+
+### ⭐ THE IDENTITY IS PER PROFILE (2026-08-20)
+
+A profile is a browsing identity in its own right, so the UA it presents is its
+own. ONE file still (`~/.yggterm/ychrome/user-agent.json`); it grows a `profiles`
+branch that OVERLAYS the browser-wide layer key by key.
+
+Resolution, most specific first: the profile's entry for the host → the browser's
+entry for the host → the profile's preset → the browser's preset → the engine's
+own UA.
+
+- **A non-default choice is written and STAYS written** — it never silently
+  follows a later browser-wide change. Choosing the default where the default
+  already applies removes the entry, so an unconfigured profile holds no state
+  and keeps inheriting. (The one case where the default IS persisted: opting a
+  profile out of an inherited spoof.)
+- `ychrome identity [<host>] [--profile P] [--set …|--reset] [--json]`. The pane
+  always writes the profile it is drawn inside and says so in its own text.
+- ⛔ `identity --set chrome` once wrote a per-site rule for a host named "chrome":
+  the verb took the first argument not starting with `--` as the hostname. Every
+  value-taking flag is skipped with its value now, from one list.
 - **claude.ai really does UA-gate, and it still reproduces** (in a real WebKit
   surface, not curl): engine identity → `403 {"error":{"type":"forbidden"}}`;
   the Safari preset → `200` at `/login`. That is what the per-site layer is FOR
