@@ -493,13 +493,19 @@ fn sponsorblock_options(
         "label": "Draw segments on the seek bar",
         "value": prefs.seek_bar_markers,
     }));
+    // ⛔⛔ INTEGERS. `number-input` declares `value`/`min`/`max` as i64, and
+    // serde REFUSES a float outright — which does not render a wrong number, it
+    // fails the whole schema, and a pane that fails renders nothing at all. The
+    // seconds are stored as an f64 (a hand-edited file may hold 4.5), so they
+    // are rounded HERE, at the one place they cross into the widget contract.
+    // `every_number_input_this_app_emits_is_an_integer` walks every schema.
     widgets.push(json!({
         "kind": "number-input",
         "id": crate::sponsorblock::PREF_MIN_DURATION,
         "label": "Ignore segments shorter than (seconds)",
-        "value": prefs.min_duration_secs,
+        "value": prefs.min_duration_secs.round() as i64,
         "min": 0,
-        "max": crate::sponsorblock::MAX_MIN_DURATION_SECS,
+        "max": crate::sponsorblock::MAX_MIN_DURATION_SECS.round() as i64,
     }));
     widgets.push(json!({
         "kind": "button",
@@ -765,6 +771,62 @@ mod tests {
             }
         }
         out
+    }
+
+    /// ⛔⛔ A FLOAT IN A `number-input` FAILS THE WHOLE PANE.
+    ///
+    /// yggterm declares `value`/`min`/`max` as **i64**, and serde does not
+    /// coerce — it refuses (`invalid type: floating point 4.5, expected i64`),
+    /// which fails the SCHEMA, not the widget. A pane that fails to parse
+    /// renders nothing at all, so one fractional number in one dialog takes the
+    /// entire settings surface down with it.
+    ///
+    /// ⚠ It is caught here and nowhere else: this app cannot link yggterm's
+    /// types, every builder test asserts on the JSON it just wrote, and the
+    /// break only appears on the far side of the wire. The first cut of the
+    /// SponsorBlock dialog shipped `4.5` and `30.0` straight from an `f64`.
+    #[test]
+    fn every_number_input_this_app_emits_is_an_integer() {
+        fn walk(widgets: &[Value], where_: &str) {
+            for widget in widgets {
+                if widget["kind"].as_str() != Some("number-input") {
+                    continue;
+                }
+                for field in ["value", "min", "max"] {
+                    let number = &widget[field];
+                    if number.is_null() {
+                        continue;
+                    }
+                    assert!(
+                        number.is_i64() || number.is_u64(),
+                        "{where_}: number-input {:?} sends {field}={number}, which yggterm \
+                         refuses — and a refused field fails the WHOLE pane",
+                        widget["id"]
+                    );
+                }
+            }
+        }
+        let state = installed(
+            &crate::extensions::catalog()
+                .iter()
+                .map(|ext| ext.stem)
+                .collect::<Vec<_>>(),
+        );
+        for stem in crate::extensions::catalog()
+            .iter()
+            .map(|ext| ext.stem)
+            .chain([ADBLOCK_STEM])
+        {
+            for placement in [Placement::Modal, Placement::Inline] {
+                let options = options(stem, "default", Some("example.com"), &state, placement)
+                    .unwrap_or_else(|| panic!("{stem} has no options"));
+                walk(&options.widgets, stem);
+            }
+        }
+        walk(
+            &generic("something-of-my-own", &state, Placement::Modal).widgets,
+            "a user's own script",
+        );
     }
 
     /// ⛔ The reserved stem shares a namespace with the catalogue's, and a
