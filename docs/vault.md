@@ -705,7 +705,7 @@ cell. Verdicts: ✅ have · ⚠ partial · ✗ gap · ⛔ deliberately not.
 | TOTP secret | yes | yes | store / generate / read raw / clear | ✅ |
 | TOTP: otpauth URIs, custom digits/period/algorithm | yes | yes | yes | ✅ |
 | TOTP: Steam | yes | yes | prefix accepted, **not** Steam's alphabet | ⚠ mis-mints for Steam |
-| Passkeys | yes | yes | read, assert, create — but only where one already exists | ⚠ see `pending-bugs.md` |
+| Passkeys | yes | yes | read, assert, create, fill + pick from the pane; enrolment is an explicit per-site opt-in | ⚠ see `pending-bugs.md` |
 
 ### Sync, search, and reports
 
@@ -877,14 +877,24 @@ Ordered by value per unit of work, honestly:
     routes, the GUI presence dialog that mints `UserPresence`, and credential
     *creation* — `/fido2/create` → the signer → the agent's `fido2-create` op →
     `VaultManager::add_passkey_login`, which seals a fresh P-256 key under the
-    user key. What is still owed is **acceptance by a real relying party** and
-    signCount increment.
-  - ⛔ **THE SHIM IS INSTALLED ONLY WHERE A PASSKEY ALREADY EXISTS, WHICH MAKES
-    ENROLMENT IMPOSSIBLE.** `passkey_shim_scripts` builds its match patterns
-    from the rpIds the vault already holds credentials for, so a site you have
-    no passkey for sees a pristine `navigator` — correct for the
-    fingerprinting bug it fixes, and it also means `create()` can never be
-    called there. Every credential in this vault was therefore enrolled in some
-    OTHER browser. Closing it needs an explicit per-site opt-in (the user asking
-    to enrol on the site they are looking at), not a return to installing
-    everywhere. Filed in `docs/pending-bugs.md`.
+    user key, and the vault PANE's fill/add/confirm surfaces (2026-08-22). What
+    is still owed is **acceptance by a real relying party** and signCount
+    increment.
+  - ⛔ **THE SHIM IS INSTALLED ONLY WHERE A PASSKEY ALREADY EXISTS.**
+    `passkey_shim_scripts` builds its match patterns from the rpIds the vault
+    already holds credentials for, so a site you have no passkey for sees a
+    pristine `navigator` — correct for the fingerprinting bug it fixes, and it
+    also means `create()` cannot be called there by default.
+    ⇒ **The per-site opt-in that answers this is BUILT**, in the vault pane
+    above the tabs (`sidebar::passkey_enrol_widgets`): "Enrol a passkey here"
+    arms the host for this process only, so a restart forgets it. Arming is the
+    exception to the fingerprinting scope, and an exception that outlives the
+    intention behind it is the old bug with extra steps. It is deliberately NOT
+    a return to installing everywhere.
+  - ⭐ **THE CEREMONY'S PRESENCE REQUEST LEAVES THROUGH THE VIEW CLIENT**
+    (2026-08-22). The signer runs in the host daemon, whose stdout is
+    `/dev/null`, so writing the OSC there raised no dialog and every ceremony
+    timed out. It is queued for the session's client now, which holds the PTY
+    the GUI routes by. `ychrome status` reports `presence_reachable` per session;
+    false means no passkey there can be approved by anyone. See
+    `docs/pending-bugs.md`.

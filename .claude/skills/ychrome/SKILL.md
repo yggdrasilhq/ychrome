@@ -859,14 +859,69 @@ a run on 2026-07-28.
 - `ychrome-vault passkeys <item>` lists stored `fido2Credentials` — metadata
   only; the key never leaves the agent and a listing cannot start a ceremony.
 - `src/passkey.rs` runs the ceremony: page -> shim -> `/fido2/get` -> Signer
-  -> OSC 7717 -> native presence dialog -> `/fido2/grant` -> agent
-  `fido2-assert` -> assertion. ES256 + `UserPresence` live in ychrome-vault
-  (`fido2.rs`), KAT-proven.
+  -> presence outbox -> the session's VIEW CLIENT -> OSC 7717 on the row's PTY
+  -> native presence dialog -> `/fido2/grant` -> agent `fido2-assert` ->
+  assertion. ES256 + `UserPresence` live in ychrome-vault (`fido2.rs`),
+  KAT-proven.
 
 Shape: **agent drives, operator approves once at the GUI.** A page can only
 trigger a ceremony, never answer one. Do not propose an auto-consent path.
 
 ⚠ Still owed: full crypto E2E against a real relying party.
+
+### ⛔⛔ THE PRESENCE REQUEST LEAVES THROUGH THE CLIENT, NOT THE SIGNER (fixed 2026-08-22)
+
+**The signer lives in the host DAEMON, and a daemon's stdout is `/dev/null`.**
+It used to `write!(stdout, ...)` the ceremony OSC, so on every daemon-served
+surface — which is all of them — the request went into nothing, no dialog was
+raised, and the ceremony parked the full 120 s `CEREMONY_TIMEOUT` before the page
+reported a generic failure. **Every passkey sign-in on this fleet was broken and
+nothing said so.** ⚠ The 2026-08-21 stderr fix redirected fd **2**; this was on
+fd **1**. Do not read one as having fixed the other.
+
+The GUI routes the OSC by the STREAM it arrives on, and the process that HOLDS
+that stream is the session's view client. So:
+
+- the signer queues the OSC (`Signer::publish_presence_request`),
+- the daemon serves op **`fido2-outbox`** per session,
+- the client drains it on its **surface tick** (not its ~4 s heartbeat — a human
+  is waiting) and writes it to its own stdout (`main::publish_presence_requests`).
+
+The bytes and yggterm's parser are unchanged, so **no yggterm change was needed**.
+
+⭐ **A queue nobody drains is the same silence with extra steps.** A session is
+presence-reachable only while a client drained it within `PRESENCE_STALE` (15 s);
+otherwise a ceremony is refused AT ONCE with a named reason (503) instead of
+parking two minutes. That refusal is what makes a stale client or a dead daemon
+diagnosable — and what stops the next session from "fixing" a working button.
+
+**First diagnostic for "the passkey dialog never appears":**
+
+```sh
+ychrome status                # per session: passkeys=yes|NO, plus a [NO PASSKEYS] block
+ychrome status --json | jq '.sessions[] | {env_id, presence_reachable, pending_ceremonies}'
+```
+
+`presence_reachable: false` ⇒ no client is publishing for that session, so every
+ceremony there refuses. Cycle that session's ychrome CLI. Explicitly false, never
+merely absent: a daemon older than the field omits it and prints `?`.
+
+### The vault pane's passkey surfaces (2026-08-22)
+
+- **A waiting ceremony is drawn above the tabs** (`passkey_ceremony_widgets`) with
+  ONE BUTTON PER ACCOUNT — that is the picker, and choosing among several
+  accounts for one site had no answer before it. Plus "Not now".
+- **A row grows a Fill-passkey button ONLY while a ceremony is live**
+  (`item_row`'s `passkey_offer`). ⛔ Do not "fix" this by showing it always: a
+  passkey signs in only when the SITE asks, because the ceremony carries the
+  site's challenge. An always-on button would be dead most of the time and teach
+  the user the feature does not work.
+- **The last ceremony's result is reported for two minutes**
+  (`passkey_outcome_widgets`) — a create that stored a passkey and said nothing
+  was indistinguishable from a silent failure.
+- A grant from the pane is a grant from the GUI: `POST /action` is control-token
+  gated and goes through the same `handle_grant` and `request_id` as the dialog.
+  It grants `user_verified: false` — a click proves presence, not verification.
 
 ### ⛔ THE SHIM IS PER-ORIGIN NOW, AND THAT HAS TWO SHARP EDGES
 
@@ -899,8 +954,11 @@ on 2026-08-01 — see `docs/pending-bugs.md`.
    surface REOPENED.
 
 3. ⚠ **You cannot ENROL a passkey on a site you have none for** — no passkey
-   means no shim means no `create()`. Every credential in this vault came from
-   another browser. Do not "fix" this by widening the scope back.
+   means no shim means no `create()`. Do not "fix" this by widening the scope
+   back. ⇒ The per-site opt-in that answers it is BUILT and lives in the VAULT
+   pane, above the tabs (`sidebar::passkey_enrol_widgets`, "Enrol a passkey
+   here" + arm/disarm; arming is per-process on purpose, so a restart forgets
+   it). A doc that placed it on the settings surface was wrong.
 
 
 ## The agent engine (`src/engine/`) — headless browsing, `ychrome ctl`

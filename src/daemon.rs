@@ -522,6 +522,22 @@ impl Daemon {
                     // CLI predates the control-token gate and never declares
                     // one. The one place to see it without reading 403s.
                     "control_token_declared": meta.declares_control_token,
+                    // ⭐ CAN A PASSKEY REQUEST REACH A HUMAN ON THIS SESSION?
+                    //
+                    // False ⇒ no view client is draining the presence outbox, so
+                    // no approval dialog can be raised and every ceremony here is
+                    // refused at once. It is the same shape as
+                    // `control_token_declared` above and exists for the same
+                    // reason: the failure it names is invisible from every other
+                    // instrument. A daemon serving surfaces whose stdout is
+                    // /dev/null looked perfectly healthy while no passkey on this
+                    // host could be approved by anyone, and cornering that took a
+                    // full session because nothing reported it.
+                    "presence_reachable": entry.control.signer.presence_reachable(),
+                    // How many ceremonies are waiting on a human right now — the
+                    // readback for "is the dialog actually in front of them, or
+                    // was it dropped".
+                    "pending_ceremonies": entry.control.signer.pending_ceremonies().len(),
                 })
             })
             .collect();
@@ -2310,6 +2326,56 @@ mod tests {
         queue.enqueue("e", 1, "toast", json!({ "title": "a" }));
         queue.ack("e#999"); // never minted
         assert_eq!(queue.pending.len(), 1);
+    }
+
+    /// ⛔ THE DEFECT THIS CHANNEL EXISTS FOR. The signer that raises a passkey
+    /// ceremony lives in THIS process, and this process's stdout is
+    /// `/dev/null` — a daemon has no terminal. The GUI routes a presence
+    /// request by the stream it arrives on, so the request has to leave through
+    /// the session's view client, which does hold that stream. This is the
+    /// handoff, and it must take each request exactly once: a re-drain that
+    /// replayed one would ask the user to approve the same sign-in twice.
+    #[test]
+    fn a_presence_request_leaves_through_the_session_that_owns_the_stream() {
+        let daemon = Daemon::new();
+        attach(&daemon, "env-a", Instant::now());
+        attach(&daemon, "env-b", Instant::now());
+        let signer = {
+            let sessions = daemon.sessions.lock().unwrap();
+            Arc::clone(&sessions["env-a"].control.signer)
+        };
+        signer.park_ceremony_for_test("req-1", "example.com", "get", &[]);
+
+        // It leaves by the session that owns it, and by no other: a ceremony
+        // delivered to the wrong row is a consent prompt in a stranger's window.
+        assert!(daemon.drain_presence("env-b").is_empty());
+        let drained = daemon.drain_presence("env-a");
+        assert_eq!(drained.len(), 1);
+        assert!(drained[0].starts_with("\u{1b}]7717;fido2;request;"));
+        assert!(daemon.drain_presence("env-a").is_empty(), "taken, not copied");
+
+        // And a client racing a reap asks about a session that is gone: nothing
+        // to publish is the right answer, not a failure.
+        assert!(daemon.drain_presence("env-gone").is_empty());
+    }
+
+    /// The drain is what marks a session reachable, so the op must reach the
+    /// signer even when there is nothing queued — an empty drain is the
+    /// liveness signal, and it is the common case.
+    #[test]
+    fn an_empty_drain_still_proves_a_client_is_listening() {
+        let daemon = Daemon::new();
+        attach(&daemon, "env-a", Instant::now());
+        let signer = {
+            let sessions = daemon.sessions.lock().unwrap();
+            Arc::clone(&sessions["env-a"].control.signer)
+        };
+        assert!(!signer.presence_reachable());
+        assert!(daemon.drain_presence("env-a").is_empty());
+        assert!(
+            signer.presence_reachable(),
+            "an empty drain is still a client saying it is there"
+        );
     }
 
     /// Attach a session without going through `register`, which would bind a
