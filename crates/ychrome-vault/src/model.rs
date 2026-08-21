@@ -741,6 +741,16 @@ pub struct VaultDiagnostic {
     pub skipped_no_name: usize,
     /// How many ciphers belong to an organization, decryptable or not.
     pub organization_ciphers: usize,
+    /// ⛔ Ciphers whose username decrypts PERFECTLY and still cannot be typed
+    /// into a form — a run of control characters, most likely a generated
+    /// secret written into the wrong field by some client.
+    ///
+    /// These are invisible to every other counter here, because every other
+    /// counter asks "did it decode". The bytes are authentic, the MAC is good
+    /// and the UTF-8 is valid; the value is simply not a username, and
+    /// `match` refuses it rather than letting an auto-fill spend a login
+    /// attempt typing it.
+    pub username_untypeable: usize,
 }
 
 /// The unlocked vault: the user key plus the still-encrypted ciphers. Secrets
@@ -1662,6 +1672,19 @@ impl Vault {
                 }
                 Some(_) => diagnostic.decrypted += 1,
             }
+            // ⛔ A FIELD CAN DECRYPT PERFECTLY AND STILL BE UNUSABLE, and this
+            // accounting used to stop at "did the cipher decode". An item whose
+            // username is a run of control characters passes every check above
+            // — the bytes are authentic, the MAC is good, the UTF-8 is valid —
+            // and then breaks the one thing a vault is for. Counting them is
+            // what lets `diagnose` answer "why did auto-fill refuse on that
+            // host" without anyone dumping a username to look at it.
+            if let Some(username) = &cipher.username
+                && let Ok(text) = key.decrypt_to_string(username)
+                && crate::matching::unusable_reason(&text).is_some()
+            {
+                diagnostic.username_untypeable += 1;
+            }
         }
         diagnostic
     }
@@ -1763,8 +1786,13 @@ impl Vault {
     /// password's reveal has had since 2026-08-02.
     pub fn past_password(&self, id: &str, index: usize) -> Option<String> {
         let cipher = self.find(id)?;
-        let entry = self.password_history_entries(cipher).into_iter().nth(index)?;
-        let encrypted = get_ci(entry.as_object()?, "password")?.as_str()?.to_string();
+        let entry = self
+            .password_history_entries(cipher)
+            .into_iter()
+            .nth(index)?;
+        let encrypted = get_ci(entry.as_object()?, "password")?
+            .as_str()?
+            .to_string();
         let key = self.cipher_key(cipher).ok()?;
         key.decrypt_to_string(&EncString::parse(&encrypted).ok()?)
             .ok()
@@ -2369,6 +2397,7 @@ mod tests {
                 skipped_name_undecryptable: 0,
                 skipped_no_name: 1,
                 organization_ciphers: 2,
+                username_untypeable: 0,
             }
         );
 
@@ -2756,15 +2785,28 @@ mod tests {
             }],
             ..Default::default()
         };
-        let vault = Vault::new(user_key, HashMap::new(), vec![cipher], vec![], HashMap::new());
+        let vault = Vault::new(
+            user_key,
+            HashMap::new(),
+            vec![cipher],
+            vec![],
+            HashMap::new(),
+        );
 
         // What the shim actually sends: base64url of the UUID's 16 bytes.
         let requested = credential_id_b64url(uuid);
         assert_ne!(requested, uuid, "the two spellings must genuinely differ");
 
         let matches = vault.passkeys_for_assertion("google.com", &[requested.clone()]);
-        assert_eq!(matches.len(), 1, "the stored passkey must answer its own id");
-        assert_eq!(matches[0].credential_id, uuid, "the vault keeps its spelling");
+        assert_eq!(
+            matches.len(),
+            1,
+            "the stored passkey must answer its own id"
+        );
+        assert_eq!(
+            matches[0].credential_id, uuid,
+            "the vault keeps its spelling"
+        );
         assert_eq!(
             matches[0].credential_id_b64url, requested,
             "the RP must be handed the byte spelling"
@@ -2772,13 +2814,15 @@ mod tests {
 
         // And an allow-list naming a DIFFERENT credential still excludes it.
         let other = credential_id_b64url("00000000-0000-4000-8000-000000000000");
-        assert!(vault
-            .passkeys_for_assertion("google.com", &[other])
-            .is_empty());
+        assert!(
+            vault
+                .passkeys_for_assertion("google.com", &[other])
+                .is_empty()
+        );
     }
 
     #[test]
-#[test]
+    #[test]
     fn passkeys_for_assertion_resolves_by_rp_and_honors_allow_credentials() {
         let key_bytes = [0x5au8; 64];
         let user_key = SymmetricKey::from_bytes(&key_bytes).unwrap();
@@ -3715,7 +3759,10 @@ mod tests {
 
         let wire = serde_json::to_string(&verification).unwrap();
         for secret in ["4111", "4242", "737", "999"] {
-            assert!(!wire.contains(secret), "a card value reached the receipt: {wire}");
+            assert!(
+                !wire.contains(secret),
+                "a card value reached the receipt: {wire}"
+            );
         }
     }
 

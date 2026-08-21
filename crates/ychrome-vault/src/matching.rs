@@ -155,6 +155,42 @@ pub fn find_by_name<'a>(
     }
 }
 
+/// Why a stored value cannot be typed into a login form, or `None` if it can.
+///
+/// ## The failure this exists to name
+///
+/// `match` is documented as *the ONE entry an auto-fill may use*, so an agent
+/// that reaches for it types whatever it returns straight into a form. On
+/// 2026-08-11 it returned, with `ok` and no warning, an item whose password was
+/// correct and whose **username was a run of control characters and Latin-1
+/// bytes**. The auto-fill typed that into a login field and spent an attempt.
+/// On a site that checkpoints or locks after repeated failures, that is
+/// expensive — and the diagnosis points at the site rather than at the vault.
+///
+/// ⚠ **The original report called it "not valid UTF-8", and that cannot be what
+/// it is.** `EncString` decryption uses a strict `String::from_utf8` and returns
+/// `CryptoError::NotUtf8` rather than converting lossily, so a field that
+/// decodes at all is already valid UTF-8. Measured on the real vault: three
+/// items carry control characters in the username, all codepoints at or below
+/// `U+00FF`, 49 characters to 68-74 UTF-8 bytes, distinct-character ratio ~0.9
+/// — the signature of **random bytes decoded as Latin-1**, almost certainly a
+/// generated secret stored in the wrong field by some client. The bytes are
+/// authentic and decrypt correctly; they are simply not a username.
+///
+/// ⇒ **So the predicate is not "is this valid UTF-8" but "could a human have
+/// typed this".** A control character cannot be typed into an HTML input and
+/// cannot survive a form post; anything carrying one is unusable as a
+/// credential whatever produced it.
+pub fn unusable_reason(value: &str) -> Option<String> {
+    let control = value.chars().filter(|c| c.is_control()).count();
+    if control == 0 {
+        return None;
+    }
+    Some(format!(
+        "it contains {control} control character(s) and cannot be typed into a form"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +303,35 @@ mod tests {
                 .unwrap_err()
                 .is_empty()
         );
+    }
+
+    // ⛔ THE VERB AN AUTO-FILL TRUSTS MUST NOT HAND BACK SOMETHING UNTYPEABLE.
+    #[test]
+    fn a_value_carrying_control_characters_is_named_unusable() {
+        assert_eq!(unusable_reason("alice@example.com"), None);
+        assert_eq!(unusable_reason(""), None);
+        // Accented and non-Latin usernames are ordinary, not suspect: the
+        // predicate must not quietly become "is it ASCII".
+        assert_eq!(unusable_reason("José"), None);
+        assert_eq!(unusable_reason("日本語"), None);
+        assert_eq!(unusable_reason("a b"), None, "a space is typeable");
+
+        for bad in ["\u{0}", "tab\there", "line\nbreak", "\u{10}", "bell\u{7}"] {
+            let reason = unusable_reason(bad)
+                .unwrap_or_else(|| panic!("{bad:?} carries a control character"));
+            assert!(reason.contains("control character"), "{reason}");
+            assert!(
+                reason.contains("cannot be typed"),
+                "the reason must say what it COSTS, not just what it is: {reason}"
+            );
+        }
+        // The shape actually found in the real vault: random bytes read as
+        // Latin-1 — every codepoint under U+0100, several of them C0 controls.
+        let latin1_bytes: String = [0x21u8, 0xD1, 0x27, 0x0C, 0x50, 0x5F, 0xB0, 0x13]
+            .iter()
+            .map(|b| *b as char)
+            .collect();
+        assert!(unusable_reason(&latin1_bytes).is_some());
     }
 
     #[test]
