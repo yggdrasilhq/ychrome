@@ -7,6 +7,43 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ⛔ `cargo test --bin ychrome` IS RED ON THE TRUNK — 4 sidebar tests, and it is not a flake
+
+**Status:** OPEN. Measured 2026-08-21. `382 passed; 4 failed`, deterministic, on a clean tree.
+
+```
+sidebar::tests::a_field_spec_round_trips_including_an_awkward_name
+sidebar::tests::the_add_tab_can_make_a_note_and_a_card_not_only_a_login
+sidebar::tests::the_edit_form_can_change_a_card_and_never_shows_one_back
+sidebar::tests::the_edit_form_puts_the_mask_the_eye_and_the_copy_on_the_field
+```
+
+The visible one: the Add tab's type picker now offers **four** item types and the test asserts
+three.
+
+```
+left:  ["Login", "Note", "Card", "Identity"]
+right: ["Login", "Note", "Card"]
+```
+
+**Cause:** commit `0c6b80e` introduced `CIPHER_TYPE_IDENTITY` and the Identity form sections
+without updating the four tests that enumerate the item types. Confirmed by
+`git log -S CIPHER_TYPE_IDENTITY`, and reproduced on a second checkout with no local changes,
+so it is the trunk and not a working tree.
+
+⛔ **Deliberately NOT fixed here.** These are another lane's in-flight feature and the failing
+assertions are the only thing standing between that feature and nobody checking it. Editing a
+test until it matches the code is exactly how a real regression gets laundered — the author
+should say which side is right.
+
+⚠ **What it costs everyone until then:** the suite cannot be used as a green gate, so every
+session must either know these four names or conclude its own change broke something. That is
+the whole reason this is filed at ⛔ rather than left for whoever notices.
+
+**Falsifier:** `cargo test --bin ychrome` prints `0 failed`.
+
+---
+
 ## ⛔⛔ YOUTUBE VIDEO PLAYBACK SEGFAULTS THE ENGINE (the crash is open; the silence around it is fixed)
 
 **Status:** OPEN. Measured 2026-08-21 on a current release build, reproduced **4/4**.
@@ -43,9 +80,35 @@ has never been diagnosed.** Three separate channels each lose it:
 | **local 4K60 H.264 progressive clip**, 258 % CPU, 16 s | **no crash**, 3/3 |
 
 ⇒ It is **not the site**, and it is **not decode load** — a locally generated 4K60 clip
-pushes the same decoder harder for longer and survives. What is left is the path YouTube
-uses and the local clip does not: **MSE / adaptive streaming**, and the codecs reached
-through it.
+pushes the same decoder harder for longer and survives.
+
+### ⛔ MSE IS EXONERATED, AND SO ARE THE CODECS AND EME — four more controls, 2026-08-21
+
+The sentence that used to end the paragraph above named **MSE / adaptive streaming** as
+"what is left". It was the reasonable next guess and it is **wrong**. Measured on an idle
+host (load average 3.9 on 32 cores), against locally generated clips and a local server, in
+an isolated `$HOME` so the operator's daemon was never touched:
+
+| control | result |
+|---|---|
+| progressive **H.264** 720p60, `file://` | plays to completion, **no crash** |
+| progressive **VP9** 720p60 | **no crash** |
+| progressive **AV1** 720p60 | **no crash** |
+| **MSE**: fragmented H.264 fed through `MediaSource.appendBuffer` | plays to completion, **no crash** |
+| **EME**: `requestMediaKeySystemAccess` for widevine / clearkey / playready / fps | all four rejected with `TypeError`, **no crash** |
+| VA-API hardware decoders demoted to rank 0, then YouTube | **still crashes** |
+| ychrome's own userscripts neutered (`scriptlets`, `cosmetic-filters`), then YouTube | **still crashes** |
+
+⇒ The engine decodes all three codecs, drives MSE correctly, and has no EME at all. **The
+crash needs something a YouTube watch page does that none of these reproduce.** It is also
+not ychrome's own injected scripts, and not the hardware-decode path.
+
+⚠ **One measurement in the earlier version of this file was an artefact of its own
+harness and is withdrawn:** progressive `<video src>` appeared to stall at the first frame
+(`currentTime` 0.07, `readyState` 2) over `http://`, while the same body played fully over
+`file://`. The cause was the throwaway `python3 -m http.server` used to serve it — it does
+not implement **Range** requests. ⇒ Never measure a media path through that server; it makes
+the engine look broken.
 
 ⚠ Alongside it in the discarded stderr, repeatedly:
 `WebLoaderStrategy::internallyFailedLoadTimerFired()` — "WebKit encountered an internal
@@ -60,6 +123,7 @@ itself. Whether the failed loads cause the segfault or share a cause with it is 
 | `+ GST_GL_DISABLED=1 + LIBGL_ALWAYS_SOFTWARE=1` | still crashes |
 | a **320x240** viewport, so the site picks a low resolution | still crashes |
 | `WEBKIT_DISABLE_COMPOSITING_MODE=1` | already set by the substrate, and insufficient |
+| **VA-API decoders demoted** (`GST_PLUGIN_FEATURE_RANK=vah264dec:0,vavp9dec:0,vah265dec:0,vavp8dec:0,vaav1dec:0`) | still crashes, in 4.9 s |
 
 ⇒ It is **not resolution-dependent** and it is **not the GL/DMA-BUF path**, which is where the
 EGL warnings invite you to look first.
@@ -80,6 +144,35 @@ loop — **not in the web content process**. That distinction is the load-bearin
 process crash is survivable and WebKit reports it, which is why the engine has no handler that
 could have caught this. Reaching a cause below this needs debug symbols for
 `libwebkit2gtk-4.1`, which are not installed and have no repo configured here.
+
+⛔⛔ **THE RECOMMENDED UPGRADE IS NOT ONE LIBRARY — IT IS A `glibc` UPGRADE ON THE LIVE
+HOST. Measured 2026-08-21, and it changes what this entry is asking for.**
+
+`libwebkit2gtk-4.1-0` **2.52.6-1** is linked against **`GLIBC_2.43`**. This host runs
+**2.42-17**. So the one-line `apt-get install libwebkit2gtk-4.1-0` below does not do what it
+looks like:
+
+```
+$ apt-get install --simulate libwebkit2gtk-4.1-0
+The following additional packages will be installed:
+  gir1.2-javascriptcoregtk-4.1 gir1.2-webkit2-4.1 libc-bin libc-dev-bin
+  libc-gconv-modules-extra libc-l10n libc6 libc6:i386 libc6-dev libc6-i386
+  libjavascriptcoregtk-4.1-0 libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev locales
+```
+
+⇒ **`libc6` 2.42-17 → 2.43-3, plus its i386 multiarch twin, on a machine with live sessions
+on it.** The previous framing — "shared system infrastructure that every GTK web app links" —
+understated it by a whole layer. This is not a browser-lane call and it is not a small
+sysadmin call either; it is a C-library upgrade under a running desktop.
+
+⚠ It also blocks the cheap version of this experiment. Extracting 2.52.6 into a private prefix
+and running the engine against it with `LD_LIBRARY_PATH` **does not work**: the loader refuses
+(`version 'GLIBC_2.43' not found`), and swapping the loader too does not help because
+`libwebkit2gtk` has **no `WEBKIT_EXEC_PATH`** in this build — the `WebKitWebProcess` helper
+path is compiled in, so the UI process would be 2.52.6 while the web process stayed 2.52.5.
+(Verified: `strings` on the library lists `WEBKIT_INJECTED_BUNDLE_PATH` and no exec-path
+variable.) A container or a `bwrap` bind-mount over `/usr/lib/x86_64-linux-gnu` is the
+remaining way to test it without touching the host, and `bwrap` is installed.
 
 ⭐⭐ **THE MOST LIKELY REMEDY, AND IT NEEDS AN OWNER DECISION: UPGRADE WebKitGTK.**
 Installed **2.52.5-1**; the distribution offers **2.52.6-1**.
@@ -160,7 +253,7 @@ daemon lifetime on its own rather than by the absence of a `daemon_stop`.
 
 ---
 
-## ⛔ THE FRAME-HEALTH COUNTERS UNDER-REPORT BY ~30x, AND `requestVideoFrameCallback` NEVER FIRES
+## ⛔ `requestVideoFrameCallback` IS ADVERTISED AND NEVER FIRES (the ~30x under-report was the HOST'S LOAD, and is withdrawn)
 
 **Status:** OPEN. Measured 2026-08-21 with locally generated clips — no network, no site.
 
@@ -205,94 +298,35 @@ frame-rate table is not.
 
 ### The measurement this wants next
 
-Re-run the ladder on an **idle** host, and on the GUI substrate rather than the headless one.
-Until then the honest statement to the owner is: *the counters cannot be trusted to report a
-shortfall, and how large the real shortfall is has not been measured cleanly.*
+Re-run the ladder on the GUI substrate rather than the headless one.
+
+### ✅ THE IDLE-HOST RUN IS DONE, AND IT CLEARS THE COUNTERS — 2026-08-21
+
+The confound above said the absolute numbers were unusable because the host sat at load
+average 42–49. It has now been re-run at **load average 3.9 on 32 cores**, on a locally
+generated 720p60 clip over `file://` (no network, no site, no server in the path):
+
+| sampled at | `currentTime` | `totalVideoFrames` | expected at 60 fps | `droppedVideoFrames` |
+|---|---|---|---|---|
+| mid-playback | 3.33 s | **200** | 200 | **0** |
+
+⇒ **`totalVideoFrames` tracks exactly, and nothing is dropped.** On an idle host the engine
+delivers 720p60 perfectly and its counter says so. The "~30x under-report" was **the host's
+load, not the engine's counter** — the instrument was reading a machine with dozens of other
+WebKit processes on it. ⇒ Do not quote the 30:1 figure; it does not survive an idle host.
+
+⚠ **`requestVideoFrameCallback` is untouched by this** — it is a separate defect, it was never
+about frame rate, and it has not been retested here.
+
+⚠ **A counter read AFTER playback ends reports `0`,** which is how a "dead counter" reading is
+manufactured: sample mid-playback or the number means nothing.
+
+⇒ The honest statement to the owner is now: *on an idle host the headless engine's frame
+counters are accurate and it holds 60 fps; what the GUI substrate does is still unmeasured.*
 
 **Context that bounds it:** the headless substrate gets no GPU —
 `libEGL warning: DRI3 error: Could not get DRI3 device` — so decode and composite are entirely
 software here. A render node exists on the host; Xvfb does not expose DRI3 to reach it.
-
----
-
-## ⛔⛔ A REGENERATED BUNDLE AT AN UNCHANGED `@version` IS UNDEPLOYABLE FOREVER, AND REPORTS AS A USER EDIT
-
-**Status:** OPEN. Measured 2026-08-21 on an ordinary host, against a clean checkout.
-
-`ychrome provision --json` reported two assets as `forked:1.20260731` — the verdict whose
-meaning is *"this host's copy is modified from the bundle, so it is the user's and we leave it
-alone"*:
-
-```
-cosmetic-filters  userscript       verdict=forked:1.20260731  wrote=False
-rules.json        adblock-ruleset  verdict=forked:1.20260731  wrote=False
-```
-
-**Neither had been edited.** Hashing each host copy against every version of the bundle in git
-history matched both, exactly, to the bundle as committed on 2026-07-31. They are not forks;
-they are an OLD RELEASE that can never be replaced.
-
-The cause is the version scheme, not the reconciler's logic. The generated assets stamp
-`@version` with a **date**, not with the bundle's own content, so a regeneration that lands on
-the same stamp ships **different bytes under an identical version**.
-
-⚠ **Precision, measured 2026-08-21 — the date is the GENERATION RUN's, not the lists'.**
-`ruleset_version()` is `RULESET_FORMAT_VERSION` joined to `today_stamp()`, and `today_stamp()`
-reads the wall clock at generation time. It has nothing to do with when the filter lists were
-published. ⇒ The collision window is a **same-day re-regeneration**, and a regeneration on any
-later day mints a new version and deploys normally. That matters for whoever fixes this: the
-trap is narrower than the opening sentence implies, and it is also why the checked-in bundle
-can be safely regenerated on a day it has not already been regenerated. `provision::verdict` then reaches its last arm — version equal, bodies differ —
-and returns `Forked`, which is `needs_write() == false`.
-
-⇒ **Two different bundled bodies sharing one version is a state the verdict table cannot
-represent.** Its five rows assume a version identifies a body. Where that breaks, the
-reconciler does not merely fail to update: it reports the staleness as a deliberate user
-choice, which is the one verdict a human reads and then leaves alone.
-
-⚠ The blast radius is the whole cosmetic plane. The bundle regenerated on 2026-08-02 opened
-the scriptlet plane; a host stuck on the 2026-07-31 body has the older cosmetic filters and
-the older ruleset, and nothing anywhere says so.
-
-### The fix this wants (not yet built)
-
-Record what the provisioner ITSELF wrote — stem → hash of the body it installed — beside the
-existing deletion tombstones. That makes the ambiguous case decidable:
-
-- bytes differ **and** match what we last wrote ⇒ ours, superseded ⇒ **write the new body**;
-- bytes differ **and** do not match ⇒ a genuine user edit ⇒ keep, and say so.
-
-It is the same distinction `.deleted` already draws between *never delivered* and *deleted on
-purpose*, applied to *stale* versus *edited*. ⛔ A version bump alone unblocks a host once and
-leaves the trap armed for the next same-day regeneration.
-
-⚠ A single content hash genuinely cannot tell an old release from a user's edit — that much of
-the existing design note is right. A hash of **what this provisioner wrote** can, because it is
-a record of our own act rather than an inference about the file.
-
-### ⛔ IT HAS NOW BITTEN THIS REPO'S OWN SHIPPED WORK (2026-08-21)
-
-Commit `5aa909f` changed `assets/web-userscripts/sponsorblock.js` — the custom-site-access
-feature — **without changing its `@version`**, which stayed `2.0.0`. On a host carrying the
-older 2.0.0 body, provisioning compared version-equal / bytes-different and returned
-`forked:2.0.0`:
-
-```
-sponsorblock   userscript   verdict=forked:2.0.0   wrote=False
-```
-
-Host copy 31,675 bytes, bundled copy 33,561 bytes, same version. ⇒ **The feature could not
-reach any host**, and the queue recorded it as delivered. It was live only after the host copy
-was removed and reinstalled by hand.
-
-⚠ **This is worse than the stale-cosmetic-filters case it was filed for.** There the drifting
-`@version` at least came from an upstream list's date. Here **a hand-edited asset kept a
-hand-written version**, so the failure needs no regeneration and no same-day collision — any
-edit that forgets the bump is enough, and the reporting calls the result a user's own edit.
-
-⚠ **An opt-in extension cannot be repaired by provisioning at all.** Provisioning refreshes
-only extensions already installed, so a `forked` opt-in asset is stuck until someone removes
-the file or reinstalls from the pane. `sponsorblock` is opt-in.
 
 ---
 
