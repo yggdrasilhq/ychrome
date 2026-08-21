@@ -45,3 +45,41 @@ DELETION against someone's row files, which is worse than a stale entry. The liv
 `lane/dev/11.24-omnibox`: `--no-activate` parks a queued `remote-cc` resume on *"Daemon PTY:
 request main viewport terminal stream"* forever, and every check the spawn contract prescribes
 passes anyway.
+
+---
+
+## 3. Nothing distinguishes campaign work from work handed to a row directly
+
+**Filed 2026-08-22**, from the owner asking whether *"subscribe to 11.0"* is the right way to
+describe a row that carries both orchestrated work and tasks he gave it personally.
+
+**It is not, and the reason is worth recording: there are THREE mechanisms and no fourth.**
+
+| what | mechanism | what it actually does |
+|---|---|---|
+| liveness | `ygg-booter.py subscribe --row <path> --campaign <token> --max-hours N` | boots the row when it goes idle, so long work survives |
+| placement | the `--campaign` token + the seat number in `outline_prefix` | says which campaign a row belongs to |
+| reporting | a message to the orchestrator's row | how a row tells 11.0 anything |
+
+⇒ A row subscribes to the **booter**, not to 11.0. 11.0 is a row, and rows are not
+subscribable. The accurate sentence is *"seated as 11.24 in campaign 11, subscribed to the
+booter under that campaign, reporting to 11.0"*.
+
+⛔ **The real gap his question found:** work the owner hands a row DIRECTLY arrives as an
+ordinary turn in that row, and **nothing anywhere records that it happened.** The booter
+record carries `campaign` and `kind`, never a task list. So:
+
+- 11.0 cannot see that a row is carrying owner-assigned work it did not route;
+- a sweep or a reassignment cannot know that retiring a row would drop that work;
+- and the only trace is the row's own transcript, which is exactly the artefact everything
+  else in this fleet refuses to treat as authoritative.
+
+**RECOMMENDATION.** The cheapest honest fix is to use the field that already exists: the
+booter record's `note`. A row given work directly should write it there in one line, because
+it is durable, machine-readable, and already read by the sweep path. This row now does that.
+⇒ A heavier alternative — a per-campaign task file that 11.0 owns — is more correct and more
+work; do not build it before the `note` convention has been tried and found wanting.
+
+**What was done meanwhile.** This row's booter `note` names its assigned work, both spawned
+successors, and its exit condition, so a sweeper reading only that file knows what dropping
+this row would cost.
