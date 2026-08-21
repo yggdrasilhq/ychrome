@@ -4858,6 +4858,18 @@ const INSTALL_ACTION_PREFIX: &str = "install:";
 /// dispatch is a `starts_with` chain, and `sponsorblock:` deliberately does not
 /// collide with `userscript:sponsorblock`, which is the on/off toggle.
 const SPONSORBLOCK_ACTION_PREFIX: &str = "sponsorblock:";
+/// Add the host in the `sponsorblock_site` field to SponsorBlock's site list,
+/// and remove one: `sponsorblock-site-remove:<host>`.
+///
+/// ⚠ HYPHEN, not colon, and deliberately: `SPONSORBLOCK_ACTION_PREFIX` is
+/// `sponsorblock:` and the dispatch is a `starts_with` chain, so a
+/// `sponsorblock:site-add` would have been swallowed by the category arm and
+/// parsed as the category `site` in behaviour `add`.
+const SPONSORBLOCK_SITE_ADD_ACTION: &str = "sponsorblock-site-add";
+const SPONSORBLOCK_SITE_REMOVE_PREFIX: &str = "sponsorblock-site-remove:";
+/// The field the host is typed into. Read from the posted values by id, like
+/// every other text input in this pane.
+const SPONSORBLOCK_SITE_FIELD: &str = "sponsorblock_site";
 
 /// The per-site zoom controls' action ids.
 const ZOOM_IN_ACTION: &str = "zoom-in";
@@ -5428,12 +5440,67 @@ fn sponsorblock_widgets(state: &crate::webpolicy::PolicyState) -> Vec<Value> {
     for (category, behaviour) in crate::sponsorblock::effective() {
         widgets.push(sponsorblock_category_row(category, behaviour));
     }
+    widgets.extend(sponsorblock_site_widgets());
     widgets.push(json!({
         "kind": "label",
         "muted": true,
         "text": "Segments come from the community database at sponsor.ajay.app, asked \
                  for by hash prefix so it is never told which video you are watching. \
                  ychrome submits nothing and votes on nothing.",
+    }));
+    widgets
+}
+
+/// CUSTOM SITE ACCESS: the hosts SponsorBlock runs on besides YouTube.
+///
+/// ⭐ Why this is worth a control. A front-end that serves YouTube's catalogue
+/// under its own domain serves the same VIDEO IDS, so the community database
+/// answers for it exactly as it does for YouTube — and without this, running
+/// your own front-end means losing the feature entirely, which is a poor trade
+/// for the privacy it was chosen for.
+///
+/// ⛔ No such host ships with ychrome, here or anywhere: an instance address is
+/// the user's own infrastructure, and a bundled list would both name whoever is
+/// on it and rot. The placeholder is an invented example.
+fn sponsorblock_site_widgets() -> Vec<Value> {
+    let sites = crate::sponsorblock::sites();
+    let mut widgets = vec![json!({
+        "kind": "label",
+        "muted": true,
+        "text": "SponsorBlock runs on YouTube. If you watch through your own front-end, \
+                 add its host here and the same segments apply — the database is keyed \
+                 by video id, not by site.",
+    })];
+    for host in &sites {
+        widgets.push(json!({
+            "kind": "list-row",
+            "id": format!("{SPONSORBLOCK_SITE_REMOVE_PREFIX}{host}"),
+            "title": host,
+            "subtitle": "SponsorBlock runs here as well as on YouTube",
+            "actions": [{
+                "action": format!("{SPONSORBLOCK_SITE_REMOVE_PREFIX}{host}"),
+                "label": "Remove",
+                "title": format!("Stop running SponsorBlock on {host}"),
+                "destructive": true,
+            }],
+        }));
+    }
+    widgets.push(json!({
+        "kind": "text-input",
+        "id": SPONSORBLOCK_SITE_FIELD,
+        "label": "Add a site",
+        // The bare host, which is what a `@match` pattern is built from — a
+        // pasted URL is the shape that would silently match nothing, so the
+        // placeholder shows the shape rather than describing it.
+        "placeholder": "videos.example.net",
+        "value": "",
+        "action": SPONSORBLOCK_SITE_ADD_ACTION,
+    }));
+    widgets.push(json!({
+        "kind": "button",
+        "id": SPONSORBLOCK_SITE_ADD_ACTION,
+        "action": SPONSORBLOCK_SITE_ADD_ACTION,
+        "label": "Add site",
     }));
     widgets
 }
@@ -5673,6 +5740,20 @@ fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
         script if script.starts_with(USERSCRIPT_DELETE_PREFIX) => {
             let stem = script.trim_start_matches(USERSCRIPT_DELETE_PREFIX);
             crate::webpolicy::delete_userscript(stem)
+        }
+        // The SITE arms come first: their ids begin `sponsorblock-`, which the
+        // category arm's `sponsorblock:` cannot match — but the ordering says so
+        // out loud rather than leaving it to a reader to check the punctuation.
+        SPONSORBLOCK_SITE_ADD_ACTION => {
+            let host = request["values"][SPONSORBLOCK_SITE_FIELD]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            crate::sponsorblock::add_site(&host)
+        }
+        site if site.starts_with(SPONSORBLOCK_SITE_REMOVE_PREFIX) => {
+            crate::sponsorblock::remove_site(site.trim_start_matches(SPONSORBLOCK_SITE_REMOVE_PREFIX))
         }
         // `sponsorblock:<category>:<behaviour>`. Checked BEFORE the userscript
         // arm even though the two prefixes cannot collide, so the ordering says
@@ -6884,6 +6965,35 @@ mod tests {
 
     // A disabled script offers no category rows: a control that nothing will
     // act on is worse than no control.
+    #[test]
+    /// The pane offers the control, and its ids cannot be swallowed by the
+    /// category arm's `starts_with` chain.
+    #[test]
+    fn the_site_control_is_offered_and_its_ids_cannot_collide_with_a_category() {
+        let widgets = sponsorblock_site_widgets();
+        let ids: Vec<&str> = widgets
+            .iter()
+            .filter_map(|w| w["id"].as_str().or_else(|| w["action"].as_str()))
+            .collect();
+        assert!(ids.contains(&SPONSORBLOCK_SITE_FIELD), "{ids:?}");
+        assert!(ids.contains(&SPONSORBLOCK_SITE_ADD_ACTION), "{ids:?}");
+
+        // ⛔ THE COLLISION THAT WOULD HAVE BEEN SILENT: the dispatch is a
+        // `starts_with` chain, so an id beginning `sponsorblock:` would reach
+        // the CATEGORY arm and be parsed as a category named `site`.
+        assert!(!SPONSORBLOCK_SITE_ADD_ACTION.starts_with(SPONSORBLOCK_ACTION_PREFIX));
+        assert!(!SPONSORBLOCK_SITE_REMOVE_PREFIX.starts_with(SPONSORBLOCK_ACTION_PREFIX));
+        assert!(!SPONSORBLOCK_SITE_ADD_ACTION.starts_with(USERSCRIPT_ACTION_PREFIX));
+
+        // ⛔ …and NO front-end is named. The whole point of the setting is that
+        // the address is the user's, so shipping one would defeat it.
+        let rendered = serde_json::to_string(&widgets).unwrap().to_ascii_lowercase();
+        assert!(!rendered.contains("invidious") && !rendered.contains("piped"), "{rendered}");
+        // The placeholder shows the SHAPE — a bare host, which is what a match
+        // pattern is built from. A pasted URL is the shape that matches nothing.
+        assert!(rendered.contains("videos.example.net"));
+    }
+
     #[test]
     fn a_disabled_sponsorblock_offers_no_category_rows() {
         let schema = settings_schema_from(

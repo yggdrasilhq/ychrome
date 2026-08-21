@@ -616,6 +616,52 @@ gate — park it rather than burning his codes.
 identifies the gap; a clean console with no outbound verify request means the
 click never reached the handler and the engine is not implicated.
 
+## ⚠ [11.1] EXTENSIONS (owner item 4): CUSTOM SITE ACCESS IS DONE; THE MODALS AND THE ADBLOCK FAILURE ARE NOT
+
+**Status:** PARTLY OPEN. Filed 2026-08-21 — the mandate lived only in a relay
+brief until now, which is why nothing in this queue answered "what is open" for it.
+
+### ✅ SPONSORBLOCK CUSTOM SITE ACCESS — delivered
+`sponsorblock::sites()` / `add_site` / `remove_site`, a settings control to manage
+them, and `match_patterns()` as the ONE owner of where SponsorBlock runs.
+
+⭐ **Why it is worth having:** a front-end serving YouTube's catalogue under its
+own domain serves the same VIDEO IDS, so the community database answers for it
+exactly as it does for YouTube. Without this, running your own front-end means
+losing the feature — a poor trade for the privacy it was chosen for.
+
+⛔ **No host ships, anywhere** — code, defaults, docs or tests. An instance
+address is the user's own infrastructure; a bundled list would name whoever is on
+it and rot. Locked by a test that greps the shipped asset and the rendered pane.
+
+⚠ **Three things had to agree**, and two of three agreeing is the failure that is
+hardest to read (a script that loads and then refuses to act): the `@match`
+patterns the engine gates injection on, the same patterns for the settings script
+injected beside it, and the allow-list that script carries into the page. All
+three now come from `match_patterns()`.
+
+⚠ **The widening happens at POLICY-BUILD time, never in the file.** Rewriting the
+bundled asset is precisely the state `crate::provision` reads as "the user edited
+this, leave it alone", after which the script would never be updated again.
+
+### ⛔ STILL OPEN
+1. **Per-extension modals.** Each extension should own a modal for its options
+   instead of adding rows to the settings pane, for 1:1 parity with its Chrome
+   counterpart. SponsorBlock alone now contributes a toggle, eleven category rows,
+   a site list and an add field — the pane is exactly as clogged as the mandate
+   says. ⚠ Unmeasured: whether the libyggterm surface protocol lets a contributed
+   pane raise a MODAL at all, or whether that needs a widget kind first. Measure
+   that before designing anything.
+2. **YouTube adblock failed again.** Not reproduced in this session, and it is
+   not a code-reading job: `extensions.rs` already carries scar tissue from two
+   previous rounds (the `/youtubei/v1/player` prune, the isolated-world placement
+   refusal, the "ads at 2x" fallback). ⇒ Needs a LIVE session against YouTube with
+   `ctl console` on, not another pass over the asset.
+
+**Falsifier for what shipped:** configure a front-end host, load a video on it,
+and a sponsor segment skips exactly as on YouTube; remove the host and the script
+stops running there.
+
 ## ⭐ OWNER-REPORTED: TABS CANNOT BE SHIFT-SELECTED, SO THEY MUST BE FILED ONE AT A TIME
 
 **Status:** OPEN
