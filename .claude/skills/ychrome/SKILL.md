@@ -927,6 +927,32 @@ answers with the count actually dispatched and the index that stopped it.
 
 Locked by `ychrome engine hit` (15 steps, fixture-backed).
 
+### ⛔⛔ THE SUBSTRATE'S OWN COMPOSITING FLAG WAS CRASHING THE ENGINE (fixed 2026-08-21)
+
+`substrate.rs` used to set `WEBKIT_DISABLE_COMPOSITING_MODE=1` unconditionally,
+reasoning that Xvfb has no DRI3 so the accelerated path "has no GPU to land on".
+That was an inference about the hardware, never checked against the output.
+Measured:
+
+| | compositing OFF | compositing ON |
+|---|---|---|
+| YouTube playback | **SIGSEGV in 1–5 s, 7/7** | survived 4/4, 14–16 s, 0 dropped |
+| `requestVideoFrameCallback` | **0 calls in 8 s** | 487 calls for 485 frames |
+| a painted page's PNG | — | **byte-identical to OFF** |
+| `engine gate`, `engine hit` | pass | pass |
+
+⇒ Disabling it bought nothing measurable and cost the whole media plane. It is
+removed now; `YCHROME_ENGINE_COMPOSITING=0` restores the old behaviour for a
+host where the accelerated path genuinely cannot paint.
+
+⭐⭐ **The transferable lesson: the flag survived years of media bugs because the
+thing it broke is not what anyone points a screenshot test at.** A setting
+justified by an inference about hardware, and verified only by "the page still
+renders", can be silently catastrophic for everything that is not a still image.
+⚠ Note also what it did NOT explain: this was invisible to seven other controls
+(DMA-BUF, GL, resolution, VA-API, MSE, EME, userscripts), all of which had been
+tried first because they are what a media crash *looks* like.
+
 ### ⭐⭐ WHICH BUILD IS ANSWERING — check this BEFORE believing a verb is missing
 
 ```sh

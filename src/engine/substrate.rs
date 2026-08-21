@@ -234,7 +234,16 @@ pub(crate) fn is_an_orphaned_engine_display(argv: &[String], ppid: u32) -> bool 
     if ppid != 1 {
         return false;
     }
-    let [program, display, screen_flag, screen, geometry, nolisten, tcp] = argv else {
+    let [
+        program,
+        display,
+        screen_flag,
+        screen,
+        geometry,
+        nolisten,
+        tcp,
+    ] = argv
+    else {
         return false;
     };
     if !std::path::Path::new(program)
@@ -398,10 +407,13 @@ impl HeadlessDisplay {
     /// daemon subsystem rather than something the browser process hosts
     /// alongside tao's GTK loop.
     ///
-    /// `WEBKIT_DISABLE_COMPOSITING_MODE` is set because Xvfb offers no DRI3:
-    /// the accelerated-compositing path has no GPU to land on here, and the
-    /// non-accelerated path is what actually paints. Recorded rather than
-    /// assumed — it shows up in the gate's journal line.
+    /// ⛔ `WEBKIT_DISABLE_COMPOSITING_MODE` is **removed**, not set. It used to
+    /// be set here on the reasoning that Xvfb offers no DRI3 — an inference
+    /// about the hardware that was never checked against the output. Measured
+    /// 2026-08-21: it changed the painted PNG not at all (byte-identical) while
+    /// crashing the engine on every MSE video page and silencing
+    /// `requestVideoFrameCallback` entirely. See the block below for the
+    /// numbers. `YCHROME_ENGINE_COMPOSITING=0` restores the old behaviour.
     pub fn install_env(&self) {
         // SAFETY: called once, from `Engine::start`, before the engine thread
         // exists and therefore before any other thread reads the environment.
@@ -427,7 +439,39 @@ impl HeadlessDisplay {
             // Same family as the x11vnc refusal and the frozen-daemon-env
             // poisoning already recorded in this fleet's memory: an inherited
             // — or absent — variable that describes a different world.
-            std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+            // ⛔⛔ COMPOSITING STAYS ON, AND TURNING IT OFF WAS KILLING THE
+            // ENGINE. This line used to read
+            // `set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1")`, on the
+            // reasoning that Xvfb offers no DRI3 so the accelerated path "has
+            // no GPU to land on". That reasoning was a plausible inference and
+            // it was measured on 2026-08-21. It is wrong in both directions:
+            //
+            //   YouTube playback, compositing OFF   crashed  7/7 (SIGSEGV, 1-5s)
+            //   YouTube playback, compositing ON    survived 4/4 (14-16s, 0 dropped)
+            //   requestVideoFrameCallback, OFF      fired 0 times in 8 s
+            //   requestVideoFrameCallback, ON       fired 487 times for 485 frames
+            //   a painted page, OFF vs ON           BYTE-IDENTICAL PNG, same pixels
+            //   `engine gate` + `engine hit`, ON    every proof passes
+            //
+            // ⇒ Disabling it bought nothing measurable — the readback is
+            // identical — and cost the whole media plane. ⭐ The lesson is not
+            // "compositing good": it is that **this flag was set from an
+            // inference about the hardware and never from a measurement of the
+            // output**, and it survived years of media bugs precisely because
+            // the thing it broke (MSE video, frame callbacks) is not what
+            // anyone points a screenshot test at.
+            //
+            // `YCHROME_ENGINE_COMPOSITING=0` forces the old behaviour back, for
+            // a host where the accelerated path genuinely cannot paint. Its
+            // name is OURS on purpose: a `WEBKIT_*` or `GDK_*` spelling can
+            // arrive by inheritance from a GUI environment describing a
+            // different world, which is the failure this whole function exists
+            // to prevent.
+            if std::env::var("YCHROME_ENGINE_COMPOSITING").as_deref() == Ok("0") {
+                std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+            } else {
+                std::env::remove_var("WEBKIT_DISABLE_COMPOSITING_MODE");
+            }
         }
     }
 }
@@ -502,6 +546,29 @@ mod tests {
             "install_env MUST force the X11 backend — otherwise GTK picks Wayland \
              and DISPLAY is ignored entirely"
         );
+        // ⛔ Compositing may be disabled ONLY behind the opt-out. Setting it
+        // unconditionally is what this substrate did for a year: it changed the
+        // painted output not at all and crashed the engine on every MSE video
+        // page, which is why a screenshot test never caught it.
+        // ⛔ Compositing may be disabled ONLY behind the opt-out. Setting it
+        // unconditionally is what this substrate did for a year: it changed the
+        // painted output not at all and crashed the engine on every MSE video
+        // page, which is why no screenshot test ever caught it.
+        //
+        // ⚠ The predicate names the env READ, not the variable's name. The
+        // first version of this assertion looked for the NAME and passed
+        // happily against a body where the guard had been deleted — because the
+        // explanatory comment beside it still mentioned the name. A source
+        // guard that a comment can satisfy protects nothing, and it was caught
+        // only by reintroducing the regression on purpose and watching the test
+        // go green. ⇒ Assert on something only code can contain, then BREAK IT
+        // ONCE to prove the assertion bites.
+        assert!(
+            !body.contains(r#"set_var("WEBKIT_DISABLE_COMPOSITING_MODE""#)
+                || body.contains(r#"var("YCHROME_ENGINE_COMPOSITING")"#),
+            "WEBKIT_DISABLE_COMPOSITING_MODE may only be set behind an actual \
+             YCHROME_ENGINE_COMPOSITING read — unconditional is the crash"
+        );
         assert!(
             body.contains(r#"remove_var("WAYLAND_DISPLAY")"#),
             "install_env MUST remove WAYLAND_DISPLAY — an UNSET one resolves to \
@@ -560,7 +627,15 @@ mod tests {
     }
 
     fn ours() -> Vec<String> {
-        argv(&["Xvfb", ":97", "-screen", "0", "1280x900x24", "-nolisten", "tcp"])
+        argv(&[
+            "Xvfb",
+            ":97",
+            "-screen",
+            "0",
+            "1280x900x24",
+            "-nolisten",
+            "tcp",
+        ])
     }
 
     // ⛔⛔ THE SAFETY PROPERTY OF THE WHOLE SWEEP. A display with a living parent
@@ -584,13 +659,74 @@ mod tests {
     #[test]
     fn only_this_modules_own_command_shape_is_reaped() {
         for (why, command) in [
-            ("a real session's display", argv(&["Xvfb", ":0", "-screen", "0", "1280x900x24", "-nolisten", "tcp"])),
-            ("below the engine's range", argv(&["Xvfb", ":89", "-screen", "0", "1280x900x24", "-nolisten", "tcp"])),
-            ("above the engine's range", argv(&["Xvfb", ":161", "-screen", "0", "1280x900x24", "-nolisten", "tcp"])),
-            ("a different program", argv(&["Xorg", ":97", "-screen", "0", "1280x900x24", "-nolisten", "tcp"])),
-            ("listening on tcp — not our flags", argv(&["Xvfb", ":97", "-screen", "0", "1280x900x24"])),
-            ("another tool's depth", argv(&["Xvfb", ":97", "-screen", "0", "1280x900x16", "-nolisten", "tcp"])),
-            ("not a geometry at all", argv(&["Xvfb", ":97", "-screen", "0", "big", "-nolisten", "tcp"])),
+            (
+                "a real session's display",
+                argv(&[
+                    "Xvfb",
+                    ":0",
+                    "-screen",
+                    "0",
+                    "1280x900x24",
+                    "-nolisten",
+                    "tcp",
+                ]),
+            ),
+            (
+                "below the engine's range",
+                argv(&[
+                    "Xvfb",
+                    ":89",
+                    "-screen",
+                    "0",
+                    "1280x900x24",
+                    "-nolisten",
+                    "tcp",
+                ]),
+            ),
+            (
+                "above the engine's range",
+                argv(&[
+                    "Xvfb",
+                    ":161",
+                    "-screen",
+                    "0",
+                    "1280x900x24",
+                    "-nolisten",
+                    "tcp",
+                ]),
+            ),
+            (
+                "a different program",
+                argv(&[
+                    "Xorg",
+                    ":97",
+                    "-screen",
+                    "0",
+                    "1280x900x24",
+                    "-nolisten",
+                    "tcp",
+                ]),
+            ),
+            (
+                "listening on tcp — not our flags",
+                argv(&["Xvfb", ":97", "-screen", "0", "1280x900x24"]),
+            ),
+            (
+                "another tool's depth",
+                argv(&[
+                    "Xvfb",
+                    ":97",
+                    "-screen",
+                    "0",
+                    "1280x900x16",
+                    "-nolisten",
+                    "tcp",
+                ]),
+            ),
+            (
+                "not a geometry at all",
+                argv(&["Xvfb", ":97", "-screen", "0", "big", "-nolisten", "tcp"]),
+            ),
             ("empty argv", argv(&[])),
         ] {
             assert!(
@@ -600,7 +736,15 @@ mod tests {
         }
         // The path form still counts — `Command::new("Xvfb")` may resolve to one.
         assert!(is_an_orphaned_engine_display(
-            &argv(&["/usr/bin/Xvfb", ":90", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"]),
+            &argv(&[
+                "/usr/bin/Xvfb",
+                ":90",
+                "-screen",
+                "0",
+                "1920x1080x24",
+                "-nolisten",
+                "tcp"
+            ]),
             1
         ));
     }
