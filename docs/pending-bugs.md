@@ -6,6 +6,11 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > only; an entry is deleted in the same commit as its verified fix and git
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
+>
+> ⭐ **A decision that is the OWNER's rather than the lane's goes in
+> `docs/owner-attention.md`** — question, options, recommendation, what was done
+> meanwhile, how to reverse it. A lane never stops on one; it routes around it
+> and carries on.
 
 ## ⛔ `cargo test --bin ychrome` IS RED ON THE TRUNK — 4 sidebar tests, and it is not a flake
 
