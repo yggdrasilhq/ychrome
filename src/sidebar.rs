@@ -2776,7 +2776,11 @@ fn add_tab_widgets(state: &PaneState, status: &Value) -> Vec<Value> {
             // and a stricter one is deserved: unlike a password, a card number
             // cannot be rotated on demand.
             widgets.push(json!({
-                "kind": "text-input", "id": "add_card_number", "label": "Number",
+                // ⚠ "Card number", not "Number" — the Edit form and the View
+                // tab both call this field Card number, and one field wearing
+                // two names across three tabs is half of what made it read as
+                // two stored values.
+                "kind": "text-input", "id": "add_card_number", "label": "Card number",
                 "placeholder": "•••• •••• •••• ••••", "secret": true, "value": "",
             }));
             widgets.push(json!({
@@ -2954,10 +2958,23 @@ fn view_tab_widgets(draft: &ViewDraft, reveal: Option<&Reveal>) -> Vec<Value> {
         // Four digits identify a card to its owner and are not the credential —
         // the same call `Vault::card` makes when it derives them from a PAN it
         // drops in the same expression.
+        //
+        // ⛔ THEY DO NOT GET A ROW OF THEIR OWN. Owner-reported 2026-08-22:
+        // *"card numbers are stored twice in the UX as Number and Card
+        // number"*. There was a static "Number" row reading `•••• 1234` AND,
+        // three lines below, a "Card number" row that masks the same field and
+        // reveals it on demand. One stored value, two rows, two names — and the
+        // reader has to work out that they are the same thing before they can
+        // trust either.
+        //
+        // ⇒ The last4 belongs INSIDE the masked form of the row that owns the
+        // field, which is what `resting` is for. That keeps the at-a-glance
+        // discriminator this comment exists to defend — telling two cards apart
+        // without revealing either — while there is only ever one Card number
+        // row on the tab.
         let last4 = card_text("last4");
         if !last4.is_empty() {
             shown = true;
-            widgets.push(view_card_row("last4", "Number", &format!("•••• {last4}")));
         }
         if !shown {
             widgets.push(json!({
@@ -2970,10 +2987,17 @@ fn view_tab_widgets(draft: &ViewDraft, reveal: Option<&Reveal>) -> Vec<Value> {
         // verify which card you are about to fill. Each eye is one `card-secret`
         // call, audited by field name (never by value), and the fill button
         // remains the only path that writes into a page.
+        // The resting form carries the last4 when the entry has one, so this ONE
+        // row both identifies the card and reveals it.
+        let number_resting = if last4.is_empty() {
+            MASK_DOTS.to_string()
+        } else {
+            format!("•••• •••• •••• {last4}")
+        };
         widgets.push(view_value_row(
             StoredField::CardNumber,
             "Card number",
-            MASK_DOTS,
+            &number_resting,
             true,
             reveal,
             Vec::new(),
@@ -7571,7 +7595,32 @@ mod tests {
         // ONE row, because the expiry is one fact — "3" and "2031" on separate
         // rows makes the reader assemble a date the vault already knows.
         assert_eq!(subtitle("card:expiry"), "03/2031");
-        assert_eq!(subtitle("card:last4"), "•••• 8814");
+        // ⛔ THE LAST4 LIVES ON THE CARD-NUMBER ROW, AND THERE IS EXACTLY ONE OF
+        // THEM. Owner-reported 2026-08-22: *"card numbers are stored twice in
+        // the UX as Number and Card number"* — a static `card:last4` row read
+        // `•••• 8814` while the row three below masked the SAME field and
+        // revealed it on demand. One stored value, two rows, two names.
+        //
+        // The discriminator this test was written to defend is unchanged: two
+        // cards from one issuer are still told apart at a glance, without
+        // revealing either. It just happens on the row that owns the field.
+        assert_eq!(subtitle("card-number"), "•••• •••• •••• 8814");
+        assert!(
+            !wire.contains("card:last4"),
+            "a second row for the card number is the duplication that was \
+             reported — the last4 belongs in the masked form of the row that \
+             owns the field: {wire}"
+        );
+        assert_eq!(
+            widgets
+                .iter()
+                .filter(|widget| widget["title"]
+                    .as_str()
+                    .is_some_and(|title| title.to_lowercase().contains("number")))
+                .count(),
+            1,
+            "exactly ONE row may say 'number' on a card view: {wire}"
+        );
         assert!(
             widgets
                 .iter()
@@ -7585,17 +7634,47 @@ mod tests {
         // ⛔ And no card row wears an eye or a copy: both ride on StoredField,
         // whose contract is "the vault hands this back on demand", and a PAN is
         // the one value this client will not fetch for a widget.
-        for id in ["card:brand", "card:cardholder", "card:expiry", "card:last4"] {
+        for id in ["card:brand", "card:cardholder", "card:expiry"] {
             let row = widgets.iter().find(|widget| widget["id"] == id).unwrap();
             assert!(
                 row["actions"].is_null(),
                 "{id} offers a verb it cannot satisfy: {row}"
             );
         }
+        // ⚠ `card-number` DOES carry verbs, and must: it is a `StoredField`, so
+        // the vault serves it on demand and the eye is the whole point. The rule
+        // the loop above enforces is about the DERIVED fact rows, which have
+        // nothing behind them to fetch. Now that the last4 rides on this row,
+        // that distinction has to be stated or the next reader will "restore"
+        // the actions-free assertion onto a row that needs them.
+        let number_row = widgets
+            .iter()
+            .find(|widget| widget["id"] == "card-number")
+            .expect("the card number row");
+        let verbs: Vec<&str> = number_row["actions"]
+            .as_array()
+            .map(|actions| {
+                actions
+                    .iter()
+                    .filter_map(|action| action["action"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            verbs,
+            vec!["view-reveal:card-number", "view-copy:card-number"],
+            "the eye and the copy, and nothing else: {number_row}"
+        );
 
         // A LOGIN grows no card section — the branch is on the item's own type.
         let login = json!(view_tab_widgets(&view_fixture(), None)).to_string();
         assert!(!login.contains("card:last4"), "{login}");
+        assert!(
+            !login.contains("card-number"),
+            "a login grows no card-number row either — the branch is on the \
+             item's own type, and `card:last4` alone no longer proves that \
+             since the last4 moved onto the card-number row: {login}"
+        );
     }
 
     /// ⛔ DO NOT FIX HALF OF IT. An expiry you can SEE and cannot CHANGE moves
