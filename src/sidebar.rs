@@ -30,6 +30,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+
+use crate::passkey::Signer;
 use serde_json::{Value, json};
 use ychrome_vault_proto::{
     CIPHER_TYPE_CARD, CIPHER_TYPE_IDENTITY, CIPHER_TYPE_LOGIN, CIPHER_TYPE_NOTE,
@@ -248,6 +250,109 @@ fn passkey_enrol_widgets(host: Option<&str>, shim: &PasskeyShimState) -> Vec<Val
             "value": host, "label": "Enrol a passkey here",
             "title": "Let this site ask this browser to create a passkey",
         }),
+    ]
+}
+
+/// Separator inside a passkey action's value: `request_id` then the credential
+/// the user picked. Same reasoning as [`ROW_SEP`] — a unit separator cannot
+/// occur in either half, so the split is unambiguous.
+const PASSKEY_SEP: char = ROW_SEP;
+
+/// ⭐ THE FILL-PASSKEY SURFACE. A site's passkey ceremony, offered where the
+/// user actually goes when a sign-in did not work.
+///
+/// **Why this exists beside the native dialog.** yggterm raises a presence
+/// dialog when the request reaches it, and that is the primary path. But a
+/// dialog is one window and one moment: dismissed, or lost behind another
+/// window, and the ceremony is still parked for two minutes with nothing on
+/// screen saying so. The user's report was exactly this shape — *no way to
+/// enter the passkey when a site asks for one*.
+///
+/// **It is also the picker.** A site where the vault holds several accounts
+/// gets one button per account, so choosing WHICH passkey signs in is a click
+/// rather than a guess. The label is the account's, never a credential id.
+///
+/// Secret-free in the sense that matters: the `request_id` is what
+/// authenticates a grant, so it rides only this GUI-token-gated schema and
+/// never a page-reachable route. There is no key material here at all.
+fn passkey_ceremony_widgets(signer: &Signer) -> Vec<Value> {
+    let mut widgets = Vec::new();
+    for ceremony in signer.pending_ceremonies() {
+        let request_id = ceremony["request_id"].as_str().unwrap_or_default();
+        let rp_id = ceremony["rp_id"].as_str().unwrap_or_default();
+        let creating = ceremony["kind"].as_str() == Some("create");
+        let accounts = ceremony["accounts"].as_array().cloned().unwrap_or_default();
+        widgets.push(json!({
+            "kind": "section",
+            "text": if creating {
+                format!("{rp_id} wants to create a passkey")
+            } else {
+                format!("{rp_id} is asking for a passkey")
+            },
+            "card": true,
+        }));
+        widgets.push(json!({
+            "kind": "label", "muted": true,
+            "text": if creating {
+                "Approving stores a new passkey for this site in your vault.".to_string()
+            } else if accounts.len() > 1 {
+                "Choose which account to sign in as.".to_string()
+            } else {
+                "Approve to sign in with the passkey this vault holds.".to_string()
+            },
+        }));
+        for (index, account) in accounts.iter().enumerate() {
+            let label = account["label"].as_str().unwrap_or("this account");
+            let credential_id = account["credential_id"].as_str().unwrap_or_default();
+            widgets.push(json!({
+                "kind": "button",
+                // The INDEX, not the credential id: two accounts on one site can
+                // share a display label, and two buttons with the same id are
+                // one button as far as a GUI keyed by id is concerned.
+                "id": format!("passkey_approve_{index}"),
+                "action": "passkey-approve",
+                "value": format!("{request_id}{PASSKEY_SEP}{credential_id}"),
+                "primary": index == 0,
+                "label": if creating {
+                    "Create the passkey".to_string()
+                } else {
+                    format!("Sign in as {label}")
+                },
+                "title": format!("Approve this request from {rp_id}"),
+            }));
+        }
+        widgets.push(json!({
+            "kind": "button",
+            "id": "passkey_refuse",
+            "action": "passkey-refuse",
+            "value": request_id,
+            "label": "Not now",
+            "title": format!("Refuse this request from {rp_id}"),
+        }));
+    }
+    widgets
+}
+
+/// What the last ceremony did, while that is still the question being asked.
+///
+/// ⛔ **A status field without a readback is decoration.** `fido2-create`
+/// stored a passkey correctly and told the user nothing, so a successful
+/// enrolment and a silent failure looked identical — and the only way to tell
+/// them apart was to try signing in later.
+fn passkey_outcome_widgets(signer: &Signer) -> Vec<Value> {
+    let Some(outcome) = signer.recent_outcome() else {
+        return Vec::new();
+    };
+    let rp_id = outcome["rp_id"].as_str().unwrap_or_default();
+    let label = outcome["label"].as_str().unwrap_or_default();
+    let text = if outcome["kind"].as_str() == Some("create") {
+        format!("Saved a new passkey for {rp_id} to your vault.")
+    } else {
+        format!("Signed in to {rp_id} as {label} with a passkey.")
+    };
+    vec![
+        json!({"kind": "section", "text": "Passkey", "card": true}),
+        json!({"kind": "label", "muted": true, "text": text}),
     ]
 }
 
@@ -1259,7 +1364,7 @@ pub(crate) fn dispatch(
             if pane.tab == "add" {
                 pane.seed_add_draft(host.as_deref());
             }
-            (200, vault_schema(&mut pane, host.as_deref()))
+            (200, vault_schema(&mut pane, host.as_deref(), &state.signer))
         }
         ("GET", p) if p == format!("/pane/{SETTINGS_PANE}") => {
             let profile = state.pane.lock().unwrap().profile.clone();
@@ -1322,7 +1427,7 @@ pub(crate) fn dispatch(
             if req.body.is_null() {
                 return (400, json!({ "toast": "bad request" }));
             }
-            (200, run_action(&state.pane, &req.body))
+            (200, run_action(&state.pane, &req.body, &state.signer))
         }
         // The WebAuthn signer routes. `/fido2/get` and `/fido2/create` come from
         // the PAGE (over SOCKS-loopback) and are bearer-token-gated, so a random
@@ -1863,7 +1968,15 @@ pub(crate) struct Reveal {
 /// resolving to the same [`read_stored`] + [`copy_script`] underneath.
 const COPY_ROW_ACTION_PREFIX: &str = "copy-row:";
 
-fn item_row(item: &Value) -> Value {
+/// One vault row.
+///
+/// `passkey_offer` says a sign-in ceremony is live right now. It gates the
+/// Fill-passkey button, because a passkey is only usable while a SITE is
+/// asking: WebAuthn ceremonies are site-initiated and carry the site's
+/// challenge, so there is no such thing as pushing one into an idle page. A
+/// button that is dead whenever nobody asked is a button that teaches the user
+/// it does not work.
+fn item_row(item: &Value, passkey_offer: bool) -> Value {
     let name = item["name"].as_str().unwrap_or_default();
     let user = item["username"].as_str().unwrap_or_default();
     let folder = item["folder"].as_str().unwrap_or_default();
@@ -1892,6 +2005,17 @@ fn item_row(item: &Value) -> Value {
             "title": "Fill this login into the page",
         })
     }];
+    // The passkey button appears only while a ceremony is waiting on one. Which
+    // of this vault's passkeys actually ANSWERS that ceremony is decided at
+    // click time against the site's own rpId, not guessed here: the listing
+    // knows an item HAS a passkey, never which site it is for.
+    if passkey_offer && item["has_passkey"].as_bool().unwrap_or(false) {
+        actions.push(json!({
+            "action": "passkey-fill",
+            "label": "icon:key",
+            "title": "Sign in with this entry's passkey",
+        }));
+    }
     // rbw's `list` could not say whether an item had an authenticator secret,
     // so the old pane drew the button on every row. Ours knows.
     if item["has_totp"].as_bool().unwrap_or(false) {
@@ -2226,8 +2350,8 @@ fn run_sync(state: &mut PaneState) -> Value {
 ///
 /// The I/O lives here so [`unlocked_schema`] stays pure and testable without an
 /// agent — a test must never touch the user's real vault.
-fn vault_schema(state: &mut PaneState, host: Option<&str>) -> Value {
-    vault_schema_revealing(state, host, None)
+fn vault_schema(state: &mut PaneState, host: Option<&str>, signer: &Signer) -> Value {
+    vault_schema_revealing(state, host, None, signer)
 }
 
 /// The pane, plus at most ONE value the user just asked to see.
@@ -2242,6 +2366,7 @@ fn vault_schema_revealing(
     state: &mut PaneState,
     host: Option<&str>,
     reveal: Option<&Reveal>,
+    signer: &Signer,
 ) -> Value {
     // ONE `status` call per schema. It is the SSOT for lock state AND agent
     // staleness, so both branches read the same answer — the Tools tab used to
@@ -2254,7 +2379,7 @@ fn vault_schema_revealing(
                 Some(_) => vault_status().unwrap_or(status),
                 None => status,
             };
-            unlocked_schema(state, host, &status, reveal)
+            unlocked_schema(state, host, &status, reveal, signer)
         }
         Ok(status) => locked_schema(&status),
         Err(error) => json!({
@@ -2276,6 +2401,7 @@ fn unlocked_schema(
     host: Option<&str>,
     status: &Value,
     reveal: Option<&Reveal>,
+    signer: &Signer,
 ) -> Value {
     let mut widgets = vec![json!({
         "kind": "tabs",
@@ -2297,7 +2423,21 @@ fn unlocked_schema(
     // arrives at this pane from a login page that just blamed their browser.
     // Silent when the shim is fine, which is nearly always.
     widgets.extend(passkey_shim_widgets(&passkey_shim_state()));
+    // ⛔ AN UNANSWERED CEREMONY OUTRANKS EVERYTHING ELSE IN THIS PANE. A site is
+    // waiting, and it will stop waiting: the request expires. It goes above the
+    // tabs for the same reason the shim banner does, and above the shim banner's
+    // neighbours because it is the only widget here with a deadline.
+    widgets.extend(passkey_ceremony_widgets(signer));
+    widgets.extend(passkey_outcome_widgets(signer));
     widgets.extend(passkey_enrol_widgets(host, &passkey_shim_state()));
+
+    // Is a sign-in ceremony waiting? Asked ONCE per render, not once per row:
+    // the answer is a property of the session, and eighty rows asking it
+    // eighty times is eighty chances for the list to disagree with itself.
+    let offering = signer
+        .pending_ceremonies()
+        .iter()
+        .any(|ceremony| ceremony["kind"] == "get");
 
     match state.tab.as_str() {
         "add" => {
@@ -2381,7 +2521,7 @@ fn unlocked_schema(
                                 "text": "No entries match this site — search or pick from all items.",
                             }));
                         } else {
-                            widgets.extend(items.iter().map(item_row));
+                            widgets.extend(items.iter().map(|item| item_row(item, offering)));
                         }
                     }
                     Err(error) => widgets.push(json!({
@@ -2398,7 +2538,12 @@ fn unlocked_schema(
                 Ok(reply) => {
                     let items = reply["items"].as_array().cloned().unwrap_or_default();
                     let total = items.len();
-                    widgets.extend(items.iter().take(MAX_ROWS).map(item_row));
+                    widgets.extend(
+                        items
+                            .iter()
+                            .take(MAX_ROWS)
+                            .map(|item| item_row(item, offering)),
+                    );
                     if total > MAX_ROWS {
                         widgets.push(json!({
                             "kind": "label", "muted": true,
@@ -4050,7 +4195,7 @@ fn uri_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
+fn run_action(state: &Mutex<PaneState>, request: &Value, signer: &Signer) -> Value {
     // Which pane the click came from. The two panes have disjoint action names,
     // but they return DIFFERENT schemas — routing on the pane id is what stops a
     // settings toggle from redrawing the rail as the vault.
@@ -4075,7 +4220,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                     state.seed_add_draft(host.as_deref());
                 }
             }
-            reschema(state, host.as_deref())
+            reschema(state, host.as_deref(), signer)
         }
         // The KIND picker. The draft was absorbed above, so switching type
         // KEEPS what the user has typed into the fields both forms share — a
@@ -4096,14 +4241,14 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                     state.add.item_type = item_type;
                 }
             }
-            reschema(state, host.as_deref())
+            reschema(state, host.as_deref(), signer)
         }
         "search" => {
             {
                 let mut state = state.lock().unwrap();
                 state.query = values["query"].as_str().unwrap_or_default().to_string();
             }
-            reschema(state, host.as_deref())
+            reschema(state, host.as_deref(), signer)
         }
         "watchtower" => match vault_op(json!({"op": "watchtower"})) {
             Ok(report) => {
@@ -4113,7 +4258,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 );
                 state.lock().unwrap().watchtower = Some(report);
                 merge(
-                    reschema(state, host.as_deref()),
+                    reschema(state, host.as_deref(), signer),
                     json!({ "toast": format!("Watchtower: {reused} reused-password groups, {weak} weak.") }),
                 )
             }
@@ -4128,7 +4273,10 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 Some(count) => format!("Synced {count} items."),
                 None => "Sync failed — the reason is in the pane.".to_string(),
             };
-            merge(reschema(state, host.as_deref()), json!({ "toast": toast }))
+            merge(
+                reschema(state, host.as_deref(), signer),
+                json!({ "toast": toast }),
+            )
         }
         // OPEN AN ENTRY. The row body's action, and now the pane's front door:
         // every other row verb puts a value into the PAGE, this one gives the
@@ -4145,7 +4293,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                         state.view = draft;
                         state.tab = "view".to_string();
                     }
-                    reschema(state, host.as_deref())
+                    reschema(state, host.as_deref(), signer)
                 }
                 Err(error) => json!({ "toast": error.to_string() }),
             }
@@ -4170,7 +4318,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                         state.edit = draft;
                         state.tab = "edit".to_string();
                     }
-                    reschema(state, host.as_deref())
+                    reschema(state, host.as_deref(), signer)
                 }
                 Err(error) => json!({ "toast": error.to_string() }),
             }
@@ -4202,7 +4350,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                         state.lock().unwrap().view = draft;
                     }
                     merge(
-                        reschema(state, host.as_deref()),
+                        reschema(state, host.as_deref(), signer),
                         json!({
                             "toast": if wanted {
                                 format!("{name} is archived.")
@@ -4237,7 +4385,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
             }
             if !confirmed {
                 return merge(
-                    reschema(state, host.as_deref()),
+                    reschema(state, host.as_deref(), signer),
                     json!({
                         "toast": format!(
                             "Press again to move {name} to the trash. It can be restored from any client.",
@@ -4255,7 +4403,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                         state.tab = "fill".to_string();
                     }
                     merge(
-                        reschema(state, host.as_deref()),
+                        reschema(state, host.as_deref(), signer),
                         json!({ "toast": format!("{name} is in the trash.") }),
                     )
                 }
@@ -4278,7 +4426,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                         state.edit = draft;
                         state.tab = "edit".to_string();
                     }
-                    reschema(state, host.as_deref())
+                    reschema(state, host.as_deref(), signer)
                 }
                 Err(error) => json!({ "toast": error.to_string() }),
             }
@@ -4296,7 +4444,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 state.edit = EditDraft::default();
                 state.tab = if open { "view" } else { "fill" }.to_string();
             }
-            reschema(state, host.as_deref())
+            reschema(state, host.as_deref(), signer)
         }
         // ⟳ ON THE PASSWORD FIELD, which is where Bitwarden puts it. It arms a
         // roll for the next save rather than generating anything now: a password
@@ -4313,7 +4461,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 state.edit.generate_password
             };
             merge(
-                reschema(state, host.as_deref()),
+                reschema(state, host.as_deref(), signer),
                 json!({
                     "toast": if armed {
                         "A new password will be rolled when you save."
@@ -4383,6 +4531,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                                 field,
                                 value: secret,
                             }),
+                            signer,
                         )
                     }
                 }
@@ -4482,7 +4631,10 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                     if let Ok(draft) = load_edit_draft(&target_name, &target_user) {
                         state.lock().unwrap().edit = draft;
                     }
-                    merge(reschema(state, host.as_deref()), json!({ "toast": toast }))
+                    merge(
+                        reschema(state, host.as_deref(), signer),
+                        json!({ "toast": toast }),
+                    )
                 }
                 Err(error) => json!({ "toast": error.to_string() }),
             }
@@ -4516,7 +4668,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                         state.lock().unwrap().edit = draft;
                     }
                     merge(
-                        reschema(state, host.as_deref()),
+                        reschema(state, host.as_deref(), signer),
                         // The RECEIPT, named: `verify_edit` re-read the item and
                         // these are the changes it could actually see. Labels
                         // only — the agent never puts a value in this list.
@@ -4539,12 +4691,12 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 Ok(reply) => {
                     let count = reply["item_count"].as_u64().unwrap_or(0);
                     merge(
-                        reschema(state, host.as_deref()),
+                        reschema(state, host.as_deref(), signer),
                         json!({ "toast": format!("Vault unlocked — {count} items.") }),
                     )
                 }
                 Err(error) => merge(
-                    reschema(state, host.as_deref()),
+                    reschema(state, host.as_deref(), signer),
                     json!({ "toast": error.to_string() }),
                 ),
             }
@@ -4562,7 +4714,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
         "hand_over_agent" => {
             match vault_dir().and_then(|dir| ychrome_vault_proto::handover(&dir)) {
                 Ok(reply) if reply["handed_over"].as_bool().unwrap_or(false) => merge(
-                    reschema(state, host.as_deref()),
+                    reschema(state, host.as_deref(), signer),
                     json!({ "toast": "Agent handed over — passkeys are on again, in web surfaces opened from now on." }),
                 ),
                 // Accepted but unproven is a FAILURE here, not a partial success:
@@ -4580,7 +4732,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 // scan is meaningless. Reschema lands on the unlock form.
                 state.lock().unwrap().watchtower = None;
                 merge(
-                    reschema(state, host.as_deref()),
+                    reschema(state, host.as_deref(), signer),
                     json!({ "toast": "Agent restarted — unlock the vault to continue." }),
                 )
             }
@@ -4592,7 +4744,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 // showing which of the user's logins share a password.
                 state.lock().unwrap().watchtower = None;
                 merge(
-                    reschema(state, host.as_deref()),
+                    reschema(state, host.as_deref(), signer),
                     json!({ "toast": "Vault locked." }),
                 )
             }
@@ -4727,7 +4879,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                         state.seed_add_draft(host.as_deref());
                     }
                     merge(
-                        reschema(state, host.as_deref()),
+                        reschema(state, host.as_deref(), signer),
                         json!({ "toast": format!("Added {name} as a {made}.") }),
                     )
                 }
@@ -4777,9 +4929,110 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 Err(error) => json!({ "toast": error.to_string() }),
             }
         }
+        // ⭐ THE THREE PASSKEY VERBS THE PANE OFFERS. All of them answer a
+        // ceremony that is ALREADY RUNNING — none can start one, because a
+        // WebAuthn ceremony belongs to the site: it carries the site's
+        // challenge, and nothing this browser does can invent one.
+        //
+        // A grant from here is a grant from the GUI. This route is
+        // control-token gated (`RouteAccess::GuiOnly`), so reaching it means
+        // the operator clicked in the sidebar — the same deliberate human act
+        // the native presence dialog stands for, through the same
+        // `handle_grant` and the same `request_id`. There is no second consent
+        // path and no new authority: the page still cannot reach either one.
+        "passkey-approve" => {
+            let (request_id, credential_id) = match value.split_once(PASSKEY_SEP) {
+                Some((request_id, credential_id)) => (request_id, credential_id),
+                None => (value.as_str(), ""),
+            };
+            let mut grant = json!({
+                "request_id": request_id,
+                // The pane cannot witness a fingerprint or a PIN, so it must not
+                // claim one. `user_verified: false` is PRESENCE, which is what
+                // a click actually proves; a relying party that requires
+                // verification will refuse, correctly.
+                "user_verified": false,
+            });
+            if !credential_id.is_empty() {
+                grant["credential_id"] = json!(credential_id);
+            }
+            signer.handle_grant(&grant);
+            let mut reply = reschema(state, host.as_deref(), signer);
+            reply["toast"] = json!("Approved. The site is completing the sign-in.");
+            reply
+        }
+        "passkey-refuse" => {
+            signer.handle_deny(&json!({ "request_id": value }));
+            let mut reply = reschema(state, host.as_deref(), signer);
+            reply["toast"] = json!("Refused. The site was told you declined.");
+            reply
+        }
+        // The row's key button: answer the live ceremony with THIS entry's
+        // passkey. The row knows only that the item has one, so the item's
+        // credentials are resolved here and intersected with what the ceremony
+        // actually offered — an entry whose passkey is for another site says so
+        // instead of grafting the wrong account onto the request.
+        "passkey-fill" => {
+            let (name, user) = split_row_id(&value);
+            let offered: Vec<Value> = signer
+                .pending_ceremonies()
+                .into_iter()
+                .filter(|ceremony| ceremony["kind"] == "get")
+                .collect();
+            let Some(ceremony) = offered.first() else {
+                return json!({
+                    "toast": "No site is asking for a passkey right now. A passkey \
+                              signs in only when the site starts the request.",
+                });
+            };
+            match vault_op(json!({"op": "passkeys", "name": name, "user": opt_field(&user)})) {
+                Ok(reply) => {
+                    let held: Vec<&str> = reply["passkeys"]
+                        .as_array()
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(|passkey| passkey["credential_id"].as_str())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let chosen = ceremony["accounts"].as_array().and_then(|accounts| {
+                        accounts
+                            .iter()
+                            .find(|account| {
+                                account["credential_id"]
+                                    .as_str()
+                                    .is_some_and(|id| held.contains(&id))
+                            })
+                            .and_then(|account| account["credential_id"].as_str())
+                    });
+                    match chosen {
+                        Some(credential_id) => {
+                            signer.handle_grant(&json!({
+                                "request_id": ceremony["request_id"],
+                                "credential_id": credential_id,
+                                "user_verified": false,
+                            }));
+                            let mut reply = reschema(state, host.as_deref(), signer);
+                            reply["toast"] = json!(format!(
+                                "Signing in to {} with {name}.",
+                                ceremony["rp_id"].as_str().unwrap_or("this site"),
+                            ));
+                            reply
+                        }
+                        None => json!({
+                            "toast": format!(
+                                "{name} has no passkey for {}.",
+                                ceremony["rp_id"].as_str().unwrap_or("this site"),
+                            ),
+                        }),
+                    }
+                }
+                Err(error) => json!({ "toast": error.to_string() }),
+            }
+        }
         "passkey-arm" => {
             if passkey_enrol_arm(&value) {
-                let mut reply = reschema(state, host.as_deref());
+                let mut reply = reschema(state, host.as_deref(), signer);
                 reply["toast"] = json!(format!(
                     "{value} can now ask for a passkey. Reopen the tab so the page is \
                      built with it."
@@ -4791,7 +5044,7 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
         }
         "passkey-disarm" => {
             passkey_enrol_disarm(&value);
-            let mut reply = reschema(state, host.as_deref());
+            let mut reply = reschema(state, host.as_deref(), signer);
             reply["toast"] = json!(format!("Passkey enrolment disarmed for {value}."));
             reply
         }
@@ -4852,8 +5105,8 @@ fn copy_reply(name: &str, field: &StoredField, secret: &str) -> Value {
     })
 }
 
-fn reschema(state: &Mutex<PaneState>, host: Option<&str>) -> Value {
-    reschema_revealing(state, host, None)
+fn reschema(state: &Mutex<PaneState>, host: Option<&str>, signer: &Signer) -> Value {
+    reschema_revealing(state, host, None, signer)
 }
 
 /// Redraw the pane, carrying at most one value the user just asked to see.
@@ -4861,9 +5114,10 @@ fn reschema_revealing(
     state: &Mutex<PaneState>,
     host: Option<&str>,
     reveal: Option<&Reveal>,
+    signer: &Signer,
 ) -> Value {
     let mut state = state.lock().unwrap();
-    json!({ "schema": vault_schema_revealing(&mut state, host, reveal) })
+    json!({ "schema": vault_schema_revealing(&mut state, host, reveal, signer) })
 }
 
 // ---------------------------------------------------------------------------
@@ -6401,6 +6655,114 @@ fn totp_script(code: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// ⭐ THE OWNER'S ASK, FIRST HALF: a way to answer a passkey request from
+    /// the pane. One button per account IS the picker — a site where the vault
+    /// holds several accounts is the case that had no answer at all.
+    #[test]
+    fn a_waiting_ceremony_is_offered_with_one_button_per_account() {
+        let signer = quiet_signer();
+        signer.park_ceremony_for_test(
+            "req-1",
+            "example.com",
+            "get",
+            &[
+                json!({"credential_id": "cred-a", "label": "someone@example.com"}),
+                json!({"credential_id": "cred-b", "label": "other@example.com"}),
+            ],
+        );
+        let widgets = passkey_ceremony_widgets(&signer);
+        let approvals: Vec<&Value> = widgets
+            .iter()
+            .filter(|widget| widget["action"] == "passkey-approve")
+            .collect();
+        assert_eq!(approvals.len(), 2, "one button per offered account");
+        assert_eq!(
+            approvals[0]["value"],
+            json!(format!("req-1{PASSKEY_SEP}cred-a")),
+        );
+        assert_eq!(
+            approvals[1]["value"],
+            json!(format!("req-1{PASSKEY_SEP}cred-b")),
+        );
+        // Distinct ids, or a GUI keyed by id draws one button for two accounts.
+        assert_ne!(approvals[0]["id"], approvals[1]["id"]);
+        // Labels name the human's account, and the site is named once.
+        let wire = json!(widgets).to_string();
+        assert!(wire.contains("someone@example.com"));
+        assert!(wire.contains("example.com is asking for a passkey"));
+        // Refusing is always offered: a dialog with only an Approve is a dialog
+        // that answers itself.
+        assert!(
+            widgets
+                .iter()
+                .any(|widget| widget["action"] == "passkey-refuse")
+        );
+    }
+
+    /// A registration is not a sign-in and must not read as one — approving it
+    /// WRITES to the vault.
+    #[test]
+    fn a_registration_ceremony_says_it_will_create_something() {
+        let signer = quiet_signer();
+        signer.park_ceremony_for_test(
+            "req-2",
+            "example.com",
+            "create",
+            &[json!({"label": "someone@example.com"})],
+        );
+        let wire = json!(passkey_ceremony_widgets(&signer)).to_string();
+        assert!(wire.contains("wants to create a passkey"));
+        assert!(wire.contains("Create the passkey"));
+        assert!(!wire.contains("Sign in as"));
+    }
+
+    /// Silence when nothing is asking: the card has a deadline, so it must not
+    /// become furniture the user learns to scroll past.
+    #[test]
+    fn the_pane_shows_no_ceremony_card_when_no_site_is_asking() {
+        assert!(passkey_ceremony_widgets(&quiet_signer()).is_empty());
+        assert!(passkey_outcome_widgets(&quiet_signer()).is_empty());
+    }
+
+    /// ⛔ THE ROW BUTTON IS GATED ON A LIVE CEREMONY. A passkey signs in only
+    /// when the SITE asks — the ceremony carries the site's challenge — so a
+    /// Fill-passkey button on an idle page could do nothing whatever it looked
+    /// like, and a button that never works is one the user stops believing.
+    #[test]
+    fn a_row_offers_the_passkey_button_only_while_a_site_is_asking() {
+        let entry = json!({"name": "example.com", "username": "someone", "has_passkey": true});
+        let plain = json!({"name": "example.com", "username": "someone", "has_passkey": false});
+        assert_eq!(
+            fill_actions(&item_row(&entry, true)),
+            ["fill", "passkey-fill"]
+        );
+        assert_eq!(fill_actions(&item_row(&entry, false)), ["fill"]);
+        // No passkey on the entry, no button, however loudly a site is asking.
+        assert_eq!(fill_actions(&item_row(&plain, true)), ["fill"]);
+    }
+
+    /// ⛔ A STATUS FIELD WITHOUT A READBACK IS DECORATION. `fido2-create` stored
+    /// a passkey correctly and said nothing, so a user could not tell a saved
+    /// passkey from a silent failure without trying to sign in days later.
+    #[test]
+    fn a_finished_ceremony_is_reported_back() {
+        let signer = quiet_signer();
+        assert!(passkey_outcome_widgets(&signer).is_empty());
+        signer.note_outcome_for_test("create", "example.com", "someone@example.com");
+        let wire = json!(passkey_outcome_widgets(&signer)).to_string();
+        assert!(wire.contains("Saved a new passkey for example.com"));
+
+        signer.note_outcome_for_test("get", "example.com", "someone@example.com");
+        let wire = json!(passkey_outcome_widgets(&signer)).to_string();
+        assert!(wire.contains("Signed in to example.com"));
+    }
+
+    /// A signer for a pane test: no session, no ceremony, nothing draining it.
+    /// Ceremony-bearing tests build their own and register on it.
+    fn quiet_signer() -> Arc<Signer> {
+        Signer::new(0, "test-session".to_string())
+    }
     use super::*;
 
     // The passkey shim is the ONE script ychrome injects that must live in the
@@ -6492,6 +6854,7 @@ mod tests {
         let reply = run_action(
             &state,
             &json!({"pane": SETTINGS_PANE, "action": "reload-surface", "values": {}}),
+            &quiet_signer(),
         );
         assert_eq!(reply["reload_surface"], true);
         assert_eq!(reply["schema"]["title"], "YChrome Settings");
@@ -6505,6 +6868,7 @@ mod tests {
         let reply = run_action(
             &state,
             &json!({"pane": SETTINGS_PANE, "action": "sync", "values": {}}),
+            &quiet_signer(),
         );
         assert!(
             reply["schema"].is_null(),
@@ -7248,7 +7612,7 @@ mod tests {
             "password": "hunter2",
             "totp_secret": "GEZDGNBVGY3TQOJQ",
         });
-        let row = item_row(&item);
+        let row = item_row(&item, false);
         let wire = row.to_string();
         assert!(!wire.contains("hunter2"), "password leaked into a row");
         assert!(
@@ -7279,7 +7643,10 @@ mod tests {
             "the pencil is gone from the row: {actions:?}"
         );
 
-        let plain = item_row(&json!({"name": "n", "username": "", "has_totp": false}));
+        let plain = item_row(
+            &json!({"name": "n", "username": "", "has_totp": false}),
+            false,
+        );
         assert_eq!(
             fill_actions(&plain),
             ["fill"],
@@ -7885,10 +8252,13 @@ mod tests {
     #[test]
     fn every_row_verb_names_a_mark_rather_than_pasting_a_character() {
         let mut labels: Vec<String> = Vec::new();
-        let row = item_row(&json!({
-            "name": "github.com", "username": "octocat",
-            "has_password": true, "has_totp": true,
-        }));
+        let row = item_row(
+            &json!({
+                "name": "github.com", "username": "octocat",
+                "has_password": true, "has_totp": true,
+            }),
+            false,
+        );
         let mut collect = |widget: &Value| {
             for action in widget["actions"].as_array().into_iter().flatten() {
                 labels.push(action["label"].as_str().unwrap_or_default().to_string());
@@ -8245,7 +8615,7 @@ mod tests {
             .and_then(|suffix| suffix.split("(\"GET\", p) if p ==").next())
             .expect("the vault pane route");
         assert!(
-            route.contains("vault_schema(&mut pane, host.as_deref())"),
+            route.contains("vault_schema(&mut pane, host.as_deref(), &state.signer)"),
             "the pane GET must build through the no-reveal owner: {route}",
         );
         assert!(
@@ -8270,7 +8640,7 @@ mod tests {
     #[test]
     fn a_row_offers_the_copy_verbs_every_other_client_has() {
         let menu = |item: Value| -> Vec<String> {
-            item_row(&item)["menu"]
+            item_row(&item, false)["menu"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -8511,7 +8881,7 @@ mod tests {
         let mut state = PaneState::new("default");
         for tab in ["fill", "tools"] {
             state.tab = tab.to_string();
-            let schema = vault_schema(&mut state, Some("git.example.org"));
+            let schema = vault_schema(&mut state, Some("git.example.org"), &quiet_signer());
             println!(
                 "=== {tab} ===\n{}",
                 serde_json::to_string_pretty(&schema).unwrap()
@@ -8521,7 +8891,7 @@ mod tests {
         let draft = load_edit_draft("git.example.org", "avik").expect("the fixture item");
         state.edit = draft;
         state.tab = "edit".to_string();
-        let schema = vault_schema(&mut state, Some("git.example.org"));
+        let schema = vault_schema(&mut state, Some("git.example.org"), &quiet_signer());
         let text = serde_json::to_string_pretty(&schema).unwrap();
         println!("=== edit ===\n{text}");
         // The fixture's secrets must not be anywhere in what the GUI receives.
@@ -8539,6 +8909,7 @@ mod tests {
             run_action(
                 &pane,
                 &json!({"pane": VAULT_PANE, "action": name, "values": {"value": value}}),
+                &quiet_signer(),
             )
         };
         for (spec, expected) in [
@@ -8555,7 +8926,7 @@ mod tests {
             // of it — which is the whole invariant, measured rather than argued.
             let again = {
                 let mut pane = pane.lock().unwrap();
-                vault_schema(&mut pane, Some("git.example.org")).to_string()
+                vault_schema(&mut pane, Some("git.example.org"), &quiet_signer()).to_string()
             };
             assert!(
                 !again.contains(expected),
@@ -8788,17 +9159,20 @@ mod tests {
     // number never travels with it.
     #[test]
     fn a_card_row_offers_the_card_injector_and_still_carries_no_secret() {
-        let card = item_row(&json!({
-            "name": "HDFC Regalia",
-            "username": "",
-            "folder": "Cards",
-            "item_type": 3,
-            "has_password": false,
-            "has_totp": false,
-            // Even if the agent ever handed these over, a row must not echo them.
-            "number": "4111111111114242",
-            "code": "737",
-        }));
+        let card = item_row(
+            &json!({
+                "name": "HDFC Regalia",
+                "username": "",
+                "folder": "Cards",
+                "item_type": 3,
+                "has_password": false,
+                "has_totp": false,
+                // Even if the agent ever handed these over, a row must not echo them.
+                "number": "4111111111114242",
+                "code": "737",
+            }),
+            false,
+        );
         let actions: Vec<&str> = card["actions"]
             .as_array()
             .unwrap()
@@ -8823,9 +9197,12 @@ mod tests {
         assert!(!wire.contains("737"), "CVV leaked: {wire}");
 
         // A login is untouched by any of this.
-        let login = item_row(&json!({
-            "name": "github.com", "username": "octocat", "item_type": 1, "has_totp": true,
-        }));
+        let login = item_row(
+            &json!({
+                "name": "github.com", "username": "octocat", "item_type": 1, "has_totp": true,
+            }),
+            false,
+        );
         let actions: Vec<&str> = login["actions"]
             .as_array()
             .unwrap()
@@ -8889,6 +9266,7 @@ mod tests {
             Some("github.com"),
             &json!({"state": "unlocked"}),
             None,
+            &quiet_signer(),
         );
         let widgets = schema["widgets"].as_array().unwrap();
 
@@ -8940,6 +9318,7 @@ mod tests {
                 Some("github.com"),
                 &json!({"state": "unlocked"}),
                 None,
+                &quiet_signer(),
             )["widgets"]
                 .as_array()
                 .unwrap()
@@ -9140,6 +9519,7 @@ mod tests {
             None,
             &json!({"state": "unlocked"}),
             None,
+            &quiet_signer(),
         );
         let notes = schema["widgets"]
             .as_array()
@@ -9184,7 +9564,8 @@ mod tests {
             ..PaneState::default()
         };
         let unlocked_stale = json!({"state": "unlocked", "item_count": 1107, "agent_stale": true});
-        let wire = unlocked_schema(&tools, None, &unlocked_stale, None).to_string();
+        let wire =
+            unlocked_schema(&tools, None, &unlocked_stale, None, &quiet_signer()).to_string();
         assert!(wire.contains("restart_agent"));
         assert!(wire.contains("1107 items"));
     }

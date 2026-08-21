@@ -14,7 +14,9 @@ Entries are removed in the same commit as their verified fix. Newest first.
 
 ## ⛔ `cargo test --bin ychrome` IS RED ON THE TRUNK — 4 sidebar tests, and it is not a flake
 
-**Status:** OPEN. Measured 2026-08-21. `382 passed; 4 failed`, deterministic, on a clean tree.
+**Status:** OPEN. Deterministic, on a clean tree. The PASS count moves as work lands (`382`
+on 2026-08-21, `406` on 2026-08-22); **the four failures below have not changed**, and that
+list is the thing to compare against, not the total.
 
 ```
 sidebar::tests::a_field_spec_round_trips_including_an_awkward_name
@@ -911,15 +913,16 @@ in the list.
 
 **Still missing, roughly in the order a user meets them:**
 
-1. **No passkey autofill, and no picker.** THE big one. A passkey is only usable when the SITE
-   starts a ceremony; the Fill tab lists logins only, so there is no "sign in with this
-   passkey" affordance and no way to CHOOSE among several for one site. Bitwarden offers it
-   from the item. ⛔ Blocked behind the presence-request bug above — a picker is pointless
-   while no grant can be delivered.
+1. ✅ **CLOSED 2026-08-22 — passkey autofill and the picker.** A waiting ceremony is offered
+   in the pane with one button per account, and a passkey row grows a Fill-passkey button
+   while a site is asking. The blocker under it (no grant could be delivered at all) is fixed
+   in the same change. ⚠ Note what is NOT possible and never was: a passkey cannot be filled
+   into an idle page, because the ceremony belongs to the site and carries its challenge.
 2. **No passkey removal.** An item's passkey can be read but not deleted from the pane.
-3. **A created passkey confirms nothing.** `fido2-create` mints and stores correctly, but the
-   sidebar says nothing afterwards, so the user trusts a silent success — the same class the
-   owner's own razor names: *a status field without a readback is decoration*.
+3. ✅ **CLOSED 2026-08-22 — a created passkey now confirms.** `fido2-create` minted and stored
+   correctly and the sidebar said nothing, so a saved passkey and a silent failure looked
+   identical. The pane reports the last ceremony's result for two minutes
+   (`passkey_outcome_widgets`) — a status field without a readback is decoration.
 4. **`clear_notes` / `clear_totp` are standing toggles**, not per-field actions. They read as
    two duplicated delete switches while scrolling and were reported as such. Bitwarden removes
    a value where the value lives.
@@ -933,115 +936,170 @@ in the list.
    two halves must land together: a reader (`Vault::identity`, the twin of `Vault::card`) and
    then the form. Until then the pane offers Login / Note / Card and says so by offering
    nothing else.
-6. **The GUI's modal state is unobservable.** `server app state` exposes no `pending_fido2`, so
-   neither an agent nor a test can tell whether a ceremony is actually in front of the user or
-   was dropped. That is what made the presence-request bug take a full session to corner.
+6. **The GUI's modal state is unobservable** — half closed 2026-08-22. `server app state` still
+   exposes no `pending_fido2`, so nothing can say whether the dialog is actually PAINTED. The
+   app's half is reported now: `ychrome status` carries `presence_reachable` and
+   `pending_ceremonies` per session, which answers "was it sent, and is it still waiting".
 
-⚠ **Sequencing:** items 1–3 all sit behind the presence-request fix. Do that first or the work
-cannot be verified end to end — which is exactly the trap this session fell into.
+⚠ **Sequencing:** items 1–3 all sat behind the presence-request fix, which is why it was done
+first. 1 and 3 closed with it; 2 (removal) is independent and still open.
 
-## ⭐ OWNER-REQUESTED: A FILL-PASSKEY BUTTON AND AN ADD-PASSKEY MECHANISM IN THE VAULT PANE
+## ✅ CLOSED 2026-08-22: A FILL-PASSKEY BUTTON AND AN ADD-PASSKEY MECHANISM IN THE VAULT PANE
 
-**Status:** OPEN, requested 2026-08-22. ⛔ **BLOCKED ON THE ENTRY DIRECTLY BELOW — read it first.**
+**Status:** SHIPPED. Requested 2026-08-22: a fill-passkey button and an add-passkey mechanism
+in the ychrome vault pane. Both landed, together with the presence-routing defect below that
+would have made either one dead on arrival.
 
-*"In ychrome vault I need a fill passkey button and a add passkey mechanism."*
+### What is there now
 
-### ⇒ THE CEREMONY MACHINERY ALREADY EXISTS. What is missing is the PANE.
+| piece | where |
+|---|---|
+| the waiting-ceremony card, above the tabs | `sidebar::passkey_ceremony_widgets` |
+| the account PICKER (one button per offered account) | same card, `passkey-approve` |
+| refusing a request | `passkey-refuse` |
+| the per-row Fill-passkey button | `sidebar::item_row`, action `passkey-fill` |
+| "Saved a new passkey for X" / "Signed in to X" | `sidebar::passkey_outcome_widgets` |
+| enrolling on a site with no passkey yet | `sidebar::passkey_enrol_widgets` (already in this pane) |
 
-Measured 2026-08-22, so the next session does not re-derive it:
+⚠ **A correction to the earlier version of this entry**, which said the enrol affordance
+"lives on the HOST/settings surface". It does not and never did: `unlocked_schema` draws it,
+which is the VAULT pane, above the tabs, on every tab. Anyone planning work off that line was
+planning to move something that was already where they wanted it.
 
-| piece | where | state |
-|---|---|---|
-| assertion (**fill**) | `passkey.rs::handle_get` | built |
-| registration (**add**) | `passkey.rs::handle_create` | built |
-| approve / refuse | `passkey.rs::handle_grant` / `handle_deny` | built |
-| the `navigator.credentials` shim | `passkey.rs::shim_userscript` | built, injected per origin |
-| write a credential onto an item | `model.rs` — `fido2Credentials` | built |
-| list an item's passkeys | vault agent op `passkeys` | built |
-| which hosts have one | vault agent op `passkey-hosts` | built |
-| enrol affordance | `sidebar.rs::passkey_enrol_widgets` — "Enrol a passkey here", arm/disarm | built, but it lives on the HOST/settings surface |
-| **a per-row Fill-passkey button** | — | ⛔ **absent** |
-| **an Add-passkey affordance in the vault pane** | — | ⛔ **absent** |
+### ⛔ WHAT A FILL BUTTON CANNOT DO, AND WHY THE ROW BUTTON IS GATED
 
-⇒ This is a WIRING job at the pane, not new crypto. The two verbs to reach are the ones the
-signer already answers; the row already knows `has_passkey` (it is in `list --json`).
+A passkey signs in **only while the site is asking**. A WebAuthn ceremony is site-initiated and
+carries the site's own challenge, so there is no such thing as pushing a passkey into an idle
+page — nothing this browser can invent will satisfy a relying party.
 
-### ⛔⛔ BUT A FILL BUTTON WOULD BE DEAD ON ARRIVAL TODAY — measured, not inferred
+⇒ The row's Fill-passkey button therefore appears **only while a ceremony is live**. A button
+that is dead whenever nobody asked is a button the user learns not to believe, and it would
+have made the feature look broken exactly when it was working. `item_row`'s `passkey_offer`
+argument is that gate, locked by
+`a_row_offers_the_passkey_button_only_while_a_site_is_asking`.
 
-The entry below says the presence request is written to the daemon's `/dev/null` stdout. **That
-is still true**, and tonight's stderr fix did NOT change it — it redirected fd **2**, and
-`emit_fido2_request` writes to fd **1**:
+Which of the vault's passkeys actually answers a live ceremony is decided at CLICK time against
+the site's rpId, never guessed at render time: the listing knows an item HAS a passkey, never
+which site it is for.
 
-```
-owner's daemon:  fd/0 -> /dev/null
-                 fd/1 -> /dev/null          <-- the OSC goes here
-                 fd/2 -> …/daemon.stderr.log   <-- fixed 2026-08-21, different fd
-```
+### Why the pane offers a ceremony at all, when a native dialog exists
 
-⇒ **Order the work: route the presence request first, then add the buttons.** A Fill button
-shipped before that parks the ceremony on its condvar for the full 120 s timeout and the page
-reports a generic failure — which is indistinguishable, to the user, from the button being
-broken. ⚠ And it would be indistinguishable to the NEXT session too, which is how a working
-button gets "fixed" into something worse.
+The dialog yggterm raises is the primary path. But it is one window and one moment: dismiss it,
+or lose it behind another window, and the ceremony is still parked for its full two minutes
+with nothing on screen saying so. The pane is where a user goes when a sign-in did not work, so
+it is where the unanswered question belongs — and it is where choosing among several accounts
+for one site became possible at all.
 
-⚠ **Do not simply point stdout at the stderr log.** The OSC is a REQUEST that needs an answer
-(`/fido2/grant`), so it needs a channel with a reader on the other end — the row's PTY when
-ychrome runs in a row, and something else entirely for a daemon-served surface. Deciding that
-channel is the actual design work in this item.
+A grant from the pane is a grant from the GUI: `POST /action` is control-token gated
+(`RouteAccess::GuiOnly`), and it goes through the same `handle_grant` and the same per-ceremony
+`request_id` as the dialog. No second consent path, no new authority, and the page still cannot
+reach either one. The pane cannot witness a fingerprint or a PIN, so it grants
+`user_verified: false` — presence, which is what a click actually proves.
 
----
+### Still open on the passkey plane
 
-## ⛔⛔ A PASSKEY CAN NEVER BE APPROVED: the presence request is written to the DAEMON'S `/dev/null` stdout
+1. **Removing a passkey from an item** — readable in the pane, not deletable.
+2. **Full crypto E2E against a real relying party.** Everything below the ceremony is
+   KAT-proven and the delivery channel is now live-proven, but no assertion this browser
+   produced has yet been ACCEPTED by a real RP. That is the one claim nobody should make yet.
+3. **signCount increment.**
 
-**Status:** OPEN — this makes `navigator.credentials.get()` unusable on every daemon-served
-surface, which is all of them.
+## ✅ FIXED 2026-08-22: the presence request went to the daemon's `/dev/null` stdout, so no passkey could ever be approved
 
-Measured on guihost 2026-08-08, driving a real Google sign-in end to end.
+**Status:** FIXED. This is the defect that made `navigator.credentials.get()` unusable on every
+daemon-served surface, which is all of them.
 
-`passkey::emit_fido2_request` publishes the ceremony as an OSC on **stdout**:
+### What was wrong
+
+`passkey::emit_fido2_request` published the ceremony as an OSC on **stdout**:
 
 ```rust
 let mut stdout = std::io::stdout().lock();
 let _ = write!(stdout, "\u{1b}]7717;fido2;request;{encoded}\u{7}");
 ```
 
-That is correct for a ychrome launched **inside a yggterm row**, where stdout IS the row's PTY
-and yggterm parses the sequence into `PendingFido2Dialog`. It is wrong for the architecture we
-actually run:
+That is correct for a ychrome launched inside a terminal row, where stdout IS the row's PTY.
+It is wrong for the architecture actually shipped:
 
 ```
-ychrome --daemon (pid 1191332)   /proc/PID/fd/1 -> /dev/null      <-- serves the surfaces
-foreground ychrome (pid 1145528) /proc/PID/fd/1 -> /dev/pts/12
+ychrome --daemon    fd/1 -> /dev/null      <-- serves the surfaces, raises the ceremonies
+foreground ychrome  fd/1 -> /dev/pts/N     <-- holds the stream the GUI routes by
 ```
 
-**The daemon serves the pages, and the daemon's stdout is `/dev/null`.** So the request is
-written into nothing, no modal is ever raised, and the ceremony parks on the `Signer` condvar
-for the full `CEREMONY_TIMEOUT` (120 s) waiting for a `/fido2/grant` that nobody was ever asked
-to send. The page then shows Google's "Something went wrong".
+**The daemon serves the pages and a daemon has no terminal.** The request was written into
+nothing, no dialog was ever raised, and the ceremony parked on the `Signer` condvar for the
+full 120 s `CEREMONY_TIMEOUT` waiting for a `/fido2/grant` nobody had been asked to send. The
+page then showed a generic failure — indistinguishable, to a user, from a broken button.
 
-**Three independent confirmations that nothing downstream is at fault:**
+⚠ The 2026-08-21 stderr fix did NOT touch this: it redirected fd **2**, and the request was on
+fd **1**. Two fixes on one path, and either alone still left passkeys broken.
 
-1. The shim IS installed on the page (`navigator.credentials.get` stringifies to our JS).
-2. The vault RESOLVES the passkey — after the 2026-08-08 credential-id fix the call returns no
-   error at all, where it previously answered `no passkey in this vault answers that request`.
-3. `~/.yggterm/vault/audit.log` contains **zero** `fido2` lines, ever. `fido2-assert` is only
-   reached after a grant, so its absence proves the grant never arrives — the failure is upstream
-   of the vault, not in it.
+### The fix: the request leaves through the process that owns the stream
 
-**What the fix has to do:** route the presence request over a channel that survives the daemon,
-the same way everything else the GUI needs already does — the per-session control endpoint the
-surface already declares (the `sidebar` declaration `/fido2/grant` is POSTed back to). The OSC
-must be emitted on the OWNING SESSION'S stream, not on whatever stdout the emitting process
-happens to hold. `emit_fido2_request` already takes a `session` argument and currently uses it
-for diagnostics only ("the GUI routes the OSC by the STREAM it arrived on, not this field") —
-under a daemon that comment is precisely the bug.
+The GUI routes a `fido2 ; request` by the STREAM it arrives on, so the OSC has to be written to
+the owning session's PTY. The daemon does not hold it; the session's **view client** does. So
+the signer QUEUES the request and the client publishes it on its own stdout.
 
-**Do not confuse this with daemon orphaning** (that one is fixed — `daemon list`/`daemon reap`,
-`docs/host-daemon.md` §6.2). A `ychrome daemon restart` ALSO leaves live
-surfaces pointing at the retired daemon's control port (observed: `connect 127.0.0.1:41459:
-Connection refused`, GUI toast "Web policy unavailable … Its surfaces open unprotected", which
-additionally strips the userscripts and therefore the shim). That is a second, separate defect
-on the same path; fixing either one alone still leaves passkeys broken.
+```
+Signer (in the daemon)  --presence outbox-->  the session's view client
+client                  --OSC 7717 ; fido2 ; request-->  yggterm, on the row's PTY
+yggterm                 --presence dialog-->  the human
+yggterm                 --POST /fido2/grant-->  Signer
+```
+
+- The OSC bytes and yggterm's parser are **unchanged**. Only the fd it is written to moved, so
+  no yggterm change was needed.
+- Drained on the client's **surface tick**, not its ~4 s heartbeat: a human is waiting on a
+  dialog, and four seconds of nothing is what a broken button looks like.
+- Daemon op `fido2-outbox`; client half `daemon::drain_presence`; publisher
+  `main::publish_presence_requests`.
+
+### ⭐ AND A QUEUE NOBODY DRAINS IS THE SAME SILENCE WITH EXTRA STEPS
+
+A session counts as presence-reachable only while a client has **drained it recently**
+(`PRESENCE_STALE`, 15 s). Otherwise a ceremony is refused **at once**, with a named reason
+(HTTP 503, `NO_PRESENCE_CHANNEL`), instead of parking two minutes and then failing generically.
+That is the same skew honesty the daemon's routing already practises: an endpoint is capable
+once it has been SEEN to be, never because it ought to be.
+
+The refusal is what makes a stale client, an old binary, or a dead daemon diagnosable rather
+than mysterious — and it is what stops the next session from "fixing" a working button.
+
+### It is observable now, which it was not
+
+The old entry noted that `server app state` exposes no `pending_fido2`, so neither an agent nor
+a test could tell whether a ceremony was in front of the user or had been dropped — and that
+this is what made the defect take a full session to corner. The app side now reports it:
+
+```sh
+ychrome status --json | jq '.sessions[] | {env_id, presence_reachable, pending_ceremonies}'
+ychrome status              # prints `passkeys=yes|NO`, and a [NO PASSKEYS] block naming the fix
+```
+
+`presence_reachable: false` means no view client is publishing for that session, so every
+passkey request there is refused. It is EXPLICITLY false, never merely absent: a daemon older
+than the field omits it, and `?` says "this daemon cannot answer" rather than inventing a fault.
+
+⚠ The GUI's own modal state is still unexposed — this reports the APP's half (was it sent, is
+it still waiting), not whether the dialog is actually painted.
+
+### What is proven, and what is not
+
+- ✅ **Live-proven on a real daemon**: the op is served, drains per session, takes each request
+  exactly once, refuses a missing env_id, yields nothing for an unknown one, and flips
+  `presence_reachable` false → true on the first drain.
+- ✅ **Live-proven with a real client**: a `ychrome` running the real surface loop drains the
+  outbox and the daemon reports `passkeys=yes`; a session with no client reports `NO` and
+  raises the `[NO PASSKEYS]` block.
+- ⚠ **NOT yet proven**: a full ceremony end to end against a real relying party — that needs a
+  stored passkey, an unlocked vault, a real sign-in page and a human at the dialog.
+
+### The separate defect on the same path, still open
+
+A `ychrome daemon restart` leaves live surfaces pointing at the retired daemon's control port
+(`connect 127.0.0.1:<port>: Connection refused`, GUI toast "Web policy unavailable … Its
+surfaces open unprotected"), which additionally strips the userscripts and therefore the shim.
+Not fixed here, and not the same bug — but it lands on the same feature.
 
 ## ★ THE VAULT PANE STILL WAITS FOR YOU TO PRESS SYNC
 

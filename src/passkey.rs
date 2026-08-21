@@ -102,9 +102,18 @@ enum Outcome {
 /// One in-flight ceremony, awaiting the GUI grant. The `/fido2/get` thread
 /// parks on the [`Signer`] condvar until `outcome` is set by `/fido2/grant` or
 /// `/fido2/deny` (or the timeout fires and the entry is swept).
-#[derive(Default)]
+///
+/// It carries what it is FOR — the site, the kind, and the accounts on offer —
+/// because the native presence dialog is not the only place a human can answer
+/// one. The vault pane offers the same ceremony, and a pane that had to guess
+/// which site was asking would be guessing about consent.
 struct Ceremony {
     outcome: Option<Outcome>,
+    rp_id: String,
+    kind: String,
+    /// `[{credential_id, label}]`, exactly as the presence OSC carries them.
+    /// Labels and public ids only: this is offered to a schema.
+    accounts: Vec<Value>,
 }
 
 /// The browser-side passkey signer. One per surface control server.
@@ -131,7 +140,30 @@ pub struct Signer {
     /// client has ever spoken the op — either none is attached, or the attached
     /// one predates the presence channel and would drop the request in silence.
     last_drain: Mutex<Option<Instant>>,
+    /// How the last ceremony ended, for the pane to report.
+    ///
+    /// ⭐ **A registration that says nothing is a registration you cannot
+    /// trust.** `fido2-create` mints and stores a passkey correctly and the
+    /// browser then went silent, so the only evidence a user had that their new
+    /// passkey existed was that nothing had visibly failed. One outcome, not a
+    /// log: the question this answers is "did the thing I just did work", and
+    /// it stops being asked within a minute.
+    last_outcome: Mutex<Option<Completed>>,
 }
+
+/// How a ceremony ended, and when — [`PRESENCE_STALE`]'s sibling for the
+/// reporting side.
+struct Completed {
+    kind: String,
+    rp_id: String,
+    label: String,
+    at: Instant,
+}
+
+/// How long a finished ceremony is still worth reporting in the pane. Long
+/// enough to survive walking back to the sidebar, short enough that it is never
+/// mistaken for the state of a LATER sign-in.
+const OUTCOME_FRESH: Duration = Duration::from_secs(120);
 
 impl Signer {
     pub fn new(port: u16, session: String) -> Arc<Self> {
@@ -143,6 +175,7 @@ impl Signer {
             cvar: Condvar::new(),
             outbox: Mutex::new(Vec::new()),
             last_drain: Mutex::new(None),
+            last_outcome: Mutex::new(None),
         })
     }
 
@@ -282,7 +315,7 @@ impl Signer {
             return Err(GetError::NoPresenceChannel);
         }
         let request_id = hex_token(16);
-        self.register(&request_id);
+        self.register(&request_id, rp_id, "get", &accounts);
         self.publish_presence_request(&request_id, rp_id, &accounts, "get", origin);
         let outcome = self.wait_for_outcome(&request_id);
 
@@ -335,6 +368,7 @@ impl Signer {
         }))
         .map_err(|error| GetError::Bad(error.to_string()))?;
 
+        self.note_outcome("get", rp_id, &account_label(candidate));
         Ok(json!({
             "credentialId": credential_id_rp,
             "clientDataJSON": b64url(client_data_json.as_bytes()),
@@ -412,7 +446,10 @@ impl Signer {
             display_name
         };
         let accounts = vec![json!({ "label": label })];
-        self.register(&request_id);
+        if !self.presence_reachable() {
+            return Err(GetError::NoPresenceChannel);
+        }
+        self.register(&request_id, rp_id, "create", &accounts);
         self.publish_presence_request(&request_id, rp_id, &accounts, "create", origin);
         let user_verified = match self.wait_for_outcome(&request_id) {
             Some(Outcome::Granted { user_verified, .. }) => user_verified,
@@ -444,6 +481,7 @@ impl Signer {
             attested_authenticator_data(rp_id, &credential_id_bytes, &cose, user_verified);
         let attestation_object = none_attestation_object(&authenticator_data);
 
+        self.note_outcome("create", rp_id, label);
         Ok(json!({
             "credentialId": credential_id,
             "clientDataJSON": b64url(client_data_json.as_bytes()),
@@ -496,11 +534,101 @@ impl Signer {
         }
     }
 
-    fn register(&self, request_id: &str) {
-        self.pending
-            .lock()
-            .unwrap()
-            .insert(request_id.to_string(), Ceremony::default());
+    fn register(&self, request_id: &str, rp_id: &str, kind: &str, accounts: &[Value]) {
+        self.pending.lock().unwrap().insert(
+            request_id.to_string(),
+            Ceremony {
+                outcome: None,
+                rp_id: rp_id.to_string(),
+                kind: kind.to_string(),
+                accounts: accounts.to_vec(),
+            },
+        );
+    }
+
+    /// Record how a ceremony ended. Called on the paths that finish one, so a
+    /// user who approved something has somewhere to see that it worked.
+    fn note_outcome(&self, kind: &str, rp_id: &str, label: &str) {
+        *self.last_outcome.lock().unwrap() = Some(Completed {
+            kind: kind.to_string(),
+            rp_id: rp_id.to_string(),
+            label: label.to_string(),
+            at: Instant::now(),
+        });
+    }
+
+    /// The last ceremony's result while it is still worth reporting, as
+    /// `{kind, rp_id, label}`. `None` once it has aged out.
+    pub fn recent_outcome(&self) -> Option<Value> {
+        let outcome = self.last_outcome.lock().unwrap();
+        let outcome = outcome.as_ref().filter(|done| done.at.elapsed() <= OUTCOME_FRESH)?;
+        Some(json!({
+            "kind": outcome.kind,
+            "rp_id": outcome.rp_id,
+            "label": outcome.label,
+        }))
+    }
+
+    /// Start a ceremony with no thread parked on it — TEST BUILDS ONLY.
+    ///
+    /// It does BOTH halves a real ceremony does, register and publish, because
+    /// they are one act: a ceremony registered but never published is a state
+    /// production cannot reach, and a test that could reach it would be
+    /// rehearsing a shape nobody ships.
+    ///
+    /// `register` and `publish_presence_request` stay private because in
+    /// production a registered ceremony always has a `/fido2/*` thread parked
+    /// on it; one registered without a waiter would sit in the pane offering a
+    /// sign-in that answers nobody.
+    #[cfg(test)]
+    pub(crate) fn park_ceremony_for_test(
+        &self,
+        request_id: &str,
+        rp_id: &str,
+        kind: &str,
+        accounts: &[Value],
+    ) {
+        self.register(request_id, rp_id, kind, accounts);
+        self.publish_presence_request(request_id, rp_id, accounts, kind, "https://example.com");
+    }
+
+    /// Stamp an outcome without running a ceremony — TEST BUILDS ONLY, for the
+    /// pane's report of what just happened.
+    #[cfg(test)]
+    pub(crate) fn note_outcome_for_test(&self, kind: &str, rp_id: &str, label: &str) {
+        self.note_outcome(kind, rp_id, label);
+    }
+
+    /// Ceremonies still waiting on a human, for the vault pane to offer.
+    ///
+    /// ⭐ **Why the pane offers them at all, when a native dialog exists.** The
+    /// dialog is one window and one moment: dismiss it, or miss it behind
+    /// another window, and the ceremony is still parked but nothing on screen
+    /// says so. The pane is where the user goes when a sign-in did not work, so
+    /// it is where the unanswered question belongs.
+    ///
+    /// Secret-free, like the OSC it mirrors: the `request_id` IS the credential
+    /// that authenticates a grant, so it travels only to the GUI-gated pane
+    /// route, never into a page-reachable one.
+    pub fn pending_ceremonies(&self) -> Vec<Value> {
+        let pending = self.pending.lock().unwrap();
+        let mut open: Vec<Value> = pending
+            .iter()
+            .filter(|(_, ceremony)| ceremony.outcome.is_none())
+            .map(|(request_id, ceremony)| {
+                json!({
+                    "request_id": request_id,
+                    "rp_id": ceremony.rp_id,
+                    "kind": ceremony.kind,
+                    "accounts": ceremony.accounts,
+                })
+            })
+            .collect();
+        // A HashMap iterates in an arbitrary order, and a pane that reshuffles
+        // its own buttons between two renders is one a user cannot click
+        // reliably. Order by the id, which is stable for the ceremony's life.
+        open.sort_by(|a, b| a["request_id"].as_str().cmp(&b["request_id"].as_str()));
+        open
     }
 
     /// Park until the ceremony has an outcome or the timeout fires, then consume
@@ -1034,7 +1162,7 @@ mod tests {
     #[test]
     fn a_grant_wakes_a_parked_ceremony_and_is_consumed() {
         let signer = Signer::new(1234, "sess".into());
-        signer.register("req-1");
+        signer.register("req-1", "example.com", "get", &[]);
 
         // Grant for a live ceremony succeeds, carrying the chosen account, and
         // is idempotent on repeat.

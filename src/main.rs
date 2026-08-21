@@ -1042,8 +1042,42 @@ fn run_status(as_json: bool) -> Result<()> {
             let depth = session["queue_depth"].as_u64().unwrap_or(0);
             let routable = session["routing_capable"].as_bool().unwrap_or(false);
             println!(
-                "  {env}  profile={profile}  queue={depth}  routable={}",
-                if routable { "yes" } else { "no" }
+                "  {env}  profile={profile}  queue={depth}  routable={}  passkeys={}",
+                if routable { "yes" } else { "no" },
+                // Same standard as `routable`: EXPLICITLY false, never merely
+                // absent. A daemon older than the presence channel omits the
+                // field, and "?" says "this daemon cannot answer" rather than
+                // inventing a "no" that would read as a fault in the surface.
+                match session["presence_reachable"].as_bool() {
+                    Some(true) => "yes",
+                    Some(false) => "NO",
+                    None => "?",
+                }
+            );
+        }
+        // ⛔ A SESSION THAT CANNOT ASK FOR APPROVAL CANNOT USE A PASSKEY, and
+        // nothing else on this host says so. The failure is silent by nature:
+        // the surface works, the vault is unlocked, the shim is installed, and
+        // every ceremony simply refuses. Named here with the fix, exactly as
+        // [NO PANES] is.
+        let no_presence: Vec<&str> = sessions
+            .iter()
+            .filter(|session| session["presence_reachable"].as_bool() == Some(false))
+            .filter_map(|session| session["env_id"].as_str())
+            .collect();
+        if !no_presence.is_empty() {
+            println!(
+                "  [NO PASSKEYS] {} session(s) have no view client publishing presence \
+                 requests, so a site asking for a passkey is refused rather than \
+                 approved:",
+                no_presence.len()
+            );
+            for env in &no_presence {
+                println!("  [NO PASSKEYS]   {env}");
+            }
+            println!(
+                "  [NO PASSKEYS] the client publishes on its surface tick; a session whose \
+                 ychrome predates that channel must be restarted."
             );
         }
         // A session whose CLI predates the control-token gate keeps its ad
@@ -1943,6 +1977,58 @@ mod second_invocation_tests {
             !drive.contains("emit_declare"),
             "the loop declares directly again, bypassing the register-then-declare \
              pairing that makes staleness impossible"
+        );
+    }
+
+    /// ⛔ THE SURFACE LOOP IS THE ONLY WAY A PASSKEY REQUEST REACHES A HUMAN.
+    ///
+    /// The signer runs inside the host daemon, whose stdout is `/dev/null`, and
+    /// the GUI routes a presence request by the STREAM it arrives on. This
+    /// process holds that stream, so a ceremony that this loop does not publish
+    /// is a ceremony nobody can approve — the page waits out the full two-minute
+    /// timeout and then reports a generic failure, which is exactly what the
+    /// button being broken would look like.
+    ///
+    /// Asserted on the loop with comments stripped, because the paragraph above
+    /// this one would otherwise satisfy the check by itself.
+    #[test]
+    fn the_surface_loop_publishes_passkey_requests_on_every_tick() {
+        let product = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source before the test module");
+        let drive = product
+            .split("fn drive_surface(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n/// The surface the picker").next())
+            .expect("drive_surface body present");
+        let code: String = drive
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let loop_body = code
+            .split("while !stop.load(")
+            .nth(1)
+            .expect("the surface loop body");
+        assert!(
+            loop_body.contains("publish_presence_requests(session)"),
+            "the surface loop stopped publishing presence requests: every passkey \
+             ceremony now parks for its full timeout with no dialog"
+        );
+        // On the TICK, not gated behind the ~4s heartbeat: a human is waiting on
+        // a dialog, and four seconds of nothing is a broken button.
+        let before_heartbeat = loop_body
+            .split("if ticks.is_multiple_of(20)")
+            .next()
+            .expect("the pre-heartbeat part of the tick");
+        assert!(
+            before_heartbeat.contains("publish_presence_requests(session)"),
+            "presence publishing moved behind the heartbeat gate, so a passkey \
+             dialog can now be up to a heartbeat late"
         );
     }
 
