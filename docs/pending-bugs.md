@@ -869,15 +869,54 @@ gate — park it rather than burning his codes.
 identifies the gap; a clean console with no outbound verify request means the
 click never reached the handler and the engine is not implicated.
 
-## ⛔ [11.2] MEDIA QUALITY (owner item 5): DIAGNOSED — the counters are dead and the engine crashes
+## ✅ [11.2] MEDIA QUALITY (owner item 5): THE FRONT-END COLLAPSE IS ANSWERED AND IT IS NOT OURS
 
-**Status:** OPEN, but no longer undiagnosed. Worked 2026-08-21 from outside the engine.
+**Status:** ⇒ **Report 1 CLOSED 2026-08-22 by seat 11.24.2, with probe evidence.** Report 2
+(YouTube frame overlaps) is unresolved and is what keeps this entry open.
 
-The two owner reports and what the measurements say about each:
+⚠ **This entry's title and its first hypothesis were both WRONG and are corrected here rather
+than quietly rewritten.** It said *"the counters are dead and the engine crashes"*: the crash
+is FIXED (`substrate.rs` compositing, 2026-08-21) and the dead-counter claim was withdrawn on
+an idle host. And it guessed the quality drop came from *"a player that measures frames itself
+and reacts to a real shortfall"* — **the measurement disproves exactly that.**
 
-1. **Front-end video starts high and falls back to prehistoric quality.** Consistent with a
-   player that measures frames itself and reacts to a real shortfall. ⚠ **Not confirmed** —
-   against a front-end instance or on an idle host.
+### ⭐ WHAT THE PROBES FOUND — report 1, closed
+
+Left to its own ABR the player collapses **1080p → 144p at t=6 s and never recovers**:
+
+```
+QUALITY  1920×1080 → 256×144   dir=-1  at=6s  buf=40.7s  upscale=4.16
+window   256×144 x 18 consecutive windows … buf climbing 40s -> 64s
+```
+
+⛔ **Two fields kill the shortfall hypothesis this entry used to carry:** `waits=0`, and a
+buffer **growing from 40 s to 64 s across the collapse**. There was no stall and no
+starvation — the buffer was filling while the picture fell apart, so there was no shortfall
+for a player to react to.
+
+**The player's own state names the cause.** At 144p it reported `systemBandwidth 9,762,989`
+(~35 Mbps throughput) while sitting on a **114 kbps** rendition; 1080p costs 5.38 Mbps. Its
+quality ladder is **unsorted and duplicated** — `240,360,480,720,144,720,1080,144,240,…` with
+the 144p entries in the MIDDLE of the array — and the player selects by walking that array.
+
+**The closing experiment settles it:** pin the ladder to 1080p, change nothing else ⇒ 1920×1080
+sustained indefinitely, 64 s buffer, no stalls. ⇒ **Decode, network, compositing and
+presentation are all fine. The only broken component is the ABR's choice**, and it lives in the
+front-end instance's DASH manifest — not in ychrome, yggterm or WebKitGTK.
+
+**Fix (owner's, not this repo's):** regenerate the manifest with representations sorted and
+de-duplicated, or set the instance's stored DASH quality preference. ⚠ A `quality_dash` URL
+parameter is **not** honoured — tested; it is a stored account preference.
+
+⇒ Full write-up, including the probe design: `~/git/journal-papers/ytrace/` (PRIVATE).
+
+⛔ **A FACT THIS LANE PASSED DOWNSTREAM RULED OUT THE WRONG THING.** A brief written by seat
+11.24 stated *"5 DRI render-node fds at 14 % CPU ⇒ hardware decode is engaged, decode is not
+the bottleneck"*. **DRI render-node descriptors prove GL, not decode.** The conclusion happened
+to be right and the reasoning was one layer off, which is worse than being wrong — it travels.
+
+### STILL OPEN — report 2
+
 2. **YouTube shows frame overlaps while nerdview reports no dropped frames.** ⇒ **Partly
    explained.** `droppedVideoFrames` under-reports by roughly thirty to one, so nerdview
    reporting nothing is consistent with a large shortfall and is not evidence of health.
