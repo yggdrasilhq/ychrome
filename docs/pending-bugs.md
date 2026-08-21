@@ -55,7 +55,7 @@ indicator that blinks on quiet rows is worse than none, because he stops trustin
 
 ## ⭐⭐ OWNER-REQUESTED: EVERY EXTENSION GETS A MODAL BUTTON, AND THE EXTENSIONS GO FULL-FLEDGED
 
-**Status:** OPEN, requested 2026-08-22. Handed to seat 11.27.
+**Status:** OPEN, requested 2026-08-22. Handed to seat 11.24.3.
 
 *"I want our extension features in ychrome to be full fledged and not a half hearted
 implementation. Make each extension a modal producing button like yggterm settings and
