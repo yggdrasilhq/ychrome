@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        SponsorBlock
-// @version     2.0.0
+// @version     2.1.0
 // @match       https://*.youtube.com/*
 // @match       https://youtube.com/*
 // @world       isolated
@@ -139,12 +139,24 @@ function ysbHostAllowed(host) {
         chapter: 'chapter'
     };
 
+    // ⛔⛔ THE CATEGORIES LIVE UNDER `.categories`, AND READING THEM ONE LEVEL
+    // TOO HIGH IS A BUG THAT SHIPPED. Until v2.1.0 this read `injected[id]`
+    // while ychrome has always written `{categories:{...}, hosts:[...]}` — so
+    // EVERY per-category choice made in the settings pane was silently ignored
+    // and the table below was what actually ran. Nothing reported it: the pane
+    // stored the choice, the preamble carried it, and the script read past it.
+    //
+    // ⚠ The old test could not catch it. It asserted that each category id and
+    // colour APPEARED somewhere in the preamble text, which is true of the
+    // nested shape too. `the_script_reads_the_behaviour_ychrome_writes` now runs
+    // this file against a real preamble under node and reads the answer back.
     function config() {
         var injected = window.__ysbConfig;
+        var table = (injected && injected.categories) || {};
         var out = {};
         for (var id in DEFAULTS) {
             if (!Object.prototype.hasOwnProperty.call(DEFAULTS, id)) continue;
-            var entry = injected && injected[id];
+            var entry = table[id];
             var behaviour = entry && typeof entry.behaviour === 'string'
                 ? entry.behaviour
                 : DEFAULTS[id];
@@ -154,6 +166,29 @@ function ysbHostAllowed(host) {
             };
         }
         return out;
+    }
+
+    // The settings that are not per-category. `src/sponsorblock.rs` owns the
+    // defaults; these are the fallback for a copy of this file deployed by hand
+    // with nothing to configure it, and they must agree with that module — which
+    // `the_script_preference_defaults_match_this_module` locks.
+    function prefs() {
+        var injected = window.__ysbConfig || {};
+        var min = typeof injected.min_duration_secs === 'number' && isFinite(injected.min_duration_secs)
+            ? Math.max(0, Math.min(30, injected.min_duration_secs))
+            : 0;
+        return {
+            skip_notice: injected.skip_notice !== false,
+            seek_bar_markers: injected.seek_bar_markers !== false,
+            min_duration_secs: min,
+            // ⛔ Off unless ychrome says otherwise, in BOTH directions: a copy of
+            // this file with no preamble must never start contributing to a
+            // shared public database on its own.
+            voting: injected.voting === true,
+            submission: injected.submission === true,
+            // The write credential. Present only while contributing is on.
+            userId: typeof injected.private_user_id === 'string' ? injected.private_user_id : null
+        };
     }
 
     // --------------------------------------------------------------- the API
@@ -332,6 +367,21 @@ function ysbHostAllowed(host) {
         });
     }
 
+    // The shortest segment worth acting on. A sub-second submission fires a
+    // notice for a seek nobody would have noticed; past a few seconds the knob
+    // stops filtering noise and starts hiding sponsors, so ychrome caps it.
+    //
+    // ⛔ LABEL segments are exempt. `poi_highlight` is a single INSTANT and
+    // `exclusive_access` is a whole-video notice — measuring either against a
+    // minimum length would silently delete the two categories that have no
+    // length to speak of.
+    function longEnough(seg) {
+        var min = prefs().min_duration_secs;
+        if (!min) return true;
+        if (seg.actionType === 'poi' || seg.actionType === 'full') return true;
+        return (seg.end - seg.start) >= min;
+    }
+
     function durationOk(seg, duration) {
         // 0 means the submitter recorded no duration: no claim, so no refusal.
         if (!seg.videoDuration) return true;
@@ -381,6 +431,7 @@ function ysbHostAllowed(host) {
         var shaped = [];
         preferLocked(state.raw).forEach(function (seg) {
             if (!durationOk(seg, duration)) return;
+            if (!longEnough(seg)) return;
             var behaviour = behaviourOf(seg, cfg);
             if (!behaviour) return;
             if (state.ignored[seg.UUID]) return;
@@ -390,6 +441,7 @@ function ysbHostAllowed(host) {
                 category: seg.category,
                 behaviour: behaviour,
                 uuid: seg.UUID,
+                actionType: seg.actionType || 'skip',
                 description: seg.description || '',
                 color: cfg[seg.category].color
             });
@@ -590,7 +642,13 @@ function ysbHostAllowed(host) {
         return el;
     }
 
+    // ⛔ `skip_notice` off silences the pill and NOTHING ELSE — the skip still
+    // happens. And it takes the UNDO with it, which is the whole cost of the
+    // setting: undo lives on the notice and there is no other way back into a
+    // segment ychrome has just seeked past. That is why the default is on and
+    // why `sidebar` says so beside the switch rather than in a document.
     function notice(text, onUndo) {
+        if (!prefs().skip_notice) return;
         var host = overlay();
         if (!host) return;
         if (host.notice) host.notice.remove();
@@ -665,6 +723,11 @@ function ysbHostAllowed(host) {
         } else {
             dropButton('highlight');
         }
+
+        // The opt-in half. It draws nothing at all unless ychrome's settings
+        // turned it on, so a user who never asked to contribute sees exactly
+        // the surface they saw before it existed.
+        updateContribution(t);
     }
 
     var labelled = null;
@@ -686,6 +749,13 @@ function ysbHostAllowed(host) {
     var markers = null;
     function renderMarkers() {
         var bar = document.querySelector('.ytp-progress-bar');
+        // Switched off: take down anything already drawn rather than merely
+        // stopping — a marker left behind by the render that ran before the
+        // setting changed would sit on the scrubber for the rest of the page.
+        if (!prefs().seek_bar_markers) {
+            if (markers) { markers.remove(); markers = null; }
+            return;
+        }
         if (!bar || !state.duration) {
             if (markers) { markers.remove(); markers = null; }
             return;
@@ -716,12 +786,265 @@ function ysbHostAllowed(host) {
         });
     }
 
+    // --------------------------------------------------- contributing (opt-in)
+
+    // ⛔⛔ EVERYTHING BELOW WRITES TO A SHARED PUBLIC DATABASE, and none of it
+    // runs unless ychrome's settings pane says the user turned it on. Reading
+    // segments is anonymous by construction (the hash-prefix query above);
+    // contributing cannot be, because the server counts votes per user and
+    // publishes a submitter's record. So:
+    //
+    //   * `prefs().voting` / `prefs().submission` gate every call site,
+    //   * `prefs().userId` is absent unless one of them is on, and a missing id
+    //     REFUSES the request rather than sending an anonymous one — an
+    //     unattributed vote is not a lighter version of a vote, it is a
+    //     malformed one,
+    //   * ⚠ A SUBMISSION SENDS THE VIDEO ID IN THE CLEAR. It has to: the point
+    //     is to say "this video has a sponsor here". The submit button says so
+    //     at the moment of pressing, because that is the one place a privacy
+    //     cost can still be declined.
+    var CONTRIB_API = 'https://sponsor.ajay.app/api/';
+    // The categories a user may submit under. Deliberately the SKIPPABLE ones
+    // only: `chapter` needs a name this UI has no field for, and the two label
+    // categories are not things a viewer marks a range for.
+    var SUBMIT_CATEGORIES = ['sponsor', 'selfpromo', 'interaction', 'intro', 'outro', 'preview', 'music_offtopic', 'filler'];
+
+    var contrib = {
+        marking: null,  // { start } while a range is half-marked
+        queue: [],      // { start, end, category } marked but not sent
+        voted: {},      // UUID -> 1 | 0, so a row can show what you already said
+        busy: false,
+        lastError: null
+    };
+
+    function contribFetch(path, options) {
+        contrib.busy = true;
+        publish();
+        return fetch(CONTRIB_API + path, options).then(function (resp) {
+            contrib.busy = false;
+            if (!resp.ok) {
+                // The API answers a refusal in plain text, and it is worth
+                // showing: "duplicate", "rate limited" and "your submission
+                // overlaps" are three different things the user can act on.
+                return resp.text().then(function (text) {
+                    throw new Error((text || '').slice(0, 160) || ('HTTP ' + resp.status));
+                });
+            }
+            return resp;
+        }).catch(function (error) {
+            contrib.busy = false;
+            contrib.lastError = String(error && error.message || error);
+            publish();
+            throw error;
+        });
+    }
+
+    // A vote on one community segment. `up` true = it is right, false = it is
+    // wrong. Upstream's own encoding: type=1 upvote, type=0 downvote.
+    function voteOn(seg, up) {
+        var cfg = prefs();
+        if (!cfg.voting || !cfg.userId || !seg || !seg.uuid) return;
+        var params = 'UUID=' + encodeURIComponent(seg.uuid) +
+            '&userID=' + encodeURIComponent(cfg.userId) +
+            '&type=' + (up ? '1' : '0');
+        contribFetch('voteOnSponsorTime?' + params, { method: 'POST' }).then(function () {
+            contrib.voted[seg.uuid] = up ? 1 : 0;
+            notice('Voted: this ' + (LABELS[seg.category] || seg.category) + ' is ' +
+                (up ? 'right' : 'wrong'), null);
+            publish();
+        }).catch(function (error) {
+            notice('Vote failed: ' + error.message, null);
+        });
+    }
+
+    function markStart() {
+        if (!bound) return;
+        contrib.marking = { start: bound.currentTime };
+        publish();
+    }
+
+    function markEnd() {
+        if (!bound || !contrib.marking) return;
+        var start = contrib.marking.start;
+        var end = bound.currentTime;
+        contrib.marking = null;
+        if (end <= start) {
+            notice('That end is before the start — mark again.', null);
+            publish();
+            return;
+        }
+        contrib.queue.push({ start: start, end: end, category: null });
+        publish();
+    }
+
+    function abandonMark() {
+        contrib.marking = null;
+        publish();
+    }
+
+    function dropQueued(index) {
+        contrib.queue.splice(index, 1);
+        publish();
+    }
+
+    // ⛔ Nothing leaves this browser until every queued range has a category AND
+    // the user presses submit. A half-described segment sent on a timer would be
+    // a submission the user never made.
+    function submitQueue() {
+        var cfg = prefs();
+        if (!cfg.submission || !cfg.userId || !state.videoId) return;
+        var ready = contrib.queue.filter(function (row) { return !!row.category; });
+        if (!ready.length) {
+            notice('Give each marked range a category first.', null);
+            return;
+        }
+        var body = {
+            videoID: state.videoId,
+            userID: cfg.userId,
+            segments: ready.map(function (row) {
+                return {
+                    segment: [row.start, row.end],
+                    category: row.category,
+                    actionType: 'skip'
+                };
+            })
+        };
+        contribFetch('skipSegments', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        }).then(function () {
+            contrib.queue = contrib.queue.filter(function (row) { return !row.category; });
+            notice('Submitted ' + ready.length + ' segment' + (ready.length === 1 ? '' : 's') +
+                '. Thank you.', null);
+            // Re-ask, so what was just contributed appears like anyone else's.
+            cacheDrop(state.videoId);
+            if (state.videoId) fetchSegments(state.videoId);
+            publish();
+        }).catch(function (error) {
+            notice('Submission refused: ' + error.message, null);
+        });
+    }
+
+    // A pill carrying SEVERAL buttons — the vote pair, the category chooser.
+    // `pill` above takes one action and is the right shape for a notice; this is
+    // the right shape for a choice.
+    function choicePill(key, text, choices) {
+        var host = overlay();
+        if (!host) return;
+        var existing = host.buttons[key];
+        if (existing && existing.isConnected && existing.dataset.text === text) return;
+        if (existing) { existing.remove(); }
+        var el = document.createElement('div');
+        el.dataset.text = text;
+        el.style.cssText = 'background:rgba(20,20,24,.92);color:#e8e8ea;padding:8px 14px;' +
+            'border-radius:9px;box-shadow:0 2px 12px rgba(0,0,0,.4);' +
+            'display:flex;align-items:center;gap:8px;pointer-events:auto;' +
+            'flex-wrap:wrap;max-width:min(420px,60vw);';
+        var label = document.createElement('span');
+        label.textContent = text;
+        el.appendChild(label);
+        choices.forEach(function (choice) {
+            var button = document.createElement('button');
+            button.textContent = choice.label;
+            button.title = choice.title || choice.label;
+            button.style.cssText = 'all:unset;cursor:pointer;color:#8ab4f8;font-weight:600;' +
+                'padding:2px 6px;border-radius:4px;border:1px solid rgba(138,180,248,.35);';
+            button.addEventListener('click', function (event) {
+                event.preventDefault();
+                event.stopPropagation();
+                choice.run();
+            }, false);
+            el.appendChild(button);
+        });
+        host.buttons[key] = el;
+        host.root.appendChild(el);
+    }
+
+    function updateContribution(t) {
+        var cfg = prefs();
+
+        // VOTE: on the segment the playhead is inside, whatever ychrome does
+        // with it — you can only judge one you can see.
+        var inside = null;
+        for (var i = 0; i < state.segments.length; i++) {
+            var seg = state.segments[i];
+            if (seg.behaviour === 'label') continue;
+            if (t >= seg.start && t <= seg.end) { inside = seg; break; }
+        }
+        if (cfg.voting && cfg.userId && inside && contrib.voted[inside.uuid] === undefined) {
+            (function (seg) {
+                choicePill('vote', 'This ' + (LABELS[seg.category] || seg.category) + '?', [
+                    { label: '👍', title: 'the segment is right', run: function () { voteOn(seg, true); dropButton('vote'); } },
+                    { label: '👎', title: 'the segment is wrong', run: function () { voteOn(seg, false); dropButton('vote'); } }
+                ]);
+            })(inside);
+        } else {
+            dropButton('vote');
+        }
+
+        // SUBMIT: mark a range, name it, send it.
+        if (!cfg.submission || !cfg.userId) {
+            dropButton('mark');
+            dropButton('category');
+            dropButton('submit');
+            return;
+        }
+        if (contrib.marking) {
+            choicePill('mark', 'Marking from ' + clock(contrib.marking.start), [
+                { label: 'End here', title: 'close the range at the playhead', run: markEnd },
+                { label: 'Cancel', title: 'forget this range', run: abandonMark }
+            ]);
+        } else {
+            choicePill('mark', 'Mark a segment', [
+                { label: 'Start here', title: 'open a range at the playhead', run: markStart }
+            ]);
+        }
+
+        var unnamed = -1;
+        for (var q = 0; q < contrib.queue.length; q++) {
+            if (!contrib.queue[q].category) { unnamed = q; break; }
+        }
+        if (unnamed >= 0) {
+            (function (index, row) {
+                var choices = SUBMIT_CATEGORIES.map(function (id) {
+                    return {
+                        label: LABELS[id] || id,
+                        title: 'file ' + clock(row.start) + '–' + clock(row.end) + ' as ' + (LABELS[id] || id),
+                        run: function () { row.category = id; dropButton('category'); publish(); }
+                    };
+                });
+                choices.push({ label: 'Discard', title: 'drop this range', run: function () { dropQueued(index); dropButton('category'); } });
+                choicePill('category', clock(row.start) + '–' + clock(row.end) + ' is a…', choices);
+            })(unnamed, contrib.queue[unnamed]);
+        } else {
+            dropButton('category');
+        }
+
+        var ready = contrib.queue.filter(function (row) { return !!row.category; }).length;
+        if (ready) {
+            // ⚠ The privacy cost, at the one moment it can still be declined.
+            choicePill('submit', ready + ' ready — submitting names this video publicly', [
+                { label: contrib.busy ? 'Sending…' : 'Submit', title: 'send to sponsor.ajay.app', run: submitQueue }
+            ]);
+        } else {
+            dropButton('submit');
+        }
+    }
+
+    function clock(seconds) {
+        var whole = Math.max(0, Math.floor(seconds));
+        var mins = Math.floor(whole / 60);
+        var secs = whole % 60;
+        return mins + ':' + (secs < 10 ? '0' : '') + secs;
+    }
+
     // ------------------------------------------------- the instrument, and SPA
 
     function publish() {
         try {
             var payload = {
-                version: '2.0.0',
+                version: '2.1.0',
                 videoId: state.videoId,
                 lookups: state.lookups,
                 skipped: state.skipped,
@@ -730,6 +1053,29 @@ function ysbHostAllowed(host) {
                 cached: state.cached,
                 bound: !!bound,
                 adShowing: adShowing(),
+                // ⭐ What is switched on, so "SponsorBlock did nothing" can be
+                // told apart from "SponsorBlock is off here" without opening
+                // the settings pane. `contributing` reports the SWITCHES and
+                // the QUEUE — never the id, which is a write credential.
+                prefs: (function () {
+                    var cfg = prefs();
+                    return {
+                        skip_notice: cfg.skip_notice,
+                        seek_bar_markers: cfg.seek_bar_markers,
+                        min_duration_secs: cfg.min_duration_secs,
+                        voting: cfg.voting,
+                        submission: cfg.submission,
+                        identified: !!cfg.userId
+                    };
+                })(),
+                contributing: {
+                    marking: !!contrib.marking,
+                    queued: contrib.queue.length,
+                    named: contrib.queue.filter(function (row) { return !!row.category; }).length,
+                    votes: Object.keys(contrib.voted).length,
+                    busy: contrib.busy,
+                    error: contrib.lastError
+                },
                 segments: state.segments.map(function (seg) {
                     return {
                         start: Math.round(seg.start * 1000) / 1000,
@@ -768,8 +1114,20 @@ function ysbHostAllowed(host) {
             state.duration = null;
             if (muteHold && bound) { bound.muted = muteHold.wasMuted; }
             muteHold = null;
+            // ⛔ A half-marked range belongs to the video it was marked in. A
+            // queue that survived an SPA navigation would submit one video's
+            // timestamps against another's id — a wrong submission the user
+            // would never see themselves make.
+            contrib.marking = null;
+            contrib.queue = [];
+            contrib.voted = {};
+            contrib.lastError = null;
             dropButton('manual');
             dropButton('highlight');
+            dropButton('vote');
+            dropButton('mark');
+            dropButton('category');
+            dropButton('submit');
             onDuration();
             if (videoId) fetchSegments(videoId);
             publish();
@@ -798,6 +1156,8 @@ function ysbHostAllowed(host) {
     window.__ysb = {
         state: state,
         config: config,
+        prefs: prefs,
+        contrib: contrib,
         rescan: rescan,
         recompute: recompute
     };

@@ -109,3 +109,48 @@ it cannot express actually turns up.
 campaign 11"* — or, in the fleet's own terms, *"re-subscribe me under campaign 11 with a
 longer max-hours."* There is no verb for "subscribe to 11.0" because 11.0 is a row, and the
 thing that keeps a row alive is the booter, not the orchestrator.
+
+---
+
+## 4. THE LAND OF `lane/dev/11.24-ychrome` IS ORPHANED — it needs an owner, and it is not blocked
+
+**Filed 2026-08-22 01:5x.** Nothing is lost; this is about who cuts.
+
+**What happened, measured rather than inferred.** 11.0's last message to this row said the
+branch was deliberately not landed and *"it stays yours to call: tell me when both are at a
+clean stopping point and I will land it in one cut."* Then, from the booter's own log:
+
+```
+00:41:43  d1095cc8  campaign 11  age=3.2h boots=0
+00:42:06  unsubscribed d1095cc8…
+01:01:17  d1095cc8… was not subscribed
+```
+
+⇒ **It unsubscribed itself and stood down twenty-three seconds later.** It did not crash — no
+process carries its uuid, it is absent from `live_sessions`, and its transcript stopped. It
+followed the landing procedure correctly.
+
+⛔ **But it promised to act on a signal and then retired without a successor to receive it.**
+That is the same shape as three other findings tonight: a request written to a channel with no
+reader. The land is now owned by nobody.
+
+### WHAT IS AND IS NOT AT RISK
+
+- ⭐ **Nothing is lost.** The branch is 9 ahead of `main`, fully pushed. Two seats keep
+  committing to it safely. Work accumulates; it simply does not reach `main`.
+- ⛔ **The condition is not met yet anyway**, so this is not urgent today: at the last check the
+  shared worktree was dirty and 11.24.3 was mid-edit.
+
+### RECOMMENDATION
+
+**When the condition is met — clean tree AND both `11.24.1` and `11.24.3` idle >15 min — the
+branch should simply be landed**, by this row or by whoever holds the campaign then. The
+standing instruction *"do not merge to main, 11.0 lands branches"* had a premise that no longer
+holds, and a branch nobody may cut is worse than a cut made by the lane that wrote it.
+
+⚠ **Not done unilaterally tonight**, and the reason is 11.0's own: two lanes are still
+committing, and cutting across in-flight work is what its message warned against. That
+reasoning survives its author.
+
+⇒ **If you want a standing orchestrator instead, that is a role with its own charter and it
+should be spawned deliberately, not improvised by a lane.** Deliberately not done here.
