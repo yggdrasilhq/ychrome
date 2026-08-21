@@ -208,7 +208,32 @@ pub fn policy(profile: &str) -> Policy {
         .flat_map(|dir| enabled_scripts(dir))
         .filter_map(|path| {
             let body = std::fs::read_to_string(&path).ok()?;
-            promote_or_refuse(&path, crate::userscript::parse(&body))
+            let mut script = promote_or_refuse(&path, crate::userscript::parse(&body))?;
+            // ⭐ CUSTOM SITE ACCESS, applied where the script's IDENTITY is still
+            // in hand — a `Userscript` is a parsed body and carries no stem, so
+            // the path is the only place this question can be asked.
+            //
+            // ⛔ Widened HERE rather than in the file. The bundled asset declares
+            // YouTube in its own `@match` header and must stay byte-identical to
+            // the release copy: rewriting it is exactly the state
+            // `crate::provision` reads as "the user edited this, leave it alone",
+            // after which the script would never be updated again.
+            //
+            // `sponsorblock::match_patterns` is the ONE owner, shared with the
+            // settings script injected beside it and with the allow-list that
+            // script carries into the page. Three things have to agree, and two
+            // of the three agreeing gives a script that loads and refuses to
+            // act — the failure that is hardest to read.
+            if path.file_stem().and_then(|stem| stem.to_str())
+                == Some(crate::extensions::SPONSORBLOCK_STEM)
+            {
+                for pattern in crate::sponsorblock::match_patterns() {
+                    if !script.matches.contains(&pattern) {
+                        script.matches.push(pattern);
+                    }
+                }
+            }
+            Some(script)
         })
         .collect();
 

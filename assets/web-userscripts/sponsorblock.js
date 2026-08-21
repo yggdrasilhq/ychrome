@@ -49,10 +49,50 @@
 // which owns the catalogue). DEFAULTS below is the fallback for a copy of this
 // file deployed by hand with nothing to configure it, and a Rust test locks the
 // two tables together.
+// Is `host` a place this script may act?
+//
+// YouTube by name, then the user's own list from `window.__ysbConfig.hosts`. A
+// configured host matches itself and its sub-domains, which is what the engine's
+// `@match` patterns do — the two must agree.
+//
+// ⛔ Compared as whole LABELS, never as a substring: `indexOf` would let
+// `notyoutube.com.evil.test` through, and the configured list is exactly the
+// place a typo becomes a permission.
+function ysbHostAllowed(host) {
+    host = String(host || '').toLowerCase();
+    var allowed = ['youtube.com'];
+    try {
+        var extra = (window.__ysbConfig && window.__ysbConfig.hosts) || [];
+        for (var i = 0; i < extra.length; i += 1) {
+            if (typeof extra[i] === 'string' && extra[i]) allowed.push(extra[i].toLowerCase());
+        }
+    } catch (_error) {
+        // A malformed config must not cost the user YouTube itself.
+    }
+    for (var j = 0; j < allowed.length; j += 1) {
+        if (host === allowed[j] || host.endsWith('.' + allowed[j])) return true;
+    }
+    return false;
+}
+
 (function () {
     'use strict';
     if (window.__ysb) return;
-    if (!/(^|\.)youtube\.com$/.test(location.hostname)) return;
+    // WHERE THIS RUNS. YouTube always, plus any host the user configured
+    // (src/sponsorblock.rs owns the list and injects it here). A front-end
+    // serving YouTube's catalogue serves the same VIDEO IDS, so the community
+    // database answers for it exactly as it does for YouTube.
+    //
+    // ⛔ The engine has already gated injection on the matching `@match`
+    // patterns; this is the second half of the same rule, and both come from
+    // one owner. A gate that disagreed with the patterns would give a script
+    // that loads and then refuses to act — which looks like a broken feature
+    // rather than a misconfigured one.
+    //
+    // ⚠ No host is hardcoded here beyond YouTube itself. An instance address is
+    // the user's own infrastructure and belongs in their config, not in a
+    // shipped asset.
+    if (!ysbHostAllowed(location.hostname)) return;
 
     // ---------------------------------------------------------------- config
 
