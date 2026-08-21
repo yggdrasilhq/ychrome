@@ -572,6 +572,24 @@ GUI's webview, so we serve the *effective* policy and yggterm applies it:
   the user meant it. `ychrome provision --json` runs the same call and prints the verdicts.
   Every bundled asset declares a version (`@version`, or `ruleset_version` in
   the sidecar) — a content hash cannot tell an old release from a user's edit.
+  ⛔⛔ **A VERSION COULD NOT EITHER, AND THAT MADE ASSETS UNDEPLOYABLE FOREVER.**
+  A version only decides this if a version identifies a BODY. Twice it did not:
+  the generated assets stamp `@version` from the wall clock, so a same-day
+  regeneration ships new bytes under an identical stamp; and a hand-edited asset
+  kept its hand-written stamp when someone forgot the bump. Both reached the last
+  arm — version equal, bytes differ — and returned `Forked`, which does not write
+  **and reads to a human as the user's own deliberate edit**, so nobody touches
+  it. It bit this repo's own shipped work: `sponsorblock.js` at an unchanged
+  `2.0.0`, 1,886 bytes different, unable to reach any host.
+  ⇒ **FIXED 2026-08-21 by a DELIVERY LEDGER.** A hash of what the provisioner
+  ITSELF wrote breaks the tie, because it records our act instead of inferring
+  about the file: `<id> <sha256>` in a `.delivered` dotfile beside the asset (not
+  a `.js`, same reasoning as `.deleted`). Bytes differ **and** match what we last
+  wrote ⇒ `Verdict::Stale` ⇒ write. Bytes differ and do not ⇒ `Forked` ⇒ keep.
+  ⭐ **`Current` records too** — that is what arms a host that is already in sync,
+  which is the common case and the one the trap springs on next. A host already
+  stuck at `Forked` cannot be rescued: nothing was recorded, so keep is still the
+  only honest answer, and it needs a version bump or a removal on that host.
 - An adblock RULESET change needs a yggterm restart (WebKit compiles the filter
   once per GUI process). Toggling it off, and every userscript change, take
   effect on the next surface (re)create — the pane's "Reload surface now" button
