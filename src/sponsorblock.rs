@@ -274,7 +274,10 @@ fn site_is_wellformed(host: &str) -> bool {
 /// policy build, and a hand-edited file with one bad line must not cost the user
 /// the rest of their configuration.
 pub fn sites() -> Vec<String> {
-    let config = read_config();
+    sites_from(&read_config())
+}
+
+fn sites_from(config: &Value) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for value in config["sites"].as_array().into_iter().flatten() {
         let Some(host) = value.as_str() else { continue };
@@ -340,6 +343,203 @@ pub fn match_patterns() -> Vec<String> {
     patterns
 }
 
+/// The settings that are not per-category.
+///
+/// Held in the SAME file as the category choices, one level up from
+/// `categories`, so there is one config to read and one stamp over it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Preferences {
+    /// Say so when a segment is skipped, with the Undo that goes with it.
+    ///
+    /// ⚠ Default ON, and it is not decoration: the notice carries the ONLY undo
+    /// there is. Turning it off is a real choice — silent seeking with no way
+    /// back — so it is offered, and it is not the default.
+    pub skip_notice: bool,
+    /// Draw the segments on the seek bar.
+    pub seek_bar_markers: bool,
+    /// Ignore any segment shorter than this many seconds. `0` = act on all.
+    ///
+    /// Upstream's own knob, for the sub-second submissions that fire a notice
+    /// for a seek nobody would have noticed.
+    pub min_duration_secs: f64,
+    /// ⛔ Let the user VOTE on segments. Off by default — see [`Contributing`].
+    pub voting: bool,
+    /// ⛔ Let the user SUBMIT segments. Off by default — see [`Contributing`].
+    pub submission: bool,
+}
+
+/// ⛔⛔ **THE CONTRIBUTING PLANE, AND WHY IT IS OFF BY DEFAULT.**
+///
+/// Voting and submission are the two things SponsorBlock does that **WRITE to a
+/// shared public database**, and they are the only ones here that need a
+/// PERSISTENT PSEUDONYMOUS IDENTITY: the server counts votes per user and
+/// publishes a submitter's record, so the moment either is on, this browser
+/// carries a stable id that links every video you contribute about into one
+/// visible trail. Reading segments needs no such thing — the client asks by
+/// hash prefix precisely so it can stay anonymous.
+///
+/// That asymmetry is the whole reason these are separated from every other
+/// setting rather than sitting in the list above:
+///
+/// 1. **Explicit.** Nothing turns them on but the user.
+/// 2. **Off by default.** A privacy property nobody chose to give up is one
+///    they still have.
+/// 3. **The consequence is stated where they are turned on**, not in a document
+///    — `sidebar` draws this module's own words beside the switches, and
+///    `the_contributing_switches_state_their_cost_where_they_are_offered` locks
+///    that they cannot be drawn without it.
+///
+/// The id is minted on the FIRST enable and kept until the user forgets it —
+/// keeping it is what makes their existing submissions still theirs, and
+/// re-minting silently on every toggle would scatter one person across several
+/// pseudonyms without telling them.
+pub struct Contributing;
+
+impl Contributing {
+    /// The sentence the pane must show beside the switches. Held here, with the
+    /// setting, so the warning cannot be edited away from the thing it warns
+    /// about — the same reason `useragent::OVERRIDE_WARNING` lives beside the
+    /// preset it warns about.
+    pub const WARNING: &'static str = "Voting and submitting WRITE to SponsorBlock's shared \
+         public database and need a permanent pseudonymous id for this browser, which links \
+         everything you contribute into one public record. Reading segments needs no id and \
+         stays anonymous. Both are off until you turn them on.";
+}
+
+/// Config keys for the flags, spelled once. They travel into the file, into the
+/// injected preamble and into a sidebar action id, exactly as the behaviour
+/// strings do.
+pub const PREF_SKIP_NOTICE: &str = "skip_notice";
+pub const PREF_SEEK_BAR_MARKERS: &str = "seek_bar_markers";
+pub const PREF_VOTING: &str = "voting";
+pub const PREF_SUBMISSION: &str = "submission";
+/// Not a flag; carried here so the one action grammar covers it.
+pub const PREF_MIN_DURATION: &str = "min_duration_secs";
+
+/// Every boolean preference, for a caller that has to enumerate them.
+pub const FLAGS: &[&str] = &[
+    PREF_SKIP_NOTICE,
+    PREF_SEEK_BAR_MARKERS,
+    PREF_VOTING,
+    PREF_SUBMISSION,
+];
+
+/// The longest segment ychrome will let a user declare uninteresting. Past a
+/// few seconds the knob stops filtering noise and starts hiding sponsors.
+pub const MAX_MIN_DURATION_SECS: f64 = 30.0;
+
+fn flag_from(config: &Value, key: &str, default: bool) -> bool {
+    config[key].as_bool().unwrap_or(default)
+}
+
+/// The effective preferences. One read of the file.
+pub fn preferences() -> Preferences {
+    preferences_from(&read_config())
+}
+
+fn preferences_from(config: &Value) -> Preferences {
+    Preferences {
+        skip_notice: flag_from(config, PREF_SKIP_NOTICE, true),
+        seek_bar_markers: flag_from(config, PREF_SEEK_BAR_MARKERS, true),
+        // Clamped on READ as well as on write: a hand-edited file must not be
+        // able to put the script into a state this build does not implement,
+        // which is the same rule `behaviour_from` follows for a category.
+        min_duration_secs: config[PREF_MIN_DURATION]
+            .as_f64()
+            .filter(|secs| secs.is_finite())
+            .map(|secs| secs.clamp(0.0, MAX_MIN_DURATION_SECS))
+            .unwrap_or(0.0),
+        voting: flag_from(config, PREF_VOTING, false),
+        submission: flag_from(config, PREF_SUBMISSION, false),
+    }
+}
+
+/// Set one boolean preference.
+///
+/// ⛔ Turning on voting or submission MINTS the pseudonymous id if there is not
+/// one yet — that is the act the user is consenting to, so it happens here,
+/// once, rather than lazily in the page where nothing could report it.
+pub fn set_flag(key: &str, on: bool) -> Result<()> {
+    if !FLAGS.contains(&key) {
+        anyhow::bail!("no SponsorBlock preference {key:?}");
+    }
+    let mut config = read_config();
+    config[key] = json!(on);
+    if on && (key == PREF_VOTING || key == PREF_SUBMISSION) && private_user_id_from(&config).is_none()
+    {
+        config[PRIVATE_USER_ID_KEY] = json!(mint_private_user_id()?);
+    }
+    write_config(&config)
+}
+
+/// Set the shortest segment worth acting on. Clamped, never refused: this is a
+/// slider, and a slider that rejects is a slider with a hidden rule.
+pub fn set_min_duration(secs: f64) -> Result<()> {
+    let secs = if secs.is_finite() { secs } else { 0.0 };
+    let mut config = read_config();
+    config[PREF_MIN_DURATION] = json!(secs.clamp(0.0, MAX_MIN_DURATION_SECS));
+    write_config(&config)
+}
+
+/// Where the pseudonymous id lives. One key, one owner.
+const PRIVATE_USER_ID_KEY: &str = "private_user_id";
+
+/// How many hex characters the minted id carries. SponsorBlock's own client
+/// mints a 36-character random local id; this is the same order of entropy
+/// (128 bits) in a shape that is trivially checkable.
+const PRIVATE_USER_ID_HEX: usize = 32;
+
+fn private_user_id_from(config: &Value) -> Option<String> {
+    config[PRIVATE_USER_ID_KEY]
+        .as_str()
+        .map(str::trim)
+        .filter(|id| id.len() == PRIVATE_USER_ID_HEX && id.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(ToOwned::to_owned)
+}
+
+/// The id this browser contributes under, if it has ever contributed.
+///
+/// ⛔ **This is a WRITE CREDENTIAL, not a name.** Anyone holding it can vote and
+/// submit as this user, and the server derives the PUBLIC id from it by hashing.
+/// So it never reaches a pane schema (see [`public_user_fingerprint`]) and it
+/// reaches the page only while contributing is actually switched on.
+pub fn private_user_id() -> Option<String> {
+    private_user_id_from(&read_config())
+}
+
+/// What the settings pane may show: the first characters of SHA-256 of the id,
+/// which is the same derivation the server publishes a submitter under.
+///
+/// ⛔ The private id itself must never travel in a schema — a schema is
+/// re-fetched on every open and re-sent on every action, and this one is a write
+/// credential. A fingerprint identifies the account to its owner without handing
+/// it to anyone.
+pub fn public_user_fingerprint() -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let id = private_user_id()?;
+    let digest = Sha256::digest(id.as_bytes());
+    Some(digest.iter().take(4).map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Forget the id. The next enable mints a new one, so this is "start a fresh
+/// pseudonym", and it is the only way to sever a browser from its record.
+pub fn forget_private_user_id() -> Result<()> {
+    let mut config = read_config();
+    if let Some(object) = config.as_object_mut() {
+        object.remove(PRIVATE_USER_ID_KEY);
+    }
+    write_config(&config)
+}
+
+/// 128 bits from the OS. Not `Date.now()`, not a counter: a guessable
+/// submission id is one anybody can vote with.
+fn mint_private_user_id() -> Result<String> {
+    let mut bytes = [0u8; PRIVATE_USER_ID_HEX / 2];
+    let mut file = std::fs::File::open("/dev/urandom").context("opening /dev/urandom")?;
+    std::io::Read::read_exact(&mut file, &mut bytes).context("reading /dev/urandom")?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 /// Every category's effective behaviour, catalogue order. One read of the file.
 pub fn effective() -> Vec<(&'static Category, &'static str)> {
     let config = read_config();
@@ -394,6 +594,36 @@ pub fn stamp() -> String {
         line.push_str(behaviour);
         line.push(';');
     }
+    // ⛔⛔ EVERY INPUT TO THE BODY, NOT JUST THE CATEGORIES. A stamp that names
+    // fewer inputs than the preamble has fails SILENTLY and in the worst
+    // possible way: the body is correct, only the version is stale, so the GUI
+    // never refetches and nothing anywhere reports a mismatch. This repo has
+    // caught that shape three times, which is why this list is written out
+    // rather than counted — and why `the_stamp_moves_for_every_input_to_the_
+    // preamble` drives each one and requires the stamp to move.
+    let prefs = preferences();
+    line.push_str(&format!(
+        "{PREF_SKIP_NOTICE}={};{PREF_SEEK_BAR_MARKERS}={};{PREF_MIN_DURATION}={};\
+         {PREF_VOTING}={};{PREF_SUBMISSION}={};",
+        prefs.skip_notice,
+        prefs.seek_bar_markers,
+        prefs.min_duration_secs,
+        prefs.voting,
+        prefs.submission,
+    ));
+    // The IDENTITY of the id, never the id: the stamp is a change detector that
+    // lands in a manifest, and a write credential does not belong in one.
+    line.push_str(&format!(
+        "id={};",
+        public_user_fingerprint().unwrap_or_else(|| "none".to_string())
+    ));
+    // The HOSTS decide where the script is injected at all, so a host added in
+    // the pane must move the stamp or the new site gets no script until
+    // something else happens to change.
+    for host in sites() {
+        line.push_str(&host);
+        line.push(',');
+    }
     line.push('\n');
     line
 }
@@ -404,29 +634,57 @@ pub fn stamp() -> String {
 /// belongs in the script that reads it, which is versioned and reviewable, not
 /// in a string built here.
 pub fn config_script_body() -> String {
-    let categories: serde_json::Map<String, Value> = effective()
-        .into_iter()
-        .map(|(category, behaviour)| {
+    config_script_body_from(&read_config())
+}
+
+/// The preamble for ONE config value.
+///
+/// Split from the disk read so a test can drive the EXACT production encoding
+/// with a config it chose — the same split `sidebar::settings_schema_from` uses,
+/// and what lets `the_script_reads_the_behaviour_ychrome_writes` be an
+/// end-to-end lock instead of a substring search.
+fn config_script_body_from(config: &Value) -> String {
+    let categories: serde_json::Map<String, Value> = catalog()
+        .iter()
+        .map(|category| {
             (
                 category.id.to_string(),
-                json!({ "behaviour": behaviour, "color": category.color }),
+                json!({
+                    "behaviour": behaviour_from(config, category),
+                    "color": category.color,
+                }),
             )
         })
         .collect();
+    let prefs = preferences_from(config);
     // ⛔ The HOSTS ride along, because the script's own run-time gate has to
     // agree with the `@match` patterns the engine gated injection on. A script
     // injected into a page it then refuses to act on is the failure mode that is
     // hardest to read: everything looks configured and nothing happens.
-    let config = json!({
+    let mut body = json!({
         "categories": Value::Object(categories),
-        "hosts": sites(),
+        "hosts": sites_from(config),
+        PREF_SKIP_NOTICE: prefs.skip_notice,
+        PREF_SEEK_BAR_MARKERS: prefs.seek_bar_markers,
+        PREF_MIN_DURATION: prefs.min_duration_secs,
+        PREF_VOTING: prefs.voting,
+        PREF_SUBMISSION: prefs.submission,
     });
+    // ⛔ THE ID RIDES ONLY WHILE CONTRIBUTING IS ON. It is a write credential
+    // for a shared public database, so a browser that is not contributing must
+    // not be carrying one into every YouTube page it opens — and a stored id
+    // the user has switched off is a record they have paused, not surrendered.
+    if prefs.voting || prefs.submission {
+        if let Some(id) = private_user_id_from(config) {
+            body[PRIVATE_USER_ID_KEY] = json!(id);
+        }
+    }
     format!(
         "// ychrome: SponsorBlock settings, generated from \
          ~/.yggterm/web-userscripts/sponsorblock.config.json.\n\
          // Not a file on disk — injected beside sponsorblock.js so the script \
          asset stays\n// byte-identical to the bundled one. Edit it from the \
-         settings pane.\nwindow.__ysbConfig = {config};\n",
+         settings pane.\nwindow.__ysbConfig = {body};\n",
     )
 }
 
@@ -752,6 +1010,221 @@ mod tests {
         assert!(
             !body.contains("function") && !body.contains("fetch("),
             "the config preamble must be a bare assignment: {body}"
+        );
+    }
+
+    fn scratch_dir(test: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("ychrome-sponsorblock-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn node_available() -> bool {
+        std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    /// ⛔⛔ THE LOCK THE OLD ONE ONLY LOOKED LIKE.
+    ///
+    /// `the_preamble_is_scoped_and_inert` asserted that every category id and
+    /// colour APPEARED somewhere in the preamble text. That is true of any
+    /// shape that mentions them — including the one that shipped, where ychrome
+    /// wrote `{categories:{sponsor:{…}}}` and the script read `injected.sponsor`
+    /// one level too high. Every per-category choice made in the settings pane
+    /// was discarded, in total silence, and the script's own default table was
+    /// what actually ran.
+    ///
+    /// So this runs BOTH HALVES TOGETHER: the exact production encoder, over a
+    /// config that is deliberately NOT the defaults, then the catalog's own
+    /// script body under node, and reads back what the script RESOLVED. A
+    /// substring proves a value was written; only this proves it was read.
+    #[test]
+    fn the_script_reads_the_behaviour_ychrome_writes() {
+        if !node_available() {
+            assert!(
+                std::env::var_os("YCHROME_ALLOW_NO_NODE").is_some(),
+                "node is needed to run the SponsorBlock config lock; install it, or set \
+                 YCHROME_ALLOW_NO_NODE=1 to knowingly ship without this proof"
+            );
+            return;
+        }
+        let ext = crate::extensions::find(crate::extensions::SPONSORBLOCK_STEM)
+            .expect("sponsorblock in catalog");
+        let dir = scratch_dir("config");
+        // The body from the CATALOG, not the asset path: a mis-pointed
+        // `include_str!` fails the behaviour lock too.
+        let script = dir.join("sponsorblock.js");
+        std::fs::write(&script, ext.body).expect("write the script under test");
+        let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sponsorblock-harness.js");
+
+        let run = |name: &str, config: Value, expectations: Value| {
+            let preamble = dir.join(format!("{name}-preamble.js"));
+            std::fs::write(&preamble, config_script_body_from(&config)).expect("write preamble");
+            let wants = dir.join(format!("{name}-expected.json"));
+            std::fs::write(&wants, expectations.to_string()).expect("write expectations");
+            let out = std::process::Command::new("node")
+                .arg(&harness)
+                .arg(&script)
+                .arg(&preamble)
+                .arg(&wants)
+                .output()
+                .expect("run the node harness");
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            assert!(
+                out.status.success() && stdout.contains("ALL OK"),
+                "sponsorblock harness failed on {name}:\n{stdout}\n{stderr}"
+            );
+        };
+
+        // ── every category moved OFF its default, so nothing can pass by
+        //    accidentally agreeing with the fallback table ──────────────────
+        let mut categories = serde_json::Map::new();
+        let mut expected_categories = serde_json::Map::new();
+        for category in catalog() {
+            let moved = category
+                .options
+                .iter()
+                .find(|option| **option != category.default)
+                .expect("every category offers something other than its default");
+            categories.insert(category.id.to_string(), json!(moved));
+            expected_categories.insert(category.id.to_string(), json!(moved));
+        }
+        let colors: serde_json::Map<String, Value> = catalog()
+            .iter()
+            .map(|category| (category.id.to_string(), json!(category.color)))
+            .collect();
+        run(
+            "moved",
+            json!({
+                "categories": Value::Object(categories),
+                PREF_SKIP_NOTICE: false,
+                PREF_SEEK_BAR_MARKERS: false,
+                PREF_MIN_DURATION: 4.5,
+                PREF_VOTING: true,
+                PREF_SUBMISSION: true,
+                PRIVATE_USER_ID_KEY: "0123456789abcdef0123456789abcdef",
+            }),
+            json!({
+                "categories": Value::Object(expected_categories),
+                "colors": Value::Object(colors),
+                "prefs": {
+                    "skip_notice": false,
+                    "seek_bar_markers": false,
+                    "min_duration_secs": 4.5,
+                    "voting": true,
+                    "submission": true,
+                },
+                "identified": true,
+            }),
+        );
+
+        // ── an EMPTY config: every default arrives, and contributing is off ──
+        let defaults: serde_json::Map<String, Value> = catalog()
+            .iter()
+            .map(|category| (category.id.to_string(), json!(category.default)))
+            .collect();
+        run(
+            "defaults",
+            json!({}),
+            json!({
+                "categories": Value::Object(defaults),
+                "prefs": {
+                    "skip_notice": true,
+                    "seek_bar_markers": true,
+                    "min_duration_secs": 0.0,
+                    "voting": false,
+                    "submission": false,
+                },
+                "identified": false,
+            }),
+        );
+
+        // ⛔ CONTRIBUTING OFF WITH AN ID ON FILE: the id must NOT ride. A stored
+        // pseudonym the user has switched off is a record they have paused, not
+        // one they have surrendered, and a browser that is not contributing has
+        // no business carrying a write credential into every YouTube page.
+        run(
+            "id-withheld",
+            json!({
+                PREF_VOTING: false,
+                PREF_SUBMISSION: false,
+                PRIVATE_USER_ID_KEY: "0123456789abcdef0123456789abcdef",
+            }),
+            json!({ "identified": false }),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The script's fallback preference table is a SECOND encoding of this
+    /// module's defaults, exactly as `DEFAULTS` is for the categories, and a
+    /// second encoding diverges. The harness above drives the empty-config case
+    /// through both halves, so this asserts the pair that case cannot see: that
+    /// the script's own literals say the same thing.
+    #[test]
+    fn the_script_preference_defaults_match_this_module() {
+        let defaults = preferences_from(&json!({}));
+        assert!(defaults.skip_notice && defaults.seek_bar_markers);
+        assert_eq!(defaults.min_duration_secs, 0.0);
+        assert!(
+            !defaults.voting && !defaults.submission,
+            "contributing must be OFF until the user turns it on"
+        );
+        // `!== false` is how the script spells "on unless told otherwise", and
+        // `=== true` is how it spells "off unless told otherwise". Getting
+        // either backwards would flip a default without changing this module.
+        assert!(
+            ASSET.contains("skip_notice: injected.skip_notice !== false"),
+            "the script's skip_notice default no longer matches this module"
+        );
+        assert!(
+            ASSET.contains("seek_bar_markers: injected.seek_bar_markers !== false"),
+            "the script's seek_bar_markers default no longer matches this module"
+        );
+        assert!(
+            ASSET.contains("voting: injected.voting === true"),
+            "the script must default voting OFF"
+        );
+        assert!(
+            ASSET.contains("submission: injected.submission === true"),
+            "the script must default submission OFF"
+        );
+    }
+
+    /// ⛔ A vote and a submission are the only two things here that WRITE, and
+    /// both need the id. A call site that could fire without one would be
+    /// sending a malformed request at best and an unattributed write at worst,
+    /// so the guard is asserted on the CODE of each entry point rather than on
+    /// the comment above it.
+    #[test]
+    fn nothing_writes_to_the_shared_database_without_an_explicit_switch_and_an_id() {
+        for (verb, needle) in [
+            ("voteOn", "if (!cfg.voting || !cfg.userId || !seg || !seg.uuid) return;"),
+            ("submitQueue", "if (!cfg.submission || !cfg.userId || !state.videoId) return;"),
+        ] {
+            assert!(
+                ASSET.contains(needle),
+                "{verb} lost its switch-and-id guard (looked for {needle:?})"
+            );
+        }
+        // …and the id can only ever have come from the preamble, which this
+        // module only fills while a switch is on.
+        assert!(
+            ASSET.contains("userId: typeof injected.private_user_id === 'string'"),
+            "the script must take its write credential from the injected config alone"
+        );
+        // The one place a video id leaves in the clear is a submission, and the
+        // button that does it has to say so.
+        assert!(
+            ASSET.contains("submitting names this video publicly"),
+            "the submit button must state the privacy cost where it is paid"
         );
     }
 

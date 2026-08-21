@@ -155,6 +155,91 @@ pub static LISTS: [FilterList; 9] = [
     },
 ];
 
+/// What the installed ruleset IS, for a surface that has to explain itself.
+///
+/// One owner, read by `ychrome adblock status` and by the settings pane's
+/// options dialog. Two readers computing "which lists is this from" separately
+/// is how a pane ends up describing a ruleset the CLI does not recognise.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Provenance {
+    /// Whether a ruleset is on this host's disk at all.
+    pub installed: bool,
+    /// Rules the installed ruleset carries. `None` when it will not parse —
+    /// which is worth showing, because ONE bad rule means no ad blocking at all
+    /// rather than one missing filter.
+    pub rule_count: Option<usize>,
+    /// The installed ruleset's declared version, dotted.
+    pub installed_version: Option<String>,
+    /// What this binary ships. Differs from `installed_version` on a host that
+    /// has not relaunched since an upgrade.
+    pub bundled_version: String,
+    /// The list names the sidecar says it was built from, with the source line
+    /// count each contributed. Empty when the sidecar is missing or has drifted
+    /// — every hand-copied ruleset reads this way, and that is a fact about the
+    /// host worth surfacing rather than hiding behind a rule count.
+    pub sources: Vec<(String, u64)>,
+    /// What the conversion produced, per LAYER, out of the sidecar's report.
+    ///
+    /// ⭐ Three layers do the blocking and they fail independently, so a surface
+    /// that reports one number cannot explain what is wrong. Network rules are
+    /// WebKit's; the cosmetic selectors and the scriptlet invocations are
+    /// carried by two generated userscripts that can be absent while the ruleset
+    /// is perfectly healthy — which is exactly the shape of the bug that
+    /// starved every host of scriptlets for weeks.
+    pub network_rules: Option<u64>,
+    pub network_exceptions: Option<u64>,
+    pub cosmetic_selectors: Option<u64>,
+    pub scriptlet_rules: Option<u64>,
+    /// Filters the converter could not translate. A real number, not a defect:
+    /// WebKit's dialect has no alternation and no arbitrary procedural
+    /// operators, so some of every list is untranslatable by construction.
+    pub untranslated: Option<u64>,
+}
+
+/// Read the installed ruleset's provenance off this host's disk.
+pub fn provenance() -> Provenance {
+    let mut out = Provenance {
+        bundled_version: bundled_ruleset_version().to_string_dotted(),
+        ..Provenance::default()
+    };
+    let Ok(dir) = adblock_dir() else {
+        return out;
+    };
+    let rules_path = dir.join(RULESET_FILE);
+    if let Ok(raw) = std::fs::read_to_string(&rules_path) {
+        out.installed = true;
+        out.rule_count = serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|value| value.as_array().map(Vec::len));
+    }
+    out.installed_version =
+        installed_ruleset_version(&rules_path).map(|version| version.to_string_dotted());
+    if let Ok(raw) = std::fs::read_to_string(dir.join(RULESET_META_FILE))
+        && let Ok(meta) = serde_json::from_str::<Value>(&raw)
+    {
+        out.sources = meta["sources"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        let name = row.as_str().or_else(|| row["name"].as_str())?;
+                        Some((name.to_string(), row["lines"].as_u64().unwrap_or(0)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let report = &meta["report"];
+        out.network_rules = report["network_block"].as_u64();
+        out.network_exceptions = report["network_exception"].as_u64();
+        out.cosmetic_selectors = report["cosmetic_domain_selectors"]
+            .as_u64()
+            .map(|domain| domain + report["cosmetic_generic_selectors"].as_u64().unwrap_or(0));
+        out.scriptlet_rules = report["scriptlet_rules"].as_u64();
+        out.untranslated = report["dropped_total"].as_u64();
+    }
+    out
+}
+
 /// `~/.yggterm/web-adblock` on the host ychrome runs on.
 pub fn adblock_dir() -> Result<PathBuf> {
     Ok(dirs::home_dir()
