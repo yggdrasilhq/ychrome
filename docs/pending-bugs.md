@@ -208,6 +208,60 @@ returning it as the one entry an auto-fill may use.
 ⚠ Sitting next to the known `/fill` decoy defect below, these compound: one picks the wrong field,
 the other supplies a wrong value, and both report success.
 
+## ⚠ `ygg-privacy-guard`'s AADHAAR PATTERN FIRES ON A NIL UUID, AND THE ONLY ESCAPE WAIVES THE WHOLE SCAN
+
+**Status:** OPEN. ⇒ **NOT this repo's to fix** — `ygg-privacy-guard` is fleet tooling shared by
+every repo. Recorded here because this is where it was met, and because the next lane to
+regenerate an adblock asset will hit it again. Route to the tooling owner.
+
+**Measured 2026-08-21** while pushing a regenerated `scriptlets.js`:
+
+```
+⛔ REFUSING THE PUSH — 1 hit(s) on a PUBLIC remote:
+  [added line] aadhaar-like: '<twelve zeros>'
+```
+
+The bytes are the tail of a **nil UUID** in a cookie-consent value carried in from the public
+upstream filter lists:
+
+```
+"consent_uuid":"<a NIL UUID — the all-zeros constant, in 8-4-4-4-12 form>"
+```
+
+⚠ **This entry cannot quote the literal, and that is the finding restated.** Writing the nil
+UUID out in this file made the guard refuse the commit that FILES the guard's own false
+positive. Rewriting was available here because this is prose; it was not available for the
+generated asset, which is the whole asymmetry.
+
+**The pattern** is `(?<![0-9a-fA-F])\d{4}\s?\d{4}\s?\d{4}(?![0-9a-fA-F])`. It already tries
+to exclude hex context with lookarounds, and a **hyphen-delimited** UUID walks straight through
+them: the final group is twelve digits, the `-` before it is not a hex character, and the `"`
+after it is not either.
+
+⭐ **Two cheap discriminators would remove this whole class without weakening the gate:**
+
+1. **A real Aadhaar never begins with 0 or 1** — the first digit is 2-9 by specification. Making
+   the first digit `[2-9]` costs nothing and kills every zero-padded identifier, nil UUID and
+   sequence number in one edit.
+2. **Twelve identical digits is not an identifier.** A zero-run of that length is a placeholder
+   everywhere it appears.
+
+⛔ **Why this matters more than one annoying push.** The only documented escape is
+`YGG_PRIVACY_ALLOW=1`, which **waives the ENTIRE scan, not the one hit**. So a recurring false
+positive trains the reflex that ships a real leak — the guard's own note says as much. A gate
+that cries wolf on generated third-party data is not a stricter gate, it is a weaker one.
+
+⚠ **Used here, deliberately and verified first**, because the file is generated output marked
+DO NOT EDIT and rewriting it would corrupt a filter rule and break
+`the_committed_cosmetic_script_is_not_older_than_its_generator`. Before waiving: the whole diff
+was re-scanned with the guard's own regex — **exactly one match, twelve zeros, and no value in
+the diff that could plausibly be a real identifier** (nothing all-non-zero starting 2-9).
+
+**Falsifier:** commit a line carrying a nil UUID (eight zeros, three groups of four, twelve) and
+push to a public remote. It should pass.
+
+---
+
 ## ⚠ `lore.py scan`'s PRIVATE-DATA GATE FIRES ON URL PATHS, BURYING A REAL LEAK IN FALSE POSITIVES
 
 **Status:** OPEN. Measured 2026-08-11 on a clean checkout, before any local edit.
