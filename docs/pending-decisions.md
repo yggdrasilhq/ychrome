@@ -127,3 +127,38 @@ forever").
 **Recommendation:** raise it with the shell's owner and look for the second caller. If
 none exists, the settings pane stays, and the clogging is better answered by collapsing
 SponsorBlock's eleven category rows behind one disclosure than by inventing a modal.
+
+## 9. Fixing the generator, and NOT regenerating the bundled asset
+
+**The fork.** `cosmetic-filters.js` runs in the isolated world and reports itself only through
+`window` globals, which no probe can read — so it is undiagnosable, in the exact way
+`docs/adblock.md` already warns about for `window.__ysb`. The generator now also publishes
+`data-ycf` to the DOM. But the shipped asset is a checked-in build artefact, and no test locks
+it to the generator, so the two can drift.
+
+**Decided: land the generator change, leave the bundled asset alone.** Regenerating pulls a
+month of upstream filter-list changes into a 19 MB asset in one unreviewed step, which is a
+different act from adding a state marker and is not what this mandate asked for.
+
+⚠ **Consequence, stated plainly: the marker does not exist on any host until someone
+regenerates.** The code is right and the artefact is stale, which is a real gap and not a
+tidy ending.
+
+**Recommendation:** regenerate with the documented `ychrome adblock update` recipe as its own
+reviewable change. It is safe on any day the bundle has not already been regenerated that day
+— the version stamp is the generation date, so a later day mints a new version and deploys
+normally.
+
+## 10. Chasing the segfault only as far as the symbols allowed
+
+**The fork.** The crash reproduces every time, and the backtrace is entirely unsymbolised
+WebKit frames. Going further means installing debug symbols for `libwebkit2gtk-4.1`.
+
+**Decided: stop at the characterisation and make the crash visible instead.** What is recorded
+is worth more than a guess: which process faults, which thread, which library, and four
+workarounds ruled out by measurement. The stderr capture means the next attempt starts from
+evidence rather than from rebuilding the instrument.
+
+**Recommendation:** install the WebKitGTK debug symbols and re-run the same gdb recipe. It is
+one package and the reproduction is 5 seconds, so the next session should get a named frame
+cheaply. ⚠ Do not re-try the four workarounds in the queue entry; they are measured negatives.
