@@ -12,44 +12,62 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > meanwhile, how to reverse it. A lane never stops on one; it routes around it
 > and carries on.
 
-## ⛔ THE BACKGROUND-MEDIA DOT KEYS ON AUDIO, SO A MUTED VIDEO NEVER LIGHTS IT
+## ⚠ THE BACKGROUND-MEDIA DOT NOW ASKS ABOUT VIDEO — BUILT, AND NOT YET SEEN TO BLINK
 
-**Status:** OPEN, re-reported by the owner 2026-08-22: *"when a bg tab plays a video I want a
-blinking working indicator on the tab."* ⛔ **The feature EXISTS and ships — this is a
-correctness gap in its trigger, not a missing feature. Do not rebuild it.**
+**Status:** fixed in code on yggterm `lane/dev/11.27-app-modal`, **not observed
+live**. Reported by the owner 2026-08-22: *"when a bg tab plays a video I want a
+blinking working indicator on the tab."*
 
-### MEASURED, SO NOBODY RE-DERIVES IT
+### WHAT WAS WRONG
 
-The indicator lives in **yggterm** (`crates/yggterm-shell/src/shell/state.rs`) and is present
-in every binary the owner is running (`strings` finds its symbols in all three). Its whole rule
-is two functions — `web_surface_tab_media_is_live` and the paint-site rule beside it — and the
-flag behind them is written from **`webkit_web_view_is_playing_audio`**.
+The indicator already existed and shipped. Its flag was written from
+**`webkit_web_view_is_playing_audio`** — WebKit's own media session, which is
+the honest answer to *"is this tab making a sound"* and not to *"is this tab
+playing"*. **A muted video plays no audio**, background video autoplays muted on
+essentially every site, and so the one case the indicator exists for was the one
+case its trigger could not see. He said *video*; the code asked about *sound*.
 
-⇒ **That is the bug. A muted video plays no audio**, so `is_playing_audio` is false, so no dot.
-He said *video*; the code asks about *sound*. Autoplaying background video is muted by default
-on essentially every site, which is exactly the case he is describing.
+### THE FIX
 
-⚠ **A second, independent way it goes dark, already documented in the code:** the claim has a
-**6 s freshness window** (`WEB_SURFACE_MEDIA_MAX_MS`). `media_playing` is only true because
-some tick asked the engine; if ticks stop, the dot lapses silently. That is deliberate and
-correct — a stale claim is indistinguishable from a destroyed surface — but it means *"the dot
-went out"* has two causes and they need telling apart before either is fixed.
+WebKitGTK exposes no `is-playing-video`, so the trigger could not be swapped —
+**the page has to answer**. `MEDIA_ACTIVITY_SHIM_JS` (vendored
+`dioxus-desktop/src/web_surface.rs`) watches `video, audio` for
+`!paused && !ended && readyState > 2` and reports edges over the **same surface
+message channel the theme-colour shim already uses** — no polling, no eval, and
+the shim rides both builders exactly as that one does.
 
-### THE FIX SHAPE
+- ⛔ **It never consults `muted`.** That is the original defect one layer down,
+  and `the_media_shim_never_filters_on_muted_and_rides_every_view` refuses it.
+- ⛔ **The engine's answer is ORed, never replaced.** `is_playing_media` =
+  `is_playing_audio || the page's word`. WebAudio and anything the shim's
+  document cannot reach still come from the engine.
+- **The latch is per SURFACE and a surface outlives its documents**, so the shim
+  reports `false` at document-start — otherwise navigating away from a video
+  leaves the dot lit on a page playing nothing — and re-asserts while playing so
+  a dropped message cannot strand it. Closing a surface drops its latch, or the
+  next surface to take that id inherits a dead page's claim.
+- **The freshness window is untouched.** `WEB_SURFACE_MEDIA_MAX_MS` (6 s) still
+  lapses a claim nobody re-confirmed, whatever feeds it.
+- ⭐ **`is_playing_audio` is GONE from the shell**, not merely bypassed. Two
+  things consult this — the activity dot and the **reap veto** — so a background
+  tab playing a muted video was not only dotless, it could be **destroyed out
+  from under the playback**. Fixing one and not the other is the obvious next
+  mistake; `nothing_in_the_shell_still_asks_only_about_audio` requires the
+  audio-only spelling to be absent from the whole shell.
 
-WebKitGTK exposes **no** `is-playing-video` property, so the trigger cannot simply be swapped.
-The page has to answer, and this repo already has the pattern: a content script that watches
-`document.querySelectorAll('video')` for `!paused && readyState > 2` and **publishes to the
-DOM** the way `data-ycf` and `data-ysb` already do (see `docs/adblock.md`, the four-script
-table). The shell then reads that alongside `is_playing_audio` rather than instead of it —
-audio-only playback must keep working.
+### ⛔ WHY THIS ENTRY IS STILL OPEN
 
-⛔ **Keep the freshness window.** Whatever feeds the flag, a claim nobody has re-confirmed
-within 6 s must still lapse, or the dot outlives the surface.
+**Nothing here has been seen to blink.** It needs a yggterm rebuild and a GUI
+restart, and the GUI host was in use. The falsifier is the owner's own sentence
+and no unit test settles it:
 
-⚠ **The falsifier is the owner's own sentence, and a unit test cannot settle it:** a live
-background tab playing a **MUTED** video shows the blinking dot, and a silent tab does not. An
-indicator that blinks on quiet rows is worse than none, because he stops trusting it.
+> a live background tab playing a **MUTED** video shows the blinking dot, and a
+> silent tab does not.
+
+⚠ Check the second failure mode before concluding anything from a dark dot: the
+claim lapses after 6 s without a renewal, so *"the dot went out"* has two causes
+and they need telling apart. An indicator that blinks on quiet rows is worse
+than none, because he stops trusting it.
 
 ---
 
