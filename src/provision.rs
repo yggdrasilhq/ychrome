@@ -37,7 +37,8 @@
 //! |---|---|---|
 //! | absent | [`Verdict::Absent`] | install the bundled body |
 //! | version < bundled (incl. unversioned) | [`Verdict::Superseded`] | replace, keeping a `.superseded` backup |
-//! | version == bundled, same bytes | [`Verdict::Current`] | nothing |
+//! | version == bundled, same bytes | [`Verdict::Current`] | nothing, but RECORD the delivery |
+//! | version == bundled, other bytes, IS what we last wrote | [`Verdict::Stale`] | replace, keeping a `.superseded` backup |
 //! | version == bundled, other bytes | [`Verdict::Forked`] | KEEP it, say so |
 //! | version > bundled | [`Verdict::Ahead`] | KEEP it, say so |
 //!
@@ -46,6 +47,48 @@
 //! ones that predate the stamp, which is exactly the population that needs
 //! healing. `Forked` and `Ahead` are never overwritten: an asset the user
 //! edited, or a ruleset they refreshed with `ychrome adblock update`, is theirs.
+//!
+//! ## ⛔ WHY A DECLARED VERSION WAS NOT ENOUGH: the delivery ledger
+//!
+//! The table above assumes **a version identifies a body**. Twice it has not:
+//!
+//! - the generated assets stamp `@version` from the wall clock at generation
+//!   time, so a **same-day regeneration** ships different bytes under an
+//!   identical stamp;
+//! - a hand-edited asset kept its hand-written stamp, so an edit that simply
+//!   forgot the bump did the same thing with no regeneration involved.
+//!
+//! In both cases the reconciler reached its last arm — version equal, bodies
+//! differ — and returned `Forked`, which does not write. That is worse than
+//! failing to update: `Forked` is the one verdict that reads as *a deliberate
+//! user choice*, so a human sees it and leaves it alone. The asset becomes
+//! **undeployable forever** and reports as the user's own edit.
+//!
+//! A content hash alone cannot break the tie — an old release of ours and a
+//! user's edit are both just "different bytes". **A hash of what this
+//! provisioner ITSELF wrote can**, because it is a record of our own act rather
+//! than an inference about the file. So every write records `<id> <sha256>` in
+//! a `.delivered` ledger beside the asset, and the ambiguous case splits:
+//!
+//! - bytes differ **and** match what we last wrote ⇒ ours, superseded ⇒ WRITE;
+//! - bytes differ **and** do not ⇒ a genuine user edit ⇒ keep, and say so.
+//!
+//! It is the same distinction `.deleted` already draws between *never
+//! delivered* and *deleted on purpose*, applied to *stale* versus *edited*.
+//!
+//! ⭐ **[`Verdict::Current`] records an entry too, and that is what arms a host
+//! that is already in sync.** A ledger written only on a write would leave every
+//! correctly-provisioned host — the common case, and the one the trap springs on
+//! next — with nothing recorded until some future release happened to change
+//! that asset. `Current` means the installed body is byte-for-byte the bundled
+//! body; that is not an inference about the file, it is the same comparison the
+//! verdict just made. So it is recorded, no write to the asset, and the host is
+//! protected from the next same-version regeneration instead of the one after.
+//!
+//! ⚠ **A host that is already stuck at `Forked` cannot be rescued by this.**
+//! With nothing recorded and the bytes already diverged, `Forked` remains the
+//! only honest answer. Unsticking one is still a version bump, or a removal, on
+//! that host.
 //!
 //! A replacement is never destructive. The old body moves to
 //! `<name>.superseded` (one generation, overwritten) before the new one lands,
@@ -88,7 +131,19 @@ pub enum Verdict {
         installed: Option<ScriptVersion>,
         bundled: ScriptVersion,
     },
-    /// Same version, different bytes: the user edited it. KEPT.
+    /// Same version, different bytes — but the installed body is EXACTLY what
+    /// this provisioner last wrote here, so it is an old release of ours that
+    /// the bundle has since changed without minting a new version. Replaced,
+    /// with the previous body kept as `<name>.superseded`.
+    ///
+    /// This is the arm that used to fall through to [`Verdict::Forked`] and
+    /// strand the asset forever. It can only be reached when the delivery
+    /// ledger has an entry, which is why it is a distinct verdict rather than a
+    /// smarter `Forked`: "we know this is ours" and "we cannot tell" must not
+    /// print the same sentence.
+    Stale { version: ScriptVersion },
+    /// Same version, different bytes, and NOT what we last wrote (or nothing
+    /// recorded): the user edited it. KEPT.
     Forked { version: ScriptVersion },
     /// A version newer than the one we bundle (a `ychrome adblock update`
     /// ruleset, or a script the user upgraded themselves). KEPT.
@@ -101,7 +156,10 @@ pub enum Verdict {
 impl Verdict {
     /// Whether this verdict means the bundled body should be written to disk.
     pub fn needs_write(&self) -> bool {
-        matches!(self, Verdict::Absent | Verdict::Superseded { .. })
+        matches!(
+            self,
+            Verdict::Absent | Verdict::Superseded { .. } | Verdict::Stale { .. }
+        )
     }
 
     /// The one-line note the settings pane shows beside the asset, or `None`
@@ -169,6 +227,14 @@ impl AssetStatus {
                 bundled.to_string_dotted(),
                 self.path.display()
             )),
+            Verdict::Stale { version } => Some(format!(
+                "ychrome: refreshed {} — this host carried the body ychrome last delivered at \
+                 v{}, and the bundle has changed under that same version (previous body kept \
+                 as {}.superseded)",
+                self.id,
+                version.to_string_dotted(),
+                self.path.display()
+            )),
             Verdict::Forked { version } => Some(format!(
                 "ychrome: {} on this host is modified from the bundled v{} — left alone",
                 self.id,
@@ -199,6 +265,83 @@ fn adblock_dir() -> Option<PathBuf> {
     Some(yggterm_home()?.join("web-adblock"))
 }
 
+/// The name of the delivery ledger, in whichever asset directory it guards.
+///
+/// A dotfile, and deliberately not ending in `.js`: `webpolicy::enabled_scripts`
+/// takes every `*.js` in the userscript directory, so a ledger that looked like
+/// a script would be injected into pages. Same reasoning, and the same
+/// spelling, as the `.deleted` tombstone file beside it.
+const DELIVERY_LEDGER: &str = ".delivered";
+
+/// SHA-256 of a body, lowercase hex. The ledger stores this rather than the
+/// body: it is a record that we wrote a thing, not a second copy of the thing.
+fn body_digest(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(body.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Parse the ledger's text into `id -> digest`. Split out from the read so the
+/// format is a unit test rather than a filesystem fixture.
+///
+/// One `<id> <digest>` pair per line. A malformed or truncated line is DROPPED,
+/// never guessed at: the whole value of this file is that an entry means "we
+/// wrote exactly this", so half an entry must mean nothing at all. The cost of
+/// dropping one is a single `Forked` where a `Stale` was possible — the same
+/// answer this file was invented to improve, which is the safe direction.
+fn parse_delivery_ledger(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let (id, digest) = line.trim().split_once(char::is_whitespace)?;
+            let digest = digest.trim();
+            if id.is_empty() || digest.is_empty() {
+                return None;
+            }
+            Some((id.to_string(), digest.to_string()))
+        })
+        .collect()
+}
+
+/// What this provisioner last wrote for `id` in `dir`, if anything.
+fn last_delivered(dir: &Path, id: &str) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(DELIVERY_LEDGER)).ok()?;
+    parse_delivery_ledger(&text)
+        .into_iter()
+        .find(|(entry, _)| entry == id)
+        .map(|(_, digest)| digest)
+}
+
+/// Record that we just wrote `body` for `id` into `dir`.
+///
+/// Best-effort by design, and the caller ignores the result: a ledger that
+/// cannot be written costs a future `Stale` its evidence, which degrades to
+/// today's behaviour. It must never be able to fail an install that succeeded.
+fn record_delivery(dir: &Path, id: &str, body: &str) -> std::io::Result<()> {
+    let path = dir.join(DELIVERY_LEDGER);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut entries = parse_delivery_ledger(&existing);
+    let digest = body_digest(body);
+    match entries.iter_mut().find(|(entry, _)| entry == id) {
+        Some(entry) => entry.1 = digest,
+        None => entries.push((id.to_string(), digest)),
+    }
+    entries.sort();
+    let mut text: String = entries
+        .iter()
+        .map(|(entry, digest)| format!("{entry} {digest}\n"))
+        .collect();
+    if text.is_empty() {
+        text.push('\n');
+    }
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(path, text)
+}
+
 /// Compare one installed body against one bundled body, given both versions.
 /// The pure core of this module: no filesystem, no printing, so every row of
 /// the verdict table above is a unit test.
@@ -206,11 +349,17 @@ fn adblock_dir() -> Option<PathBuf> {
 /// 19 MB of gzip that only two of the five verdict rows ever need to look at.
 /// Inflating it to answer "is this host at v1.0.0?" would pay for the whole
 /// ruleset on every launch of the browser.
+///
+/// `last_delivered` is the digest this provisioner recorded the last time it
+/// wrote this asset here, or `None` when it has never written one (or the
+/// ledger predates this mechanism). It is only ever consulted in the one arm
+/// the version scheme cannot decide.
 pub fn verdict(
     installed: Option<&str>,
     installed_version: Option<ScriptVersion>,
     bundled_body: impl FnOnce() -> &'static str,
     bundled_version: &ScriptVersion,
+    last_delivered: Option<&str>,
 ) -> Verdict {
     let Some(installed_body) = installed else {
         return Verdict::Absent;
@@ -233,6 +382,13 @@ pub fn verdict(
         Some(version) => {
             if installed_body == bundled_body() {
                 Verdict::Current
+            } else if last_delivered.is_some_and(|digest| digest == body_digest(installed_body)) {
+                // Same version, different bytes, and this is byte-for-byte what
+                // we put here. The bundle changed without minting a version;
+                // the host did nothing. Ours to replace.
+                Verdict::Stale {
+                    version: version.clone(),
+                }
             } else {
                 Verdict::Forked {
                     version: version.clone(),
@@ -274,6 +430,7 @@ fn reconcile_one(
     bundled_version: &ScriptVersion,
     installed_version_of: impl Fn(&str, &Path) -> Option<ScriptVersion>,
 ) -> AssetStatus {
+    let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let installed = std::fs::read_to_string(&path).ok();
     let installed_version = installed
         .as_deref()
@@ -283,13 +440,26 @@ fn reconcile_one(
         installed_version,
         bundled,
         bundled_version,
+        last_delivered(&dir, id).as_deref(),
     );
     let error = if verdict.needs_write() {
-        write_with_backup(&path, bundled())
-            .and_then(|()| companion(kind, &path))
-            .err()
-            .map(|error| error.to_string())
+        let body = bundled();
+        let outcome = write_with_backup(&path, body).and_then(|()| companion(kind, &path));
+        if outcome.is_ok() {
+            // Best-effort: a ledger that will not write must not fail an
+            // install that did.
+            let _ = record_delivery(&dir, id, body);
+        }
+        outcome.err().map(|error| error.to_string())
     } else {
+        // An in-sync host is the one the trap springs on NEXT, and it would
+        // otherwise carry no record at all. `Current` is proof the body on disk
+        // is ours, so record it without touching the asset.
+        if verdict == Verdict::Current
+            && let Some(body) = installed.as_deref()
+        {
+            let _ = record_delivery(&dir, id, body);
+        }
         None
     };
     AssetStatus {
@@ -359,10 +529,18 @@ pub fn reconcile() -> Vec<AssetStatus> {
                     installed_version,
                     || body,
                     &bundled_version,
+                    last_delivered(&dir, ext.stem).as_deref(),
                 );
                 let error = if verdict.needs_write() {
-                    write_with_backup(&path, body).err().map(|e| e.to_string())
+                    let outcome = write_with_backup(&path, body);
+                    if outcome.is_ok() {
+                        let _ = record_delivery(&dir, ext.stem, body);
+                    }
+                    outcome.err().map(|e| e.to_string())
                 } else {
+                    if verdict == Verdict::Current {
+                        let _ = record_delivery(&dir, ext.stem, body);
+                    }
                     None
                 };
                 AssetStatus {
@@ -420,9 +598,11 @@ pub fn reconcile() -> Vec<AssetStatus> {
                 let path = scripts.join(format!("{}.js", ext.stem));
                 let disabled = scripts.join(format!("{}.js.disabled", ext.stem));
                 if !path.exists() && !disabled.exists() {
-                    let error = write_with_backup(&path, ext.body)
-                        .err()
-                        .map(|e| e.to_string());
+                    let outcome = write_with_backup(&path, ext.body);
+                    if outcome.is_ok() {
+                        let _ = record_delivery(&scripts, ext.stem, ext.body);
+                    }
+                    let error = outcome.err().map(|e| e.to_string());
                     statuses.push(AssetStatus {
                         id: ext.stem.to_string(),
                         kind: AssetKind::Userscript,
@@ -484,6 +664,8 @@ pub fn run(as_json: bool) -> anyhow::Result<()> {
                                 .unwrap_or_else(|| "unversioned".to_string()),
                             bundled.to_string_dotted()
                         ),
+                        Verdict::Stale { version } =>
+                            format!("stale:{}", version.to_string_dotted()),
                         Verdict::Forked { version } =>
                             format!("forked:{}", version.to_string_dotted()),
                         Verdict::Ahead { installed, bundled } => format!(
@@ -529,6 +711,9 @@ pub fn userscript_note(stem: &str, installed_body: &str) -> Option<String> {
         crate::userscript::parse(installed_body).version,
         || ext.body,
         &bundled_version,
+        userscript_dir()
+            .and_then(|dir| last_delivered(&dir, stem))
+            .as_deref(),
     )
     .pane_note()
 }
@@ -594,9 +779,12 @@ mod tests {
     // checkable without touching a disk.
     #[test]
     fn the_verdict_table_holds_row_for_row() {
-        assert_eq!(verdict(None, None, || "body", &v("1.0.0")), Verdict::Absent);
         assert_eq!(
-            verdict(Some("old"), None, || "new", &v("1.0.0")),
+            verdict(None, None, || "body", &v("1.0.0"), None),
+            Verdict::Absent
+        );
+        assert_eq!(
+            verdict(Some("old"), None, || "new", &v("1.0.0"), None),
             Verdict::Superseded {
                 installed: None,
                 bundled: v("1.0.0")
@@ -605,25 +793,38 @@ mod tests {
              youtube-adblock bug"
         );
         assert_eq!(
-            verdict(Some("old"), Some(v("0.9")), || "new", &v("1.0.0")),
+            verdict(Some("old"), Some(v("0.9")), || "new", &v("1.0.0"), None),
             Verdict::Superseded {
                 installed: Some(v("0.9")),
                 bundled: v("1.0.0")
             }
         );
         assert_eq!(
-            verdict(Some("same"), Some(v("1.0.0")), || "same", &v("1.0.0")),
+            verdict(Some("same"), Some(v("1.0.0")), || "same", &v("1.0.0"), None),
             Verdict::Current
         );
         assert_eq!(
-            verdict(Some("edited"), Some(v("1.0.0")), || "bundled", &v("1.0.0")),
+            verdict(
+                Some("edited"),
+                Some(v("1.0.0")),
+                || "bundled",
+                &v("1.0.0"),
+                None
+            ),
             Verdict::Forked {
                 version: v("1.0.0")
             },
-            "same version, different bytes is the user's edit and must be kept"
+            "same version, different bytes, and NOTHING recorded as delivered — we \
+             cannot tell an edit from an old release, so it is the user's and kept"
         );
         assert_eq!(
-            verdict(Some("newer"), Some(v("2.0")), || "bundled", &v("1.0.0")),
+            verdict(
+                Some("newer"),
+                Some(v("2.0")),
+                || "bundled",
+                &v("1.0.0"),
+                None
+            ),
             Verdict::Ahead {
                 installed: v("2.0"),
                 bundled: v("1.0.0")
@@ -631,8 +832,124 @@ mod tests {
         );
     }
 
-    // Only the two verdicts that mean "this host is behind" write anything. A
-    // fork or an ahead copy is the user's, and a write here would destroy it.
+    // ⛔ THE ROW THE VERSION SCHEME CANNOT DECIDE, and the whole reason the
+    // ledger exists. Identical inputs on both sides of this test except for one
+    // thing: whether we have a record of having written that exact body.
+    #[test]
+    fn a_body_we_delivered_ourselves_is_stale_not_forked() {
+        let ours = "the body ychrome shipped last time";
+        assert_eq!(
+            verdict(
+                Some(ours),
+                Some(v("1.0.0")),
+                || "a NEW bundle at the SAME version",
+                &v("1.0.0"),
+                Some(&body_digest(ours)),
+            ),
+            Verdict::Stale {
+                version: v("1.0.0")
+            },
+            "we wrote this body ourselves — the bundle moved under an unchanged \
+             version, so it is ours to replace"
+        );
+        assert_eq!(
+            verdict(
+                Some("the user rewrote this by hand"),
+                Some(v("1.0.0")),
+                || "a NEW bundle at the SAME version",
+                &v("1.0.0"),
+                Some(&body_digest(ours)),
+            ),
+            Verdict::Forked {
+                version: v("1.0.0")
+            },
+            "a ledger entry that does NOT match is the strongest evidence of a \
+             real edit there is — it must still be kept"
+        );
+        assert_eq!(
+            verdict(
+                Some(ours),
+                Some(v("1.0.0")),
+                || ours,
+                &v("1.0.0"),
+                Some(&body_digest(ours)),
+            ),
+            Verdict::Current,
+            "matching the ledger must never turn an up-to-date host into a write"
+        );
+    }
+
+    // The ledger is a record of OUR act, so it must survive a round trip
+    // exactly, tolerate the file not existing, and drop anything it cannot read
+    // in full rather than guess.
+    #[test]
+    fn the_ledger_round_trips_and_drops_what_it_cannot_read() {
+        assert_eq!(
+            parse_delivery_ledger("scriptlets abc123\ncosmetic-filters def456\n"),
+            vec![
+                ("scriptlets".to_string(), "abc123".to_string()),
+                ("cosmetic-filters".to_string(), "def456".to_string()),
+            ]
+        );
+        assert_eq!(
+            parse_delivery_ledger("scriptlets\n\n   \nrules.json  ff00  \n"),
+            vec![("rules.json".to_string(), "ff00".to_string())],
+            "a stem with no digest is half an entry, and half an entry must mean \
+             nothing — the file's only value is that an entry is exact"
+        );
+    }
+
+    #[test]
+    fn a_delivery_is_recorded_and_read_back() {
+        let dir = std::env::temp_dir().join(format!(
+            "ychrome-ledger-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        assert_eq!(last_delivered(&dir, "scriptlets"), None, "nothing yet");
+        record_delivery(&dir, "scriptlets", "body one").expect("record");
+        record_delivery(&dir, "rules.json", "another body").expect("record");
+        assert_eq!(
+            last_delivered(&dir, "scriptlets").as_deref(),
+            Some(body_digest("body one").as_str())
+        );
+        // A second delivery of the same asset REPLACES the entry — the question
+        // is only ever "what did we write LAST", never a history.
+        record_delivery(&dir, "scriptlets", "body two").expect("record");
+        assert_eq!(
+            last_delivered(&dir, "scriptlets").as_deref(),
+            Some(body_digest("body two").as_str())
+        );
+        assert_eq!(
+            last_delivered(&dir, "rules.json").as_deref(),
+            Some(body_digest("another body").as_str()),
+            "recording one asset must not disturb another"
+        );
+        // An entry recorded for an in-sync host must be the SAME evidence a
+        // written one is — otherwise arming a `Current` host would be a
+        // different, weaker promise than arming a freshly installed one.
+        assert_eq!(
+            verdict(
+                Some("body two"),
+                Some(v("1.0.0")),
+                || "the bundle, changed under an unchanged version",
+                &v("1.0.0"),
+                last_delivered(&dir, "scriptlets").as_deref(),
+            ),
+            Verdict::Stale {
+                version: v("1.0.0")
+            }
+        );
+        // ⛔ It must not look like a userscript: `webpolicy::enabled_scripts`
+        // takes every *.js in this directory and would inject it into pages.
+        assert!(!DELIVERY_LEDGER.ends_with(".js"));
+        assert!(DELIVERY_LEDGER.starts_with('.'));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Only the verdicts that mean "this host is behind" write anything. A fork
+    // or an ahead copy is the user's, and a write here would destroy it.
     #[test]
     fn only_absent_and_superseded_write() {
         assert!(Verdict::Absent.needs_write());
@@ -642,6 +959,14 @@ mod tests {
                 bundled: v("1.0.0")
             }
             .needs_write()
+        );
+        assert!(
+            Verdict::Stale {
+                version: v("1.0.0")
+            }
+            .needs_write(),
+            "a body we delivered ourselves is ours to replace — this is the arm \
+             whose absence made an asset undeployable forever"
         );
         assert!(!Verdict::Current.needs_write());
         assert!(
@@ -678,6 +1003,9 @@ mod tests {
             Verdict::Superseded {
                 installed: None,
                 bundled: v("1.0.0"),
+            },
+            Verdict::Stale {
+                version: v("1.0.0"),
             },
             Verdict::Forked {
                 version: v("1.0.0"),

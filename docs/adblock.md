@@ -415,9 +415,42 @@ tell "an old release of ours" from "the user's edit"; a declared version can.
 |---|---|---|
 | absent | `Absent` | install |
 | older, **or unversioned** | `Superseded` | replace, keeping `<name>.superseded` |
-| same version, same bytes | `Current` | nothing |
+| same version, same bytes | `Current` | nothing, but RECORD the delivery |
+| same version, other bytes, **is what we last wrote** | `Stale` | replace, keeping `<name>.superseded` |
 | same version, other bytes | `Forked` | **keep it**, and say so in the pane |
 | newer than the bundle | `Ahead` | **keep it**, and say so |
+
+### ⛔ The declared version was not enough: the delivery ledger
+
+A version only decides this if **a version identifies a body**, and twice it did
+not. The generated assets stamp `@version` from the wall clock at generation
+time, so a same-day regeneration ships different bytes under an identical stamp;
+and a hand-edited asset kept its hand-written stamp, so an edit that forgot the
+bump did the same with no regeneration involved. Both landed in the last arm —
+version equal, bytes differ — and returned `Forked`, which does not write.
+
+That is worse than failing to update. `Forked` is the one verdict that reads as
+*a deliberate user choice*, so a human sees it and leaves it alone: the asset
+becomes **undeployable forever while reporting as the user's own edit**. It has
+happened to this repo's own shipped work (`sponsorblock.js` at an unchanged
+`2.0.0`, 1,886 bytes different, unable to reach any host).
+
+A content hash still cannot break the tie. **A hash of what the provisioner
+itself wrote can**, because it records our own act instead of inferring about the
+file. Every write, and every `Current` verdict, appends `<id> <sha256>` to a
+`.delivered` ledger in the asset's own directory — a dotfile, not a `.js`, for
+the same reason `.deleted` is. The ambiguous arm then splits: bytes differ and
+match what we last wrote ⇒ ours, superseded ⇒ **write**; bytes differ and do not
+⇒ a real edit ⇒ **keep**.
+
+⭐ **`Current` records too, and that is what protects a host that is already in
+sync** — the common case, and the one the trap springs on next. `Current` means
+the installed body is byte-for-byte the bundled body, so recording it is not an
+inference; it costs no write to the asset and arms the host immediately.
+
+⚠ **A host already stuck at `Forked` cannot be rescued by this.** With nothing
+recorded and the bytes already diverged, `Forked` stays the only honest answer;
+unsticking one is still a version bump or a removal on that host.
 
 Unversioned reads as older than every release, because every body ychrome has
 shipped declares one — so the only unstamped bodies predate the stamp, which is
@@ -699,7 +732,7 @@ missing filter, it is no ad blocking at all.
 **Proven here.** The ceiling, the regex and selector dialects, the valid trigger
 keys, the compile cost, and that the shipped ruleset compiles — all by running
 `WebKitUserContentFilterStore` on this host (the 2026-07-31 regeneration
-compiles in 14.8 s). The reconciler's five verdicts, end to end over a scratch
+compiles in 14.8 s). The reconciler's six verdicts, end to end over a scratch
 `$HOME`, including the GUI host's exact header-less `youtube-adblock` and a hand-copied
 60-rule `rules.json`. The YouTube prune, against a real captured response. The
 generated cosmetic script, against a stub DOM. The SponsorBlock hash-prefix
