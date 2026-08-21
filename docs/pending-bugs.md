@@ -12,6 +12,76 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > meanwhile, how to reverse it. A lane never stops on one; it routes around it
 > and carries on.
 
+## ⭐⭐ OWNER-REQUESTED: EVERY EXTENSION GETS A MODAL BUTTON, AND THE EXTENSIONS GO FULL-FLEDGED
+
+**Status:** OPEN, requested 2026-08-22. Handed to seat 11.27.
+
+*"I want our extension features in ychrome to be full fledged and not a half hearted
+implementation. Make each extension a modal producing button like yggterm settings and
+implement the extensions with all features; specially adblock and sponsorblock."*
+
+### ⛔⛔ THIS OVERRULES THE EARLIER ROUTING — READ IT BEFORE RE-DERIVING THE REFUSAL
+
+An earlier lane measured per-extension modals and routed them AWAY, correctly at the time: a
+contributed pane **cannot raise a modal**, because the surface protocol says an app *"informs
+and cannot ask; anything needing an answer is a modal the shell owns"*. Admitting a new widget
+kind needs two rules to hold, and rule 1 is **at least two apps want it** — one app's need is
+a feature request. Only ychrome wanted it, so the honest answer was "raise it with the shell's
+owner".
+
+⇒ **The shell's owner has now asked for it directly.** Rule 1 is satisfied by decision rather
+than by a second caller. **Do not re-file this as a Tier C admission question.**
+
+⭐ **There is a worked example to copy rather than invent:** the **`fido2` dialog** is the
+documented shell-owned modal — an OSC request (`fido2 ; request`, payload
+`{session, request_id, rp_id, account, kind, origin}`) and an approve/deny round trip back over
+the app's own control channel (`/fido2/grant`, `/fido2/deny`), with the app parked on its own
+endpoint matching by `request_id`. A per-extension options modal is that same split with a
+different payload. See `yggterm/.agents/skills/libyggterm-surfaces/SKILL.md`.
+
+⚠ **"like yggterm settings"** names the model he wants — read how the shell's own settings
+modal is built before designing a second vocabulary beside it.
+
+### THE CATALOG AS IT STANDS (`src/extensions.rs`)
+
+`cosmetic-filters`, `scriptlets` (both GENERATED — the adblock ruleset's other halves),
+`sponsorblock`, `youtube-adblock`, `idcac`, `unblock-select`. Today they are configured through
+**19 buttons flattened into the settings pane**, which is exactly the clogging he objected to.
+
+### WHAT "FULL FLEDGED" MEANS, NAMED SO IT IS NOT GUESSED
+
+**SponsorBlock** (`src/sponsorblock.rs`) already has the category catalog, per-category
+behaviour (`set_behaviour`), custom site access (`sites`/`add_site`/`remove_site`, with
+`match_patterns` as the ONE owner of where it runs), and a synthetic-userscript config channel.
+`docs/adblock.md` names what is deliberately absent:
+- **segment submission and voting** — ⛔ they WRITE to a shared public database and need a
+  persistent pseudonymous id. If added they must be **explicit, off by default, and the privacy
+  consequence stated where the user turns them on.** That constraint is the owner's own and
+  survives this request.
+- the unsubmitted-segment queue; chapter renaming (community chapters are drawn as markers
+  beside YouTube's own list, never merged into it).
+
+**Adblock** — the ruleset pipeline, provisioning and per-site plumbing exist. Absent: a per-site
+enable/disable surface, an element picker, a "what did this page block" report, and any
+user-facing view of the ruleset's provenance beyond `adblock status`.
+
+### ⛔ TRAPS THAT WILL BITE THIS WORK SPECIFICALLY
+
+1. **A generated asset drifts from its generator.** `cosmetic-filters` and `scriptlets` are
+   GENERATED — never hand-edit them; regenerate per `docs/adblock.md`. A test guards this now.
+2. **`adblock update` places its companions through `provision::place_generated_companion`.**
+   Generated output added by this work needs the same placement, or it refreshes into a
+   directory nothing injects from.
+3. **Four scripts publish state four different ways**, two into an ISOLATED world a page-world
+   `eval` cannot see (`data-ycf`, `data-ysb` on `<html>`). Table in `docs/adblock.md`.
+4. **An opt-in extension cannot be repaired by provisioning** — it only refreshes what is
+   already installed.
+
+**Falsifier:** every extension in the catalog opens its own options modal from its own button,
+and the settings pane no longer carries per-extension controls.
+
+---
+
 ## ⛔ `cargo test --bin ychrome` IS RED ON THE TRUNK — 4 sidebar tests, and it is not a flake
 
 **Status:** OPEN. Deterministic, on a clean tree. The PASS count moves as work lands (`382`
