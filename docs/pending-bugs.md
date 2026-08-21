@@ -940,6 +940,57 @@ in the list.
 ⚠ **Sequencing:** items 1–3 all sit behind the presence-request fix. Do that first or the work
 cannot be verified end to end — which is exactly the trap this session fell into.
 
+## ⭐ OWNER-REQUESTED: A FILL-PASSKEY BUTTON AND AN ADD-PASSKEY MECHANISM IN THE VAULT PANE
+
+**Status:** OPEN, requested 2026-08-22. ⛔ **BLOCKED ON THE ENTRY DIRECTLY BELOW — read it first.**
+
+*"In ychrome vault I need a fill passkey button and a add passkey mechanism."*
+
+### ⇒ THE CEREMONY MACHINERY ALREADY EXISTS. What is missing is the PANE.
+
+Measured 2026-08-22, so the next session does not re-derive it:
+
+| piece | where | state |
+|---|---|---|
+| assertion (**fill**) | `passkey.rs::handle_get` | built |
+| registration (**add**) | `passkey.rs::handle_create` | built |
+| approve / refuse | `passkey.rs::handle_grant` / `handle_deny` | built |
+| the `navigator.credentials` shim | `passkey.rs::shim_userscript` | built, injected per origin |
+| write a credential onto an item | `model.rs` — `fido2Credentials` | built |
+| list an item's passkeys | vault agent op `passkeys` | built |
+| which hosts have one | vault agent op `passkey-hosts` | built |
+| enrol affordance | `sidebar.rs::passkey_enrol_widgets` — "Enrol a passkey here", arm/disarm | built, but it lives on the HOST/settings surface |
+| **a per-row Fill-passkey button** | — | ⛔ **absent** |
+| **an Add-passkey affordance in the vault pane** | — | ⛔ **absent** |
+
+⇒ This is a WIRING job at the pane, not new crypto. The two verbs to reach are the ones the
+signer already answers; the row already knows `has_passkey` (it is in `list --json`).
+
+### ⛔⛔ BUT A FILL BUTTON WOULD BE DEAD ON ARRIVAL TODAY — measured, not inferred
+
+The entry below says the presence request is written to the daemon's `/dev/null` stdout. **That
+is still true**, and tonight's stderr fix did NOT change it — it redirected fd **2**, and
+`emit_fido2_request` writes to fd **1**:
+
+```
+owner's daemon:  fd/0 -> /dev/null
+                 fd/1 -> /dev/null          <-- the OSC goes here
+                 fd/2 -> …/daemon.stderr.log   <-- fixed 2026-08-21, different fd
+```
+
+⇒ **Order the work: route the presence request first, then add the buttons.** A Fill button
+shipped before that parks the ceremony on its condvar for the full 120 s timeout and the page
+reports a generic failure — which is indistinguishable, to the user, from the button being
+broken. ⚠ And it would be indistinguishable to the NEXT session too, which is how a working
+button gets "fixed" into something worse.
+
+⚠ **Do not simply point stdout at the stderr log.** The OSC is a REQUEST that needs an answer
+(`/fido2/grant`), so it needs a channel with a reader on the other end — the row's PTY when
+ychrome runs in a row, and something else entirely for a daemon-served surface. Deciding that
+channel is the actual design work in this item.
+
+---
+
 ## ⛔⛔ A PASSKEY CAN NEVER BE APPROVED: the presence request is written to the DAEMON'S `/dev/null` stdout
 
 **Status:** OPEN — this makes `navigator.credentials.get()` unusable on every daemon-served
