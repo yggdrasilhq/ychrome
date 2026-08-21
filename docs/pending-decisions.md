@@ -78,3 +78,52 @@ half was delivered; the rest of 4 and all of 5 are now filed in
 
 **Recommendation for the next wave:** do item 5 before item 4's modals. Item 5 is
 two owner-visible defects; the modals are a refactor of a pane that works.
+
+## 6. Deploying to unstick the adblock plane, rather than only reporting it
+
+**The fork.** The YouTube adblock failure turned out to be a stale asset plane, not a
+code defect: a three-week-old ruleset, cosmetic filters to match, and the scriptlet
+companion absent entirely. The lane could have filed that and stopped, or deployed.
+
+**Decided: deploy.** A current binary was built and installed, and the three stuck
+copies were moved aside so the reconciler would rewrite them. All six assets now read
+`current` and the block is live-proven. The reasoning: the mandate asks whether the
+adblock works, and that question is unanswerable on a host whose blocker is three weeks
+stale — the deploy is not a side quest, it is the precondition for the measurement.
+
+**Reverse it** by restoring the previous binary and the three asset copies, both kept
+aside during the session. Nothing in the repo changed to achieve it.
+
+⚠ **What this does NOT do:** it fixes one host. The `@version` defect that stuck those
+assets is untouched, so the same freeze returns on the next same-day regeneration, and
+every other host is still stuck. That fix is a code change filed at the top of
+`docs/pending-bugs.md` and was deliberately not attempted here.
+
+## 7. Restoring SponsorBlock from the repo after provisioning de-listed it
+
+**The fork.** Moving the stuck `sponsorblock.js` aside made it *not installed*, and
+provisioning only refreshes extensions that are already installed — so it vanished from
+the asset list rather than being rewritten.
+
+**Decided: reinstall it from the bundled asset directly**, which is what the settings
+pane's install action does. The host copy is now byte-identical to the repo's, which is
+the end state that was wanted anyway: it is the first copy anywhere to carry `5aa909f`.
+
+**Reverse it** by deleting the file; it is opt-in and the pane can reinstall it.
+
+## 8. Not building the modal widget kind
+
+**The fork.** Item 4 asks for per-extension modals. Measurement says a contributed pane
+cannot raise one at all: the protocol's split is that an app informs and cannot ask, and
+every modal that exists is a native shell construct.
+
+**Decided: measure, file, route — do not build.** It is a Tier C change to the shell's
+widget vocabulary, and the spec admits one only when **two** apps want it. SponsorBlock
+is one. Building it here would either mean changing another repo's vocabulary on one
+app's say-so, or opening a native surface to dodge the question — which the spec names
+as the expensive mistake ("serves one app and charges every app the native-surface tax
+forever").
+
+**Recommendation:** raise it with the shell's owner and look for the second caller. If
+none exists, the settings pane stays, and the clogging is better answered by collapsing
+SponsorBlock's eleven category rows behind one disclosure than by inventing a modal.
