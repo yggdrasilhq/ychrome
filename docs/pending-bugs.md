@@ -1101,6 +1101,35 @@ A `ychrome daemon restart` leaves live surfaces pointing at the retired daemon's
 surfaces open unprotected"), which additionally strips the userscripts and therefore the shim.
 Not fixed here, and not the same bug — but it lands on the same feature.
 
+## ⚠ THE AGENT ENGINE CANNOT DO PASSKEYS AT ALL, and nothing says so
+
+**Status:** OPEN, found 2026-08-22 while looking for a way to prove the presence channel
+without a human at the GUI.
+
+`src/engine/` installs no `navigator.credentials` shim and reaches no signer. The only `fido2`
+token in the whole engine tree is `fido2_token: None`, filling a shared request struct. So a
+page driven through `ychrome ctl` sees a pristine `navigator` on every site, including the
+twenty this vault holds passkeys for.
+
+⇒ **An agent driving a passkey-only sign-in through `ctl` cannot get in**, and what it will be
+told is the site's own message — *your browser does not support WebAuthn* — which is true of
+the engine and useless as a remedy. It is the same misdirection the visible plane's shim
+banner exists to correct, on a plane that has no banner.
+
+**Two ways to close it, and they are not equivalent:**
+
+1. **Install the shim on the engine plane and give it a signer.** Then the presence question
+   becomes real there — an engine page has no PTY and no human, so a ceremony would refuse on
+   the presence channel, correctly and immediately. That is honest but still cannot sign in.
+2. **Let an engine ceremony be approved by an operator elsewhere** (the vault pane already
+   renders and grants a waiting ceremony). This is the one that would actually work, and it is
+   also the one that needs thinking about: an agent must not be able to summon consent prompts
+   at will, so the arming would have to be deliberate and per-run, the way passkey ENROLMENT
+   already is.
+
+⚠ Do not do (1) alone and call the item closed: a plane that refuses clearly is better than
+one that lies, but the user still cannot sign in.
+
 ## ★ THE VAULT PANE STILL WAITS FOR YOU TO PRESS SYNC
 
 **Status:** OPEN — only (c), the sync SCHEDULE, survives. Everything else in
