@@ -354,10 +354,10 @@ fn record_delivery(dir: &Path, id: &str, body: &str) -> std::io::Result<()> {
 /// wrote this asset here, or `None` when it has never written one (or the
 /// ledger predates this mechanism). It is only ever consulted in the one arm
 /// the version scheme cannot decide.
-pub fn verdict(
+pub fn verdict<'a>(
     installed: Option<&str>,
     installed_version: Option<ScriptVersion>,
-    bundled_body: impl FnOnce() -> &'static str,
+    bundled_body: impl FnOnce() -> &'a str,
     bundled_version: &ScriptVersion,
     last_delivered: Option<&str>,
 ) -> Verdict {
@@ -495,6 +495,87 @@ fn companion(kind: AssetKind, path: &Path) -> std::io::Result<()> {
             .map_err(std::io::Error::other)
         }
     }
+}
+
+/// Place a FRESHLY GENERATED companion script where it will actually be
+/// INJECTED, under the same contract the reconciler uses.
+///
+/// ⛔⛔ **THE FAILURE THIS EXISTS TO CLOSE.** `ychrome adblock update` writes
+/// four files into ONE directory — `rules.json`, its sidecar, and the two
+/// companion userscripts — because they are one conversion's output and two
+/// owners of "what the filter lists say" is the divergence this repo forbids.
+/// But that directory is `web-adblock/`, and [`crate::webpolicy`] injects
+/// userscripts from `web-userscripts/` and **only** from there. So every
+/// `adblock update` refreshed the network ruleset, reported success, and left
+/// the cosmetic filters and the scriptlets exactly as stale as it found them.
+///
+/// Measured 2026-08-21 on a real host: the freshly generated cosmetic script
+/// carried a DOM-published state attribute its generator had gained weeks
+/// earlier; the copy actually being injected did not, and was three weeks old.
+/// Nothing anywhere said so, because the ruleset — the visible half — really
+/// had been updated.
+///
+/// ⇒ Generating and PLACING are two steps, and only the first had an owner.
+///
+/// The placement is not a copy. A generated body is newer than the bundle by
+/// construction, but the host's copy may be the user's own edit, or a script
+/// they deleted on purpose, and both must survive an update they did not ask
+/// for. So it runs the same [`verdict`] the reconciler does, against the
+/// generated body instead of the bundled one.
+///
+/// `None` when there is no userscript directory, or the user deleted this
+/// script — a deletion that an update resurrects makes the pane's Delete button
+/// a lie, which is the rule `.deleted` already exists to enforce.
+pub fn place_generated_companion(stem: &str, body: &str) -> Option<AssetStatus> {
+    let dir = userscript_dir()?;
+    if crate::webpolicy::deleted_userscripts()
+        .iter()
+        .any(|entry| entry == stem)
+    {
+        return None;
+    }
+    // Whichever spelling is on disk is the one that gets updated: a script the
+    // user turned OFF still gets the current body under it, so re-enabling does
+    // not resurrect a version from six releases ago.
+    let disabled = dir.join(format!("{stem}.js.disabled"));
+    let path = if disabled.exists() {
+        disabled
+    } else {
+        dir.join(format!("{stem}.js"))
+    };
+    let installed = std::fs::read_to_string(&path).ok();
+    let installed_version = installed
+        .as_deref()
+        .and_then(|text| crate::userscript::parse(text).version);
+    let generated_version = crate::userscript::parse(body)
+        .version
+        .unwrap_or_else(|| ScriptVersion::parse("0").expect("0 parses"));
+    let verdict = verdict(
+        installed.as_deref(),
+        installed_version,
+        || body,
+        &generated_version,
+        last_delivered(&dir, stem).as_deref(),
+    );
+    let error = if verdict.needs_write() {
+        let outcome = write_with_backup(&path, body);
+        if outcome.is_ok() {
+            let _ = record_delivery(&dir, stem, body);
+        }
+        outcome.err().map(|error| error.to_string())
+    } else {
+        if verdict == Verdict::Current {
+            let _ = record_delivery(&dir, stem, body);
+        }
+        None
+    };
+    Some(AssetStatus {
+        id: stem.to_string(),
+        kind: AssetKind::Userscript,
+        path,
+        verdict,
+        error,
+    })
 }
 
 pub fn reconcile() -> Vec<AssetStatus> {
@@ -946,6 +1027,48 @@ mod tests {
         assert!(!DELIVERY_LEDGER.ends_with(".js"));
         assert!(DELIVERY_LEDGER.starts_with('.'));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ⛔ A GENERATED COMPANION IS JUDGED, NOT COPIED. `adblock update` produces
+    // a body newer than the bundle by construction, but the host's copy may be
+    // the user's own edit — and an update they did not ask for must not eat it.
+    #[test]
+    fn a_generated_companion_is_judged_against_the_generated_body() {
+        let old_release = "// ==UserScript==\n// @version 1.20260731\n// ==/UserScript==\nold";
+        let regenerated = "// ==UserScript==\n// @version 1.20260821\n// ==/UserScript==\nnew";
+        let v = |body: &str| crate::userscript::parse(body).version;
+
+        // The whole point: a stale host copy is SUPERSEDED by the regenerated
+        // body, so `adblock update` finally moves the script it injects.
+        assert_eq!(
+            verdict(
+                Some(old_release),
+                v(old_release),
+                || regenerated,
+                &v(regenerated).unwrap(),
+                None
+            ),
+            Verdict::Superseded {
+                installed: v(old_release),
+                bundled: v(regenerated).unwrap()
+            }
+        );
+
+        // A user's copy that is NEWER than what we just generated is still
+        // theirs — regeneration is not a licence to downgrade.
+        assert_eq!(
+            verdict(
+                Some(regenerated),
+                v(regenerated),
+                || old_release,
+                &v(old_release).unwrap(),
+                None
+            ),
+            Verdict::Ahead {
+                installed: v(regenerated).unwrap(),
+                bundled: v(old_release).unwrap()
+            }
+        );
     }
 
     // Only the verdicts that mean "this host is behind" write anything. A fork

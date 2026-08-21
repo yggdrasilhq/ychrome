@@ -1,16 +1,16 @@
 {
   "generator": "ychrome abp converter",
   "report": {
-    "comments": 13826,
-    "cosmetic_domain_rules": 20793,
-    "cosmetic_domain_selectors": 27589,
+    "comments": 13851,
+    "cosmetic_domain_rules": 20875,
+    "cosmetic_domain_selectors": 27753,
     "cosmetic_generic_rules": 18,
-    "cosmetic_generic_selectors": 35535,
-    "cosmetic_procedural_rules": 415,
-    "cosmetic_unhide_applied": 545,
-    "deduplicated": 191,
-    "document_exception": 597,
-    "domain_entries_dropped": 869,
+    "cosmetic_generic_selectors": 35539,
+    "cosmetic_procedural_rules": 421,
+    "cosmetic_unhide_applied": 548,
+    "deduplicated": 190,
+    "document_exception": 593,
+    "domain_entries_dropped": 871,
     "dropped": {
       "badfilter": {
         "count": 2,
@@ -32,7 +32,7 @@
         "why": "there is no action that injects a response header"
       },
       "html-filtering": {
-        "count": 50,
+        "count": 51,
         "samples": [
           "abema.tv##^script:has-text(NREUM)",
           "wetteronline.*##^script:has-text(runCount)",
@@ -43,18 +43,18 @@
         "why": "editing the response body is not a blocker action"
       },
       "procedural-selector": {
-        "count": 238,
+        "count": 244,
         "samples": [
           "deliveroo.*#?#a[role=\"button\"]:has(p:has-text(Sponsored))",
           "deliveroo.*#?#div[class^=\"HomeFeedScrollTracker-\"]:has(span[class^=\"HomeFeedUILines-\"]:has-text(Sponsored))",
           "agoda.com#?#.PropertyCardItem:has(div:has-text(Promoted))",
-          "atlanticsuperstore.ca,fortinos.ca,loblaws.ca,maxi.ca,newfoundlandgrocerystores.ca,nofrills.ca,provigo.ca,realcanadiansuperstore.ca,valumart.ca,yourindependentgrocer.ca,zehrs.ca#?#.indiana-scroll-container > ul > li:has(.chakra-badge:has-text(/Sponsorisé|Sponsored/))",
-          "autotrader.co.uk#?#[data-testid=\"desktop-search\"] li:has(span:has-text(Ad))"
+          "alibaba.com#?#.no-divider[style*=\"margin-bottom\"]:has([data-state=\"closed\"]:has-text(Ad))",
+          "atlanticsuperstore.ca,fortinos.ca,loblaws.ca,maxi.ca,newfoundlandgrocerystores.ca,nofrills.ca,provigo.ca,realcanadiansuperstore.ca,valumart.ca,yourindependentgrocer.ca,zehrs.ca#?#.indiana-scroll-container > ul > li:has(.chakra-badge:has-text(/Sponsorisé|Sponsored/))"
         ],
         "why": "not a CSS selector; WebKit drops it silently, so it is counted rather than shipped"
       },
       "redirect": {
-        "count": 322,
+        "count": 327,
         "samples": [
           "||2mdn.net/videoplayback/$rewrite=abp-resource:blank-mp4,domain=laurelberninteriors.com|safeframe.googlesyndication.com",
           "||googlevideo.com/videoplayback?$rewrite=abp-resource:blank-mp4,domain=laurelberninteriors.com|safeframe.googlesyndication.com",
@@ -65,7 +65,7 @@
         "why": "WebKit's content blocker has no redirect action; a rule can only allow or deny"
       },
       "request-rewrite": {
-        "count": 438,
+        "count": 451,
         "samples": [
           "||www.youtube.com/playlist?list=$xhr,1p,replace=/\"adPlacements\"/\"no_ads\"/",
           "||www.youtube.com/playlist?list=$xhr,1p,replace=/\"adSlots\"/\"no_ads\"/",
@@ -76,11 +76,11 @@
         "why": "a declarative blocker cannot edit a request URL, only allow or deny it"
       },
       "scriptlet": {
-        "count": 1718,
+        "count": 1716,
         "samples": [
           "ranker.com##+js(aost, HTMLElement.prototype.insertBefore, /[A-Z] .+chunks\\/\\d{4}\\./)",
           "reuters.com##+js(aost, admiral, .js?)",
-          "al.com,attackofthefanboy.com,destructoid.com,edmontonsun.com,gamepur.com,gamerjournalist.com,gameskinny.com,lehighvalleylivecom,lgbtqnation.com,macwelt.de,mlive.com,news8000.com,nj.com,oregonlive.com,pcwelt.de,pennlive.com,primagames.com,progameguides.com,siliconera.com,syracuse.com,themarysue.com,touchtapplay.com,wegotthiscovered.com##+js(aost, decodeURI, /(?=^(?!.*\\.js))/)",
+          "al.com,attackofthefanboy.com,beavertonvalleytimes.com,destructoid.com,edmontonsun.com,gamepur.com,gamerjournalist.com,gameskinny.com,lehighvalleylivecom,lgbtqnation.com,macwelt.de,mlive.com,news8000.com,nj.com,pcwelt.de,pennlive.com,portlandtribune.com,primagames.com,progameguides.com,queerty.com,siliconera.com,syracuse.com,techcrunch.com,thebeenews.com,themarysue.com,theoutlookonline.com,touchtapplay.com,wegotthiscovered.com##+js(aost, decodeURI, /(?=^(?!.*\\.js))/)",
           "mensjournal.com##+js(json-edit, ..props.children.*[?.key==\"admiral-script\"])",
           "phileweb.com##+js(set-attr, span[class] img.lazyload[width], src, [data-src])"
         ],
@@ -105,7 +105,7 @@
         "why": "could not be proven to be valid CSS, and an invalid selector is dropped silently"
       },
       "unsupported-option": {
-        "count": 248,
+        "count": 251,
         "samples": [
           "||void.nicopr.fr/rec$method=POST",
           "*$script,3p,denyallow=googleapis.com,domain=skidrowcodexgames.com",
@@ -127,7 +127,7 @@
         "why": "uses regex WebKit's dialect lacks (no alternation, no {n,m}, no lookahead, no \\w); emitting it would fail the entire ruleset compile"
       },
       "untranslatable-domain": {
-        "count": 637,
+        "count": 638,
         "samples": [
           "read.amazon.*##.kw-ads-ftue-container",
           "radiome.*##.min-h-\\[250px\\].mx-auto.w-full.hidden.my-1.lg\\:flex.center-children",
@@ -138,48 +138,48 @@
         "why": "if-domain takes a lower-case ASCII domain — not a pattern, a regex or an IDN — and a bad one fails the ENTIRE ruleset compile"
       }
     },
-    "dropped_total": 3947,
-    "emitted": 146817,
-    "network_block": 122614,
-    "network_exception": 2212,
+    "dropped_total": 3974,
+    "emitted": 141320,
+    "network_block": 117029,
+    "network_exception": 2217,
     "network_important": 52,
-    "scriptlet_rules": 3341,
+    "scriptlet_rules": 3357,
     "scriptlet_unhide_applied": 1,
-    "source_lines": 218380
+    "source_lines": 213043
   },
-  "rules_fnv1a": "d0eb85c872af248f",
-  "ruleset_version": "1.20260731",
+  "rules_fnv1a": "f08595edd8b759ac",
+  "ruleset_version": "1.20260821",
   "sources": [
     {
-      "lines": 85015,
+      "lines": 79285,
       "name": "easylist"
     },
     {
-      "lines": 56422,
+      "lines": 56677,
       "name": "easyprivacy"
     },
     {
-      "lines": 10925,
+      "lines": 10916,
       "name": "ubo-filters"
     },
     {
-      "lines": 3227,
+      "lines": 3295,
       "name": "ubo-privacy"
     },
     {
-      "lines": 6373,
+      "lines": 6366,
       "name": "ubo-badware"
     },
     {
-      "lines": 534,
+      "lines": 515,
       "name": "ubo-quick-fixes"
     },
     {
-      "lines": 25838,
+      "lines": 25922,
       "name": "easylist-cookie"
     },
     {
-      "lines": 5707,
+      "lines": 5728,
       "name": "ubo-annoyances-cookies"
     },
     {

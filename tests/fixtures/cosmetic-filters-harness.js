@@ -76,9 +76,21 @@ sandbox.MutationObserver = function MutationObserver(callback) {
     this.observe = () => {};
     this.disconnect = () => {};
 };
+// `documentElement` carries real attribute storage: the script publishes its
+// state there, because the DOM is the one thing the isolated world and the page
+// world share. A stub without these would make the publish silently a no-op and
+// the harness would prove the opposite of what it claims.
+const rootAttributes = Object.create(null);
 sandbox.document = {
     readyState: 'complete',
-    documentElement: {},
+    documentElement: {
+        setAttribute(name, value) {
+            rootAttributes[name] = String(value);
+        },
+        getAttribute(name) {
+            return name in rootAttributes ? rootAttributes[name] : null;
+        },
+    },
     addEventListener() {},
     querySelectorAll(selector) {
         return elements.filter((el) => el.selector === selector);
@@ -105,10 +117,23 @@ vm.createContext(sandbox);
 vm.runInContext(source, sandbox, { filename: scriptPath });
 
 if (mine.length === 0) {
-    // An unlisted host: the script must bail before it observes anything. This
-    // is the performance contract, and @match only enforces it in the engine —
-    // the script must hold it too, for a GUI too old to apply @match.
-    check('an unlisted host gets no state at all', sandbox.__yggCosmeticState === undefined);
+    // An unlisted host: the script must bail before it does any WORK. This is
+    // the performance contract, and @match only enforces it in the engine — the
+    // script must hold it too, for a GUI too old to apply @match.
+    //
+    // ⛔ BUT IT MUST STILL SAY IT RAN. This check used to require
+    // `__yggCosmeticState === undefined`, which made "ran, nothing to do here"
+    // and "never loaded at all" the same reading — and the second is the
+    // failure the whole provisioning lane exists to detect. So the state is
+    // published BEFORE the early return: `rules: 0` with no passes.
+    const idle = sandbox.__yggCosmeticState;
+    check('an unlisted host still reports that it ran', idle !== undefined);
+    check('an unlisted host has no rules', idle && idle.rules === 0);
+    check('an unlisted host does no work', idle && idle.passes === 0);
+    check(
+        'an unlisted host publishes to the DOM, which both worlds share',
+        sandbox.document.documentElement.getAttribute('data-ycf') !== null,
+    );
     console.log(`ALL OK (${checks.length} checks, host=${hostname}, unlisted)`);
     process.exit(0);
 }
