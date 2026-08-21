@@ -616,6 +616,36 @@ gate — park it rather than burning his codes.
 identifies the gap; a clean console with no outbound verify request means the
 click never reached the handler and the engine is not implicated.
 
+## ⛔ [11.1] MEDIA QUALITY (owner item 5): TWO REPORTS, NEITHER DIAGNOSED — and the instrument is the trap
+
+**Status:** OPEN, NOT STARTED. Filed 2026-08-21 so this queue answers for it; it
+lived only in a relay brief before, which is why nothing here mentioned it.
+
+Two owner reports, and they may or may not be one fault:
+
+1. **Front-end video starts high and falls back to prehistoric quality.** Starts
+   high, so the ladder is available and something is stepping DOWN — which points
+   at a throughput or decode judgement, not at a missing format.
+2. **YouTube shows VIDEO FRAME OVERLAPS while nerdview reports NO dropped
+   frames.** The overlap is visible and the counter says nothing is wrong, so
+   whatever is failing happens after the frame is counted as delivered.
+
+⛔⛔ **THE TRAP, carried forward from 11.4 and stated because it is what makes
+this expensive:** *an instrument running on the thing it measures reads zero.*
+Nerdview is computed by the same engine that is dropping the frames, so it is not
+evidence of health — it is evidence that the engine believes it is healthy.
+⇒ **Ask what STOPS CHANGING when the fault engages**, rather than what reports an
+error. A counter that keeps advancing while the picture tears is answering a
+different question than the one being asked of it.
+
+⇒ **Wire `ytrace`** (the probe bus already in the workspace, pinned in the
+top-level `Cargo.toml`) so the frame path can be watched from OUTSIDE the engine.
+That is the whole reason the mandate names it rather than naming a fix.
+
+⚠ **Not a code-reading job.** It needs a live session with real playback on both
+surfaces; nothing in the asset tree will show which of the two reports is the
+root and which is a symptom.
+
 ## ⚠ [11.1] EXTENSIONS (owner item 4): CUSTOM SITE ACCESS IS DONE; THE MODALS AND THE ADBLOCK FAILURE ARE NOT
 
 **Status:** PARTLY OPEN. Filed 2026-08-21 — the mandate lived only in a relay
