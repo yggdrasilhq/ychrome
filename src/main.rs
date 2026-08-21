@@ -27,6 +27,7 @@ mod build;
 mod daemon;
 mod engine;
 mod extensions;
+mod extmodal;
 mod manifest;
 mod passkey;
 mod provision;

@@ -5185,6 +5185,15 @@ const SPONSORBLOCK_ACTION_PREFIX: &str = "sponsorblock:";
 /// `sponsorblock:` and the dispatch is a `starts_with` chain, so a
 /// `sponsorblock:site-add` would have been swallowed by the category arm and
 /// parsed as the category `site` in behaviour `add`.
+/// `ext-reinstall:<stem>` — replace this host's copy with the bundled one.
+const EXT_REINSTALL_PREFIX: &str = "ext-reinstall:";
+/// `sponsorblock-pref:<key>` — a SponsorBlock setting that is not a category.
+///
+/// ⚠ Checked BEFORE `sponsorblock:` cannot help here — the two do not share a
+/// prefix (`sponsorblock-` vs `sponsorblock:`), which is the same punctuation
+/// split the site actions already rely on and the reason both are spelled with
+/// a hyphen rather than a second colon.
+const SPONSORBLOCK_PREF_PREFIX: &str = "sponsorblock-pref:";
 const SPONSORBLOCK_SITE_ADD_ACTION: &str = "sponsorblock-site-add";
 const SPONSORBLOCK_SITE_REMOVE_PREFIX: &str = "sponsorblock-site-remove:";
 /// The field the host is typed into. Read from the posted values by id, like
@@ -5232,6 +5241,14 @@ struct PageContext {
     secure: Option<bool>,
     vertical_tabs: bool,
     restore_tabs: bool,
+    /// ⛔ Can this GUI raise a modal for us? A CAPABILITY, not a preference.
+    ///
+    /// An "Options…" button on a shell that will drop the reply is a DEAD
+    /// CONTROL — it looks like the feature and does nothing — so the pane has to
+    /// ask before it declares one. Absent means an older GUI, which is exactly
+    /// how a GUI that never heard of app modals answers too, and the pane then
+    /// draws every extension's controls inline as it always did.
+    app_modals: bool,
 }
 
 impl PageContext {
@@ -5242,6 +5259,7 @@ impl PageContext {
             secure: query_value(query, "secure").map(|text| text == "true"),
             vertical_tabs: query_value(query, "vertical_tabs").as_deref() == Some("true"),
             restore_tabs: query_value(query, "restore_tabs").as_deref() == Some("true"),
+            app_modals: query_value(query, "app_modals").as_deref() == Some("true"),
         }
     }
 
@@ -5255,6 +5273,7 @@ impl PageContext {
             secure: read_bool(&values["secure"]),
             vertical_tabs: read_bool(&values["vertical_tabs"]).unwrap_or(false),
             restore_tabs: read_bool(&values["restore_tabs"]).unwrap_or(false),
+            app_modals: read_bool(&values["app_modals"]).unwrap_or(false),
         }
     }
 
@@ -5585,97 +5604,12 @@ fn settings_schema_from(
     // the window looks like.
     widgets.extend(browsing_widgets(page));
 
-    widgets.push(json!({"kind": "section", "text": "Ad blocking", "card": true}));
-    if state.adblock_rules_present {
-        widgets.push(json!({
-            "kind": "toggle",
-            "id": "adblock-enabled",
-            "action": "adblock-enabled",
-            "label": format!("Block ads & trackers ({} rules)", state.adblock_rule_count),
-            "value": state.adblock_enabled,
-        }));
-        widgets.push(json!({
-            "kind": "toggle",
-            "id": "adblock-profile",
-            "action": "adblock-profile",
-            "label": format!("Enabled for “{profile}”"),
-            "value": !state.adblock_profile_disabled,
-        }));
-    } else {
-        widgets.push(json!({
-            "kind": "label",
-            "muted": true,
-            "text": "No ruleset installed. ychrome installs the bundled one at launch, so \
-                     this means the write failed — check that ~/.yggterm/web-adblock/ is \
-                     writable, or run `ychrome adblock update` on this host.",
-        }));
-    }
+    widgets.extend(extension_widgets(profile, page, state));
 
-    // Hardware capture, beside ad blocking: both are "what may a page do to me",
-    // and this is the one the user comes looking for when they want a grant back.
+    // Hardware capture, after the extensions: both are "what may a page do to
+    // me", and this is the one the user comes looking for when they want a
+    // grant back.
     widgets.extend(media_permission_widgets(media_sites));
-
-    // SponsorBlock is a userscript, but a flagship one, so it gets its own named
-    // section with a friendly toggle — pulled out of the generic list below.
-    widgets.extend(sponsorblock_widgets(state));
-
-    // Everything EXCEPT sponsorblock: one list-row each, with Enable/Disable and
-    // a Delete (the "toggle + trash icon" the design calls for).
-    widgets.push(json!({"kind": "section", "text": "Userscripts", "card": true}));
-    let managed: Vec<&crate::webpolicy::UserscriptStatus> = state
-        .userscripts
-        .iter()
-        .filter(|script| script.stem != crate::extensions::SPONSORBLOCK_STEM)
-        .collect();
-    if managed.is_empty() {
-        widgets.push(json!({
-            "kind": "label",
-            "muted": true,
-            "text": "None installed. Add one below, or drop *.js into \
-                     ~/.yggterm/web-userscripts/ on the host ychrome runs on.",
-        }));
-    }
-    for script in managed {
-        widgets.push(userscript_row(
-            &script.stem,
-            script.enabled,
-            // A refusal outranks a note: a refused script is not running at
-            // all, which is the more urgent of the two things to say.
-            script.refusal.as_deref().or(script.note.as_deref()),
-        ));
-    }
-
-    // The catalog, filtered to what is not already installed. "Installed" is read
-    // from the SAME `state` snapshot the rest of the pane draws from — one source
-    // of truth per render, so the catalog can never disagree with the list above
-    // it. Omit the whole section when there is nothing left to add.
-    let installed: std::collections::HashSet<&str> = state
-        .userscripts
-        .iter()
-        .map(|script| script.stem.as_str())
-        .collect();
-    let installable: Vec<&crate::extensions::Extension> = crate::extensions::catalog()
-        .iter()
-        .filter(|ext| !installed.contains(ext.stem))
-        .collect();
-    if !installable.is_empty() {
-        widgets.push(json!({"kind": "section", "text": "Add an extension"}));
-        for ext in installable {
-            widgets.push(json!({
-                "kind": "list-row",
-                "id": format!("catalog-{}", ext.stem),
-                "title": ext.name,
-                "subtitle": ext.description,
-                "actions": [
-                    {
-                        "action": format!("{INSTALL_ACTION_PREFIX}{}", ext.stem),
-                        "label": "Install",
-                        "title": format!("Install {}", ext.name),
-                    }
-                ],
-            }));
-        }
-    }
 
     widgets.extend(user_agent_widgets(profile));
 
@@ -5695,6 +5629,141 @@ fn settings_schema_from(
     }));
 
     json!({ "title": "YChrome Settings", "widgets": widgets })
+}
+
+/// The stored value of one SponsorBlock flag, for a list-row button that has to
+/// flip what is there rather than post a state.
+fn sponsorblock_flag(key: &str) -> bool {
+    let prefs = crate::sponsorblock::preferences();
+    match key {
+        k if k == crate::sponsorblock::PREF_SKIP_NOTICE => prefs.skip_notice,
+        k if k == crate::sponsorblock::PREF_SEEK_BAR_MARKERS => prefs.seek_bar_markers,
+        k if k == crate::sponsorblock::PREF_VOTING => prefs.voting,
+        k if k == crate::sponsorblock::PREF_SUBMISSION => prefs.submission,
+        _ => false,
+    }
+}
+
+/// The EXTENSIONS section: one row per extension, each opening its own options.
+///
+/// ⛔ This replaced nineteen controls flattened into the pane — ad blocking's
+/// two toggles, SponsorBlock's eleven category rows and its site list, and a
+/// row per userscript, all in one column. The owner's word for it was
+/// "half-hearted", and the fix is that an extension's settings live behind that
+/// extension's own button.
+///
+/// ⚠ **ONE action per row, state in the subtitle.** A rail `list-row` gives its
+/// actions their width FIRST and the title takes what is left under
+/// `overflow:hidden`; a three-action row has been measured at a 0px title on
+/// this rail. So the row says what is going on and the dialog does the work.
+///
+/// The fallback is not a second implementation — see [`crate::extmodal`]. When
+/// the GUI cannot raise a dialog, the very same widgets are drawn inline.
+fn extension_widgets(
+    profile: &str,
+    page: &PageContext,
+    state: &crate::webpolicy::PolicyState,
+) -> Vec<Value> {
+    let placement = if page.app_modals {
+        crate::extmodal::Placement::Modal
+    } else {
+        crate::extmodal::Placement::Inline
+    };
+    let host = page.host();
+    // The catalogue's own order, then whatever the user dropped in themselves.
+    // Ad blocking leads: it is the one that is on by default and the one the
+    // other rows keep referring to.
+    let mut stems: Vec<String> = vec![crate::extmodal::ADBLOCK_STEM.to_string()];
+    stems.extend(
+        crate::extensions::catalog()
+            .iter()
+            .map(|ext| ext.stem.to_string()),
+    );
+    // "Installed" is read from the SAME `state` snapshot the rest of the pane
+    // draws from — one source of truth per render, so this list can never
+    // disagree with the rows above it.
+    for script in &state.userscripts {
+        if !stems.iter().any(|stem| *stem == script.stem) {
+            stems.push(script.stem.clone());
+        }
+    }
+
+    let mut widgets = vec![json!({"kind": "section", "text": "Extensions"})];
+    if !page.app_modals {
+        widgets.push(json!({
+            "kind": "label",
+            "muted": true,
+            "text": "This yggterm cannot open a settings window for an app, so every \
+                     extension's controls are laid out below instead. Restart yggterm to get \
+                     the compact list back.",
+        }));
+    }
+    let mut inline: Vec<Value> = Vec::new();
+    for stem in &stems {
+        let options = if crate::extmodal::has_options(stem) {
+            crate::extmodal::options(stem, profile, host, state, placement)
+        } else {
+            Some(crate::extmodal::generic(stem, state, placement))
+        };
+        let Some(options) = options else { continue };
+        if page.app_modals {
+            widgets.push(json!({
+                "kind": "list-row",
+                "id": format!("ext-{stem}"),
+                "title": options.title,
+                "subtitle": extension_state_line(stem, state),
+                "actions": [{
+                    "action": format!("{}{stem}", crate::extmodal::OPEN_ACTION_PREFIX),
+                    "label": "Options…",
+                    "title": format!("Settings for {}", options.title),
+                }],
+            }));
+        } else {
+            inline.push(json!({
+                "kind": "section",
+                "text": options.title,
+                "card": true,
+            }));
+            inline.push(json!({"kind": "label", "muted": true, "text": options.subtitle}));
+            inline.extend(options.widgets);
+        }
+    }
+    widgets.extend(inline);
+    widgets
+}
+
+/// What a row says about an extension without opening it.
+///
+/// ⛔ A REFUSAL OUTRANKS EVERYTHING. A refused script is injected nowhere
+/// whatever its filename says, so a row reading "On" for one would be a lie in
+/// the one place a user looks to check.
+fn extension_state_line(stem: &str, state: &crate::webpolicy::PolicyState) -> String {
+    if stem == crate::extmodal::ADBLOCK_STEM {
+        if !state.adblock_rules_present {
+            return "⛔ No ruleset on this host".to_string();
+        }
+        if !state.adblock_enabled {
+            return "Off".to_string();
+        }
+        if state.adblock_profile_disabled {
+            return "Off for this profile".to_string();
+        }
+        return format!("On — {} rules", state.adblock_rule_count);
+    }
+    match state.userscripts.iter().find(|script| script.stem == stem) {
+        Some(script) => {
+            if let Some(refusal) = script.refusal.as_deref() {
+                format!("⛔ Not running: {refusal}")
+            } else if let Some(note) = script.note.as_deref() {
+                format!("⚠ {note}")
+            } else if script.enabled {
+                "On".to_string()
+            } else {
+                "Off".to_string()
+            }
+        }
+        None => "Not installed".to_string(),
+    }
 }
 
 /// The connection line for "This site". Honest and narrow: HTTPS vs not, which is
@@ -5719,220 +5788,91 @@ fn current_site_security_widgets(host: Option<&str>, secure: Option<bool>) -> Ve
     }
 }
 
-/// The SponsorBlock section. Installed ⇒ a friendly toggle (its state is the
-/// `sponsorblock.js` vs `.js.disabled` rename, exactly like any userscript),
-/// then one row per category so the user can say what each one should do.
-/// Not installed ⇒ nothing here; it appears under "Add an extension" instead.
-///
-/// The category rows are drawn from `crate::sponsorblock`, which is the one
-/// owner of the catalogue, the defaults and the stored choices. The pane
-/// re-derives none of it: a category added there appears here with no change,
-/// and the buttons it offers are that category's own `options`.
-fn sponsorblock_widgets(state: &crate::webpolicy::PolicyState) -> Vec<Value> {
-    let installed = state
-        .userscripts
-        .iter()
-        .find(|script| script.stem == crate::extensions::SPONSORBLOCK_STEM);
-    let Some(script) = installed else {
-        return Vec::new();
-    };
-    let mut widgets = vec![
-        json!({"kind": "section", "text": "SponsorBlock"}),
-        json!({
-            "kind": "toggle",
-            "id": format!("{USERSCRIPT_ACTION_PREFIX}{}", script.stem),
-            "action": format!("{USERSCRIPT_ACTION_PREFIX}{}", script.stem),
-            "label": "Skip YouTube sponsor segments",
-            // The toggle stays honest to the FILENAME (that is what it flips);
-            // a gate refusal — impossible for the bundled header, but a user
-            // can edit the file — is surfaced right under it.
-            "value": script.enabled,
-        }),
-    ];
-    if let Some(refusal) = &script.refusal {
-        widgets.push(json!({ "kind": "label", "muted": true, "text": refusal }));
-    }
-    // The per-category rows only when the script is on: offering a choice that
-    // nothing will act on is worse than offering none.
-    if !script.enabled {
-        return widgets;
-    }
-    for (category, behaviour) in crate::sponsorblock::effective() {
-        widgets.push(sponsorblock_category_row(category, behaviour));
-    }
-    widgets.extend(sponsorblock_site_widgets());
-    widgets.push(json!({
-        "kind": "label",
-        "muted": true,
-        "text": "Segments come from the community database at sponsor.ajay.app, asked \
-                 for by hash prefix so it is never told which video you are watching. \
-                 ychrome submits nothing and votes on nothing.",
-    }));
-    widgets
-}
 
-/// CUSTOM SITE ACCESS: the hosts SponsorBlock runs on besides YouTube.
-///
-/// ⭐ Why this is worth a control. A front-end that serves YouTube's catalogue
-/// under its own domain serves the same VIDEO IDS, so the community database
-/// answers for it exactly as it does for YouTube — and without this, running
-/// your own front-end means losing the feature entirely, which is a poor trade
-/// for the privacy it was chosen for.
-///
-/// ⛔ No such host ships with ychrome, here or anywhere: an instance address is
-/// the user's own infrastructure, and a bundled list would both name whoever is
-/// on it and rot. The placeholder is an invented example.
-fn sponsorblock_site_widgets() -> Vec<Value> {
-    let sites = crate::sponsorblock::sites();
-    let mut widgets = vec![json!({
-        "kind": "label",
-        "muted": true,
-        "text": "SponsorBlock runs on YouTube. If you watch through your own front-end, \
-                 add its host here and the same segments apply — the database is keyed \
-                 by video id, not by site.",
-    })];
-    for host in &sites {
-        widgets.push(json!({
-            "kind": "list-row",
-            "id": format!("{SPONSORBLOCK_SITE_REMOVE_PREFIX}{host}"),
-            "title": host,
-            "subtitle": "SponsorBlock runs here as well as on YouTube",
-            "actions": [{
-                "action": format!("{SPONSORBLOCK_SITE_REMOVE_PREFIX}{host}"),
-                "label": "Remove",
-                "title": format!("Stop running SponsorBlock on {host}"),
-                "destructive": true,
-            }],
-        }));
-    }
-    widgets.push(json!({
-        "kind": "text-input",
-        "id": SPONSORBLOCK_SITE_FIELD,
-        "label": "Add a site",
-        // The bare host, which is what a `@match` pattern is built from — a
-        // pasted URL is the shape that would silently match nothing, so the
-        // placeholder shows the shape rather than describing it.
-        "placeholder": "videos.example.net",
-        "value": "",
-        "action": SPONSORBLOCK_SITE_ADD_ACTION,
-    }));
-    widgets.push(json!({
-        "kind": "button",
-        "id": SPONSORBLOCK_SITE_ADD_ACTION,
-        "action": SPONSORBLOCK_SITE_ADD_ACTION,
-        "label": "Add site",
-    }));
-    widgets
-}
 
-/// The action id for "put `<category>` into `<behaviour>`". One string, parsed
-/// back by `run_settings_action` — the row and the handler agree by
-/// construction rather than by two matching format strings.
-fn sponsorblock_action(category: &str, behaviour: &str) -> String {
-    format!("{SPONSORBLOCK_ACTION_PREFIX}{category}:{behaviour}")
-}
 
-/// One category as a list-row: what it does now in the subtitle, and a button
-/// for each state it is NOT in.
-///
-/// The current state is deliberately absent from the buttons rather than shown
-/// pressed: `list-row` actions render as plain buttons with no selected state,
-/// so a row offering "Auto-skip" while already auto-skipping is a control that
-/// appears to do nothing when clicked.
-fn sponsorblock_category_row(
-    category: &'static crate::sponsorblock::Category,
-    behaviour: &'static str,
-) -> Value {
-    let actions: Vec<Value> = category
-        .options
-        .iter()
-        .filter(|option| **option != behaviour)
-        .map(|option| {
-            json!({
-                "action": sponsorblock_action(category.id, option),
-                "label": sponsorblock_behaviour_label(option),
-                "title": format!(
-                    "{}: {}",
-                    category.label,
-                    sponsorblock_behaviour_title(option),
-                ),
-            })
-        })
-        .collect();
-    json!({
-        "kind": "list-row",
-        "id": format!("sponsorblock-{}", category.id),
-        "title": category.label,
-        "subtitle": format!(
-            "{} — {}",
-            sponsorblock_behaviour_label(behaviour),
-            category.description,
-        ),
-        "actions": actions,
-    })
-}
 
-fn sponsorblock_behaviour_label(behaviour: &str) -> &'static str {
-    match behaviour {
-        crate::sponsorblock::AUTO => "Auto-skip",
-        crate::sponsorblock::MANUAL => "Skip button",
-        crate::sponsorblock::MUTE => "Mute",
-        crate::sponsorblock::SHOW => "Show",
-        _ => "Off",
-    }
-}
 
-fn sponsorblock_behaviour_title(behaviour: &str) -> &'static str {
-    match behaviour {
-        crate::sponsorblock::AUTO => "seek past it without asking",
-        crate::sponsorblock::MANUAL => "offer a skip button while it plays",
-        crate::sponsorblock::MUTE => "mute it rather than seek past it",
-        crate::sponsorblock::SHOW => "mark it on the seek bar",
-        _ => "ignore it entirely",
-    }
-}
 
-/// One managed userscript as a list-row: its on/off state in the subtitle, an
-/// Enable/Disable action, and a Delete. Keyed by stem so Dioxus never patches one
-/// script's row into another's (identity, not index — the pane's hard-won rule).
-///
-/// A gate-refused script is on disk and enabled BY FILENAME, but injected
-/// nowhere — its subtitle carries the refusal (naming each offending line
-/// verbatim) instead of the lie "Enabled". The actions stay: refusal is a
-/// verdict on the header, not a lock-out, and Disable/Delete are exactly what
-/// a user may want to do with a script that runs nowhere.
-fn userscript_row(stem: &str, enabled: bool, notice: Option<&str>) -> Value {
-    let toggle_label = if enabled { "Disable" } else { "Enable" };
-    let subtitle = match notice {
-        Some(notice) => notice.to_string(),
-        None if enabled => "Enabled".to_string(),
-        None => "Disabled".to_string(),
-    };
-    json!({
-        "kind": "list-row",
-        "id": format!("script-{stem}"),
-        "title": stem,
-        "subtitle": subtitle,
-        "actions": [
-            {
-                "action": format!("{USERSCRIPT_ACTION_PREFIX}{stem}"),
-                "label": toggle_label,
-                "title": format!("{toggle_label} {stem}"),
-            },
-            {
-                "action": format!("{USERSCRIPT_DELETE_PREFIX}{stem}"),
-                "label": "Delete",
-                "title": format!("Delete {stem}"),
-            }
-        ],
-    })
-}
 
 /// A settings click. Every mutation lands on THIS host's disk, then the pane
 /// re-reads it — the files are the source of truth, so the toggle can never
 /// disagree with what `/policy` will serve next.
 fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
     let action = request["action"].as_str().unwrap_or_default();
+    let page = PageContext::from_values(&request["values"]);
+    let profile = state.lock().unwrap().profile.clone();
+
+    // ⭐ RAISE an extension's options dialog. The whole reply is the dialog:
+    // yggterm owns the window, we own what is in it.
+    if let Some(stem) = action.strip_prefix(crate::extmodal::OPEN_ACTION_PREFIX) {
+        return open_extension_modal(&profile, &page, stem);
+    }
+
+    // ⭐ A click made INSIDE one. Strip the envelope, run the action underneath
+    // through the ONE dispatch below, then redraw the dialog beside the pane.
+    //
+    // ⛔ The inner action is untouched on purpose: `sponsorblock:intro:auto`
+    // means the same thing whether it was clicked in a dialog or in the pane,
+    // and there is one handler for both. A second grammar for dialogs would be
+    // a second place every verb has to be added.
+    if let Some(rest) = action.strip_prefix(crate::extmodal::MODAL_ACTION_PREFIX) {
+        // A stem is a bare filename stem by construction, so it carries no `:`
+        // and the split is unambiguous.
+        let Some((stem, inner)) = rest.split_once(':') else {
+            return json!({ "toast": format!("malformed extension action {action:?}") });
+        };
+        let (stem, inner) = (stem.to_string(), inner.to_string());
+        let mut reply = run_settings_action_inner(state, request, &inner);
+        // The dialog is redrawn from DISK, after the action landed — so a
+        // refused write snaps its controls back to what the file system says
+        // rather than leaving them showing the click.
+        let refreshed = open_extension_modal(&profile, &page, &stem);
+        if let Some(modal) = refreshed.get("modal") {
+            reply["modal"] = modal.clone();
+        }
+        // …and so is the pane behind it, which is showing that extension's
+        // state line.
+        if reply.get("schema").is_none() {
+            reply["schema"] = settings_schema(&profile, &page);
+        }
+        return reply;
+    }
+
+    run_settings_action_inner(state, request, action)
+}
+
+/// Build the reply that raises one extension's options dialog.
+fn open_extension_modal(profile: &str, page: &PageContext, stem: &str) -> Value {
+    let policy = crate::webpolicy::state(profile);
+    let options = if crate::extmodal::has_options(stem) {
+        crate::extmodal::options(
+            stem,
+            profile,
+            page.host(),
+            &policy,
+            crate::extmodal::Placement::Modal,
+        )
+    } else {
+        Some(crate::extmodal::generic(
+            stem,
+            &policy,
+            crate::extmodal::Placement::Modal,
+        ))
+    };
+    let Some(options) = options else {
+        return json!({ "toast": format!("no extension named {stem:?}") });
+    };
+    json!({
+        "modal": {
+            "title": options.title,
+            "subtitle": options.subtitle,
+            "widgets": options.widgets,
+        }
+    })
+}
+
+fn run_settings_action_inner(state: &Mutex<PaneState>, request: &Value, action: &str) -> Value {
     // Everything the GUI knows about the live surface: host, zoom, HTTPS, and its
     // own web-surface prefs.
     let page = PageContext::from_values(&request["values"]);
@@ -6090,6 +6030,58 @@ fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 )),
             }
         }
+        // Replace this host's copy with the one ychrome ships. Distinct from
+        // `install:` because install REFUSES to clobber an existing file — that
+        // refusal is right for a fresh install and is exactly what a repair has
+        // to get past.
+        stem if stem.starts_with(EXT_REINSTALL_PREFIX) => {
+            let stem = stem.trim_start_matches(EXT_REINSTALL_PREFIX);
+            match crate::extensions::find(stem) {
+                Some(ext) => crate::webpolicy::delete_userscript(ext.stem)
+                    .and_then(|()| crate::webpolicy::install_userscript(ext.stem, ext.body)),
+                // ⛔ Never offered for a script ychrome does not ship, and
+                // refused here too: the delete above would destroy the user's
+                // own file and there would be nothing to put back.
+                None => Err(anyhow::anyhow!(
+                    "ychrome does not ship {stem:?}, so there is no copy to reinstall"
+                )),
+            }
+        }
+        // Fetch every list and rebuild the ruleset on THIS host. The CLI verb,
+        // reached from the dialog that explains what it does.
+        "adblock-update" => {
+            match crate::adblock::run(Some("update"), &[]) {
+                Ok(()) => {
+                    return redraw(json!({
+                        "toast": "Ruleset rebuilt. A new RULESET needs a yggterm restart — \
+                                  WebKit compiles the filter once per GUI process.",
+                    }));
+                }
+                Err(error) => return redraw(json!({ "toast": error.to_string() })),
+            }
+        }
+        // A SponsorBlock preference that is not per-category.
+        pref if pref.starts_with(SPONSORBLOCK_PREF_PREFIX) => {
+            let key = pref.trim_start_matches(SPONSORBLOCK_PREF_PREFIX);
+            // A toggle posts its new state; anything else flips what is stored.
+            let on = match posted {
+                Some("true") => true,
+                Some("false") => false,
+                _ => !sponsorblock_flag(key),
+            };
+            crate::sponsorblock::set_flag(key, on)
+        }
+        "sponsorblock-min-duration" => {
+            let typed = request["values"][crate::sponsorblock::PREF_MIN_DURATION].clone();
+            let secs = typed
+                .as_f64()
+                .or_else(|| typed.as_str().and_then(|text| text.trim().parse::<f64>().ok()));
+            match secs {
+                Some(secs) => crate::sponsorblock::set_min_duration(secs),
+                None => Err(anyhow::anyhow!("give the minimum as a number of seconds")),
+            }
+        }
+        "sponsorblock-forget-id" => crate::sponsorblock::forget_private_user_id(),
         install if install.starts_with(INSTALL_ACTION_PREFIX) => {
             let stem = install.trim_start_matches(INSTALL_ACTION_PREFIX);
             match crate::extensions::find(stem) {
@@ -7417,9 +7409,27 @@ mod tests {
     // where a format-string edit on one side ships a dead button.
     #[test]
     fn a_category_action_id_round_trips_through_the_dispatchers_parser() {
+        // ⛔ Built the way the dialog builds it, through the ONE owner. A test
+        // that formatted the string itself would agree with itself forever
+        // while the dialog shipped a dead button.
+        let options = crate::extmodal::options(
+            crate::extensions::SPONSORBLOCK_STEM,
+            "work",
+            None,
+            &policy_state(true, &[("sponsorblock", true)]),
+            crate::extmodal::Placement::Inline,
+        )
+        .expect("sponsorblock options");
+        let emitted = dialog_actions(&options.widgets);
         for category in crate::sponsorblock::catalog() {
             for option in category.options {
-                let action = sponsorblock_action(category.id, option);
+                let action = format!("sponsorblock:{}:{option}", category.id);
+                // Every one the dialog is CAPABLE of emitting must parse; the
+                // row for the state a category is already in emits nothing, so
+                // that one is not required to be present.
+                if !emitted.contains(&action) {
+                    continue;
+                }
                 let rest = action
                     .strip_prefix(SPONSORBLOCK_ACTION_PREFIX)
                     .unwrap_or_else(|| panic!("{action} lost its prefix"));
@@ -7442,14 +7452,19 @@ mod tests {
         );
     }
 
-    // A disabled script offers no category rows: a control that nothing will
-    // act on is worse than no control.
-    #[test]
-    /// The pane offers the control, and its ids cannot be swallowed by the
+    /// The dialog offers the control, and its ids cannot be swallowed by the
     /// category arm's `starts_with` chain.
     #[test]
     fn the_site_control_is_offered_and_its_ids_cannot_collide_with_a_category() {
-        let widgets = sponsorblock_site_widgets();
+        let options = crate::extmodal::options(
+            crate::extensions::SPONSORBLOCK_STEM,
+            "work",
+            None,
+            &policy_state(true, &[("sponsorblock", true)]),
+            crate::extmodal::Placement::Inline,
+        )
+        .expect("sponsorblock options");
+        let widgets = options.widgets;
         let ids: Vec<&str> = widgets
             .iter()
             .filter_map(|w| w["id"].as_str().or_else(|| w["action"].as_str()))
@@ -7478,67 +7493,262 @@ mod tests {
         assert!(rendered.contains("videos.example.net"));
     }
 
-    #[test]
-    fn a_disabled_sponsorblock_offers_no_category_rows() {
-        let schema = settings_schema_from(
-            "work",
-            &PageContext::default(),
-            &no_zoom(),
-            &policy_state(true, &[("sponsorblock", false)]),
-            &no_media(),
-        );
-        let widgets = schema["widgets"].as_array().expect("widgets");
-        assert!(
-            !widgets.iter().any(|w| {
-                w["id"]
-                    .as_str()
-                    .is_some_and(|id| id.starts_with("sponsorblock-"))
-            }),
-            "category rows drawn for a script that is switched off"
-        );
+    /// A page context whose GUI CAN raise a dialog for us. The default is a
+    /// shell that cannot, which is the honest default for a marker that is
+    /// absent on every older build.
+    fn with_modals() -> PageContext {
+        PageContext {
+            app_modals: true,
+            ..PageContext::default()
+        }
     }
 
-    // SponsorBlock gets its own named toggle; a plain userscript becomes a
-    // list-row with Enable/Disable + Delete actions, keyed by stem.
+    /// Every action a set of dialog widgets offers, as WHOLE strings.
+    ///
+    /// ⛔ Actions here share stems on purpose (`install:` sits inside
+    /// `ext-reinstall:`), so a substring search over the rendered JSON answers a
+    /// different question than the one being asked.
+    fn dialog_actions(widgets: &[Value]) -> Vec<String> {
+        let mut out = Vec::new();
+        for widget in widgets {
+            if let Some(action) = widget["action"].as_str() {
+                out.push(action.to_string());
+            }
+            for row_action in widget["actions"].as_array().into_iter().flatten() {
+                if let Some(action) = row_action["action"].as_str() {
+                    out.push(action.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    fn widget_ids(schema: &Value) -> Vec<String> {
+        schema["widgets"]
+            .as_array()
+            .expect("widgets")
+            .iter()
+            .filter_map(|w| w["id"].as_str().map(ToOwned::to_owned))
+            .collect()
+    }
+
+    /// ⭐⭐ THE OWNER'S ASK, AS A TEST.
+    ///
+    /// "Make each extension a modal producing button like yggterm settings."
+    /// Every extension gets ONE row carrying ONE button, and the pane carries
+    /// none of their controls — which is the half that was actually wrong: the
+    /// settings pane had grown ad blocking's two toggles, SponsorBlock's eleven
+    /// category rows and its site list, and a row per script, all in one column.
     #[test]
-    fn sponsorblock_is_promoted_and_other_scripts_get_delete_rows() {
+    fn every_extension_gets_one_row_and_its_own_options_button() {
         let schema = settings_schema_from(
             "work",
-            &PageContext::default(),
+            &with_modals(),
             &no_zoom(),
             &policy_state(true, &[("sponsorblock", true), ("darkmode", false)]),
             &no_media(),
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
-        // SponsorBlock: its own toggle, friendly label, NOT in the generic list.
-        let sponsor = widgets
-            .iter()
-            .find(|w| w["id"] == "userscript:sponsorblock")
-            .expect("sponsorblock toggle");
-        assert_eq!(sponsor["kind"], "toggle");
-        assert_eq!(sponsor["value"], true);
-        assert!(widgets.iter().any(|w| w["text"] == "SponsorBlock"));
-        // darkmode: a managed list-row with a toggle action and a delete action.
-        let dark = widgets
-            .iter()
-            .find(|w| w["id"] == "script-darkmode")
-            .expect("darkmode row");
-        assert_eq!(dark["kind"], "list-row");
-        assert_eq!(dark["subtitle"], "Disabled");
-        let actions: Vec<&str> = dark["actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|a| a["action"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            actions,
-            ["userscript:darkmode", "userscript-delete:darkmode"]
+
+        // Ad blocking, every catalogue entry, and the user's own script.
+        let mut expected: Vec<String> = vec![format!("ext-{}", crate::extmodal::ADBLOCK_STEM)];
+        expected.extend(
+            crate::extensions::catalog()
+                .iter()
+                .map(|ext| format!("ext-{}", ext.stem)),
         );
-        // sponsorblock must NOT also appear as a managed script row.
+        expected.push("ext-darkmode".to_string());
+        for id in &expected {
+            let row = widgets
+                .iter()
+                .find(|w| w["id"].as_str() == Some(id.as_str()))
+                .unwrap_or_else(|| panic!("no row for {id}"));
+            assert_eq!(row["kind"], "list-row");
+            let actions = row["actions"].as_array().expect("actions");
+            // ⚠ ONE action. A rail row gives its actions their width FIRST and
+            // the title takes what is left; a three-action row has been measured
+            // at a 0px title on this rail.
+            assert_eq!(actions.len(), 1, "{id} carries more than one action");
+            assert_eq!(actions[0]["label"], "Options…");
+            assert!(
+                actions[0]["action"]
+                    .as_str()
+                    .is_some_and(|action| action.starts_with(crate::extmodal::OPEN_ACTION_PREFIX)),
+                "{id}'s button does not raise a dialog"
+            );
+            // …and the state is in the SUBTITLE, which is what the one action
+            // buys back.
+            assert!(
+                row["subtitle"].as_str().is_some_and(|line| !line.is_empty()),
+                "{id} says nothing about its state"
+            );
+        }
+    }
+
+    /// ⛔ THE OTHER HALF OF THE SAME ASK, and the one a row test cannot see:
+    /// the pane must no longer CARRY those controls. A pane that grew a tidy
+    /// list of buttons and kept every old toggle underneath it is the thing that
+    /// was complained about, with one more section.
+    #[test]
+    fn the_pane_itself_carries_no_per_extension_controls() {
+        let schema = settings_schema_from(
+            "work",
+            &with_modals(),
+            &no_zoom(),
+            &policy_state(true, &[("sponsorblock", true)]),
+            &no_media(),
+        );
+        let ids = widget_ids(&schema);
+        for banished in [
+            "adblock-enabled",
+            "adblock-profile",
+            "userscript:sponsorblock",
+            "script-sponsorblock",
+            "catalog-unblock-select",
+            "sponsorblock_site",
+        ] {
+            assert!(
+                !ids.iter().any(|id| id == banished),
+                "{banished:?} is still drawn in the pane itself"
+            );
+        }
+        // No category row either — those are eleven of the nineteen.
         assert!(
-            !widgets.iter().any(|w| w["id"] == "script-sponsorblock"),
-            "sponsorblock leaked into the generic userscripts list"
+            !ids.iter()
+                .any(|id| id.starts_with("sponsorblock-") && id != "sponsorblock-site-add"),
+            "SponsorBlock's category rows are still in the pane: {ids:?}"
+        );
+    }
+
+    /// ⛔ And the CAPABILITY GATE, which is what stops the change from being a
+    /// regression on a shell that has not been restarted. `app_modals` absent
+    /// means the GUI would silently drop the dialog, so the same controls are
+    /// drawn inline instead — a button that opens nothing is worse than a long
+    /// pane.
+    #[test]
+    fn a_shell_that_cannot_raise_a_dialog_gets_the_controls_inline() {
+        let state = policy_state(true, &[("sponsorblock", true)]);
+        let inline = settings_schema_from(
+            "work",
+            &PageContext::default(),
+            &no_zoom(),
+            &state,
+            &no_media(),
+        );
+        let ids = widget_ids(&inline);
+        // ⚠ The test is on the ACTION, not on an id prefix: the inline controls
+        // legitimately carry `ext-on-…`/`ext-install-…` widget ids, and a test
+        // that banned the prefix would be testing its own naming rather than
+        // the thing that matters — whether a button exists that this shell
+        // would silently drop.
+        let rendered_ids = inline.to_string();
+        assert!(
+            !rendered_ids.contains(crate::extmodal::OPEN_ACTION_PREFIX),
+            "an Options button was drawn on a shell that cannot open it: {ids:?}"
+        );
+        // The controls themselves are all still reachable.
+        assert!(ids.iter().any(|id| id == "adblock-enabled"));
+        assert!(ids.iter().any(|id| id == "sponsorblock-sponsor"));
+        assert!(ids.iter().any(|id| id == "sb-voting"));
+        // …and their actions are BARE, not wrapped in the dialog envelope,
+        // which would ask a shell with no dialog to redraw one.
+        let rendered = inline.to_string();
+        assert!(
+            !rendered.contains(crate::extmodal::MODAL_ACTION_PREFIX),
+            "inline controls posted the dialog envelope"
+        );
+    }
+
+    /// An extension ychrome ships but this host has not installed is still
+    /// LISTED — you cannot ask for what you cannot see — and its dialog is where
+    /// the install lives.
+    #[test]
+    fn an_uninstalled_extension_is_listed_and_its_dialog_offers_the_install() {
+        let state = policy_state(true, &[("sponsorblock", true)]);
+        let schema = settings_schema_from("work", &with_modals(), &no_zoom(), &state, &no_media());
+        let row = schema["widgets"]
+            .as_array()
+            .expect("widgets")
+            .iter()
+            .find(|w| w["id"] == "ext-unblock-select")
+            .expect("an uninstalled extension is still listed");
+        assert_eq!(row["subtitle"], "Not installed");
+
+        let options = crate::extmodal::options(
+            "unblock-select",
+            "work",
+            None,
+            &state,
+            crate::extmodal::Placement::Modal,
+        )
+        .expect("options");
+        assert!(
+            dialog_actions(&options.widgets)
+                .contains(&"ext-in:unblock-select:install:unblock-select".to_string()),
+            "the dialog for an uninstalled extension does not offer to install it"
+        );
+        // …and an INSTALLED one must not be offered an install, which would
+        // refuse rather than clobber and read as a broken button.
+        //
+        // ⚠ Compared as a WHOLE ACTION, never as a substring: the Reinstall verb
+        // this dialog does carry is `ext-reinstall:sponsorblock`, and
+        // `install:sponsorblock` sits inside it. The first cut of this test used
+        // `contains` and failed on a dialog that was perfectly correct.
+        let installed = crate::extmodal::options(
+            crate::extensions::SPONSORBLOCK_STEM,
+            "work",
+            None,
+            &state,
+            crate::extmodal::Placement::Modal,
+        )
+        .expect("options");
+        assert!(
+            !dialog_actions(&installed.widgets)
+                .contains(&"ext-in:sponsorblock:install:sponsorblock".to_string()),
+            "an installed extension was still offered an install"
+        );
+    }
+
+    /// SponsorBlock's categories are settings for a script that is ON THIS HOST.
+    /// Not installed ⇒ nothing to configure; the dialog offers the install
+    /// instead. (Installed-but-off DOES offer them: you opened that extension's
+    /// own window, and configuring it before switching it on is the point of
+    /// having one.)
+    #[test]
+    fn a_sponsorblock_that_is_not_installed_offers_no_category_rows() {
+        let state = policy_state(true, &[]);
+        let options = crate::extmodal::options(
+            crate::extensions::SPONSORBLOCK_STEM,
+            "work",
+            None,
+            &state,
+            crate::extmodal::Placement::Modal,
+        )
+        .expect("options");
+        let ids: Vec<&str> = options
+            .widgets
+            .iter()
+            .filter_map(|w| w["id"].as_str())
+            .collect();
+        assert!(
+            !ids.iter().any(|id| id.starts_with("sponsorblock-")),
+            "category rows drawn for a script that is not on this host: {ids:?}"
+        );
+        let installed = policy_state(true, &[("sponsorblock", false)]);
+        let options = crate::extmodal::options(
+            crate::extensions::SPONSORBLOCK_STEM,
+            "work",
+            None,
+            &installed,
+            crate::extmodal::Placement::Modal,
+        )
+        .expect("options");
+        assert!(
+            options
+                .widgets
+                .iter()
+                .any(|w| w["id"] == "sponsorblock-sponsor"),
+            "an installed-but-off SponsorBlock could not be configured"
         );
     }
 
@@ -7551,23 +7761,16 @@ mod tests {
         let mut state = policy_state(true, &[("broken", true)]);
         state.userscripts[0].refusal =
             Some("Refused — not injected: @exclude https://*.youtube.com/embed/*".to_string());
-        let schema = settings_schema_from(
-            "work",
-            &PageContext::default(),
-            &no_zoom(),
-            &state,
-            &no_media(),
-        );
-        let widgets = schema["widgets"].as_array().expect("widgets");
-        let row = widgets
+        let schema =
+            settings_schema_from("work", &with_modals(), &no_zoom(), &state, &no_media());
+        let row = schema["widgets"]
+            .as_array()
+            .expect("widgets")
             .iter()
-            .find(|w| w["id"] == "script-broken")
+            .find(|w| w["id"] == "ext-broken")
             .expect("broken row");
         let subtitle = row["subtitle"].as_str().expect("subtitle");
-        assert_ne!(
-            subtitle, "Enabled",
-            "a refused script was presented as running"
-        );
+        assert_ne!(subtitle, "On", "a refused script was presented as running");
         assert!(
             subtitle.contains("Refused"),
             "the refusal state is invisible in the pane: {subtitle}"
@@ -7576,38 +7779,19 @@ mod tests {
             subtitle.contains("@exclude https://*.youtube.com/embed/*"),
             "the refusal must name the offending line verbatim: {subtitle}"
         );
-        // The row keeps its controls: refusal is a verdict, not a lock-out.
-        let actions: Vec<&str> = row["actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|a| a["action"].as_str().unwrap())
-            .collect();
-        assert_eq!(actions, ["userscript:broken", "userscript-delete:broken"]);
-    }
-
-    // The catalog shows only what is NOT installed, judged against the SAME state
-    // snapshot the pane draws from. sponsorblock is installed here, so it is
-    // absent from "Add an extension"; unblock-select is not, so it is offered.
-    #[test]
-    fn the_catalog_offers_only_uninstalled_extensions() {
-        let schema = settings_schema_from(
-            "work",
-            &PageContext::default(),
-            &no_zoom(),
-            &policy_state(true, &[("sponsorblock", true)]),
-            &no_media(),
-        );
-        let widgets = schema["widgets"].as_array().expect("widgets");
+        // …and the dialog says it again, beside the toggle it contradicts: the
+        // toggle reads the FILENAME, and a refused script is not running
+        // whatever the filename says.
+        let options =
+            crate::extmodal::generic("broken", &state, crate::extmodal::Placement::Modal);
+        let rendered = json!(options.widgets).to_string();
         assert!(
-            !widgets.iter().any(|w| w["id"] == "catalog-sponsorblock"),
-            "an installed extension was still offered in the catalog"
+            rendered.contains("Not running"),
+            "the dialog presents a refused script as running: {rendered}"
         );
-        let unblock = widgets
-            .iter()
-            .find(|w| w["id"] == "catalog-unblock-select")
-            .expect("unblock-select should be offered when not installed");
-        assert_eq!(unblock["actions"][0]["action"], "install:unblock-select");
+        // The controls stay: refusal is a verdict, not a lock-out.
+        assert!(rendered.contains("ext-in:broken:userscript:broken"));
+        assert!(rendered.contains("ext-in:broken:userscript-delete:broken"));
     }
 
     // The security line is honest and omitted when unknown: HTTPS -> a lock,
