@@ -772,6 +772,20 @@ pub(crate) struct PaneState {
     /// When a sync was last ATTEMPTED, successful or not, so a failing server
     /// cannot make every click wait for a timeout.
     last_sync_attempt: Option<std::time::Instant>,
+    /// Which extension's options are OPEN INLINE, on a shell that cannot raise
+    /// a dialog for us.
+    ///
+    /// ⛔ The reason it exists: without it the fallback inlines EVERY
+    /// extension's full options at once, which is longer than the pane the
+    /// owner objected to — the fix for clutter would ship more of it to any host
+    /// whose yggterm has not been rebuilt yet. With it, the fallback keeps the
+    /// shape that was asked for (one row, one button) and only the extension
+    /// actually asked for is unfolded.
+    ///
+    /// ⚠ Draft state, so it lives here and not on disk: which panel a user has
+    /// open is not a setting, and a `PaneState` is exactly the scope that dies
+    /// with the pane.
+    open_extension: Option<String>,
 }
 
 impl Default for PaneState {
@@ -788,6 +802,7 @@ impl Default for PaneState {
             view: ViewDraft::default(),
             last_sync_error: None,
             last_sync_attempt: None,
+            open_extension: None,
         }
     }
 }
@@ -1400,7 +1415,8 @@ pub(crate) fn dispatch(
         ("GET", p) if p == format!("/pane/{SETTINGS_PANE}") => {
             let profile = state.pane.lock().unwrap().profile.clone();
             let page = PageContext::from_query(query);
-            (200, settings_schema(&profile, &page))
+            let open = state.pane.lock().unwrap().open_extension.clone();
+            (200, settings_schema(&profile, &page, open.as_deref()))
         }
         // The per-site zoom overrides for this host. yggterm applies the entry
         // for the current page's host on navigation and falls back to its global
@@ -5570,13 +5586,14 @@ fn current_site_zoom_widgets(
 /// web-surface prefs. ychrome owns the per-site zoom OVERRIDE; it never knows
 /// yggterm's global, so `page.zoom` is how the "This site" row shows a real
 /// number when a site is on the global.
-fn settings_schema(profile: &str, page: &PageContext) -> Value {
+fn settings_schema(profile: &str, page: &PageContext, open_extension: Option<&str>) -> Value {
     settings_schema_from(
         profile,
         page,
         &crate::webzoom::sites(),
         &crate::webpolicy::state(profile),
         &crate::webmedia::sites(),
+        open_extension,
     )
 }
 
@@ -5586,6 +5603,9 @@ fn settings_schema_from(
     zoom_sites: &std::collections::BTreeMap<String, f64>,
     state: &crate::webpolicy::PolicyState,
     media_sites: &std::collections::BTreeMap<String, crate::webmedia::SiteDecisions>,
+    // Which extension is unfolded INLINE. Meaningless when the GUI can raise a
+    // dialog, and ignored there.
+    open_extension: Option<&str>,
 ) -> Value {
     let (host, live_zoom, secure) = (page.host(), page.zoom, page.secure);
     let mut widgets = vec![json!({"kind": "section", "text": "This site", "card": true})];
@@ -5604,7 +5624,7 @@ fn settings_schema_from(
     // the window looks like.
     widgets.extend(browsing_widgets(page));
 
-    widgets.extend(extension_widgets(profile, page, state));
+    widgets.extend(extension_widgets(profile, page, state, open_extension));
 
     // Hardware capture, after the extensions: both are "what may a page do to
     // me", and this is the one the user comes looking for when they want a
@@ -5663,6 +5683,7 @@ fn extension_widgets(
     profile: &str,
     page: &PageContext,
     state: &crate::webpolicy::PolicyState,
+    open_extension: Option<&str>,
 ) -> Vec<Value> {
     let placement = if page.app_modals {
         crate::extmodal::Placement::Modal
@@ -5698,7 +5719,6 @@ fn extension_widgets(
                      the compact list back.",
         }));
     }
-    let mut inline: Vec<Value> = Vec::new();
     for stem in &stems {
         let options = if crate::extmodal::has_options(stem) {
             crate::extmodal::options(stem, profile, host, state, placement)
@@ -5706,29 +5726,29 @@ fn extension_widgets(
             Some(crate::extmodal::generic(stem, state, placement))
         };
         let Some(options) = options else { continue };
-        if page.app_modals {
-            widgets.push(json!({
-                "kind": "list-row",
-                "id": format!("ext-{stem}"),
-                "title": options.title,
-                "subtitle": extension_state_line(stem, state),
-                "actions": [{
-                    "action": format!("{}{stem}", crate::extmodal::OPEN_ACTION_PREFIX),
-                    "label": "Options…",
-                    "title": format!("Settings for {}", options.title),
-                }],
-            }));
-        } else {
-            inline.push(json!({
-                "kind": "section",
-                "text": options.title,
-                "card": true,
-            }));
-            inline.push(json!({"kind": "label", "muted": true, "text": options.subtitle}));
-            inline.extend(options.widgets);
+        // ⛔ THE ROW IS DRAWN EITHER WAY. On a shell with dialogs the button
+        // raises one; without, it unfolds this extension in place and folds the
+        // last one away. What must never happen is the fallback inlining ALL of
+        // them: that is longer than the pane this change exists to shorten, and
+        // it would ship more clutter to every host whose yggterm is not rebuilt.
+        let open = !page.app_modals && open_extension == Some(stem.as_str());
+        widgets.push(json!({
+            "kind": "list-row",
+            "id": format!("ext-{stem}"),
+            "title": options.title,
+            "subtitle": extension_state_line(stem, state),
+            "selected": open,
+            "actions": [{
+                "action": format!("{}{stem}", crate::extmodal::OPEN_ACTION_PREFIX),
+                "label": if open { "Close" } else { "Options…" },
+                "title": format!("Settings for {}", options.title),
+            }],
+        }));
+        if open {
+            widgets.push(json!({"kind": "label", "muted": true, "text": options.subtitle}));
+            widgets.extend(options.widgets);
         }
     }
-    widgets.extend(inline);
     widgets
 }
 
@@ -5803,10 +5823,25 @@ fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
     let page = PageContext::from_values(&request["values"]);
     let profile = state.lock().unwrap().profile.clone();
 
-    // ⭐ RAISE an extension's options dialog. The whole reply is the dialog:
-    // yggterm owns the window, we own what is in it.
+    // ⭐ OPEN an extension's options. On a shell that can raise a dialog the
+    // whole reply IS the dialog — yggterm owns the window, we own what is in it.
+    // Without one, the same click unfolds that extension in the pane and folds
+    // the last one away, so the row-and-button shape survives either way.
     if let Some(stem) = action.strip_prefix(crate::extmodal::OPEN_ACTION_PREFIX) {
-        return open_extension_modal(&profile, &page, stem);
+        if page.app_modals {
+            return open_extension_modal(&profile, &page, stem);
+        }
+        let open = {
+            let mut pane = state.lock().unwrap();
+            let next = if pane.open_extension.as_deref() == Some(stem) {
+                None
+            } else {
+                Some(stem.to_string())
+            };
+            pane.open_extension = next.clone();
+            next
+        };
+        return json!({ "schema": settings_schema(&profile, &page, open.as_deref()) });
     }
 
     // ⭐ A click made INSIDE one. Strip the envelope, run the action underneath
@@ -5834,7 +5869,8 @@ fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
         // …and so is the pane behind it, which is showing that extension's
         // state line.
         if reply.get("schema").is_none() {
-            reply["schema"] = settings_schema(&profile, &page);
+            let open = state.lock().unwrap().open_extension.clone();
+            reply["schema"] = settings_schema(&profile, &page, open.as_deref());
         }
         return reply;
     }
@@ -5877,13 +5913,19 @@ fn run_settings_action_inner(state: &Mutex<PaneState>, request: &Value, action: 
     // own web-surface prefs.
     let page = PageContext::from_values(&request["values"]);
     let profile = state.lock().unwrap().profile.clone();
-    let redraw = |extra: Value| merge(json!({ "schema": settings_schema(&profile, &page) }), extra);
+    let open_extension = state.lock().unwrap().open_extension.clone();
+    let redraw = |extra: Value| {
+        merge(
+            json!({ "schema": settings_schema(&profile, &page, open_extension.as_deref()) }),
+            extra,
+        )
+    };
 
     // Per-site zoom lands FIRST: it needs the host and reports back with a fresh
     // schema plus `refetch_zoom` so the GUI re-reads `/zoom` and re-applies the
     // override to the live page without waiting for the ~4s heartbeat.
     if matches!(action, ZOOM_IN_ACTION | ZOOM_OUT_ACTION | ZOOM_RESET_ACTION) {
-        return run_zoom_action(&profile, action, &page);
+        return run_zoom_action(&profile, action, &page, open_extension.as_deref());
     }
 
     // A toggle widget posts its new state as `values.value`; a list-row button
@@ -5906,7 +5948,7 @@ fn run_settings_action_inner(state: &Mutex<PaneState>, request: &Value, action: 
             json!({ "restore_tabs": want })
         };
         return json!({
-            "schema": settings_schema(&profile, &next),
+            "schema": settings_schema(&profile, &next, open_extension.as_deref()),
             "surface_prefs": patch,
         });
     }
@@ -6113,7 +6155,12 @@ fn run_settings_action_inner(state: &Mutex<PaneState>, request: &Value, action: 
 /// A per-site zoom click. `−`/`+` step the override from the live effective zoom
 /// the GUI reported; `Reset` clears it. The reply asks the GUI to re-read `/zoom`
 /// so the change reaches the live page at once.
-fn run_zoom_action(profile: &str, action: &str, page: &PageContext) -> Value {
+fn run_zoom_action(
+    profile: &str,
+    action: &str,
+    page: &PageContext,
+    open_extension: Option<&str>,
+) -> Value {
     let Some(host) = page.host() else {
         return json!({ "toast": "No site is open to zoom." });
     };
@@ -6130,7 +6177,7 @@ fn run_zoom_action(profile: &str, action: &str, page: &PageContext) -> Value {
     if action == ZOOM_RESET_ACTION {
         next.zoom = None;
     }
-    let schema = settings_schema(profile, &next);
+    let schema = settings_schema(profile, &next, open_extension);
     match outcome {
         Ok(()) => json!({ "schema": schema, "refetch_zoom": true }),
         Err(error) => json!({ "schema": schema, "toast": error.to_string() }),
@@ -6987,6 +7034,59 @@ mod tests {
         );
     }
 
+    /// Without a dialog, the SAME button unfolds the extension in place and a
+    /// second press folds it away — and opening another folds the first.
+    ///
+    /// ⛔ One at a time is the whole point. The alternative the first cut
+    /// shipped was inlining every extension at once, which is longer than the
+    /// pane this change exists to shorten.
+    #[test]
+    fn without_a_dialog_the_same_button_unfolds_one_extension_at_a_time() {
+        let state = Arc::new(Mutex::new(PaneState::new("default")));
+        let press = |stem: &str| {
+            run_settings_action(
+                &state,
+                &json!({
+                    "pane": SETTINGS_PANE,
+                    "action": format!("{}{stem}", crate::extmodal::OPEN_ACTION_PREFIX),
+                    // No `app_modals`: a shell that cannot raise a dialog.
+                    "values": {},
+                }),
+            )
+        };
+        let unfolded = |reply: &Value| -> Vec<String> {
+            reply["schema"]["widgets"]
+                .as_array()
+                .expect("widgets")
+                .iter()
+                .filter_map(|w| w["id"].as_str().map(ToOwned::to_owned))
+                .collect()
+        };
+
+        let reply = press(crate::extmodal::ADBLOCK_STEM);
+        assert!(reply["modal"].is_null(), "a dialog was raised on a shell without one");
+        let ids = unfolded(&reply);
+        assert!(ids.iter().any(|id| id == "adblock-enabled"), "{ids:?}");
+
+        // A different extension: the first folds away.
+        let reply = press(crate::extensions::SPONSORBLOCK_STEM);
+        let ids = unfolded(&reply);
+        assert!(ids.iter().any(|id| id == "ext-on-sponsorblock"), "{ids:?}");
+        assert!(
+            !ids.iter().any(|id| id == "adblock-enabled"),
+            "two extensions unfolded at once: {ids:?}"
+        );
+
+        // The same one again: it folds.
+        let reply = press(crate::extensions::SPONSORBLOCK_STEM);
+        let ids = unfolded(&reply);
+        assert!(
+            !ids.iter().any(|id| id == "ext-on-sponsorblock"),
+            "a second press did not fold it away: {ids:?}"
+        );
+        assert!(ids.iter().any(|id| id == "ext-sponsorblock"), "the row went away too");
+    }
+
     /// A malformed envelope is answered, not swallowed. An action id that lost
     /// its stem would otherwise fall through to the unknown-action arm and
     /// report the whole envelope as the unknown verb, which points the reader at
@@ -7152,6 +7252,7 @@ mod tests {
             &no_zoom(),
             &policy_state(true, &[]),
             &media,
+            None,
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
         let row = |id: &str| {
@@ -7212,6 +7313,7 @@ mod tests {
             &no_zoom(),
             &policy_state(true, &[]),
             &no_media(),
+            None,
         );
         let text = schema.to_string();
         assert!(
@@ -7330,6 +7432,7 @@ mod tests {
             &no_zoom(),
             &policy_state(true, &[]),
             &no_media(),
+            None,
         );
         assert_eq!(schema["title"], "YChrome Settings");
         assert!(
@@ -7353,6 +7456,7 @@ mod tests {
             &no_zoom(),
             &policy_state(true, &[]),
             &no_media(),
+            None,
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
         let toggle = |id: &str| {
@@ -7406,6 +7510,7 @@ mod tests {
             &no_zoom(),
             &policy_state(true, &[]),
             &no_media(),
+            None,
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
         for preset in crate::useragent::Preset::ALL {
@@ -7435,6 +7540,7 @@ mod tests {
             &no_zoom(),
             &policy_state(false, &[]),
             &no_media(),
+            None,
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
         assert!(
@@ -7450,12 +7556,15 @@ mod tests {
     // a pane that quietly drops one goes red.
     #[test]
     fn every_sponsorblock_category_gets_a_row_offering_the_states_it_is_not_in() {
+        // Unfolded INLINE (no dialog available), which is where a category row
+        // reaches the pane's own widget list.
         let schema = settings_schema_from(
             "work",
             &PageContext::default(),
             &no_zoom(),
             &policy_state(true, &[("sponsorblock", true)]),
             &no_media(),
+            Some(crate::extensions::SPONSORBLOCK_STEM),
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
         let live: std::collections::HashMap<&str, &str> = crate::sponsorblock::effective()
@@ -7638,6 +7747,7 @@ mod tests {
             &no_zoom(),
             &policy_state(true, &[("sponsorblock", true), ("darkmode", false)]),
             &no_media(),
+            None,
         );
         let widgets = schema["widgets"].as_array().expect("widgets");
 
@@ -7688,6 +7798,7 @@ mod tests {
             &no_zoom(),
             &policy_state(true, &[("sponsorblock", true)]),
             &no_media(),
+            None,
         );
         let ids = widget_ids(&schema);
         for banished in [
@@ -7719,33 +7830,49 @@ mod tests {
     #[test]
     fn a_shell_that_cannot_raise_a_dialog_gets_the_controls_inline() {
         let state = policy_state(true, &[("sponsorblock", true)]);
+
+        // ⛔ NOTHING is unfolded until one is asked for. Inlining every
+        // extension's full options at once would be LONGER than the pane this
+        // whole change exists to shorten — the fix for clutter shipping more of
+        // it to any host whose yggterm has not been rebuilt yet.
+        let folded = settings_schema_from(
+            "work",
+            &PageContext::default(),
+            &no_zoom(),
+            &state,
+            &no_media(),
+            None,
+        );
+        let folded_ids = widget_ids(&folded);
+        assert!(
+            !folded_ids.iter().any(|id| id == "sponsorblock-sponsor"),
+            "the fallback unfolded an extension nobody asked for: {folded_ids:?}"
+        );
+        // The row-and-button shape survives without a dialog: the button is
+        // still there and it still does something.
+        assert!(folded_ids.iter().any(|id| id == "ext-sponsorblock"));
+        assert!(folded.to_string().contains(crate::extmodal::OPEN_ACTION_PREFIX));
+
+        // Asked for, it unfolds — and ONLY it.
         let inline = settings_schema_from(
             "work",
             &PageContext::default(),
             &no_zoom(),
             &state,
             &no_media(),
+            Some(crate::extensions::SPONSORBLOCK_STEM),
         );
         let ids = widget_ids(&inline);
-        // ⚠ The test is on the ACTION, not on an id prefix: the inline controls
-        // legitimately carry `ext-on-…`/`ext-install-…` widget ids, and a test
-        // that banned the prefix would be testing its own naming rather than
-        // the thing that matters — whether a button exists that this shell
-        // would silently drop.
-        let rendered_ids = inline.to_string();
-        assert!(
-            !rendered_ids.contains(crate::extmodal::OPEN_ACTION_PREFIX),
-            "an Options button was drawn on a shell that cannot open it: {ids:?}"
-        );
-        // The controls themselves are all still reachable.
-        assert!(ids.iter().any(|id| id == "adblock-enabled"));
         assert!(ids.iter().any(|id| id == "sponsorblock-sponsor"));
         assert!(ids.iter().any(|id| id == "sb-voting"));
-        // …and their actions are BARE, not wrapped in the dialog envelope,
-        // which would ask a shell with no dialog to redraw one.
-        let rendered = inline.to_string();
         assert!(
-            !rendered.contains(crate::extmodal::MODAL_ACTION_PREFIX),
+            !ids.iter().any(|id| id == "adblock-enabled"),
+            "a second extension unfolded alongside the one asked for: {ids:?}"
+        );
+        // …and the unfolded controls' actions are BARE, not wrapped in the
+        // dialog envelope, which would ask a shell with no dialog to redraw one.
+        assert!(
+            !inline.to_string().contains(crate::extmodal::MODAL_ACTION_PREFIX),
             "inline controls posted the dialog envelope"
         );
     }
@@ -7756,7 +7883,7 @@ mod tests {
     #[test]
     fn an_uninstalled_extension_is_listed_and_its_dialog_offers_the_install() {
         let state = policy_state(true, &[("sponsorblock", true)]);
-        let schema = settings_schema_from("work", &with_modals(), &no_zoom(), &state, &no_media());
+        let schema = settings_schema_from("work", &with_modals(), &no_zoom(), &state, &no_media(), None);
         let row = schema["widgets"]
             .as_array()
             .expect("widgets")
@@ -7853,7 +7980,7 @@ mod tests {
         state.userscripts[0].refusal =
             Some("Refused — not injected: @exclude https://*.youtube.com/embed/*".to_string());
         let schema =
-            settings_schema_from("work", &with_modals(), &no_zoom(), &state, &no_media());
+            settings_schema_from("work", &with_modals(), &no_zoom(), &state, &no_media(), None);
         let row = schema["widgets"]
             .as_array()
             .expect("widgets")
