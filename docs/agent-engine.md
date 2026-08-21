@@ -387,11 +387,32 @@ POST /input {page_id, events: [
   | 409 {ok:false, error, dispatched, failed_at, resolved}   # the PAGE refused
 POST /fill  {page_id, entry, user?}               # vault autofill — SHIPPED 2026-08-02
   → {ok, entry, filled: "filled"|"user-only"|"no-fields"|"unverified",
-     fields: [{field, target, present, ok, want, got}…], confirm, secret_field_count}
+     fields: [{field, target, present, ok, want, got}…], confirm, secret_field_count,
+     secret_fields_visible, secret_fields_hidden,
+     secret_choice: "only-field"|"skipped-hidden"|"no-visible-field"}
   | 502 {error: "vault: …"}                       # the VAULT refused (locked, no item)
     `user` disambiguates when one item name holds several logins.
     The reply names FIELDS, never a value: the secret comes off the host's
     vault agent, goes straight into the eval script, and is dropped.
+    ⛔⛔ **A DECOY PASSWORD BOX IS A REAL DEFENCE, AND `fill` USED TO WALK
+    STRAIGHT INTO IT.** An Indian bank sandwiches its real password box between
+    two `display:none` `autocomplete="new-password"` honeypots. Taking the FIRST
+    `input[type=password]` wrote into a decoy, read that decoy back, and
+    answered `filled` with `want:14, got:14` — while the field the form submits
+    stayed EMPTY. A submit in that state spends a login attempt on a bank that
+    locks after a few, and the diagnosis points at the credential.
+    ⇒ The readback hardening below CANNOT catch this: it reads back the field it
+    wrote, and that field is perfectly happy. **Visibility is the discriminator**
+    (fixed 2026-08-21), measured from LAYOUT — `getClientRects()` is empty
+    whenever the element or any ancestor is `display:none`, which is the whole
+    family, because a honeypot is hidden by a stylesheet rule on an ancestor and
+    its own style attribute says nothing.
+    ⇒ `secret_choice` reports which case you got. `skipped-hidden` means decoys
+    were present and avoided. **`no-visible-field` means NOTHING was visible**:
+    the field is still filled, because some forms reveal the box a step later,
+    but `filled` is forced to `unverified` so it can never read as ready to
+    submit.
+
     ⛔ `unverified` is the word that matters, added 2026-08-07: the other
     three describe what the script SET OUT to do, and only `fields`' readback
     (a LENGTH, never a value) separates a fill that landed from one the page

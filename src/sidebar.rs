@@ -5753,7 +5753,9 @@ fn run_settings_action(state: &Mutex<PaneState>, request: &Value) -> Value {
             crate::sponsorblock::add_site(&host)
         }
         site if site.starts_with(SPONSORBLOCK_SITE_REMOVE_PREFIX) => {
-            crate::sponsorblock::remove_site(site.trim_start_matches(SPONSORBLOCK_SITE_REMOVE_PREFIX))
+            crate::sponsorblock::remove_site(
+                site.trim_start_matches(SPONSORBLOCK_SITE_REMOVE_PREFIX),
+            )
         }
         // `sponsorblock:<category>:<behaviour>`. Checked BEFORE the userscript
         // arm even though the two prefixes cannot collide, so the ordering says
@@ -5917,6 +5919,36 @@ function ychromeSet(el, value) {
   const got = typeof el.value === 'string' ? el.value.length : -1;
   return { present: true, ok: got === want, want: want, got: got };
 }
+// ⛔⛔ A DECOY PASSWORD BOX IS A REAL DEFENCE ON REAL SITES, AND PICKING IT
+// SPENDS A LOGIN ATTEMPT. An Indian bank sandwiches its real password box
+// between two `display:none` `autocomplete="new-password"` honeypots. Taking
+// the FIRST `input[type=password]` wrote into a decoy, read the decoy back,
+// and answered `filled` with `want:14, got:14` — while the field the form
+// actually submits stayed EMPTY. The readback hardening cannot catch this: it
+// reads back the field it wrote, and that field is perfectly happy.
+//
+// ⇒ Visibility is the discriminator, and it must be measured from LAYOUT, not
+// from the style attribute: a honeypot is usually hidden by a stylesheet rule
+// on an ANCESTOR, so `el.style.display` is empty on the element itself.
+// `getClientRects()` is empty whenever the element or any ancestor is
+// `display:none`, which is the whole family in one check; `visibility` and
+// `opacity` are then read from the computed style because those keep a box.
+function ychromeVisible(el) {
+  if (!el) return false;
+  try {
+    if (el.getClientRects().length === 0) return false;
+    const cs = (el.ownerDocument.defaultView || window).getComputedStyle(el);
+    if (!cs) return true;
+    if (cs.visibility === 'hidden' || cs.visibility === 'collapse') return false;
+    if (parseFloat(cs.opacity || '1') === 0) return false;
+    return true;
+  } catch (e) {
+    // An instrument must never be the thing that breaks the fill. If
+    // visibility cannot be decided, treat the field as usable — that is the
+    // behaviour every caller had before this check existed.
+    return true;
+  }
+}
 function ychromeField(el) {
   if (!el) return null;
   return {
@@ -5994,7 +6026,14 @@ fn fill_script(username: &str, password: &str) -> String {
         r#"(function() {{
 {SET_FIELD}
   const secrets = Array.from(document.querySelectorAll('input[type=password]:not([disabled])'));
-  const pw = secrets[0] || null;
+  const shown = secrets.filter(ychromeVisible);
+  // Prefer a field a human could actually type into. When NONE is visible the
+  // old behaviour is kept — some forms reveal the box a step later, and
+  // refusing outright would break them — but the verdict below says so, so a
+  // caller can never read it as "ready to submit".
+  const pw = shown[0] || secrets[0] || null;
+  const decoys = secrets.length - shown.length;
+  const guessed = secrets.length > 0 && shown.length === 0;
   let user = null;
   if (pw) {{
     const form = pw.form || document;
@@ -6010,7 +6049,11 @@ fn fill_script(username: &str, password: &str) -> String {
   const describes = (el) => [el.getAttribute('name'), el.getAttribute('id'),
     el.getAttribute('placeholder'), el.getAttribute('aria-label'),
     el.getAttribute('autocomplete')].filter(Boolean).join(' ');
-  const twin = secrets.slice(1).find((el) => CONFIRM.test(describes(el))) || null;
+  // The confirm twin is chosen from the same population the real field came
+  // from: pairing a visible password with a hidden "confirm" is the decoy bug
+  // one field over.
+  const pool = shown.length ? shown : secrets;
+  const twin = pool.filter((el) => el !== pw).find((el) => CONFIRM.test(describes(el))) || null;
   const fields = [];
   const record = (label, el, verdict) => {{
     fields.push(Object.assign({{ field: label, target: ychromeField(el) }}, verdict));
@@ -6028,10 +6071,16 @@ fn fill_script(username: &str, password: &str) -> String {
   // wrote, that sentence is false and the honest answer is that this run was
   // not verified.
   if (fields.some((f) => f.present && !f.ok)) {{ filled = 'unverified'; }}
+  // ⛔ Writing into a field nothing can see is not a fill a caller may submit
+  // on. It reads back perfectly, so only this can say so.
+  if (guessed) {{ filled = 'unverified'; }}
   return {{
     filled: filled,
     fields: fields,
     secret_field_count: secrets.length,
+    secret_fields_visible: shown.length,
+    secret_fields_hidden: decoys,
+    secret_choice: guessed ? 'no-visible-field' : (decoys > 0 ? 'skipped-hidden' : 'only-field'),
     confirm: twin ? (twinVerdict.ok ? 'filled' : 'unverified')
                   : (secrets.length > 1 ? 'present-but-unnamed' : 'absent'),
   }};
@@ -6987,8 +7036,13 @@ mod tests {
 
         // ⛔ …and NO front-end is named. The whole point of the setting is that
         // the address is the user's, so shipping one would defeat it.
-        let rendered = serde_json::to_string(&widgets).unwrap().to_ascii_lowercase();
-        assert!(!rendered.contains("invidious") && !rendered.contains("piped"), "{rendered}");
+        let rendered = serde_json::to_string(&widgets)
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(
+            !rendered.contains("invidious") && !rendered.contains("piped"),
+            "{rendered}"
+        );
         // The placeholder shows the SHAPE — a bare host, which is what a match
         // pattern is built from. A pasted URL is the shape that matches nothing.
         assert!(rendered.contains("videos.example.net"));
@@ -7192,7 +7246,10 @@ mod tests {
         // ⛔ EVERY ROW OPENS, and NO row wears an edit glyph. The pencil was a
         // third button on a 300px rail that existed only because the row body
         // did nothing; the body is the affordance now (user, 2026-08-04).
-        assert_eq!(row["row_action"], "view-open", "the row body opens the entry");
+        assert_eq!(
+            row["row_action"], "view-open",
+            "the row body opens the entry"
+        );
         assert!(
             !actions.contains(&"edit-open"),
             "the pencil is gone from the row: {actions:?}"
@@ -7583,7 +7640,10 @@ mod tests {
             let box_ = widget(id);
             assert_eq!(box_["secret"], true, "{id} is not marked secret");
             assert_eq!(box_["value"], "", "{id} pre-filled something");
-            assert!(box_["actions"].is_null(), "{id} offers an eye it cannot satisfy");
+            assert!(
+                box_["actions"].is_null(),
+                "{id} offers an eye it cannot satisfy"
+            );
         }
         // A login form grows none of it.
         let login = json!(edit_tab_widgets(&EditDraft::default(), None)).to_string();
@@ -7653,7 +7713,14 @@ mod tests {
         // Everything a value row can hold at rest is either the mask or
         // metadata. The one place a real string appears is the username, which
         // the row that opened this page was already showing.
-        for row in ["password", "totp", "totp-secret", "notes", "past:0", "past:1"] {
+        for row in [
+            "password",
+            "totp",
+            "totp-secret",
+            "notes",
+            "past:0",
+            "past:1",
+        ] {
             let widget = widgets
                 .iter()
                 .find(|widget| widget["id"] == row)
@@ -8476,7 +8543,21 @@ mod tests {
     /// must be a comparison rather than a constant.
     #[test]
     fn a_set_field_is_judged_by_reading_the_field_back() {
-        let (_, after_write) = SET_FIELD
+        // ⚠ Scoped to `ychromeSet`'s OWN body. This used to read "everything
+        // after the change dispatch", which quietly meant "and every helper
+        // declared below it too" — so adding an unrelated function whose happy
+        // path ends in `return true` failed a test about the readback verdict.
+        // A guard that fires on proximity rather than on its subject teaches
+        // people to move code around until it goes quiet, which is the opposite
+        // of what it is for.
+        let body = SET_FIELD
+            .split_once("function ychromeSet(")
+            .expect("the setter is present")
+            .1
+            .split_once("\nfunction ")
+            .expect("another helper follows it")
+            .0;
+        let (_, after_write) = body
             .split_once("dispatchEvent(new Event('change'")
             .expect("the set still fires a change event");
         assert!(
@@ -8576,6 +8657,41 @@ mod tests {
 
     // The secret is embedded in the eval script (that is the design), but it
     // must be escaped so it cannot break out of the string literal.
+    // ⛔⛔ THE DECOY. An Indian bank sandwiches its real password box between
+    // two `display:none` honeypots; taking the FIRST `input[type=password]`
+    // wrote into one, read it back happily, and answered `filled` while the
+    // field the form submits stayed EMPTY. A readback cannot catch that — it
+    // reads the field it wrote. Only visibility can.
+    //
+    // This emits the REAL generated script so a live falsifier can run the
+    // shipped bytes rather than a paraphrase of them.
+    #[test]
+    fn the_fill_script_prefers_a_visible_secret_over_a_decoy() {
+        let script = fill_script("someone", "hunter2-not-a-real-secret");
+        // The selection must be layout-based, and it must keep a fallback.
+        assert!(script.contains("ychromeVisible"), "visibility must decide");
+        assert!(
+            script.contains("getClientRects"),
+            "a honeypot is hidden by an ANCESTOR rule, so the element's own \
+             style attribute cannot answer this"
+        );
+        assert!(
+            script.contains("shown[0] || secrets[0]"),
+            "a form that reveals its box a step later must still fill"
+        );
+        assert!(
+            script.contains("guessed") && script.contains("'unverified'"),
+            "writing into a field nothing can see must never read as ready to submit"
+        );
+        // The confirm twin comes from the same population, or it is the same
+        // bug one field over.
+        assert!(script.contains("shown.length ? shown : secrets"));
+
+        if let Ok(path) = std::env::var("YCHROME_EMIT_FILL_SCRIPT") {
+            std::fs::write(&path, &script).expect("emit the script");
+        }
+    }
+
     #[test]
     fn fill_script_escapes_a_hostile_password() {
         let script = fill_script("a\"b", "p\"; alert(1); //");

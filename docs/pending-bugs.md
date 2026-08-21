@@ -362,22 +362,56 @@ say it: it already enumerates the candidate accounts, so it should name the flag
 `wait needs an 'until': {load}, {idle_ms}, {selector,state} or {js}`, which is a good refusal, but
 the two planes using different grammars for the same concept is a trap worth one line of docs.
 
-## ⛔⛔ `ctl fill` WRITES THE SECRET INTO A HIDDEN DECOY INPUT AND THEN VERIFIES THE DECOY
+## ⚠ `ctl fill` — THE DECOY IS FIXED; the OTHER two gaps in that report are not
 
-Measured on a live Indian bank login (`netbank.examplebank-a.example`), which sandwiches the real password box
-between two `display:none` `autocomplete="new-password"` honeypots. `/fill` takes the first
-`input[type=password]`, writes there, and answers `{"filled":"filled","ok":true}` with its own
-length readback passing (`want:14, got:14`) — while the field the form will submit is **empty**.
-The 2026-08-07 `unverified` hardening cannot catch it: it reads back *the field it wrote*.
+**Status:** ⇒ **The decoy defect is FIXED and live-proven 2026-08-21.** The two companion gaps
+from the same report (D2, D3) are untouched — see below.
 
-**Cost: a submit in that state spends a bank login attempt with an empty password**, on a bank that
-locks after repeated failures, and points the diagnosis at the credential instead of the tool.
-Plus **D2** (`type`'s `landed` is a false negative on every masked input) and **D3** (`lore.py`'s
-private-data lock caught a phone number and passed a bank customer ID into a public lore file).
+### ✅ THE DECOY — fixed
 
-⇒ Full report with exact commands, exact responses, suggested fixes and one ranked feature ask
-(`/fill` needs a target selector — its absence forces the plaintext into the agent's argv):
-**`docs/agent-cobrowse-gaps-2026-08-10.md`** (a peer campaign row, 2026-08-10).
+A bank login sandwiches its real password box between two `display:none`
+`autocomplete="new-password"` honeypots. `fill` took the first
+`input[type=password]`, wrote there, and answered `{"filled":"filled","ok":true}` with its own
+readback passing (`want:14, got:14`) — while the field the form submits was **empty**. A submit
+in that state spends a login attempt on a bank that locks after a few, and points the diagnosis
+at the credential rather than the tool.
+
+⛔ **The 2026-08-07 `unverified` hardening could never catch it: it reads back the field it
+WROTE**, and that field is perfectly happy. Only visibility can tell the two apart.
+
+⇒ **Fixed by choosing a visible secret**, measured from LAYOUT rather than from the element's
+own style — a honeypot is hidden by a stylesheet rule on an ANCESTOR, so `el.style.display` is
+empty on the input itself. `getClientRects()` is empty whenever the element or any ancestor is
+`display:none`, which is the whole family in one check; `visibility` and `opacity` are read from
+the computed style because those keep a box.
+
+**Live-proven** against a page shaped like the bank's, running the SHIPPED script in the engine:
+
+```
+secret landed in:  REAL_password (25 chars)   decoys: 0 and 0
+reply:             secret_choice=skipped-hidden, visible=1, hidden=2
+control:           the old selection would have picked `decoy_before` (getClientRects().length === 0)
+```
+
+⚠ **The fallback is deliberate and it is reported, not hidden.** When NOTHING is visible the
+field is still filled — some forms reveal the box a step later, and refusing outright would
+break them — but `filled` is forced to **`unverified`** and `secret_choice` reads
+`no-visible-field`, so a caller can never read it as ready to submit. Live-proven on a
+second page where every password box is hidden.
+
+⚠ The confirm twin is chosen from the same population, or it is the same bug one field over.
+
+### ⛔ STILL OPEN from the same report
+
+- **D2 — `type`'s `landed` is a false negative on every masked input.**
+- **D3 — `lore.py`'s private-data lock caught a phone number and passed a bank customer ID into
+  a public lore file.** ⚠ Sibling of the `ygg-privacy-guard` entry above: both are gates whose
+  precision is the whole product, and both are fleet tooling rather than this repo's.
+- **The ranked feature ask: `fill` needs a target selector.** Its absence is what forces a
+  plaintext into the agent's argv when the page's own shape defeats the heuristic. The
+  visibility fix removes the common case; it does not remove the need.
+
+⇒ Full report with exact commands and responses: `docs/agent-cobrowse-gaps-2026-08-10.md`.
 
 ## ⛔ THE ENGINE SERVES FROM A DELETED BINARY FOR DAYS — it now SAYS SO; the self-retire half is still open
 
