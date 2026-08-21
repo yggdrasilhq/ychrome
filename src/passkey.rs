@@ -10,12 +10,37 @@
 //! ```text
 //! page  --navigator.credentials.get()-->  shim (our userscript)
 //! shim  --POST /fido2/get (SOCKS-loopback, bearer token)-->  Signer (this file)
-//! Signer --OSC 7717 ; fido2 ; request-->  yggterm GUI       (rpId + account)
+//! Signer --presence outbox-->  the session's VIEW CLIENT     (rpId + account)
+//! client --OSC 7717 ; fido2 ; request-->  yggterm GUI        (on the row's PTY)
 //! yggterm --native presence dialog-->  user clicks Approve
 //! yggterm --POST /fido2/grant (ssh -L)-->  Signer            (request_id)
 //! Signer --agent fido2-assert-->  ychrome-vault agent        (mints UserPresence, signs)
 //! Signer --assertion-->  shim  --PublicKeyCredential-->  page
 //! ```
+//!
+//! ## ⛔ WHY THE REQUEST IS QUEUED AND NOT WRITTEN TO STDOUT
+//!
+//! The GUI routes a `fido2 ; request` by the STREAM it arrives on, so the OSC
+//! has to be written to the owning session's PTY. The signer does not hold that
+//! PTY. It lives in the HOST DAEMON, one process per host serving every
+//! session's control endpoint, and a daemon's stdout is `/dev/null` — so a
+//! `write!(stdout, ...)` here published the ceremony into nothing. No dialog was
+//! ever raised, the ceremony parked on the condvar for the full
+//! [`CEREMONY_TIMEOUT`], and the page reported a generic failure that read, to
+//! the user and to the next reader of this code, as a broken button.
+//!
+//! The process that DOES hold the session's PTY is its view client, the
+//! foreground `ychrome` whose stdout is the row. So the signer queues the OSC
+//! and the client drains it on its tick and writes it to its OWN stdout. The
+//! byte sequence and yggterm's parser are unchanged; only the fd it is written
+//! to is now the one the GUI reads.
+//!
+//! ⭐ **And a queue nobody drains is the same silence with extra steps.** A
+//! session is presence-reachable only while a client has drained it recently
+//! ([`PRESENCE_STALE`]); otherwise a ceremony is refused AT ONCE, naming the
+//! reason, instead of parking two minutes on a dialog that can never appear.
+//! That is the same skew honesty the daemon's routing already practises: an
+//! endpoint is capable once it has been SEEN to be, never because it should be.
 //!
 //! **Where consent lives.** The `UserPresence` that authorizes a signature is
 //! minted in the `ychrome-vault` agent — but only when THIS module calls its
@@ -39,9 +64,9 @@
 //! the agent; the assertion (public bytes) is what reaches the page.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use base64::Engine;
@@ -51,6 +76,16 @@ use sha2::{Digest, Sha256};
 /// How long a `/fido2/get` blocks for the user to approve before giving up. A
 /// ceremony the user ignores must not pin a control-server thread forever.
 const CEREMONY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How recently a view client must have drained the presence outbox for this
+/// session to count as reachable.
+///
+/// The client drains on its own surface tick, far faster than this; the window
+/// is sized against the DAEMON's session expiry, not against the tick, so a
+/// client that died a moment ago is not still treated as a place a dialog could
+/// appear. Generous enough that a stalled tick does not refuse a real ceremony,
+/// short enough that a closed surface stops pretending.
+const PRESENCE_STALE: Duration = Duration::from_secs(15);
 
 /// What the GUI dialog delivered for a pending ceremony.
 enum Outcome {
@@ -84,10 +119,18 @@ pub struct Signer {
     /// over the surface's SOCKS-loopback (remote) or plain loopback (local).
     port: u16,
     /// The emitting session's `YGGTERM_SESSION_ID`. Diagnostic only — the GUI
-    /// routes the OSC by the STREAM it arrived on, not this field.
+    /// routes the OSC by the STREAM it arrived on, not this field, which is
+    /// exactly why the OSC cannot be written from here (see the module docs).
     session: String,
     pending: Mutex<HashMap<String, Ceremony>>,
     cvar: Condvar,
+    /// Presence-request OSCs waiting for this session's view client to publish
+    /// on the row's PTY. Written by a ceremony, drained by the client's tick.
+    outbox: Mutex<Vec<String>>,
+    /// When a view client last drained [`Signer::outbox`]. `None` means no
+    /// client has ever spoken the op — either none is attached, or the attached
+    /// one predates the presence channel and would drop the request in silence.
+    last_drain: Mutex<Option<Instant>>,
 }
 
 impl Signer {
@@ -98,6 +141,8 @@ impl Signer {
             session,
             pending: Mutex::new(HashMap::new()),
             cvar: Condvar::new(),
+            outbox: Mutex::new(Vec::new()),
+            last_drain: Mutex::new(None),
         })
     }
 
@@ -114,6 +159,39 @@ impl Signer {
         header_token == Some(self.token.as_str())
     }
 
+    /// Take every queued presence OSC, and record that a client asked.
+    ///
+    /// The DRAIN is what makes this session presence-reachable — not the
+    /// client's registration, and not the fact that a surface is open. Only a
+    /// client that speaks this op can put the sequence on the PTY, so only a
+    /// client that has spoken it is evidence that a dialog can be raised. An
+    /// empty drain still counts: it is the liveness signal, and it is the
+    /// common case.
+    pub fn drain_presence(&self) -> Vec<String> {
+        *self.last_drain.lock().unwrap() = Some(Instant::now());
+        std::mem::take(&mut *self.outbox.lock().unwrap())
+    }
+
+    /// Can a presence dialog actually be raised for this session right now?
+    pub fn presence_reachable(&self) -> bool {
+        matches!(*self.last_drain.lock().unwrap(), Some(at) if at.elapsed() <= PRESENCE_STALE)
+    }
+
+    /// Queue one presence request for the view client to publish. See
+    /// [`fido2_request_osc`] for the payload and the module docs for why this
+    /// is a queue rather than a write.
+    fn publish_presence_request(
+        &self,
+        request_id: &str,
+        rp_id: &str,
+        accounts: &[Value],
+        kind: &str,
+        origin: &str,
+    ) {
+        let osc = fido2_request_osc(&self.session, request_id, rp_id, accounts, kind, origin);
+        self.outbox.lock().unwrap().push(osc);
+    }
+
     /// `POST /fido2/get` — a `navigator.credentials.get()` ceremony. Blocks up
     /// to [`CEREMONY_TIMEOUT`] for the GUI grant, then signs. Returns the HTTP
     /// status and the JSON body the shim turns into a `PublicKeyCredential`.
@@ -128,6 +206,7 @@ impl Signer {
             Err(GetError::TimedOut) => {
                 (408, json!({ "error": "the user did not respond in time" }))
             }
+            Err(GetError::NoPresenceChannel) => (503, json!({ "error": NO_PRESENCE_CHANNEL })),
             Err(GetError::Bad(message)) => (400, json!({ "error": message })),
         }
     }
@@ -199,9 +278,12 @@ impl Signer {
                 })
             })
             .collect();
+        if !self.presence_reachable() {
+            return Err(GetError::NoPresenceChannel);
+        }
         let request_id = hex_token(16);
         self.register(&request_id);
-        emit_fido2_request(&self.session, &request_id, rp_id, &accounts, "get", origin);
+        self.publish_presence_request(&request_id, rp_id, &accounts, "get", origin);
         let outcome = self.wait_for_outcome(&request_id);
 
         let (user_verified, chosen_id) = match outcome {
@@ -272,6 +354,7 @@ impl Signer {
             Err(GetError::TimedOut) => {
                 (408, json!({ "error": "the user did not respond in time" }))
             }
+            Err(GetError::NoPresenceChannel) => (503, json!({ "error": NO_PRESENCE_CHANNEL })),
             Err(GetError::Bad(message)) => (400, json!({ "error": message })),
             // create() has no "no credential" case; fold it into a 400.
             Err(GetError::NoCredential) => (400, json!({ "error": "invalid create request" })),
@@ -330,14 +413,7 @@ impl Signer {
         };
         let accounts = vec![json!({ "label": label })];
         self.register(&request_id);
-        emit_fido2_request(
-            &self.session,
-            &request_id,
-            rp_id,
-            &accounts,
-            "create",
-            origin,
-        );
+        self.publish_presence_request(&request_id, rp_id, &accounts, "create", origin);
         let user_verified = match self.wait_for_outcome(&request_id) {
             Some(Outcome::Granted { user_verified, .. }) => user_verified,
             Some(Outcome::Denied) => return Err(GetError::Denied),
@@ -462,8 +538,21 @@ enum GetError {
     NoCredential,
     Denied,
     TimedOut,
+    /// No view client is draining this session's presence outbox, so the
+    /// approval dialog cannot be raised and no grant can ever arrive. Refused
+    /// at once rather than parked for [`CEREMONY_TIMEOUT`]: a two-minute wait
+    /// followed by a generic failure is indistinguishable from a broken
+    /// button, which is how this defect survived a full session undiagnosed.
+    NoPresenceChannel,
     Bad(String),
 }
+
+/// What the page is told when the presence channel is down. ONE owner, because
+/// `get` and `create` must not describe the same fault two ways — and because
+/// this string is the only diagnosis a user ever sees for it.
+const NO_PRESENCE_CHANNEL: &str = "this browser cannot ask you to approve the passkey: \
+     no ychrome view client is publishing presence requests for this session. \
+     Reopen the page in a ychrome web surface.";
 
 /// The label the presence dialog shows for an account: the passkey's userName,
 /// else the item name, else the RP name — whatever names the human's account.
@@ -505,14 +594,17 @@ fn origin_host(origin: &str) -> Option<String> {
 /// and, on the user's choice, POSTs `/fido2/grant {request_id, credential_id}`
 /// back to this control endpoint. `account` is kept as the first label so an
 /// older yggterm that reads only that still names an account.
-fn emit_fido2_request(
+///
+/// Returns the sequence rather than writing it: the process that must write it
+/// is the session's view client, not this one. See the module docs.
+fn fido2_request_osc(
     session: &str,
     request_id: &str,
     rp_id: &str,
     accounts: &[Value],
     kind: &str,
     origin: &str,
-) {
+) -> String {
     let first_label = accounts
         .first()
         .and_then(|a| a["label"].as_str())
@@ -527,9 +619,7 @@ fn emit_fido2_request(
         "origin": origin,
     });
     let encoded = base64::engine::general_purpose::STANDARD.encode(payload.to_string());
-    let mut stdout = std::io::stdout().lock();
-    let _ = write!(stdout, "\u{1b}]7717;fido2;request;{encoded}\u{7}");
-    let _ = stdout.flush();
+    format!("\u{1b}]7717;fido2;request;{encoded}\u{7}")
 }
 
 /// Send one request to this host's `ychrome-vault` agent and return its reply,
@@ -763,6 +853,153 @@ fn shim_js(port: u16, token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// Rust source with `//` comments stripped.
+    ///
+    /// ⛔ **A source guard that reads comments is not a guard.** Three written
+    /// in this repo were vacuous and one was satisfied by the explanatory
+    /// comment sitting directly above the call it was meant to police — the
+    /// prose describing the bug kept the test green while the bug was present.
+    /// Every assertion below runs on this, never on the raw file.
+    ///
+    /// It also stops at `#[cfg(test)]`. The guard is about what the SIGNER
+    /// does, and a test's own assertion message naming the forbidden call is
+    /// not the signer making it — the first spelling of this failed on its own
+    /// error string, which is a guard measuring the wrong file.
+    fn code_only(source: &str) -> String {
+        source
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(source)
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The guard's own guard: prove `code_only` actually removes the thing that
+    /// fooled the earlier attempts, so the assertions below rest on something
+    /// that has been seen to work.
+    #[test]
+    fn code_only_drops_a_comment_that_would_satisfy_a_guard() {
+        let source = "// let mut stdout = std::io::stdout().lock();\nlet x = 1;";
+        assert!(!code_only(source).contains("stdout"));
+        assert!(code_only(source).contains("let x = 1;"));
+        // And it stops at the test module, so a test's own prose is out of scope.
+        assert!(!code_only("let x = 1;\n#[cfg(test)]\nmod tests { stdout }").contains("stdout"));
+    }
+
+    /// ⛔ THE REGRESSION THIS FILE EXISTS TO PREVENT. The signer runs inside the
+    /// host daemon, whose stdout is `/dev/null`; a presence request written
+    /// there reaches nobody and the ceremony parks for two minutes. The request
+    /// is queued for the session's view client instead, and this module must not
+    /// touch stdout at all.
+    #[test]
+    fn the_signer_never_writes_the_presence_request_to_stdout() {
+        let code = code_only(include_str!("passkey.rs"));
+        assert!(
+            !code.contains("stdout"),
+            "passkey.rs must not touch stdout: the signer lives in the daemon, \
+             whose stdout is /dev/null, so a request written there is a ceremony \
+             nobody can ever approve"
+        );
+    }
+
+    /// A queued ceremony must actually be handed to whoever drains it, exactly
+    /// once, as the OSC yggterm parses.
+    #[test]
+    fn a_presence_request_is_queued_for_the_client_and_drained_once() {
+        let signer = Signer::new(1234, "sess-7".into());
+        assert!(signer.drain_presence().is_empty());
+
+        signer.publish_presence_request(
+            "req-9",
+            "example.com",
+            &[json!({ "credential_id": "cred-a", "label": "someone@example.com" })],
+            "get",
+            "https://example.com",
+        );
+        let drained = signer.drain_presence();
+        assert_eq!(drained.len(), 1);
+        assert!(drained[0].starts_with("\u{1b}]7717;fido2;request;"));
+        assert!(drained[0].ends_with('\u{7}'));
+        // Drained means taken: a re-drain must not replay a ceremony the user
+        // has already been asked about.
+        assert!(signer.drain_presence().is_empty());
+    }
+
+    /// The payload carries what the dialog needs and nothing the page could use.
+    #[test]
+    fn the_presence_payload_names_the_accounts_and_carries_no_secret() {
+        let osc = fido2_request_osc(
+            "sess-7",
+            "req-9",
+            "example.com",
+            &[json!({ "credential_id": "cred-a", "label": "someone@example.com" })],
+            "get",
+            "https://example.com",
+        );
+        let encoded = osc
+            .trim_start_matches("\u{1b}]7717;fido2;request;")
+            .trim_end_matches('\u{7}');
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("the OSC payload is base64");
+        let payload: Value = serde_json::from_slice(&decoded).expect("the payload is JSON");
+        assert_eq!(payload["request_id"], "req-9");
+        assert_eq!(payload["rp_id"], "example.com");
+        assert_eq!(payload["kind"], "get");
+        assert_eq!(payload["account"], "someone@example.com");
+        assert_eq!(payload["accounts"][0]["credential_id"], "cred-a");
+        // Never the challenge, never a key.
+        let raw = String::from_utf8(decoded).unwrap();
+        assert!(!raw.contains("challenge") && !raw.contains("private"));
+    }
+
+    /// ⭐ SKEW HONESTY. A session nobody drains cannot raise a dialog, so a
+    /// ceremony there is refused AT ONCE and named — never parked for
+    /// `CEREMONY_TIMEOUT` and then reported as a generic failure, which is what
+    /// a broken button looks like to a user and to the next reader of this code.
+    #[test]
+    fn a_session_with_no_draining_client_is_not_presence_reachable() {
+        let signer = Signer::new(1234, "sess-7".into());
+        assert!(
+            !signer.presence_reachable(),
+            "a signer nobody has drained must not claim it can raise a dialog"
+        );
+        signer.drain_presence();
+        assert!(
+            signer.presence_reachable(),
+            "a client that drained is the evidence a dialog can be raised"
+        );
+    }
+
+    /// And the refusal must be REACHED, not merely available: `create` and `get`
+    /// both check before registering a ceremony. A `create` on an unreachable
+    /// session answers 503 with the shared wording rather than blocking.
+    #[test]
+    fn create_refuses_immediately_when_no_client_is_draining() {
+        let signer = Signer::new(1234, "sess-7".into());
+        let started = Instant::now();
+        let (status, body) = signer.handle_create(&json!({
+            "origin": "https://example.com",
+            "rp": { "id": "example.com", "name": "Example" },
+            "challenge": "Y2hhbGxlbmdl",
+            "user": { "id": "dXNlcg", "name": "someone", "displayName": "Someone" },
+        }));
+        assert_eq!(status, 503);
+        assert_eq!(body["error"], NO_PRESENCE_CHANNEL);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the refusal must be immediate, not a park on the ceremony timeout"
+        );
+        // Refused before it was registered: nothing is left parked to be woken.
+        assert!(signer.pending.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn rp_id_must_be_a_suffix_of_the_origin_host() {

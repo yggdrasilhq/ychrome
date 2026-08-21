@@ -626,6 +626,24 @@ impl Daemon {
         });
     }
 
+    /// Take the presence-request OSCs queued for one session, for its view
+    /// client to write onto the row's PTY.
+    ///
+    /// **Why the daemon cannot just write them.** A `fido2 ; request` is routed
+    /// by the GUI on the STREAM it arrives on, and this process holds no
+    /// session's stream — a daemon's stdout is `/dev/null`. The client does hold
+    /// it. So the ceremony queues here and the client publishes; see
+    /// [`crate::passkey`]'s module docs for the defect that shape fixes.
+    ///
+    /// An unknown env_id yields nothing rather than an error: a client racing a
+    /// reap should stop draining, not fail.
+    fn drain_presence(&self, env_id: &str) -> Vec<String> {
+        let entry = self.sessions.lock().unwrap().get(env_id).cloned();
+        entry
+            .map(|entry| entry.control.signer.drain_presence())
+            .unwrap_or_default()
+    }
+
     /// Reap sessions whose client stopped heartbeating.
     fn reap(&self) {
         let mut sessions = self.sessions.lock().unwrap();
@@ -822,6 +840,18 @@ fn handle_unix_conn(daemon: &Arc<Daemon>, stream: UnixStream) -> bool {
             let env_id = request.get("env_id").and_then(Value::as_str).unwrap_or("");
             daemon.deregister(env_id);
             json!({ "ok": true })
+        }
+        // The presence channel. Deliberately NOT folded into `register`: a
+        // ceremony is a human waiting, and the register heartbeat is ~4s, so
+        // riding it would put up to four seconds between the click and the
+        // dialog. This op is cheap enough to run on the client's own tick.
+        "fido2-outbox" => {
+            let env_id = request.get("env_id").and_then(Value::as_str).unwrap_or("");
+            if env_id.is_empty() {
+                json!({ "ok": false, "error": "fido2-outbox needs env_id" })
+            } else {
+                json!({ "ok": true, "osc": daemon.drain_presence(env_id) })
+            }
         }
         "route" => {
             let profile = request.get("profile").and_then(Value::as_str).unwrap_or("default");
@@ -1595,6 +1625,36 @@ pub fn register_supervised(env_id: &str, profile: &str) -> Option<ControlEndpoin
 
 pub fn deregister(env_id: &str) {
     let _ = socket_request(&json!({ "op": "deregister", "env_id": env_id }));
+}
+
+/// Take this session's queued passkey presence requests, for the caller to
+/// write onto its own stdout — the row's PTY, which is the stream the GUI
+/// routes a `fido2 ; request` by.
+///
+/// `socket_request_silent`, not `socket_request`: this runs on the surface tick,
+/// several times a second, and the staleness notice it would otherwise carry is
+/// a once-per-daemon announcement the heartbeat already makes. Printing it here
+/// would put the same line on the user's terminal five times a second.
+///
+/// A daemon that is down, or one too old to know the op, yields nothing. That is
+/// the honest answer and it is also the safe one: the signer refuses a ceremony
+/// it has not seen drained, so a silent empty here becomes a NAMED refusal at
+/// the page rather than a dialog that never comes.
+pub fn drain_presence(env_id: &str) -> Vec<String> {
+    let Some(reply) = socket_request_silent(&json!({ "op": "fido2-outbox", "env_id": env_id }))
+    else {
+        return Vec::new();
+    };
+    reply
+        .get("osc")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Ask the daemon to route a url. Returns the parsed reply (`routed`, `session`,

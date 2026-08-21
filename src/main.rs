@@ -247,6 +247,29 @@ fn emit_web_surface_osc(
     let _ = stdout.flush();
 }
 
+/// Publish this session's queued passkey presence requests on OUR stdout.
+///
+/// ⛔ **The whole point is the fd.** The signer that raises a ceremony lives in
+/// the host daemon, whose stdout is `/dev/null`, and the GUI routes a
+/// `fido2 ; request` by the stream it arrives on — so a request written there
+/// reached nobody, no approval dialog was ever raised, and every passkey
+/// sign-in failed after a silent two-minute park. This process is the one that
+/// holds the session's PTY, so this process is the one that writes.
+///
+/// Called on the surface tick rather than the ~4s heartbeat: a human is waiting
+/// on a dialog, and four seconds of nothing is what a broken button looks like.
+fn publish_presence_requests(session: &str) {
+    let requests = daemon::drain_presence(session);
+    if requests.is_empty() {
+        return;
+    }
+    let mut stdout = std::io::stdout().lock();
+    for osc in requests {
+        let _ = write!(stdout, "{osc}");
+    }
+    let _ = stdout.flush();
+}
+
 /// Minimal JSON string escaping (avoid a serde dependency for one payload).
 fn serde_json_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
@@ -398,6 +421,11 @@ fn drive_surface(
     if !declare_current(session, profile) {
         eprintln!("ychrome: sidebar unavailable (daemon did not come up)");
     }
+    // Drain once BEFORE the surface exists. The drain is what marks the session
+    // presence-reachable, and the signer refuses a ceremony it has not seen
+    // drained — so without this the first page could load into a window where a
+    // real passkey request would be refused as unreachable.
+    publish_presence_requests(session);
     emit_web_surface_osc("open", session, url, title, profile, start_page);
     eprintln!(
         "ychrome: web surface open — {url} [{profile}]  (Ctrl+C to close, Ctrl+Z / yggterm Zzz to suspend)"
@@ -418,6 +446,8 @@ fn drive_surface(
             emit_web_surface_osc("open", session, url, title, profile, start_page);
         }
         last_tick = std::time::Instant::now();
+        // Every tick, not every heartbeat: this is a human waiting on a dialog.
+        publish_presence_requests(session);
         ticks += 1;
         // Heartbeat every ~4s (20 × 200ms) — the GUI's liveness truth, and the
         // daemon re-register that keeps this session in the registry.

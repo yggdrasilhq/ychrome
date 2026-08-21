@@ -25,3 +25,23 @@ a green gate, and every session must either know the four names or suspect its o
 
 **What was done meanwhile.** Worked around it: this lane ran targeted tests and reports its own
 counts against the same 4 pre-existing failures (382→389 passing, same 4 failing).
+
+---
+
+## 2. Two stale rows in the sidebar that a sweep should take, not you
+
+**Filed 2026-08-22.** Not a decision so much as a thing that looks like a defect and is not.
+
+The wedged first successor (`70c2ae44…`) is **dead** — no process, `live_processes: []`, and
+`session remove` accepted twice. Its row **still appears in the listing**, on the
+`remote-cc://dev/` spelling and as a project-folder entry. That is the row plane's own
+documented law: *the verb reports the request, not the effect*.
+
+**RECOMMENDATION: leave it for a sweep.** Re-removing an already-removed row files a second
+DELETION against someone's row files, which is worse than a stale entry. The live successor is
+`9eb57932…`, seat 11.25.
+
+**What was done meanwhile.** The cause is recorded in the fleet skill's §11 register on
+`lane/dev/11.24-omnibox`: `--no-activate` parks a queued `remote-cc` resume on *"Daemon PTY:
+request main viewport terminal stream"* forever, and every check the spawn contract prescribes
+passes anyway.
