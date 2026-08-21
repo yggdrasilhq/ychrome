@@ -927,6 +927,33 @@ answers with the count actually dispatched and the index that stopped it.
 
 Locked by `ychrome engine hit` (15 steps, fixture-backed).
 
+### ⭐⭐ WHICH BUILD IS ANSWERING — check this BEFORE believing a verb is missing
+
+```sh
+ychrome ctl status | jq .engine
+# {"build":"33edbc13e25b","exe":"…/ychrome","exe_deleted":true,"started_unix":…}
+```
+
+⛔ **A long-lived engine goes on serving from an inode that was replaced on disk,
+and an audit once found TEN OF ELEVEN ychrome processes on one host doing
+exactly that, the oldest by thirteen days.** `ctl frame` was reported as
+"advertised by the help and 404s" with the proposed remedy *drop it from the
+usage line* — it was implemented; the help came from a CLI installed that
+afternoon and the 404 came from a 43-hour-old daemon. **A 404 that cannot tell
+"no such verb" from "this build predates it" sends you to the wrong system every
+time**, and the cost arrives as a belief rather than a crash.
+
+⇒ Since 2026-08-21 an unknown verb whose CLI differs from the engine says so
+outright, naming both builds and telling you to restart the engine. When the
+builds match it stays silent, so a typo is still a typo. `exe_deleted: true`
+means *restart before concluding anything*.
+
+⚠ **`--version` cannot answer this and neither can the path** — both read the
+file that is there NOW, which is exactly the file a stale process is not
+running. The identity is a digest of `/proc/self/exe`, which stays readable
+after the inode is unlinked. ⛔ The self-retire half is NOT built: an engine
+still serves indefinitely, it merely admits to being stale.
+
 ### ⭐ KEYS AND DRAGS — the vocabulary, and what used to be silently undeliverable
 
 `input` takes `click | move | scroll | type | key | mousedown | mouseup | drag`.

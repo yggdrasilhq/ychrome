@@ -555,9 +555,49 @@ private-data lock caught a phone number and passed a bank customer ID into a pub
 (`/fill` needs a target selector — its absence forces the plaintext into the agent's argv):
 **`docs/agent-cobrowse-gaps-2026-08-10.md`** (a peer campaign row, 2026-08-10).
 
-## ⛔⛔ THE ENGINE SERVES FROM A DELETED BINARY FOR DAYS AND 404s VERBS THE CLI ADVERTISES — and nothing says which build is answering
+## ⛔ THE ENGINE SERVES FROM A DELETED BINARY FOR DAYS — it now SAYS SO; the self-retire half is still open
 
-**Status:** OPEN
+**Status:** ⇒ **HALF CLOSED 2026-08-21.** The handshake (fix 1) is built and live-proven; the
+stale-binary self-retire (fix 2) is untouched and still OPEN. Demoted from ⛔⛔ to ⛔ because the
+failure no longer reaches the reader as a wrong conclusion — it reaches them as a named skew.
+
+### ✅ FIX 1 — THE VERSION HANDSHAKE, DELIVERED
+
+`src/build.rs` is the one owner of "which build is answering". Every `ctl status` carries an
+`engine` block, and an unknown verb's 404 carries it too, so the CLI can compare and say which
+side is stale:
+
+```
+$ ychrome ctl frame-of-the-future          # engine NOT restarted after a rebuild
+ychrome ctl: unknown engine verb "frame-of-the-future" — but THIS IS A VERSION SKEW,
+             not a missing feature.
+ychrome ctl:   the engine answering is build 33edbc13e25b (started 1787329146),
+               running a binary already replaced on disk
+ychrome ctl:   your CLI is build 633c71a5a753
+ychrome ctl:   restart the engine before concluding the verb is missing.
+```
+
+**Live-proven by this entry's own falsifier** — rebuild without restarting the engine, then run a
+verb. When the two builds MATCH the note is silent, so an ordinary typo is still just a typo.
+
+⭐ **The identity is a SHA-256 of `/proc/self/exe`, not `--version` and not the path.** Both of
+those read the file that is there NOW, which is exactly the file a stale process is no longer
+running. The magic link stays readable after the inode is unlinked, which is the whole population
+this is for.
+
+⛔ **AND THE FIRST IMPLEMENTATION FAILED ITS OWN FALSIFIER, WHICH IS WHY THE RULE IS WORTH
+WRITING DOWN.** `exe_deleted` was cached beside the digest at startup, so the engine answered
+`exe_deleted: false` while `/proc/<pid>/exe` plainly read `(deleted)`. ⇒ **The digest is an
+identity and is rightly computed once — the bytes a process executes cannot change. "Has my
+binary been replaced" is the opposite kind of fact: it belongs to the DISK, it starts false and
+becomes true, and that transition is the entire event.** Caching it guarantees the answer
+`false` for exactly the population being hunted. It is read live on every reply now.
+
+⚠ **A second trap, met while testing:** a comment-only Rust change compiles to **byte-identical
+output**, so it cannot be used to manufacture a skew. The first falsifier run proved nothing and
+looked like it had. Change a string literal.
+
+### ⛔ FIX 2 — STALE-BINARY SELF-RETIRE, STILL OPEN
 
 **Reported by the `practice` campaign row 2026-08-09** as *"`ctl frame` is
 advertised by the CLI's own help and the engine 404s it — either implement it or
@@ -624,14 +664,9 @@ one of the long-lived instances, 398 processes against a `pid_max` of 4,194,304.
 These are idle, not breeding. The cost today is memory and a wrong answer, not a
 host outage — say so plainly rather than borrowing the older incident's urgency.
 
-**The fix, and it is two things:**
+**What is left:**
 
-1. **A version handshake.** Every `ctl` reply carries the engine's build
-   identity, and an unknown verb whose CLI is NEWER than the engine says so:
-   `unknown engine verb "frame" — this engine is build X (started <t>), your CLI
-   is build Y; restart the engine`. ⛔ Not `--version`: that reads the binary on
-   disk, which is exactly the file this engine is no longer running.
-2. **Stale-binary self-retire**, the same shape yggterm's daemon already has:
+**Stale-binary self-retire**, the same shape yggterm's daemon already has:
    poll `/proc/self/exe` for the `(deleted)` marker and retire once no page is
    mid-navigation. ⚠ It must PRESERVE live pages or it is worse than the bug —
    this engine was holding two live exam sessions when it was measured.
@@ -646,8 +681,13 @@ host outage — say so plainly rather than borrowing the older incident's urgenc
    group; they are eleven independent strays. Use `ps -o lstart=` — see the
    ⚠ note under the audit above.
 
-**Falsifier:** rebuild ychrome without restarting the engine, then run any verb.
-The reply names both builds and tells you which one is stale.
+**Falsifier for what remains:** leave a rebuilt-but-unrestarted engine idle with no live pages.
+It should retire itself; today it serves indefinitely and only SAYS that it is stale.
+
+⚠ **Retiring is a genuinely harder job than reporting and must not be treated as its other half.**
+It has to preserve live pages (the engine that produced this entry was holding two live exam
+sessions when it was measured) and it has to sweep a SET — eleven instances, started across at
+least five different days. A retire that assumes "the engine" leaves ten behind.
 
 ## ⛔⛔ `ctl eval` IS SYNCHRONOUS-ONLY, SO EVERY rAF-DRIVEN CANVAS SILENTLY RECORDS A DEGENERATE RESULT AND REPORTS SUCCESS
 

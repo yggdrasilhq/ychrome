@@ -170,7 +170,56 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut text = String::new();
     reader.read_to_string(&mut text)?;
     println!("{}", text.trim());
+    if let Some(note) = version_skew_note(status, &text) {
+        eprintln!("{note}");
+    }
     exit_status(status)
+}
+
+/// The sentence that turns a 404 into an actionable one, or `None`.
+///
+/// ⛔ **"Unknown verb" and "this engine predates the verb" are different facts
+/// and they send you to different systems.** `ctl frame` was once reported as
+/// advertised-but-404ing, with the proposed remedy "drop it from the usage
+/// line" — it was implemented, and the daemon answering was 43 hours old,
+/// serving from an inode replaced on disk hours after it started. The help came
+/// from the CLI; the 404 came from an older build. Deleting the feature would
+/// have been the wrong repair to the wrong component.
+///
+/// Pure, so the message is a unit test rather than something only a stale
+/// daemon can produce.
+fn version_skew_note(status: u16, body: &str) -> Option<String> {
+    if status != 404 {
+        return None;
+    }
+    let reply: serde_json::Value = serde_json::from_str(body).ok()?;
+    let engine_build = reply["engine"]["build"].as_str()?;
+    let error = reply["error"].as_str().unwrap_or("unknown engine verb");
+    let mine = crate::build::identity();
+    if engine_build == mine.build {
+        // Same bytes on both ends. The verb really does not exist, and saying
+        // anything about builds here would send the reader off to restart a
+        // daemon that is already current.
+        return None;
+    }
+    let deleted = reply["engine"]["exe_deleted"].as_bool().unwrap_or(false);
+    let started = reply["engine"]["started_unix"].as_u64();
+    let mut note = format!(
+        "ychrome ctl: {error} — but THIS IS A VERSION SKEW, not a missing feature.\n\
+         ychrome ctl:   the engine answering is build {engine_build}"
+    );
+    if let Some(started) = started {
+        note.push_str(&format!(" (started {started})"));
+    }
+    if deleted {
+        note.push_str(", running a binary already replaced on disk");
+    }
+    note.push_str(&format!(
+        "\nychrome ctl:   your CLI is build {}\n\
+         ychrome ctl:   restart the engine before concluding the verb is missing.",
+        mine.build
+    ));
+    Some(note)
 }
 
 /// What `--out` prints: the capture's own account with the file it landed in
@@ -264,6 +313,42 @@ fn read_head(reader: &mut BufReader<UnixStream>) -> Result<(u16, String, Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ⛔ THE WHOLE VALUE IS IN TELLING TWO FACTS APART. Same build on both ends
+    // means the verb really is missing; different builds mean the reader is
+    // about to repair the wrong component.
+    #[test]
+    fn a_404_only_blames_version_skew_when_the_builds_actually_differ() {
+        let mine = &crate::build::identity().build;
+
+        // Same build: say NOTHING about versions, or every genuine typo sends
+        // someone off to restart a daemon that is already current.
+        let same = format!(
+            r#"{{"ok":false,"error":"unknown engine verb \"nope\"","engine":{{"build":"{mine}","exe_deleted":false,"started_unix":1700000000}}}}"#
+        );
+        assert_eq!(version_skew_note(404, &same), None);
+
+        // Different build: name both, and say which way to fix it.
+        let skewed = r#"{"ok":false,"error":"unknown engine verb \"frame\"","engine":{"build":"0123456789ab","exe_deleted":true,"started_unix":1700000000}}"#;
+        let note = version_skew_note(404, skewed).expect("a skew must be reported");
+        assert!(note.contains("0123456789ab"), "{note}");
+        assert!(note.contains(mine.as_str()), "{note}");
+        assert!(note.contains("replaced on disk"), "{note}");
+        assert!(note.contains("restart the engine"), "{note}");
+        assert!(
+            note.contains("not a missing feature"),
+            "the reader's next move must not be to delete the verb: {note}"
+        );
+
+        // Anything that is not a 404, or carries no engine block (an engine too
+        // old to send one), stays silent rather than guessing.
+        assert_eq!(version_skew_note(200, skewed), None);
+        assert_eq!(
+            version_skew_note(404, r#"{"ok":false,"error":"nope"}"#),
+            None
+        );
+        assert_eq!(version_skew_note(404, "not json at all"), None);
+    }
 
     // The value rule is the whole reason this client can stay thin: it must not
     // need a per-verb schema. Numbers must arrive as numbers or `timeout_ms`
