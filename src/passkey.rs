@@ -53,6 +53,7 @@ use sha2::{Digest, Sha256};
 const CEREMONY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// What the GUI dialog delivered for a pending ceremony.
+#[derive(Clone)]
 enum Outcome {
     Granted {
         user_verified: bool,
@@ -77,6 +78,12 @@ struct Ceremony {
     ceremony: String,
     accounts: Vec<Value>,
     registered_at_ms: Option<u64>,
+    /// The validated request (and, for a get, the resolved credential
+    /// candidates) stashed at begin time, so a NON-blocking poller can finish
+    /// the ceremony later. The scheme-handler transport cannot park: its
+    /// callback runs on the engine's main loop, and blocking there froze every
+    /// ctl call for the length of a ceremony — measured 2026-08-28.
+    context: Option<Value>,
 }
 
 fn now_ms() -> u64 {
@@ -228,7 +235,10 @@ impl Signer {
         }
     }
 
-    fn try_get(&self, body: &Value) -> Result<Value, GetError> {
+    /// Validate, resolve matching passkeys, and REGISTER the ceremony — but do
+    /// not wait. The scheme-handler transport calls this from the engine's main
+    /// loop, which must never park; the outcome is collected by [`Self::poll`].
+    pub(crate) fn begin_get(&self, body: &Value) -> Result<(String, Vec<Value>), GetError> {
         let rp_id = body
             .get("rpId")
             .and_then(Value::as_str)
@@ -275,15 +285,6 @@ impl Signer {
             return Err(GetError::NoCredential);
         }
 
-        // The bytes the RP will re-hash: whatever we sign, we return verbatim.
-        // Independent of which account — computed once.
-        let client_data_json = format!(
-            r#"{{"type":"webauthn.get","challenge":{},"origin":{},"crossOrigin":false}}"#,
-            json_string(challenge),
-            json_string(origin),
-        );
-        let client_data_hash = Sha256::digest(client_data_json.as_bytes());
-
         // Ask the human, offering every matched account. One entry ⇒ the dialog
         // is a plain Approve; several ⇒ a picker. Labels only — no key.
         let accounts: Vec<Value> = matches
@@ -296,18 +297,45 @@ impl Signer {
             })
             .collect();
         let request_id = hex_token(16);
-        self.register_ceremony(&request_id, rp_id, origin, "get", &accounts);
+        self.register_ceremony(
+            &request_id,
+            rp_id,
+            origin,
+            "get",
+            &accounts,
+            json!({ "body": body.clone(), "matches": matches }),
+        );
         emit_fido2_request(&self.session, &request_id, rp_id, &accounts, "get", origin);
-        let outcome = self.wait_for_outcome(&request_id);
+        Ok((request_id, accounts))
+    }
+
+    /// Finish a parked get from the context stored at begin time.
+    fn finish_get(&self, ceremony: &Ceremony, outcome: Outcome) -> Result<Value, GetError> {
+        let context = ceremony
+            .context
+            .clone()
+            .ok_or_else(|| GetError::Bad("ceremony lost its begin context".into()))?;
+        let body = &context["body"];
+        let matches: Vec<Value> = context["matches"].as_array().cloned().unwrap_or_default();
+        let rp_id = &ceremony.rp_id;
+        let origin = &ceremony.origin;
 
         let (user_verified, chosen_id) = match outcome {
-            Some(Outcome::Granted {
+            Outcome::Granted {
                 user_verified,
                 credential_id,
-            }) => (user_verified, credential_id),
-            Some(Outcome::Denied) => return Err(GetError::Denied),
-            None => return Err(GetError::TimedOut),
+            } => (user_verified, credential_id),
+            Outcome::Denied => return Err(GetError::Denied),
         };
+
+        let challenge = body.get("challenge").and_then(Value::as_str).unwrap_or_default();
+        // The bytes the RP will re-hash: whatever we sign, we return verbatim.
+        let client_data_json = format!(
+            r#"{{"type":"webauthn.get","challenge":{},"origin":{},"crossOrigin":false}}"#,
+            json_string(challenge),
+            json_string(origin),
+        );
+        let client_data_hash = Sha256::digest(client_data_json.as_bytes());
 
         // The account the user chose (or the only one). A chosen id the resolver
         // did not return is refused rather than silently signing another account.
@@ -358,6 +386,17 @@ impl Signer {
         }))
     }
 
+    /// The blocking form the sidebar HTTP route uses: a server thread per
+    /// ceremony is fine there — the scheme handler's main-loop thread is what
+    /// may never park.
+    fn try_get(&self, body: &Value) -> Result<Value, GetError> {
+        let (request_id, _) = self.begin_get(body)?;
+        let Some((outcome, ceremony)) = self.wait_for_outcome(&request_id) else {
+            return Err(GetError::TimedOut);
+        };
+        self.finish_get(&ceremony, outcome)
+    }
+
     /// `POST /fido2/create` — a `navigator.credentials.create()` ceremony. Same
     /// consent flow as `get`, then a vault WRITE: the agent mints and stores the
     /// keypair and returns the public material this assembles into an attestation.
@@ -374,7 +413,8 @@ impl Signer {
         }
     }
 
-    fn try_create(&self, body: &Value) -> Result<Value, GetError> {
+    /// The non-blocking create begin — see [`Self::begin_get`].
+    pub(crate) fn begin_create(&self, body: &Value) -> Result<(String, Vec<Value>), GetError> {
         let origin = body
             .get("origin")
             .and_then(Value::as_str)
@@ -397,23 +437,11 @@ impl Signer {
         let user = body
             .get("user")
             .ok_or_else(|| GetError::Bad("create needs a user".into()))?;
-        let user_id = user.get("id").and_then(Value::as_str).unwrap_or_default();
         let user_name = user.get("name").and_then(Value::as_str).unwrap_or_default();
         let display_name = user
             .get("displayName")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let rp_name = body
-            .get("rp")
-            .and_then(|rp| rp.get("name"))
-            .and_then(Value::as_str)
-            .unwrap_or(rp_id);
-
-        let client_data_json = format!(
-            r#"{{"type":"webauthn.create","challenge":{},"origin":{},"crossOrigin":false}}"#,
-            json_string(challenge),
-            json_string(origin),
-        );
 
         // Ask the human — a registration is a presence ceremony too. One account
         // (the one being created), so the dialog is a plain Approve, never a
@@ -425,7 +453,14 @@ impl Signer {
             display_name
         };
         let accounts = vec![json!({ "label": label })];
-        self.register_ceremony(&request_id, rp_id, origin, "create", &accounts);
+        self.register_ceremony(
+            &request_id,
+            rp_id,
+            origin,
+            "create",
+            &accounts,
+            json!({ "body": body.clone() }),
+        );
         emit_fido2_request(
             &self.session,
             &request_id,
@@ -434,11 +469,41 @@ impl Signer {
             "create",
             origin,
         );
-        let user_verified = match self.wait_for_outcome(&request_id) {
-            Some(Outcome::Granted { user_verified, .. }) => user_verified,
-            Some(Outcome::Denied) => return Err(GetError::Denied),
-            None => return Err(GetError::TimedOut),
+        Ok((request_id, accounts))
+    }
+
+    fn finish_create(&self, ceremony: &Ceremony, outcome: Outcome) -> Result<Value, GetError> {
+        let context = ceremony
+            .context
+            .clone()
+            .ok_or_else(|| GetError::Bad("ceremony lost its begin context".into()))?;
+        let body = &context["body"];
+        let rp_id = &ceremony.rp_id;
+        let origin = &ceremony.origin;
+
+        let user_verified = match outcome {
+            Outcome::Granted { user_verified, .. } => user_verified,
+            Outcome::Denied => return Err(GetError::Denied),
         };
+
+        let challenge = body.get("challenge").and_then(Value::as_str).unwrap_or_default();
+        let client_data_json = format!(
+            r#"{{"type":"webauthn.create","challenge":{},"origin":{},"crossOrigin":false}}"#,
+            json_string(challenge),
+            json_string(origin),
+        );
+        let user = body.get("user").cloned().unwrap_or(Value::Null);
+        let user_id = user.get("id").and_then(Value::as_str).unwrap_or_default();
+        let user_name = user.get("name").and_then(Value::as_str).unwrap_or_default();
+        let display_name = user
+            .get("displayName")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let rp_name = body
+            .get("rp")
+            .and_then(|rp| rp.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or(rp_id);
 
         // Consent in hand: the agent generates + stores the keypair, returns the
         // public material (the private key never leaves the agent process).
@@ -469,6 +534,46 @@ impl Signer {
             "clientDataJSON": b64url(client_data_json.as_bytes()),
             "attestationObject": b64url(&attestation_object),
         }))
+    }
+
+    /// The blocking form the sidebar HTTP route uses — see [`Self::try_get`].
+    fn try_create(&self, body: &Value) -> Result<Value, GetError> {
+        let (request_id, _) = self.begin_create(body)?;
+        let Some((outcome, ceremony)) = self.wait_for_outcome(&request_id) else {
+            return Err(GetError::TimedOut);
+        };
+        self.finish_create(&ceremony, outcome)
+    }
+
+    /// NON-BLOCKING outcome collection for the scheme-handler transport. `None`
+    /// = still parked (ask again); `Some` = finished (and the entry consumed —
+    /// a late grant cannot replay it). Entries nobody resolved within the
+    /// ceremony timeout are swept here, since nothing else ever waits on them.
+    pub fn poll(&self, request_id: &str) -> Option<Result<Value, GetError>> {
+        let mut pending = self.pending.lock().unwrap();
+        let deadline_ms = CEREMONY_TIMEOUT.as_millis() as u64;
+        let expired: Vec<String> = pending
+            .iter()
+            .filter(|(_, c)| {
+                c.outcome.is_none()
+                    && now_ms().saturating_sub(c.registered_at_ms.unwrap_or(0)) > deadline_ms
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in expired {
+            pending.remove(&key);
+        }
+        let ceremony = pending.get(request_id)?;
+        if ceremony.outcome.is_none() {
+            return None;
+        }
+        let (_, ceremony) = pending.remove_entry(request_id)?;
+        let outcome = ceremony.outcome.clone()?;
+        match ceremony.ceremony.as_str() {
+            "get" => Some(self.finish_get(&ceremony, outcome)),
+            "create" => Some(self.finish_create(&ceremony, outcome)),
+            _ => Some(Err(GetError::Bad("unknown ceremony kind".into()))),
+        }
     }
 
     /// `POST /fido2/grant` — the GUI dialog approved. Wakes the parked ceremony.
@@ -523,6 +628,7 @@ impl Signer {
         origin: &str,
         ceremony: &str,
         accounts: &[Value],
+        context: Value,
     ) {
         self.pending.lock().unwrap().insert(
             request_id.to_string(),
@@ -533,19 +639,23 @@ impl Signer {
                 accounts: accounts.to_vec(),
                 registered_at_ms: Some(now_ms()),
                 outcome: None,
+                context: Some(context),
             },
         );
     }
 
     /// Park until the ceremony has an outcome or the timeout fires, then consume
-    /// the entry (so a late grant cannot replay it).
-    fn wait_for_outcome(&self, request_id: &str) -> Option<Outcome> {
+    /// the entry (so a late grant cannot replay it). Returns the ceremony too —
+    /// the finisher needs the context stashed at begin time.
+    fn wait_for_outcome(&self, request_id: &str) -> Option<(Outcome, Ceremony)> {
         let mut pending = self.pending.lock().unwrap();
         let deadline = std::time::Instant::now() + CEREMONY_TIMEOUT;
         loop {
             match pending.get(request_id) {
                 Some(ceremony) if ceremony.outcome.is_some() => {
-                    return pending.remove(request_id).and_then(|c| c.outcome);
+                    return pending
+                        .remove(request_id)
+                        .and_then(|c| c.outcome.clone().map(|o| (o, c)));
                 }
                 Some(_) => {}
                 None => return None,
@@ -566,7 +676,7 @@ impl Signer {
 }
 
 /// Why a `get()` could not complete.
-enum GetError {
+pub(crate) enum GetError {
     /// No stored passkey answers the request (wrong RP, or the allow-list names
     /// nothing we hold). The shim reports `NotAllowedError` to the page.
     NoCredential,
@@ -750,12 +860,114 @@ fn json_string(value: &str) -> String {
 /// intercepts `get()`/`create()`, forwards to the signer over loopback, and
 /// rebuilds a `PublicKeyCredential` from the response. `PORT`/`TOKEN` are baked
 /// in per surface. Kept as one self-contained IIFE so it needs nothing else.
+/// The page served at `yggterm-appctl://signer/helper` — the scheme-origin
+/// resident the shim talks to. See [`shim_js`] for why this page exists: the
+/// scheme handler answers SAME-ORIGIN fetches and TOP-LEVEL navigations, and
+/// this page is the one thing at that origin, so every ceremony is a
+/// postMessage from the shim and a same-origin fetch from here.
+///
+/// It holds no secrets: the signer's bearer token travels per-request and the
+/// handler gates every fido2 route on it, so a rogue page that opens the
+/// helper gets exactly nothing it could not get by talking to the handler
+/// directly.
+pub const HELPER_DOC: &str = r#"<!doctype html>
+<html><body>
+<script>
+(function () {
+  'use strict';
+  var ENDPOINT = 'yggterm-appctl://signer';
+  var IDLE_MS = 300000;  // close when nothing has asked for five minutes
+
+  var closer = setTimeout(function () { window.close(); }, IDLE_MS);
+
+  window.addEventListener('message', function (event) {
+    var d = event.data;
+    if (!d || typeof d !== 'object' || d.__yfido2 !== 1 || d.kind !== 'request') return;
+    if (typeof d.path !== 'string' || d.path.indexOf('/fido2/') !== 0) return;
+    clearTimeout(closer);
+    closer = setTimeout(function () { window.close(); }, IDLE_MS);
+    function relay(ok, body) {
+      // Reply ONLY to the asker, only at the origin the asker spoke from.
+      if (event.source) {
+        event.source.postMessage(
+          { __yfido2: 1, kind: 'reply', id: d.id, ok: ok, body: body },
+          event.origin);
+      }
+    }
+    // BEGIN first; while the outcome is pending, POLL. The scheme handler
+    // must never park — it runs on the engine's main loop, and a parked
+    // ceremony there froze the whole daemon (measured 2026-08-28).
+    var base = ENDPOINT + d.path
+      + '?id=' + encodeURIComponent(String(d.id))
+      + '&token=' + encodeURIComponent(String(d.token || ''))
+      + '&origin=' + encodeURIComponent(String(d.origin || ''))
+      + '&payload=' + encodeURIComponent(JSON.stringify(d.payload || null));
+    function parse(t) { try { return JSON.parse(t); } catch (e) { return { error: 'bad reply from signer' }; } }
+    // Every handler reply is an ENVELOPE: {ok, body} — and `pending` rides
+    // INSIDE the body, so a bare `j.pending` never fires and a parked ceremony
+    // gets mistaken for a final answer.
+    fetch(base, { method: 'POST', body: '{}' })
+      .then(function (r) { return r.text(); })
+      .then(function (t) {
+        var env = parse(t);
+        var body = env && env.body !== undefined ? env.body : env;
+        if (env && env.ok && body && body.pending) {
+          var pollUrl = ENDPOINT + '/fido2/poll?request_id=' +
+            encodeURIComponent(String(body.request_id || '')) +
+            '&token=' + encodeURIComponent(String(d.token || ''));
+          var tries = 0;
+          var iv = setInterval(function () {
+            tries += 1;
+            if (tries > 220) {  // ~132s, just past the signer's own timeout
+              clearInterval(iv);
+              relay(false, { error: 'the user did not respond in time' });
+              return;
+            }
+            fetch(pollUrl, { method: 'POST', body: '{}' })
+              .then(function (r2) { return r2.text(); })
+              .then(function (t2) {
+                var env2 = parse(t2);
+                var b2 = env2 && env2.body !== undefined ? env2.body : env2;
+                if (env2 && env2.ok && b2 && b2.pending) return;  // keep asking
+                clearInterval(iv);
+                if (env2 && env2.ok) relay(true, b2);
+                else relay(false, b2 || { error: 'signer error' });
+              })
+              .catch(function () { /* transient; keep asking */ });
+          }, 600);
+          return;
+        }
+        if (env && env.ok) relay(true, body);
+        else relay(false, body || { error: 'signer error' });
+      })
+      .catch(function (e) { relay(false, { error: String(e) }); });
+  });
+
+  // Tell our opener we can take requests (it queues until this arrives).
+  window.__yfido2HelperArmed = true;
+  if (window.opener) {
+    window.opener.postMessage({ __yfido2: 1, kind: 'ready' }, '*');
+  }
+})();
+</script>
+</body></html>
+"#;
+
 fn shim_js(port: u16, token: &str) -> String {
     // The shim reaches the signer through yggterm's `yggterm-appctl://` bridge,
     // NOT `http://127.0.0.1:{port}` directly: WebKitGTK blocks an https page from
-    // fetching http-loopback (mixed content). yggterm registers the scheme as
-    // secure and proxies it to this app's control endpoint. The port is unused in
-    // the page (the GUI knows which signer to route to); the token still gates.
+    // fetching http-loopback (mixed content). The port is unused in the page
+    // (the GUI knows which signer to route to); the token still gates.
+    //
+    // ⛔ THE TRANSPORT IS A HELPER PAGE AT THE SCHEME ORIGIN, NOT fetch() FROM
+    // THE SITE PAGE. Measured on webkit 2.52.6 (2026-08-28): the scheme
+    // handler serves TOP-LEVEL navigations and SAME-ORIGIN fetches only — an
+    // https page's own fetch/XHR to the scheme dies `TypeError: Load failed`
+    // at the network layer (handler never consulted, journal-proven zero hits
+    // ever), and a subframe navigation is rebased to `about:blank`. But a page
+    // AT the scheme origin fetches the scheme freely. So the shim opens the
+    // helper once (a top-level open — served), and ceremonies travel
+    // shim → helper by postMessage, helper → signer by same-origin fetch.
     let _ = port;
     format!(
         r#"(function () {{
@@ -777,13 +989,80 @@ fn shim_js(port: u16, token: &str) -> String {
     for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
     return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   }}
+  var PENDING = {{}};
+  var SEQ = 0;
+  var TIMER_MS = 130000;  // just past the signer's own 120s ceremony timeout
+  var HELPER = null;      // the yggterm-appctl://signer helper window
+  var HELPER_READY = false;
+  var QUEUE = [];
+
+  // The transport, and why it is shaped like this (measured on webkit 2.52.6,
+  // 2026-08-28): the scheme handler serves TOP-LEVEL navigations and
+  // SAME-ORIGIN fetches only — an https page's own fetch/XHR to the scheme
+  // dies `TypeError: Load failed` at the network layer (handler never
+  // consulted, journal-proven), and a subframe navigation is rebased to
+  // `about:blank`. But a page AT the scheme origin can fetch the scheme
+  // freely. So: this shim opens the helper page once (a top-level open, which
+  // the handler serves), and every ceremony is a postMessage to the helper
+  // and a same-origin fetch inside it.
+
+  function helperMessage(event) {{
+    var data = event.data;
+    if (!data || typeof data !== 'object' || data.__yfido2 !== 1) return;
+    if (data.kind === 'ready') {{
+      HELPER_READY = true;
+      var q = QUEUE; QUEUE = [];
+      for (var i = 0; i < q.length; i++) dispatch(q[i]);
+      return;
+    }}
+    if (data.kind !== 'reply') return;
+    // A reply binds to the helper window WE opened, and to a live pending id.
+    if (!HELPER || event.source !== HELPER) return;
+    var p = PENDING[data.id];
+    if (!p) return;
+    delete PENDING[data.id];
+    clearTimeout(p.timer);
+    p.resolve(data.ok ? {{ ok: true, body: data.body }}
+                      : {{ ok: false, body: data.body || {{ error: 'signer error' }} }});
+  }}
+  window.addEventListener('message', helperMessage);
+  window.addEventListener('message', function (event) {{
+    window.__yfido2Got = (window.__yfido2Got || 0) + 1;
+    window.__yfido2LastOrigin = String(event.origin || '');
+  }});
+
+  function dispatch(req) {{
+    var sent = false;
+    try {{
+      if (HELPER && HELPER_READY && !HELPER.closed) {{
+        HELPER.postMessage(req, 'yggterm-appctl://signer');
+        sent = true;
+      }}
+    }} catch (e) {{ sent = false; }}
+    if (!sent) QUEUE.push(req);
+  }}
+
+  function ensureHelper() {{
+    if (HELPER && !HELPER.closed) return HELPER;
+    HELPER_READY = false;
+    HELPER = window.open('yggterm-appctl://signer/helper', 'yggterm-fido2-helper');
+    return HELPER;
+  }}
+
   function post(path, body) {{
-    return fetch(ENDPOINT + path, {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json', 'X-Ychrome-Fido2': TOKEN }},
-      body: JSON.stringify(body),
-    }}).then(function (r) {{
-      return r.json().then(function (j) {{ return {{ ok: r.ok, body: j }}; }});
+    return new Promise(function (resolve) {{
+      var id = ++SEQ;
+      PENDING[id] = {{ resolve: resolve }};
+      PENDING[id].timer = setTimeout(function () {{
+        delete PENDING[id];
+        resolve({{ ok: false, body: {{ error: 'passkey signer timed out' }} }});
+      }}, TIMER_MS);
+      var req = {{
+        __yfido2: 1, kind: 'request', id: id, path: path,
+        token: TOKEN, origin: location.origin, payload: body,
+      }};
+      if (ensureHelper()) dispatch(req);
+      else resolve({{ ok: false, body: {{ error: 'passkey helper could not be opened' }} }});
     }});
   }}
 
@@ -907,7 +1186,14 @@ mod tests {
     #[test]
     fn a_grant_wakes_a_parked_ceremony_and_is_consumed() {
         let signer = Signer::new(1234, "sess".into());
-        signer.register("req-1");
+        signer.register_ceremony(
+            "req-1",
+            "example.com",
+            "https://example.com",
+            "get",
+            &[],
+            json!(null),
+        );
 
         // Grant for a live ceremony succeeds, carrying the chosen account, and
         // is idempotent on repeat.
@@ -923,7 +1209,7 @@ mod tests {
         // The parked side consumes it exactly once, with the picked account.
         assert!(matches!(
             signer.wait_for_outcome("req-1"),
-            Some(Outcome::Granted { user_verified: true, credential_id: Some(id) }) if id == "cred-b"
+            Some((Outcome::Granted { user_verified: true, credential_id: Some(id) }, _)) if id == "cred-b"
         ));
         // Consumed: a later look finds nothing.
         assert!(signer.wait_for_outcome("req-1").is_none());

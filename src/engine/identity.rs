@@ -238,6 +238,65 @@ fn register_channel(content: &UserContentManager, channel: &MessageChannel) -> V
 }
 
 /// Build (or reuse) a profile's identity. Engine thread only.
+/// The body of a refusal, in the shim/helper reply envelope (`ok:false` plus
+/// the human-readable cause).
+fn get_error_payload(error: &crate::passkey::GetError) -> Value {
+    let message = match error {
+        crate::passkey::GetError::NoCredential => {
+            "no passkey in this vault answers that request".to_string()
+        }
+        crate::passkey::GetError::Denied => "the user declined".to_string(),
+        crate::passkey::GetError::TimedOut => {
+            "the user did not respond in time".to_string()
+        }
+        crate::passkey::GetError::Bad(message) => message.clone(),
+    };
+    json!({ "error": message })
+}
+
+/// One `?key=value` parameter out of a scheme-URL query, percent-decoded.
+fn query_param(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let mut parts = pair.splitn(2, '=');
+        let k = parts.next()?;
+        if k == key {
+            Some(percent_decode(parts.next().unwrap_or("")))
+        } else {
+            None
+        }
+    })
+}
+
+/// Minimal percent-decoding (`%XX` only; the shim encodes with
+/// `encodeURIComponent`, which never emits a bare `+`, so `+` stays `+`).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The reply body for a helper-relayed fido2 request: plain JSON (the helper
+/// fetches and `JSON.parse`s it, then postMessages the parsed outcome to the
+/// site page). `ok:false` rides IN the body — a scheme-level error page would
+/// give the helper nothing to relay.
+fn fido2_scheme_reply(ok: bool, payload: &serde_json::Value) -> String {
+    json!({ "ok": ok, "body": payload }).to_string()
+}
+
 pub fn for_profile(profile: &str) -> Result<ProfileIdentity> {
     if let Some(existing) = IDENTITIES.with(|map| map.borrow().get(profile).cloned()) {
         return Ok(existing);
@@ -331,57 +390,123 @@ fn build(profile: &str) -> Result<ProfileIdentity> {
         let security = context.security_manager();
         if let Some(security) = security {
             security.register_uri_scheme_as_secure("yggterm-appctl");
+            // ⛔ AND CORS-ENABLED, or the browser refuses a cross-origin
+            // SUBRESOURCE load (fetch/XHR — the shim's only transport) at the
+            // network layer and the handler below is never consulted. Measured
+            // 2026-08-28, webkit 2.52.6: with only `as_secure`, every fetch
+            // from an https page failed `TypeError: Load failed` and the
+            // journal saw zero `passkey_scheme_fetch` lines; XHR failed
+            // identically (status 0). "Secure" makes the scheme's origin
+            // trustworthy; "cors-enabled" is what puts it in the fetchable
+            // set alongside http(s).
+            security.register_uri_scheme_as_cors_enabled("yggterm-appctl");
         }
-        let context_for_scheme = context.clone();
         context.register_uri_scheme("yggterm-appctl", move |request| {
-            crate::daemon::journal(
-                "passkey_scheme_fetch",
-                json!({ "uri": request.uri().map(|u| u.to_string()).unwrap_or_default() }),
-            );
-            let Some(signer) = crate::engine::api::ctl_signer() else {
-                crate::daemon::journal(
-                    "passkey_scheme_fetch",
-                    json!({ "error": "no ctl signer" }),
-                );
-                return;
+            let uri = request.uri().map(|u| u.to_string()).unwrap_or_default();
+            let raw = uri.strip_prefix("yggterm-appctl://").unwrap_or(&uri).to_string();
+            // `raw` still carries the scheme HOST ("signer/fido2/get?…") — the
+            // handler routes on the PATH, so drop the host component first.
+            let (host_and_path, query) = match raw.split_once('?') {
+                Some((p, q)) => (p.to_string(), q.to_string()),
+                None => (raw.clone(), String::new()),
             };
-            let uri = request
-                .uri()
-                .map(|u| u.to_string())
-                .unwrap_or_default();
-            let path = uri.trim_start_matches("yggterm-appctl://").to_string();
-            let method = request.http_method().map(|m| m.to_string()).unwrap_or_else(|| "GET".into());
-            let body_json: serde_json::Value = request.http_body().and_then(|stream| {
-                use gio::prelude::*;
-                let mut bytes = Vec::new();
-                loop {
-                    let mut chunk = [0u8; 16384];
-                    let read = stream.read(&mut chunk, gio::Cancellable::NONE);
-                    match read {
-                        Ok(0) => break,
-                        Ok(n) => bytes.extend_from_slice(&chunk[..n]),
-                        Err(_) => break,
+            let path = match host_and_path.split_once('/') {
+                Some((_, rest)) => format!("/{}", rest),
+                None => "/".to_string(),
+            };
+            // ⛔ THE TOKEN AND THE PAYLOAD RIDE THE QUERY — navigation carries
+            // no body or headers. Journal the PATH ONLY, never the query, or
+            // every ceremony leaks its bearer token to the journal.
+            crate::daemon::journal("passkey_scheme_fetch", json!({ "path": path }));
+
+            // The helper page is served BEFORE any token gate: it carries no
+            // secrets (every fido2 route below still demands the token), and
+            // it is the transport's own resident — see [`crate::passkey::
+            // HELPER_DOC`].
+            if path == "/helper" {
+                let bytes = crate::passkey::HELPER_DOC.as_bytes().to_vec();
+                let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from(&bytes));
+                request.finish(&stream, bytes.len() as i64, Some("text/html"));
+                return;
+            }
+
+            let outcome: (bool, serde_json::Value) = match crate::engine::api::ctl_signer() {
+                None => {
+                    crate::daemon::journal(
+                        "passkey_scheme_fetch",
+                        json!({ "error": "no ctl signer" }),
+                    );
+                    (false, json!({ "error": "signer unavailable" }))
+                }
+                Some(signer) => {
+                    if !signer.authorized(query_param(&query, "token").as_deref()) {
+                        (false, json!({ "error": "bad or missing token" }))
+                    } else {
+                        let body = query_param(&query, "payload")
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or(serde_json::Value::Null);
+                        match path.as_str() {
+                            // ⛔ BEGIN, NOT BLOCK: the scheme callback runs on
+                            // the engine's main loop, and a parked ceremony
+                            // here froze every ctl call for up to 120s
+                            // (measured). Begin registers + emits and returns;
+                            // the helper collects by polling.
+                            p if p.starts_with("/fido2/get") => match signer.begin_get(&body) {
+                                Ok((request_id, accounts)) => (
+                                    true,
+                                    json!({
+                                        "pending": true,
+                                        "request_id": request_id,
+                                        "accounts": accounts,
+                                    }),
+                                ),
+                                Err(error) => (false, get_error_payload(&error)),
+                            },
+                            p if p.starts_with("/fido2/create") => {
+                                match signer.begin_create(&body) {
+                                    Ok((request_id, accounts)) => (
+                                        true,
+                                        json!({
+                                            "pending": true,
+                                            "request_id": request_id,
+                                            "accounts": accounts,
+                                        }),
+                                    ),
+                                    Err(error) => (false, get_error_payload(&error)),
+                                }
+                            }
+                            p if p.starts_with("/fido2/poll") => {
+                                let request_id = query_param(&query, "request_id")
+                                    .unwrap_or_default();
+                                match signer.poll(&request_id) {
+                                    None => (true, json!({ "pending": true })),
+                                    Some(Ok(value)) => (true, value),
+                                    Some(Err(error)) => (false, get_error_payload(&error)),
+                                }
+                            }
+                            _ => (false, json!({ "error": "unknown fido2 path" })),
+                        }
                     }
                 }
-                serde_json::from_slice(&bytes).ok()
-            }).unwrap_or(serde_json::Value::Null);
-            let (status, payload) = match path.as_str() {
-                p if p.starts_with("/fido2/get") => signer.handle_get(&body_json),
-                p if p.starts_with("/fido2/create") => signer.handle_create(&body_json),
-                _ => (404, serde_json::json!({ "error": "unknown fido2 path" })),
             };
-            let _ = method;
-            let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
-            let stream = gio::MemoryInputStream::from_bytes(
-                &glib::Bytes::from(&payload_bytes),
-            );
-            request.finish(
-                &stream,
-                payload_bytes.len() as i64,
-                Some("application/json"),
-            );
-            let _ = status;
+            let html = fido2_scheme_reply(outcome.0, &outcome.1);
+            let bytes = html.into_bytes();
+            let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from(&bytes));
+            // 200 ALWAYS: the helper parses the body and relays `ok:false`
+            // itself — a non-200 scheme reply gives fetch an error, not a
+            // relayingable body.
+            request.finish(&stream, bytes.len() as i64, Some("application/json"));
         });
+    }
+    {
+        use glib::translate::ToGlibPtr;
+        let ctx_ptr: usize = <
+            webkit2gtk::WebContext as ToGlibPtr<*mut webkit2gtk::ffi::WebKitWebContext>
+        >::to_glib_none(&context).0 as usize;
+        crate::daemon::journal(
+            "passkey_scheme_registered",
+            json!({ "context_ptr": ctx_ptr }),
+        );
     }
 
     // THE policy — one call, one owner. The engine does not decide whether ad

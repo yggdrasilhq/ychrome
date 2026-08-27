@@ -372,7 +372,7 @@ impl Engine {
                 responder.fail(format!("page {id:?} is already open"));
                 return;
             }
-            match build_page(width, height, &profile, None) {
+            match build_page(width, height, &profile, None, false) {
                 Ok(page) => {
                     PAGES.with(|pages| pages.borrow_mut().insert(id, page));
                     responder.ok(())
@@ -1148,7 +1148,7 @@ const DIALOG_MESSAGE_MAX: usize = 200;
 /// requires the child of a `create` to be built *with the related view* — that
 /// relation is what gives the popup its opener, its `window.name` and the same
 /// web process, and a view built without it cannot be returned from the signal.
-fn build_page(width: i32, height: i32, profile: &str, opener: Option<&WebView>) -> Result<Page> {
+fn build_page(width: i32, height: i32, profile: &str, opener: Option<&WebView>, hidden: bool) -> Result<Page> {
     // The profile's identity — jar, adblock filter, userscripts, UA — from its
     // owners, built once per profile and reused. This is what makes the engine
     // and the visible surface the SAME browser.
@@ -1170,27 +1170,49 @@ fn build_page(width: i32, height: i32, profile: &str, opener: Option<&WebView>) 
             .user_content_manager(&identity.content)
             .build(),
     };
+    {
+        // ⛔ SCHEME-HANDLER GROUND TRUTH: the passkey transport lives on the
+        // identity's context (identity.rs registers `yggterm-appctl` there).
+        // If the view a page actually uses were NOT that context, every
+        // scheme fetch would fail "Load failed" with zero handler entries.
+        // Journal both pointers so a mismatch is readable, not guessed.
+        let view_ctx: webkit2gtk::WebContext = view.property("web-context");
+        crate::daemon::journal(
+            "page_context_check",
+            json!({
+                "identity_context_ptr": identity.context.as_ptr() as usize,
+                "view_context_ptr": view_ctx.as_ptr() as usize,
+                "same": view_ctx.as_ptr() == identity.context.as_ptr(),
+            }),
+        );
+    }
     if let Some(agent) = &identity.user_agent {
         let settings: webkit2gtk::Settings = WebViewExt::settings(&view).unwrap_or_default();
         settings.set_user_agent(Some(agent.as_str()));
         WebViewExt::set_settings(&view, &settings);
     }
     window.add(&view);
-    match opener {
-        None => window.show_all(),
-        // ⛔ A popup must NOT be shown before `create` returns. Realising the
-        // view runs WebKit's page-proxy setup, and doing that while WebKit is
-        // still inside `createNewPage` loses the navigation it was handing us:
-        // measured, the view came back listed at the gateway's url with
-        // `location.href === "about:blank"` and a load that never finished —
-        // the exact symptom this whole fix started from, reproduced one layer
-        // in. Showing it on the next main-loop turn is after `create` has
-        // returned, by construction, since we are inside a main-loop callback.
-        Some(_) => {
-            let window = window.clone();
-            glib::idle_add_local_once(move || window.show_all());
+    if !hidden {
+        match opener {
+            None => window.show_all(),
+            // ⛔ A popup must NOT be shown before `create` returns. Realising the
+            // view runs WebKit's page-proxy setup, and doing that while WebKit is
+            // still inside `createNewPage` loses the navigation it was handing us:
+            // measured, the view came back listed at the gateway's url with
+            // `location.href === "about:blank"` and a load that never finished —
+            // the exact symptom this whole fix started from, reproduced one layer
+            // in. Showing it on the next main-loop turn is after `create` has
+            // returned, by construction, since we are inside a main-loop callback.
+            Some(_) => {
+                let window = window.clone();
+                glib::idle_add_local_once(move || window.show_all());
+            }
         }
     }
+    // `hidden` pages — the passkey helper and anything else at
+    // `yggterm-appctl://` — are machine furniture: the load runs, the JS runs,
+    // but nothing maps on the owner's screen. Their loads never need paint, so
+    // the unmapped-view trade the comment above describes does not apply.
     arm_new_window(&view, profile);
     arm_script_dialogs(&view);
     arm_page_instrument(&view);
@@ -1228,7 +1250,12 @@ fn arm_new_window(view: &WebView, profile: &str) {
             .filter(|(w, h)| *w > 0 && *h > 0)
             .unwrap_or((super::api::DEFAULT_W, super::api::DEFAULT_H));
         let id = super::api::new_page_id();
-        match build_page(width, height, &profile, Some(opener)) {
+        // Machine furniture never maps. The passkey shim opens its helper at
+        // `yggterm-appctl://signer/helper` from inside a ceremony; a blank
+        // window flashing on the owner's screen is a defect, not a cost of
+        // doing business.
+        let hidden = requested.starts_with("yggterm-appctl://");
+        match build_page(width, height, &profile, Some(opener), hidden) {
             Ok(page) => {
                 let child = page.view.clone();
                 arm_load_trace(&child, &id);
