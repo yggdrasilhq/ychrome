@@ -138,6 +138,52 @@ pub fn owns(path: &str) -> bool {
 /// Every verb is journaled with its latency whether it succeeded or not —
 /// §6's "no silent driving" rule. An agent's whole session through the engine
 /// is replayable in reading order from `journal.jsonl`.
+/// The ctl plane's control state — the signer whose token the shim bakes into
+/// ctl-opened pages, and the registry the `fido2` verbs resolve against. Set
+/// once by the daemon at startup; absent in tests and in session servers
+/// (which answer `/fido2/*` through their own sidebar route).
+pub fn set_ctl_control(control: std::sync::Arc<crate::sidebar::ControlState>) {
+    *CTL_CONTROL
+        .lock()
+        .unwrap() = Some(control);
+}
+fn ctl_control() -> Option<std::sync::Arc<crate::sidebar::ControlState>> {
+    CTL_CONTROL.lock().unwrap().clone()
+}
+static CTL_CONTROL: std::sync::Mutex<Option<std::sync::Arc<crate::sidebar::ControlState>>> =
+    std::sync::Mutex::new(None);
+
+/// Does `url` satisfy one userscript match pattern? The patterns the passkey
+/// shim carries are GM-style (`*://www.npmjs.com/*`); the check is deliberately
+/// shallow - scheme wildcard, host wildcard-or-exact, any path.
+fn url_matches_pattern(url: &str, pattern: &str) -> bool {
+    let Some((scheme_part, rest)) = pattern.split_once("://") else {
+        return url.contains(pattern.trim_start_matches('*'));
+    };
+    let (pattern_host, pattern_path) = match rest.split_once('/') {
+        Some((host, path)) => (host, Some(path)),
+        None => (rest, None),
+    };
+    let Some((url_scheme, url_rest)) = url.split_once("://") else {
+        return false;
+    };
+    let url_host_path = url_rest.split('/').next().unwrap_or(url_rest);
+    let (url_host, url_path) = match url_host_path.split_once('/') {
+        Some((host, path)) => (host, Some(path)),
+        None => (url_host_path, None),
+    };
+    let scheme_ok = scheme_part == "*" || scheme_part == url_scheme;
+    let host_ok = pattern_host == "*"
+        || pattern_host
+            .strip_prefix("*.")
+            .map(|suffix| url_host.ends_with(suffix))
+            .unwrap_or_else(|| pattern_host == url_host);
+    let path_ok = pattern_path.is_none_or(|wanted| {
+        wanted == "*" || url_path.is_some_and(|actual| actual.starts_with(wanted))
+    });
+    scheme_ok && host_ok && path_ok
+}
+
 pub fn dispatch(request: &ParsedRequest) -> Reply {
     let started = Instant::now();
     let verb = request
@@ -243,6 +289,22 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
             pool().unpin(&id);
             if let Err(error) = loaded {
                 return Reply::bad(502, error.to_string());
+            }
+            // ⛔ THE PASSKEY SHIM, FOR PAGES NO SESSION SURFACE OPENED. Session
+            // surfaces get the scoped shim from their `/policy` fetch; a
+            // ctl-opened page never makes that request, so `navigator.credentials`
+            // stayed undefined on it and EVERY site's WebAuthn died silently —
+            // the "passkey UX is broken" report. Same scoping (vault rp_ids),
+            // same signer token, evaluated here because the page has just
+            // loaded; the `goto` arm re-applies it across in-page navigations.
+            if let Some(control) = ctl_control() {
+                for script in crate::sidebar::passkey_shim_scripts(&control) {
+                    if script.matches.is_empty()
+                        || script.matches.iter().any(|pattern| url_matches_pattern(url, pattern))
+                    {
+                        let _ = engine.eval(&id, &script.body);
+                    }
+                }
             }
             Reply::Json(200, page_status(&engine, &id))
         }
@@ -416,57 +478,59 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
         // to a second secret field. See `sidebar::SET_FIELD`.
         "fido2" => {
             // THE AGENTIC PASSKEY DOOR. A headless daemon parks a WebAuthn
-            // ceremony whose OSC emission has no GUI stream to arrive on —
+            // ceremony whose OSC emission has no GUI stream to arrive on -
             // without this verb the login timed out every time. `list` shows
             // every parked ceremony with the accounts that match; `grant` and
             // `deny` resolve one through the SAME path the GUI dialog's HTTP
-            // grant takes. Walks every live signer (weakly held), so retired
-            // sessions drop out on their own.
+            // grant takes. The ctl control's signer is answered first (it is
+            // the one whose token ctl pages carry); the signer registry walk
+            // covers session signers too.
             let action = request
                 .body
                 .get("action")
                 .and_then(Value::as_str)
                 .unwrap_or("list");
+            let resolve = |signer: &crate::passkey::Signer| {
+                if action == "grant" {
+                    signer.ctl_grant(&request.body)
+                } else {
+                    signer.ctl_deny(&request.body)
+                }
+            };
             match action {
                 "list" => {
                     let mut ceremonies: Vec<Value> = Vec::new();
+                    if let Some(control) = ctl_control() {
+                        ceremonies.extend(control.signer.pending_summary());
+                    }
                     crate::passkey::for_each_live_signer(|signer| {
                         ceremonies.extend(signer.pending_summary());
                     });
                     Reply::Json(200, json!({ "ok": true, "ceremonies": ceremonies }))
                 }
                 "grant" | "deny" => {
-                    let mut replies: Vec<Value> = Vec::new();
                     let mut resolved = false;
-                    let request_id = request.body.get("request_id").cloned();
-                    crate::passkey::for_each_live_signer(|signer| {
-                        if resolved {
-                            return;
-                        }
-                        // Route by request_id: a ceremony lives on exactly
-                        // one signer, and a grant for an unknown id is
-                        // "already answered" (idempotent, as the GUI path
-                        // is) — so probe each signer and stop at the hit.
-                        let reply = if action == "grant" {
-                            signer.ctl_grant(&request.body)
-                        } else {
-                            signer.ctl_deny(&request.body)
-                        };
-                        if reply.0 == 200 {
+                    if let Some(control) = ctl_control() {
+                        if resolve(&control.signer).0 == 200 {
                             resolved = true;
-                            replies.push(reply.1);
                         }
-                    });
-                    if resolved {
-                        Reply::Json(200, json!({ "ok": true, "resolved": true }))
-                    } else {
-                        Reply::Json(
-                            200,
-                            json!({ "ok": true, "resolved": false, "already": true }),
-                        )
                     }
+                    if !resolved {
+                        crate::passkey::for_each_live_signer(|signer| {
+                            if !resolved && resolve(signer).0 == 200 {
+                                resolved = true;
+                            }
+                        });
+                    }
+                    Reply::Json(
+                        200,
+                        json!({ "ok": true, "resolved": resolved, "already": !resolved }),
+                    )
                 }
-                other => Reply::bad(400, format!("fido2 action must be list|grant|deny, got {other:?}")),
+                other => Reply::bad(
+                    400,
+                    format!("fido2 action must be list|grant|deny, got {other:?}"),
+                ),
             }
         }
         "fill" => {

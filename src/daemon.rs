@@ -1065,6 +1065,13 @@ pub fn run() -> Result<()> {
         // could not establish. Step aside WITHOUT unlinking its socket.
         return Ok(());
     };
+    // The ctl plane gets its OWN signer: pages the ctl opens carry its token,
+    // `fido2 list|grant|deny` resolve against it, and agents complete passkey
+    // logins without a GUI. (Set once, here, where "this daemon serves" is
+    // already proven.)
+    crate::engine::api::set_ctl_control(std::sync::Arc::new(
+        ControlState::new("default", "ctl", 0),
+    ));
     // Parked where the retire path can hand it on the moment we stop serving,
     // rather than at process exit. See `SINGLETON`.
     if let Ok(mut held) = SINGLETON.lock() {

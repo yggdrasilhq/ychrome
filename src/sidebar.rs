@@ -356,7 +356,7 @@ pub(crate) fn rp_id_match_patterns(rp_id: &str) -> Vec<String> {
 /// control-endpoint reads time out. The agent is host-local and answers in
 /// microseconds when it is there at all, so anything slower is a failure, and a
 /// failure means no shim.
-fn passkey_shim_scripts(state: &ControlState) -> Vec<crate::userscript::Userscript> {
+pub(crate) fn passkey_shim_scripts(state: &ControlState) -> Vec<crate::userscript::Userscript> {
     // ⛔ ONE FAILURE HERE IS NOT LIKE THE OTHERS, AND IT MUST NOT BE SILENT. A
     // locked or absent vault installing no shim is correct — a ceremony needs an
     // unlocked agent anyway. But an agent that simply PREDATES this op is
