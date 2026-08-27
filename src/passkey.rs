@@ -70,6 +70,51 @@ enum Outcome {
 #[derive(Default)]
 struct Ceremony {
     outcome: Option<Outcome>,
+    /// Recorded at register time so the ctl `fido2 list` can answer "who is
+    /// asking" without the GUI dialog.
+    rp_id: String,
+    origin: String,
+    ceremony: String,
+    accounts: Vec<Value>,
+    registered_at_ms: Option<u64>,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Every live [`Signer`], weakly held so a retiring session's server drops out
+/// on its own. THE AGENTIC DOOR: the ctl plane (`ychrome ctl fido2 …`) walks
+/// this registry to list pending ceremonies and to grant/deny them, which is
+/// how a headless daemon — or a session whose presence dialog cannot reach a
+/// human — still completes a WebAuthn login. Without it a headless ceremony
+/// parked forever: the OSC emission has no GUI stream to arrive on, nothing
+/// could ever answer it, and the login simply timed out.
+fn live_signers() -> &'static Mutex<Vec<std::sync::Weak<Signer>>> {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<Mutex<Vec<std::sync::Weak<Signer>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn register_signer(signer: &Arc<Signer>) {
+    live_signers()
+        .lock()
+        .unwrap()
+        .push(Arc::downgrade(signer));
+}
+
+pub(crate) fn for_each_live_signer(mut visit: impl FnMut(&Signer)) {
+    let mut registry = live_signers().lock().unwrap();
+    registry.retain(|weak| match weak.upgrade() {
+        Some(signer) => {
+            visit(&signer);
+            true
+        }
+        None => false,
+    });
 }
 
 /// The browser-side passkey signer. One per surface control server.
@@ -92,13 +137,64 @@ pub struct Signer {
 
 impl Signer {
     pub fn new(port: u16, session: String) -> Arc<Self> {
-        Arc::new(Signer {
+        let signer = Arc::new(Signer {
             token: hex_token(32),
             port,
             session,
             pending: Mutex::new(HashMap::new()),
             cvar: Condvar::new(),
-        })
+        });
+        register_signer(&signer);
+        signer
+    }
+
+    /// One entry of the ctl `fido2 list` answer: everything an agent needs to
+    /// decide and grant — the request id, who is asking, which accounts
+    /// match, and how long the ceremony has been parked.
+    pub fn pending_summary(&self) -> Vec<Value> {
+        let pending = self.pending.lock().unwrap();
+        pending
+            .iter()
+            .filter(|(_, ceremony)| ceremony.outcome.is_none())
+            .map(|(request_id, ceremony)| {
+                json!({
+                    "request_id": request_id,
+                    "session": self.session,
+                    "rp_id": ceremony.rp_id,
+                    "origin": ceremony.origin,
+                    "ceremony": ceremony.ceremony,
+                    "accounts": ceremony.accounts,
+                    "age_ms": ceremony
+                        .registered_at_ms
+                        .map(|at| now_ms().saturating_sub(at))
+                        .unwrap_or(0),
+                })
+            })
+            .collect()
+    }
+
+    /// The ctl-plane grant: the SAME resolution the GUI dialog's HTTP grant
+    /// takes, reached without a GUI.
+    pub fn ctl_grant(&self, body: &Value) -> (u16, Value) {
+        self.resolve_ceremony(
+            body,
+            Outcome::Granted {
+                user_verified: body
+                    .get("user_verified")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                credential_id: body
+                    .get("credential_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string),
+            },
+        )
+    }
+
+    /// The ctl-plane deny.
+    pub fn ctl_deny(&self, body: &Value) -> (u16, Value) {
+        self.resolve_ceremony(body, Outcome::Denied)
     }
 
     /// The `navigator.credentials` shim, ready to serve as a userscript, with
@@ -200,7 +296,7 @@ impl Signer {
             })
             .collect();
         let request_id = hex_token(16);
-        self.register(&request_id);
+        self.register_ceremony(&request_id, rp_id, origin, "get", &accounts);
         emit_fido2_request(&self.session, &request_id, rp_id, &accounts, "get", origin);
         let outcome = self.wait_for_outcome(&request_id);
 
@@ -329,7 +425,7 @@ impl Signer {
             display_name
         };
         let accounts = vec![json!({ "label": label })];
-        self.register(&request_id);
+        self.register_ceremony(&request_id, rp_id, origin, "create", &accounts);
         emit_fido2_request(
             &self.session,
             &request_id,
@@ -420,11 +516,25 @@ impl Signer {
         }
     }
 
-    fn register(&self, request_id: &str) {
-        self.pending
-            .lock()
-            .unwrap()
-            .insert(request_id.to_string(), Ceremony::default());
+    fn register_ceremony(
+        &self,
+        request_id: &str,
+        rp_id: &str,
+        origin: &str,
+        ceremony: &str,
+        accounts: &[Value],
+    ) {
+        self.pending.lock().unwrap().insert(
+            request_id.to_string(),
+            Ceremony {
+                rp_id: rp_id.to_string(),
+                origin: origin.to_string(),
+                ceremony: ceremony.to_string(),
+                accounts: accounts.to_vec(),
+                registered_at_ms: Some(now_ms()),
+                outcome: None,
+            },
+        );
     }
 
     /// Park until the ceremony has an outcome or the timeout fires, then consume
