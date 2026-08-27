@@ -414,6 +414,61 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
         // four of those answered `filled`. `fields` carries the per-field
         // readback (a LENGTH, never a value) and `confirm` names what happened
         // to a second secret field. See `sidebar::SET_FIELD`.
+        "fido2" => {
+            // THE AGENTIC PASSKEY DOOR. A headless daemon parks a WebAuthn
+            // ceremony whose OSC emission has no GUI stream to arrive on —
+            // without this verb the login timed out every time. `list` shows
+            // every parked ceremony with the accounts that match; `grant` and
+            // `deny` resolve one through the SAME path the GUI dialog's HTTP
+            // grant takes. Walks every live signer (weakly held), so retired
+            // sessions drop out on their own.
+            let action = request
+                .body
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("list");
+            match action {
+                "list" => {
+                    let mut ceremonies: Vec<Value> = Vec::new();
+                    crate::passkey::for_each_live_signer(|signer| {
+                        ceremonies.extend(signer.pending_summary());
+                    });
+                    Reply::Json(200, json!({ "ok": true, "ceremonies": ceremonies }))
+                }
+                "grant" | "deny" => {
+                    let mut replies: Vec<Value> = Vec::new();
+                    let mut resolved = false;
+                    let request_id = request.body.get("request_id").cloned();
+                    crate::passkey::for_each_live_signer(|signer| {
+                        if resolved {
+                            return;
+                        }
+                        // Route by request_id: a ceremony lives on exactly
+                        // one signer, and a grant for an unknown id is
+                        // "already answered" (idempotent, as the GUI path
+                        // is) — so probe each signer and stop at the hit.
+                        let reply = if action == "grant" {
+                            signer.ctl_grant(&request.body)
+                        } else {
+                            signer.ctl_deny(&request.body)
+                        };
+                        if reply.0 == 200 {
+                            resolved = true;
+                            replies.push(reply.1);
+                        }
+                    });
+                    if resolved {
+                        Reply::Json(200, json!({ "ok": true, "resolved": true }))
+                    } else {
+                        Reply::Json(
+                            200,
+                            json!({ "ok": true, "resolved": false, "already": true }),
+                        )
+                    }
+                }
+                other => Reply::bad(400, format!("fido2 action must be list|grant|deny, got {other:?}")),
+            }
+        }
         "fill" => {
             let (Some(id), Some(entry)) =
                 (page_id, request.body.get("entry").and_then(Value::as_str))
