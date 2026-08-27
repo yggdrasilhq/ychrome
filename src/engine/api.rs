@@ -184,6 +184,22 @@ fn url_matches_pattern(url: &str, pattern: &str) -> bool {
     scheme_ok && host_ok && path_ok
 }
 
+/// The passkey shim scripts for the ctl control's signer, with the vault
+/// rp_id scoping already applied. `None` when the ctl control state is absent
+/// (tests, session servers) — callers simply skip the injection.
+/// The ctl signer, for the engine's `yggterm-appctl://` scheme handler.
+pub fn ctl_signer() -> Option<std::sync::Arc<crate::passkey::Signer>> {
+    let control = ctl_control()?;
+    Some(std::sync::Arc::clone(&control.signer))
+}
+
+pub fn ctl_passkey_shim_scripts() -> Vec<crate::userscript::Userscript> {
+    match ctl_control() {
+        Some(control) => crate::sidebar::passkey_shim_scripts(&control),
+        None => Vec::new(),
+    }
+}
+
 pub fn dispatch(request: &ParsedRequest) -> Reply {
     let started = Instant::now();
     let verb = request
@@ -527,9 +543,22 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
                         json!({ "ok": true, "resolved": resolved, "already": !resolved }),
                     )
                 }
+                "shim" => {
+                    // The BUILT shim for the ctl signer, so an agent can inject
+                    // it by eval on pages whose WebKit allowlist matching is in
+                    // doubt. Token included: the caller already is the host
+                    // operator (this is the same trust the open/goto injection
+                    // runs with).
+                    match ctl_control() {
+                        Some(control) => {
+                            Reply::Json(200, json!({ "ok": true, "shim": control.signer.shim_userscript() }))
+                        }
+                        None => Reply::bad(503, "no ctl control state"),
+                    }
+                }
                 other => Reply::bad(
                     400,
-                    format!("fido2 action must be list|grant|deny, got {other:?}"),
+                    format!("fido2 action must be list|grant|deny|shim, got {other:?}"),
                 ),
             }
         }

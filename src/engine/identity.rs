@@ -317,6 +317,73 @@ fn build(profile: &str) -> Result<ProfileIdentity> {
     }
     let context = WebContext::with_website_data_manager(&manager);
 
+    // ⛔ THE PASSKEY TRANSPORT FOR ENGINE PAGES. Session surfaces reach the
+    // signer through yggterm's `yggterm-appctl://` bridge; the engine's own
+    // context (headless ctl pages) has no such bridge, so a ceremony's fetch
+    // died at the scheme and every passkey login silently failed. The engine
+    // registers the scheme ITSELF, backed by the ctl signer (set at daemon
+    // start): the handler reads the POST body, parks on the signer exactly
+    // like the sidebar HTTP route, and finishes with the JSON. Blocking the
+    // handler is the same shape the session bridge has, bounded by the
+    // ceremony timeout; the agent grants in seconds.
+    {
+        use webkit2gtk::{SecurityManagerExt, URISchemeRequestExt, WebContextExt};
+        let security = context.security_manager();
+        if let Some(security) = security {
+            security.register_uri_scheme_as_secure("yggterm-appctl");
+        }
+        let context_for_scheme = context.clone();
+        context.register_uri_scheme("yggterm-appctl", move |request| {
+            crate::daemon::journal(
+                "passkey_scheme_fetch",
+                json!({ "uri": request.uri().map(|u| u.to_string()).unwrap_or_default() }),
+            );
+            let Some(signer) = crate::engine::api::ctl_signer() else {
+                crate::daemon::journal(
+                    "passkey_scheme_fetch",
+                    json!({ "error": "no ctl signer" }),
+                );
+                return;
+            };
+            let uri = request
+                .uri()
+                .map(|u| u.to_string())
+                .unwrap_or_default();
+            let path = uri.trim_start_matches("yggterm-appctl://").to_string();
+            let method = request.http_method().map(|m| m.to_string()).unwrap_or_else(|| "GET".into());
+            let body_json: serde_json::Value = request.http_body().and_then(|stream| {
+                use gio::prelude::*;
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0u8; 16384];
+                    let read = stream.read(&mut chunk, gio::Cancellable::NONE);
+                    match read {
+                        Ok(0) => break,
+                        Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                        Err(_) => break,
+                    }
+                }
+                serde_json::from_slice(&bytes).ok()
+            }).unwrap_or(serde_json::Value::Null);
+            let (status, payload) = match path.as_str() {
+                p if p.starts_with("/fido2/get") => signer.handle_get(&body_json),
+                p if p.starts_with("/fido2/create") => signer.handle_create(&body_json),
+                _ => (404, serde_json::json!({ "error": "unknown fido2 path" })),
+            };
+            let _ = method;
+            let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+            let stream = gio::MemoryInputStream::from_bytes(
+                &glib::Bytes::from(&payload_bytes),
+            );
+            request.finish(
+                &stream,
+                payload_bytes.len() as i64,
+                Some("application/json"),
+            );
+            let _ = status;
+        });
+    }
+
     // THE policy — one call, one owner. The engine does not decide whether ad
     // blocking is on, which scripts are enabled, or what the UA is; it asks.
     let policy = crate::webpolicy::policy(profile);
@@ -350,7 +417,19 @@ fn build(profile: &str) -> Result<ProfileIdentity> {
     // script uses, reading its placement out of its own metadata block. A second
     // placement decision here is how a script ends up in a world its channel was
     // not registered in, silently.
-    for script in std::iter::once(super::frame::bridge()).chain(policy.userscripts.iter().cloned())
+    // The passkey shim rides the IDENTITY, not the session /policy path: an
+    // engine page (ctl-opened, headless) never fetches /policy, so without this
+    // `navigator.credentials` is undefined there and every site's WebAuthn dies
+    // silently at the first call — the "passkeys are broken" report, 2026-08-27.
+    // The shim is GM-pattern-scoped to the rp_ids the vault holds, so it stays
+    // invisible everywhere else (the fingerprinting fix below is untouched).
+    // ⚠ The identity is cached per profile: shim scoping is read once per
+    // daemon life — a passkey newly added to the vault is picked up at the
+    // next daemon restart. Acceptable: enrolment is rarer than login.
+    let ctl_shim_scripts = crate::engine::api::ctl_passkey_shim_scripts();
+    for script in std::iter::once(super::frame::bridge())
+        .chain(policy.userscripts.iter().cloned())
+        .chain(ctl_shim_scripts)
     {
         attach_script(&content, &script)?;
         scripts_attached += 1;
