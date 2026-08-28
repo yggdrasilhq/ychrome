@@ -4,6 +4,25 @@ ychrome is a web viewport for the Yggdrasil ecosystem, and the pilot app for
 **libyggterm** — the pattern where a program launched in a yggterm terminal
 takes over yggterm's GUI surfaces.
 
+## Install
+
+**ynpm** — ships with yggterm. One manager keeps every yggdrasilhq binary current across
+the whole fleet: generations with rollback, drift-watching, one command.
+
+```sh
+ynpm install @ygghq/ychrome
+```
+
+**No npm, no yggterm?** One curl, straight from the registry:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yggdrasilhq/ychrome/main/install.sh | sh
+```
+
+Prebuilt for linux (x64, arm64) — WebKitGTK does not exist on windows/mac.
+`ychrome-vault` installs alongside (`ynpm install @ygghq/ychrome` brings both; for the curl path add `YNPM_BIN=ychrome-vault` to the command).
+
+
 ## The design
 
 The primary UX is *locality by invocation*:
