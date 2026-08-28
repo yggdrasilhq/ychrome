@@ -365,14 +365,27 @@ pub(crate) fn passkey_shim_scripts(state: &ControlState) -> Vec<crate::userscrip
     // deploy-ordering hazard of this change, it reached the user on 2026-08-01,
     // and the remedy is [`passkey_shim_widgets`] in the pane — a stderr line
     // reached nobody.
+    // ⛔ GLOBAL INJECTION — the human-UX directive (owner, 2026-08-28),
+    // superseding the rp_id scoping this function shipped with. Scoping to
+    // rp_ids the vault ALREADY holds made enrollment structurally
+    // impossible: a site you have no passkey for never saw
+    // navigator.credentials, so create() could never reach the vault, and
+    // the conditional-mediation autofill probe never fired. The
+    // fingerprinting tradeoff is accepted: a browser with a built-in
+    // passkey manager looks like a browser with a passkey manager. get()
+    // still only answers credentials the vault actually holds (handle_get
+    // refuses NoCredential without parking), so nothing else changes
+    // semantically for sites you have no passkey with.
     let mut patterns: Vec<String> = match passkey_shim_state() {
-        PasskeyShimState::ScopedTo(rp_ids) => rp_ids
-            .iter()
-            .flat_map(|rp_id| rp_id_match_patterns(rp_id))
-            .collect(),
-        PasskeyShimState::NoStoredPasskeys
-        | PasskeyShimState::VaultUnavailable(_)
-        | PasskeyShimState::AgentPredatesBrowser => Vec::new(),
+        PasskeyShimState::VaultUnavailable(_) | PasskeyShimState::AgentPredatesBrowser => {
+            // No vault agent to sign with: injecting would advertise an
+            // authenticator that always fails. Stay silent; the pane
+            // widgets name the reason.
+            Vec::new()
+        }
+        PasskeyShimState::ScopedTo(_) | PasskeyShimState::NoStoredPasskeys => {
+            vec!["https://*/*".to_string()]
+        }
     };
     // ⛔ ENROLMENT WAS IMPOSSIBLE, AND SCOPING IS WHY. The patterns above come
     // only from rp_ids the vault ALREADY holds a credential for, so a site you

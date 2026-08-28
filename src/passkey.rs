@@ -1142,8 +1142,14 @@ fn shim_js(port: u16, token: &str) -> String {
   window.PublicKeyCredential = window.PublicKeyCredential || function () {{}};
   window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable =
     function () {{ return Promise.resolve(true); }};
+  // ⛔ CONDITIONAL MEDIATION IS OURS TO ANSWER (the human-UX directive,
+  // 2026-08-28). Sites that offer passkey autofill probe this first and
+  // call get({{mediation:'conditional'}}) on input focus; answering false is
+  // how a browser says "no passkey autofill here", which is exactly the
+  // report we were getting. A conditional get parks the same ceremony as
+  // any other — the vault pane dialog is the autofill surface.
   window.PublicKeyCredential.isConditionalMediationAvailable =
-    function () {{ return Promise.resolve(false); }};
+    function () {{ return Promise.resolve(true); }};
 }})();
 "#
     )
