@@ -37,10 +37,13 @@ jobs:
       - name: Build release (ychrome + ychrome-vault)
         shell: bash
         run: |
+          # default-members is ["."] (the browser only) — the vault crate is
+          # built EXPLICITLY or the pack step finds no ychrome-vault binary.
           if [ -n "${{ matrix.triple }}" ]; then
-            cargo build --release --target ${{ matrix.triple }}
+            cargo build --release --target ${{ matrix.triple }} \
+              --package ychrome --package ychrome-vault
           else
-            cargo build --release
+            cargo build --release --package ychrome --package ychrome-vault
           fi
       - name: Pack platform package
         shell: bash
