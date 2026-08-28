@@ -1,5 +1,10 @@
 name: ynpm publish
 
+# ⛔ LINUX ONLY, HONESTLY. ychrome is a WebKitGTK app: there is no webkit2gtk
+# on Windows or macOS, so those targets were removed rather than left to fail
+# (the fleet runs ychrome on Linux; the darwin/win32 optionalDependencies in
+# package.json are gone with them).
+
 on:
   push:
     tags: ["v*"]
@@ -17,17 +22,19 @@ jobs:
         include:
           - {target: linux-x64, os: ubuntu-24.04, triple: ""}
           - {target: linux-arm64, os: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu}
-          - {target: darwin-x64, os: macos-15, triple: ""}
-          - {target: darwin-arm64, os: macos-14, triple: ""}
-          - {target: win32-x64, os: windows-2025, triple: ""}
-          - {target: win32-arm64, os: windows-2025, triple: aarch64-pc-windows-msvc}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install the WebKitGTK build stack
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev libglib2.0-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.triple }}
-      - name: Build release
+      - name: Build release (workspace: ychrome + ychrome-vault)
         shell: bash
         run: |
           if [ -n "${{ matrix.triple }}" ]; then
@@ -43,16 +50,26 @@ jobs:
         run: |
           set -e
           BUILT="target/release"; [ -n "$TRIPLE" ] && BUILT="target/$TRIPLE/release"
-          EXE="ychrome"; case "$TARGET" in win32-*) EXE="ychrome.exe";; esac
+          case "$TARGET" in
+            linux-x64) PKG_OS=linux; PKG_CPU=x64 ;;
+            linux-arm64) PKG_OS=linux; PKG_CPU=arm64 ;;
+          esac
           mkdir -p "pack/@ygghq/ychrome-$TARGET/bin"
-          cp "$BUILT/$EXE" "pack/@ygghq/ychrome-$TARGET/bin/ychrome"
-          printf '{{"name":"@ygghq/ychrome-%s","version":"0.1.0","bin":{{"ychrome":"bin/ychrome"}},"os":[],"cpu":[],"license":"GPL-3.0-or-later"}}\n' "$TARGET" > "pack/@ygghq/ychrome-$TARGET/package.json"
+          cp "$BUILT/ychrome" "pack/@ygghq/ychrome-$TARGET/bin/ychrome"
+          cp "$BUILT/ychrome-vault" "pack/@ygghq/ychrome-$TARGET/bin/ychrome-vault"
+          printf '{"name":"@ygghq/ychrome-%s","version":"0.1.0","bin":{"ychrome":"bin/ychrome","ychrome-vault":"bin/ychrome-vault"},"os":["%s"],"cpu":["%s"],"license":"GPL-3.0-or-later","repository":{"type":"git","url":"git+https://github.com/yggdrasilhq/ychrome.git"}}\n' "$TARGET" "$PKG_OS" "$PKG_CPU" > "pack/@ygghq/ychrome-$TARGET/package.json"
       - name: Publish platform package
+        shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          echo '//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}' > ~/.npmrc
           cd "pack/@ygghq/ychrome-${{ matrix.target }}"
-          npm publish --access public --provenance || echo "version already published"
+          if ! npm publish --access public --provenance 2>pub_err.txt; then
+            grep -qE "EPUBLISHCONFLICT|previously published|cannot publish over" pub_err.txt || { cat pub_err.txt >&2; exit 1; }
+            echo "version already published — skipping (genuine conflict)"
+          fi
+          rm -f pub_err.txt
 
   publish-main:
     needs: build

@@ -1,0 +1,56 @@
+#!/usr/bin/env node
+'use strict';
+/**
+ * The ynpm entry shim — permanent by design, no install step may be
+ * required for it to work. ONE body, many bins: the binary name comes from
+ * this file's own filename.
+ *
+ * Resolves the platform binary where the ecosystem puts it: the finalize
+ * fast copy (bin/<name>.platform), the platform package NESTED under this
+ * package's own node_modules (npm 11 global layout), or as a flat sibling.
+ * Walks the node_modules chain so every layout lands.
+ */
+const fs = require("fs");
+const path = require("path");
+const { spawnSync } = require("child_process");
+
+const name = path.basename(__filename);
+const pkgRoot = path.join(__dirname, "..");
+const pkg = JSON.parse(fs.readFileSync(path.join(pkgRoot, "package.json"), "utf8"));
+const shortName = pkg.name.includes("/") ? pkg.name.split("/")[1] : pkg.name;
+const platform = `${process.platform}-${process.arch}`;
+const rel = path.join("@ygghq", `${shortName}-${platform}`, "bin", name);
+
+const candidates = [
+  path.join(__dirname, name + ".platform"),
+  path.join(pkgRoot, "node_modules", rel),
+];
+
+// Every node_modules root from this package upward (nested, sibling, and
+// any grandparent layout an installer or a store produces).
+let dir = pkgRoot;
+for (let i = 0; i < 6; i++) {
+  const nm = dir.lastIndexOf(path.join("node_modules"));
+  if (nm === -1) break;
+  dir = dir.slice(0, nm + "node_modules".length);
+  candidates.push(path.join(dir, rel));
+  const up = path.dirname(dir);
+  if (up === dir) break;
+  dir = up;
+}
+
+const target = candidates.map((c) => [c, fs.existsSync(c)]).find(([, ok]) => ok);
+
+if (!target) {
+  console.error(
+    `${name}: no binary for ${platform} — ${rel} is missing; reinstall the package (or allow its install scripts so finalize can copy it)`
+  );
+  process.exit(1);
+}
+
+const res = spawnSync(target[0], process.argv.slice(2), { stdio: "inherit" });
+if (res.error) {
+  console.error(`${name}: failed to exec ${target[0]}: ${String(res.error)}`);
+  process.exit(1);
+}
+process.exit(res.status == null ? 0 : res.status);
