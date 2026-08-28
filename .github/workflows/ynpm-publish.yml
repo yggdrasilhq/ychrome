@@ -34,7 +34,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.triple }}
-      - name: Build release (workspace: ychrome + ychrome-vault)
+      - name: Build release (ychrome + ychrome-vault)
         shell: bash
         run: |
           if [ -n "${{ matrix.triple }}" ]; then
