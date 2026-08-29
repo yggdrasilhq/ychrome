@@ -1,6 +1,6 @@
 {
   "name": "@ygghq/ychrome",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "ychrome - the yggdrasilhq build, delivered by ynpm",
   "bin": {
     "ychrome": "bin/ychrome",
@@ -11,8 +11,8 @@
     "finalize.mjs"
   ],
   "optionalDependencies": {
-    "@ygghq/ychrome-linux-x64": "0.2.0",
-    "@ygghq/ychrome-linux-arm64": "0.2.0"
+    "@ygghq/ychrome-linux-x64": "0.2.1",
+    "@ygghq/ychrome-linux-arm64": "0.2.1"
   },
   "scripts": {
     "postinstall": "node ./finalize.mjs"

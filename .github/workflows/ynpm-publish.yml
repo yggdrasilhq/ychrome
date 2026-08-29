@@ -4,6 +4,13 @@ name: ynpm publish
 # on Windows or macOS, so those targets were removed rather than left to fail
 # (the fleet runs ychrome on Linux; the darwin/win32 optionalDependencies in
 # package.json are gone with them).
+#
+# THE VERSION SSOT IS Cargo.toml (what `ychrome --version` prints, via
+# CARGO_PKG_VERSION). The npm package version is DERIVED from it here — a
+# release bumps Cargo.toml and nothing else. v0.2.0 shipped the reverse way
+# (npm bumped, Cargo left at 0.1.0) and every binary it delivered answered
+# `--version` with a lie; this derivation is the fix that makes that class
+# of drift impossible.
 
 on:
   push:
@@ -52,6 +59,8 @@ jobs:
           TRIPLE: ${{ matrix.triple }}
         run: |
           set -e
+          # THE ONE VERSION: Cargo.toml, which is what the binaries print.
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
           BUILT="target/release"; [ -n "$TRIPLE" ] && BUILT="target/$TRIPLE/release"
           case "$TARGET" in
             linux-x64) PKG_OS=linux; PKG_CPU=x64 ;;
@@ -60,7 +69,7 @@ jobs:
           mkdir -p "pack/@ygghq/ychrome-$TARGET/bin"
           cp "$BUILT/ychrome" "pack/@ygghq/ychrome-$TARGET/bin/ychrome"
           cp "$BUILT/ychrome-vault" "pack/@ygghq/ychrome-$TARGET/bin/ychrome-vault"
-          printf '{"name":"@ygghq/ychrome-%s","version":"0.2.0","bin":{"ychrome":"bin/ychrome","ychrome-vault":"bin/ychrome-vault"},"os":["%s"],"cpu":["%s"],"license":"GPL-3.0-or-later","repository":{"type":"git","url":"git+https://github.com/yggdrasilhq/ychrome.git"}}\n' "$TARGET" "$PKG_OS" "$PKG_CPU" > "pack/@ygghq/ychrome-$TARGET/package.json"
+          printf '{"name":"@ygghq/ychrome-%s","version":"%s","bin":{"ychrome":"bin/ychrome","ychrome-vault":"bin/ychrome-vault"},"os":["%s"],"cpu":["%s"],"license":"GPL-3.0-or-later","repository":{"type":"git","url":"git+https://github.com/yggdrasilhq/ychrome.git"}}\n' "$TARGET" "$VERSION" "$PKG_OS" "$PKG_CPU" > "pack/@ygghq/ychrome-$TARGET/package.json"
       - name: Publish platform package
         shell: bash
         env:
@@ -83,7 +92,15 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-      - name: Publish main package
+      - name: Stamp the version from Cargo.toml and publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public --provenance
+        run: |
+          # Derive from Cargo.toml — the same answer the binaries print — so
+          # the main package, the platform pins and `ychrome --version` can
+          # never disagree again.
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          npm pkg set "version=$VERSION" \
+            "optionalDependencies.@ygghq/ychrome-linux-x64=$VERSION" \
+            "optionalDependencies.@ygghq/ychrome-linux-arm64=$VERSION"
+          npm publish --access public --provenance

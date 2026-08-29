@@ -1,6 +1,6 @@
 [package]
 name = "ychrome-vault"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2024"
 license = "Apache-2.0"
 description = "ychrome's self-reliant Bitwarden/Vaultwarden client — the vault sidebar's backend and the `ychrome-vault` CLI/agent. A libyggterm app owns its own capabilities; this crate lives with ychrome, not yggterm."

@@ -13,7 +13,7 @@ default-members = ["."]
 
 [package]
 name = "ychrome"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "A minimal profile-aware web viewport for the Yggdrasil ecosystem — multi-account browsing and ssh-tunneled localhost views, and the libyggterm pilot app"
