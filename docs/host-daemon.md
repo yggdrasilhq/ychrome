@@ -301,6 +301,27 @@ no page, so it is idle by every signal available from outside and still in use.
 a dead one. Only a refused connect means unreachable — collapsing the two is how
 a busy daemon gets killed.
 
+### 6.3 The census is scheduled, not remembered (BUILT 2026-09-07)
+
+The 2026-08-08 finding was cleaned by hand, and the leak regrew anyway — a
+manual-only cleanup of a recurring leak is a leak. Measured again on
+2026-09-07: an under-glass sandbox daemon (`uglass-1`, spawned with the
+sandbox's remapped `HOME`) serving a binary deleted from disk for 16 days,
+holding its singleton lock with nothing answering on its socket — invisible
+to `daemon restart` (which resolves only this shell's root) and harmless to
+nobody. The same morning: an oc default-root daemon serving deleted code for
+8 days, healed by `daemon restart` (no surfaces attached, nothing lost).
+
+The standing answer is the census on a timer: `scripts/install-reap-timer.sh`
+installs a systemd user timer running `daemon reap` hourly on every host
+ychrome runs on. `reap` is safe by construction (§6.2): it retires only
+zombies — lock held, socket refused — and asks `retire_if_idle` of everything
+else, which a busy daemon refuses by naming what holds it. A glass sandbox
+whose compositor died leaves its namespace daemon unreachable by definition,
+so the timer is also the teardown the sandbox's own `stop` cannot guarantee.
+Run `install-reap-timer.sh` after provisioning a host; `daemon list`
+remains the on-demand census.
+
 ## 7. The agent engine mounts here (settled)
 
 `docs/agent-engine.md` §3 is amended: no separate `engine.sock`/token/
