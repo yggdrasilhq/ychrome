@@ -1,0 +1,16 @@
+# Retire leaked ychrome daemons on this host, whatever HOME namespace they
+# were spawned under. `daemon reap` is safe by construction
+# (docs/host-daemon.md §6.2): it identifies daemons from kernel facts
+# (daemon.lock FDs in /proc), sends retire_if_idle to each daemon's OWN
+# socket, and a daemon refuses unless it is genuinely idle (no attached
+# session, no engine page). Only unreachable zombies — lock held, nothing
+# answering — are retired outright.
+
+[Unit]
+Description=ychrome: retire leaked or stale daemons across all HOME roots
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/ychrome daemon reap
+# A non-zero exit means the census itself failed (never that a daemon was
+# busy — reap reports and exits 0). Keep the failure visible in the journal.
