@@ -26,7 +26,6 @@ mod adblock;
 mod daemon;
 mod engine;
 mod extensions;
-mod manifest;
 mod passkey;
 mod provision;
 mod sidebar;
@@ -1509,13 +1508,6 @@ fn main() -> Result<()> {
     }
 
     let args = Args::parse();
-
-    // Declare ourselves to this host's yggterm launcher registry, on EVERY run:
-    // that is what repairs the recorded binary path after an upgrade moves it.
-    // Never fatal — a browser must not refuse to start over a menu entry.
-    if let Err(error) = manifest::write() {
-        eprintln!("ychrome: could not register launcher manifest ({error})");
-    }
 
     // Bring this host's copies of the bundled assets up to date BEFORE the
     // policy is built, because `policy()` is a read of the disk and a GET must
