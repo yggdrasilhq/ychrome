@@ -31,9 +31,9 @@ jobs:
         shell: bash
         run: |
           if [ -n "${{ matrix.triple }}" ]; then
-            cargo build --release --target ${{ matrix.triple }} --bin ychrome --bin ychrome-vault
+            cargo build --release --target ${{ matrix.triple }} -p ychrome --bin ychrome -p ychrome-vault --bin ychrome-vault
           else
-            cargo build --release --bin ychrome --bin ychrome-vault
+            cargo build --release -p ychrome --bin ychrome -p ychrome-vault --bin ychrome-vault
           fi
       - name: Pack platform package
         shell: bash
