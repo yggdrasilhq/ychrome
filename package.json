@@ -12,11 +12,7 @@
   ],
   "optionalDependencies": {
     "@ygghq/ychrome-linux-x64": "0.2.2",
-    "@ygghq/ychrome-linux-arm64": "0.2.2",
-    "@ygghq/ychrome-darwin-x64": "0.2.2",
-    "@ygghq/ychrome-darwin-arm64": "0.2.2",
-    "@ygghq/ychrome-win32-x64": "0.2.2",
-    "@ygghq/ychrome-win32-arm64": "0.2.2"
+    "@ygghq/ychrome-linux-arm64": "0.2.2"
   },
   "scripts": {
     "postinstall": "node ./finalize.mjs"
