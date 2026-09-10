@@ -4148,7 +4148,7 @@ dependencies = [
 
 [[package]]
 name = "ychrome"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -4175,7 +4175,7 @@ dependencies = [
 
 [[package]]
 name = "ychrome-vault"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "aes",
  "anyhow",
@@ -4205,7 +4205,7 @@ dependencies = [
 
 [[package]]
 name = "ychrome-vault-proto"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
