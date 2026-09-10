@@ -56,7 +56,8 @@ jobs:
           mkdir -p "pack/@ygghq/ychrome-$TARGET/bin"
           cp "$BUILT/$EXE" "pack/@ygghq/ychrome-$TARGET/bin/ychrome"
           cp "$BUILT/$VAULT_EXE" "pack/@ygghq/ychrome-$TARGET/bin/ychrome-vault"
-          printf '{"name":"@ygghq/ychrome-%s","version":"0.1.0","bin":{"ychrome":"bin/ychrome","ychrome-vault":"bin/ychrome-vault"},"os":["$PKG_OS"],"cpu":["$PKG_CPU"],"license":"GPL-3.0-or-later","repository":{"type":"git","url":"git+https://github.com/yggdrasilhq/ychrome.git"}}\n' "$TARGET" > "pack/@ygghq/ychrome-$TARGET/package.json"
+          VER=$(node -p "require('./package.json').version")
+          printf '{"name":"@ygghq/ychrome-%s","version":"%s","bin":{"ychrome":"bin/ychrome","ychrome-vault":"bin/ychrome-vault"},"os":["%s"],"cpu":["%s"],"license":"GPL-3.0-or-later","repository":{"type":"git","url":"git+https://github.com/yggdrasilhq/ychrome.git"}}\n' "$TARGET" "$VER" "$PKG_OS" "$PKG_CPU" > "pack/@ygghq/ychrome-$TARGET/package.json"
       - name: Publish platform package
         shell: bash
         env:
