@@ -7,6 +7,54 @@ Entries are removed in the same commit as their verified fix. Newest first.
 > remembers it. The law, the owner table for every other question, and how to
 > search the archive are in `yggterm/docs/docs-ssot.md`.
 
+## ⛔⛔ OWNER DIRECTIVE 2026-09-11: BRING YCHROME UP TO SPEC WITH CHROMIUM-BASED BROWSERS — four daily-use blockers, and the @ygghq/blink backend direction
+
+**Status:** OPEN. Owner-reported 2026-09-11 (zcode seat; measured against
+origin/main `9504ac9` — dev was down, nothing here was taken from a local
+checkout). ychrome exists to REPLACE the owner's chromium-based browsers, and by
+his word it is still not fit to. The seats door (`project-campaign-11-ychrome-seats`)
+and the 08-22 lane doors keep the seat/branch facts; THIS entry supersedes their
+priorities.
+
+**The owner's daily-use blockers, in his order:**
+
+1. **The backend cache is not chromium's cache.** ychrome's backend speed and
+   cache both lag a chromium browser; he names chromium's aggressive caching as
+   the thing ychrome is missing. Pages refetch what chromium would serve
+   locally. Measure before tuning: per-profile cache mode, size budget,
+   revalidation rate, and what a chromium profile actually keeps.
+2. **Favicons do not render for all sites, and stale entries persist.** The
+   favicon render and cache live across the repo line — yggterm-shell's right
+   rail (`crates/yggterm-shell/src/shell/right_rail.rs`, `state.rs`;
+   `~/.yggterm/web-favicons`) — so the fix is cross-repo. Filed in the yggterm
+   queue the same day (`lane/fleet/favicon-queue`); do not fix half of it here.
+3. **Row change and dragging are sluggish — in ychrome AND in yggterm itself.**
+   Same situation in both, which is the tell: the shared daemon plane, not
+   ychrome's pane. The yggterm queue already carries the measurements
+   (row-switch fat tail, the one runtime lock a slow request holds). ychrome
+   inherits; the fix lands there.
+4. **Sidebar UX polish overall, and passkeys that work.** The passkey blockers
+   are already filed below (the presence request written to the daemon's
+   /dev/null stdout; the shim patching challenge pages). Nothing new is known
+   here — the directive is priority, not new evidence.
+
+**The backend direction (owner's idea, 2026-09-11):** ship a different browser
+backend for ychrome — an npm package **`@ygghq/blink`** shipping **Blink
+bindings** to run ychrome. Measured the same day: the `@ygghq` scope is already
+ours (`@ygghq/ytop` published 2026-09-10) and the name `@ygghq/blink` is free
+(registry 404). Today's engine is `wry 0.55` + `webkit2gtk v2_40`; the
+WebKitGTK ceiling (the YouTube segfault class, dead `requestVideoFrameCallback`,
+dropped-frame under-reporting — all filed below) is exactly what "up to spec"
+is measured against.
+
+⛔ **The direction is the owner's; the architecture is still an open call.**
+What `@ygghq/blink` binds (chromium content API / a CEF-style embed / a
+headless shell), what it ships (native binaries per target, on the ynpm dev
+channel precedent, vs bindings only), and the GPL compatibility work (ychrome
+is GPL-3.0-or-later; Blink is BSD) are decision debts for the design consult.
+Run the consulting chain before the design lands; do not re-derive it inside a
+lane.
+
 ## ⛔ A THIRD-PARTY FORM CAN RESHAPE A VALUE UNTIL EVERY LITERAL IN A SCANNER'S TERM LIST BREAKS
 
 **Status:** OPEN on the host side only. Detected, purged and requested 2026-08-14; the
