@@ -1,0 +1,71 @@
+{
+  "name": "@ygghq/ychrome",
+  "version": "0.2.2",
+  "description": "ychrome - the yggdrasilhq build, delivered by ynpm",
+  "bin": {
+    "ychrome": "bin/ychrome",
+    "ychrome-vault": "bin/ychrome-vault"
+  },
+  "files": [
+    "bin/",
+    "finalize.mjs"
+  ],
+  "optionalDependencies": {
+    "@ygghq/ychrome-linux-x64": "0.2.2",
+    "@ygghq/ychrome-linux-arm64": "0.2.2"
+  },
+  "scripts": {
+    "postinstall": "node ./finalize.mjs"
+  },
+  "ynpm": {
+    "build": "cargo build --release --bin ychrome --bin ychrome-vault",
+    "bins": {
+      "ychrome": "target/release/ychrome",
+      "ychrome-vault": "target/release/ychrome-vault"
+    },
+    "watch": "@ygghq/ychrome"
+  },
+  "yggterm": {
+    "schema": 1,
+    "app": {
+      "name": "ychrome",
+      "label": "Ychrome",
+      "icon": "",
+      "binary": "ychrome",
+      "verbs": [
+        {
+          "id": "new",
+          "label": "New Ychrome",
+          "args": [],
+          "row_spawn": true
+        },
+        {
+          "id": "incognito",
+          "label": "New Ychrome (Incognito)",
+          "args": ["--profile", "temp"],
+          "row_spawn": true
+        }
+      ],
+      "context_menu": {
+        "enabled": true,
+        "contexts": [
+          "workspace",
+          "session"
+        ],
+        "verbs": [
+          "new",
+          "incognito"
+        ]
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yggdrasilhq/ychrome.git"
+  },
+  "license": "GPL-3.0-or-later",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

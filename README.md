@@ -4,6 +4,13 @@ ychrome is a web viewport for the Yggdrasil ecosystem, and the pilot app for
 **libyggterm** — the pattern where a program launched in a yggterm terminal
 takes over yggterm's GUI surfaces.
 
+## Quick start
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yggdrasilhq/yggterm/main/scripts/install.sh | sh
+ynpx @ygghq/ychrome
+```
+
 ## The design
 
 The primary UX is *locality by invocation*:

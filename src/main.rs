@@ -26,7 +26,6 @@ mod adblock;
 mod daemon;
 mod engine;
 mod extensions;
-mod manifest;
 mod passkey;
 mod provision;
 mod sidebar;
@@ -482,6 +481,13 @@ fn enumerate_profiles() -> Vec<String> {
     names
 }
 
+/// The picker's machine-readable profile list: the SAME enumeration the HTML
+/// picker renders, as JSON for the GUI's native picker card. One enumerator,
+/// so the page a human sees and the card an agent drives cannot diverge.
+fn picker_profiles_json() -> serde_json::Value {
+    serde_json::json!({ "profiles": enumerate_profiles() })
+}
+
 /// Sanitize a picker-chosen profile to one path-safe component (mirrors the
 /// yggterm side's `normalize_web_surface_profile`): a hostile value can never
 /// escape `~/.yggterm/web-profiles/`. Falls back to "default".
@@ -761,6 +767,21 @@ fn respond_html(mut stream: TcpStream, status: u16, body: &str) {
     let _ = stream.flush();
 }
 
+fn respond_json(mut stream: TcpStream, status: u16, body: &str) {
+    let reason = match status {
+        200 => "OK",
+        404 => "Not Found",
+        _ => "OK",
+    };
+    let resp = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+         Content-Length: {len}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+        len = body.len(),
+    );
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.flush();
+}
+
 fn respond_empty(mut stream: TcpStream, status: u16) {
     let reason = if status == 204 { "No Content" } else { "OK" };
     let resp =
@@ -814,6 +835,15 @@ fn handle_picker_conn(stream: TcpStream, session: &str, target: &Arc<Mutex<Surfa
             eprintln!("ychrome: picker → {url} [{profile}]");
             respond_html(stream, 200, &opening_html(&url));
         }
+        // The GUI's picker card draws THIS list when the session is remote:
+        // the session host is the machine whose profile jars are real for
+        // this browser. The GUI host's own ~/.yggterm/web-profiles is another
+        // machine's truth, and a GUI-host-local list once drew all of the GUI
+        // host's profiles into a dev session's picker — the "ychrome always
+        // opens on the GUI host" defect. Names only: avatars and the protect
+        // flag stay GUI-side until the card's metadata writes learn to cross
+        // hosts too.
+        "/profiles" => respond_json(stream, 200, &picker_profiles_json().to_string()),
         "/favicon.ico" => respond_empty(stream, 204),
         _ => respond_html(stream, 404, "<!doctype html><title>404</title>not found"),
     }
@@ -1510,13 +1540,6 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Declare ourselves to this host's yggterm launcher registry, on EVERY run:
-    // that is what repairs the recorded binary path after an upgrade moves it.
-    // Never fatal — a browser must not refuse to start over a menu entry.
-    if let Err(error) = manifest::write() {
-        eprintln!("ychrome: could not register launcher manifest ({error})");
-    }
-
     // Bring this host's copies of the bundled assets up to date BEFORE the
     // policy is built, because `policy()` is a read of the disk and a GET must
     // not mutate it. This is where a userscript that predates its metadata
@@ -1726,6 +1749,16 @@ mod second_invocation_tests {
     // reaches an anchor. The message must NAME the act, because the old
     // phrasing ("opened <url> in session <id>") was indistinguishable from
     // the navigation that destroyed A4's live page.
+    // The /profiles route is the remote picker's source of truth: it must
+    // always carry at least "default" (enumerate_profiles guarantees it), so
+    // a GUI that fetched this list never renders an empty picker.
+    #[test]
+    fn the_profiles_route_always_names_the_default_profile() {
+        let parsed = picker_profiles_json();
+        let names = parsed["profiles"].as_array().expect("profiles array");
+        assert!(names.iter().any(|n| n.as_str() == Some("default")));
+    }
+
     #[test]
     fn a_routed_url_reports_a_new_tab_in_the_running_session_and_never_anchors() {
         let reply = json!({ "ok": true, "routed": true, "session": "env-1" });

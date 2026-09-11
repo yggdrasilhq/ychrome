@@ -1,6 +1,6 @@
 [package]
 name = "ychrome-vault-proto"
-version = "0.1.0"
+version = "0.2.2"
 edition = "2024"
 license = "Apache-2.0"
 description = "The ychrome vault agent's client transport — the newline-JSON unix-socket wire, with no crypto and no http. The browser/daemon talks to the agent through this instead of spawning the ychrome-vault CLI per operation; the agent (server) and the crypto stay in ychrome-vault."
