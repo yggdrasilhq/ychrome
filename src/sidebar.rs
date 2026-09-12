@@ -788,7 +788,9 @@ pub(crate) enum RouteAccess {
 pub(crate) fn route_access(path: &str) -> RouteAccess {
     match path {
         "/policy" | "/zoom" | "/ping" => RouteAccess::Open,
-        "/fido2/get" | "/fido2/create" => RouteAccess::PageSigner,
+        "/fido2/get" | "/fido2/create" | crate::autofill::AUTOFILL_LEARN_ROUTE => {
+            RouteAccess::PageSigner
+        }
         "/fido2/grant" | "/fido2/deny" => RouteAccess::Ceremony,
         _ => RouteAccess::GuiOnly,
     }
@@ -1323,6 +1325,12 @@ pub(crate) fn dispatch(
         // vault REFERENCES into ready fill scripts — a page holding those
         // would hold the credential).
         ("POST", crate::autofill::AUTOFILL_LEARN_ROUTE) => {
+            // PAGE credential (the signer's token, baked into the shim): a
+            // page may learn for ITS OWN origin; the plan half stays GUI-only,
+            // because the plan resolves vault references into ready scripts.
+            if !state.signer.authorized(req.fido2_token.as_deref()) {
+                return (401, json!({ "error": "unauthorized" }));
+            }
             if req.body.is_null() {
                 return (400, json!({ "error": "bad request" }));
             }

@@ -573,3 +573,131 @@ mod tests {
         }
     }
 }
+
+/// The page-side half of the learned-autofill plane, delivered as a synthetic
+/// userscript (the SponsorBlock config precedent: compiled-in, one placement).
+/// Two halves, one document-start body:
+///
+/// **Capture** — `change` events plus a submit-button `pointerdown` (consult
+/// Q2: SPA logins intercept submit and unmount before blur fires). Only
+/// non-secret fields are stashed, and a secret is classified THREE ways
+/// before a value may leave the page: input type, autocomplete token, and the
+/// identity string. The stashed fields ride the EXISTING `yggtermSurface`
+/// message channel; the route they reach is gated by the signer's token (the
+/// page routes' existing credential), so a page can forge captures for its
+/// OWN origin and nothing else — forgeable learn is noise, forgeable PLAN is
+/// a credential, which is why the plan stays GUI-only.
+///
+/// **Apply** — `__ychromeApplyPlan(plan)` is called BY THE HOST (surface eval)
+/// with the origin's learned values: exact identities fill directly, the weak
+/// vault-username candidate fills only email/username-shaped fields, and a
+/// field the human already typed into is never overwritten. The plan's SECRET
+/// script does NOT ride through here — the host evaluates it separately, so
+/// a strict-CSP page cannot break the arming with `Function`.
+pub(crate) fn capture_userscript() -> crate::userscript::Userscript {
+    let body = r#"// ==UserScript==
+// @match      *://*/*
+// @run-at     document-start
+// ==/UserScript==
+(function () {
+  if (window.__ychromeAutofillShim) return;
+  window.__ychromeAutofillShim = true;
+  var SECRET = function (el) {
+    var t = (el.getAttribute('type') || '').toLowerCase();
+    if (t === 'password' || t === 'hidden') return true;
+    var ac = (el.getAttribute('autocomplete') || '').toLowerCase();
+    if (ac.indexOf('one-time-code') >= 0 || ac.indexOf('new-password') >= 0 || ac.indexOf('current-password') >= 0) return true;
+    return false;
+  };
+  var identityFor = function (el) {
+    var ac = el.getAttribute('autocomplete');
+    if (ac) return 'ac:' + ac.toLowerCase();
+    var lbl = (el.labels && el.labels[0] && el.labels[0].innerText || '').trim().toLowerCase().slice(0, 48);
+    if (lbl) return 'label:' + lbl;
+    var aria = el.getAttribute('aria-label');
+    if (aria) return 'aria:' + aria.trim().toLowerCase().slice(0, 48);
+    var nm = el.getAttribute('name');
+    var id = nm ? null : el.getAttribute('id');
+    if (nm || id) return (nm ? 'name:' : 'id:') + (nm || id).toLowerCase();
+    if (el.form) {
+      var inputs = Array.prototype.slice.call(el.form.querySelectorAll('input'));
+      return 'idx:' + inputs.indexOf(el);
+    }
+    return null;
+  };
+  var stash = {};
+  var stashCount = 0;
+  var capture = function (el) {
+    if (!el || !el.matches || !el.matches('input,textarea') || el.disabled || el.readOnly) return;
+    if (SECRET(el)) return;
+    var v = (el.value || '').trim();
+    if (!v || v.length > 512) return;
+    var id = identityFor(el);
+    if (!id) return;
+    if (!stash[id]) stashCount += 1;
+    stash[id] = { identity: id, kind: (el.getAttribute('type') || 'text').toLowerCase(), value: v };
+  };
+  var flush = function () {
+    if (!stashCount) return;
+    var fields = Object.keys(stash).map(function (k) { return stash[k]; });
+    stash = {}; stashCount = 0;
+    try {
+      window.webkit.messageHandlers.yggtermSurface.postMessage(JSON.stringify({
+        type: 'autofill-learn', origin: location.host || '', fields: fields
+      }));
+    } catch (e) { /* no host channel (standalone window): nothing to learn into */ }
+  };
+  document.addEventListener('change', function (e) { capture(e.target); }, true);
+  document.addEventListener('pointerdown', function (e) {
+    var b = e.target && e.target.closest ? e.target.closest('button, [role=button], input[type=submit]') : null;
+    if (!b) return;
+    var text = ((b.innerText || b.value || '') + '').toLowerCase();
+    if ((b.closest && b.closest('form')) || /sign|log|next|continue|submit/.test(text)) {
+      Array.prototype.slice.call(document.querySelectorAll('input,textarea')).forEach(capture);
+      flush();
+    }
+  }, true);
+  window.addEventListener('pagehide', flush);
+  window.__ychromeApplyPlan = function (plan) {
+    try {
+      var used = {};
+      var byIdentity = {};
+      (plan.values || []).forEach(function (v) { byIdentity[v.identity] = v; });
+      var weak = byIdentity['weak:vault-username'] || null;
+      var matchFor = function (el) {
+        var id = identityFor(el);
+        if (id && byIdentity[id] && !used[id]) return byIdentity[id];
+        if (weak && !used[weak.identity]) {
+          var t = (el.getAttribute('type') || '').toLowerCase();
+          var ac = (el.getAttribute('autocomplete') || '').toLowerCase();
+          if (t === 'email' || ac.indexOf('email') >= 0 || ac.indexOf('username') >= 0) return weak;
+        }
+        return null;
+      };
+      var apply = function () {
+        Array.prototype.slice.call(document.querySelectorAll('input,textarea')).forEach(function (el) {
+          if (SECRET(el) || el.disabled || el.readOnly) return;
+          if (el.value && el.value.length) return;
+          var hit = matchFor(el);
+          if (!hit) return;
+          var proto = Object.getPrototypeOf(el);
+          var setter = Object.getOwnPropertyDescriptor(proto, 'value');
+          if (setter && setter.set) setter.set.call(el, hit.value); else el.value = hit.value;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          used[hit.identity] = true;
+        });
+      };
+      apply();
+      if (window.MutationObserver) {
+        new MutationObserver(apply).observe(document.documentElement, { childList: true, subtree: true });
+      }
+    } catch (e) { /* a plan that cannot apply must never break the page */ }
+  };
+})();
+"#;
+    // Authored above with its own metadata block; `parse` is infallible and
+    // the placement gate is for FILE scripts, not compiled-in ones (the
+    // SponsorBlock config precedent).
+    crate::userscript::parse(body)
+}
