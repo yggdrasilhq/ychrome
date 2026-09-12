@@ -705,5 +705,6 @@ pub(crate) fn capture_userscript(token: &str) -> crate::userscript::Userscript {
     // Authored above with its own metadata block; `parse` is infallible and
     // the placement gate is for FILE scripts, not compiled-in ones (the
     // SponsorBlock config precedent).
-    crate::userscript::parse(body)
+    let body = body.replace("{token}", token);
+    crate::userscript::parse(&body)
 }
