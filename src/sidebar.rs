@@ -62,7 +62,7 @@ fn vault_dir() -> Result<std::path::PathBuf> {
 /// operation. The agent is host-resident and caches the unlocked vault, so a
 /// read is cheap and keyless once the user has unlocked. The workspace still
 /// keeps the crypto in `ychrome-vault`; only the wire (this op) is shared.
-fn vault_op(op: Value) -> Result<Value> {
+pub(crate) fn vault_op(op: Value) -> Result<Value> {
     with_readable_error(ychrome_vault_proto::request(&vault_dir()?, &op))
 }
 
@@ -1317,6 +1317,32 @@ pub(crate) fn dispatch(
                 policy.prepend(script);
             }
             (200, policy.to_json())
+        }
+        // THE LEARNED AUTOFILL PLANE. GuiOnly via the default route access:
+        // a page must never read what this profile typed (the plan resolves
+        // vault REFERENCES into ready fill scripts — a page holding those
+        // would hold the credential).
+        ("POST", crate::autofill::AUTOFILL_LEARN_ROUTE) => {
+            if req.body.is_null() {
+                return (400, json!({ "error": "bad request" }));
+            }
+            let profile = state.pane.lock().unwrap().profile.clone();
+            match crate::autofill::learn(
+                &profile,
+                req.body["origin"].as_str().unwrap_or_default(),
+                &req.body["fields"],
+            ) {
+                Ok(reply) => (200, reply),
+                Err(error) => (400, json!({ "error": error })),
+            }
+        }
+        ("GET", p) if p == crate::autofill::AUTOFILL_PLAN_ROUTE => {
+            let profile = state.pane.lock().unwrap().profile.clone();
+            let origin = query_value(query, "origin");
+            match crate::autofill::plan(&profile, origin.as_deref().unwrap_or_default()) {
+                Ok(reply) => (200, reply),
+                Err(error) => (400, json!({ "error": error })),
+            }
         }
         ("POST", "/action") => {
             if req.body.is_null() {
@@ -4722,10 +4748,26 @@ fn run_action(state: &Mutex<PaneState>, request: &Value) -> Value {
                 // blank, so name the fact instead — the same sentence the
                 // agent used to raise.
                 Ok(reply) => match reply["entry"]["password"].as_str() {
-                    Some(password) if !password.is_empty() => json!({
-                        "eval": fill_script(&user, password),
-                        "toast": format!("Filled {name}."),
-                    }),
+                    Some(password) if !password.is_empty() => {
+                        // THE VAULT MEMORY (see crate::autofill): the same arm
+                        // that built the fill script records WHICH item this
+                        // site's secret field was filled from — a reference,
+                        // never the secret — so the plan endpoint can offer the
+                        // same fill armed on the next visit.
+                        {
+                            let profile = state.lock().unwrap().profile.clone();
+                            let _ = crate::autofill::remember_vault(
+                                &profile,
+                                host.as_deref().unwrap_or_default(),
+                                &name,
+                                &user,
+                            );
+                        }
+                        json!({
+                            "eval": fill_script(&user, password),
+                            "toast": format!("Filled {name}."),
+                        })
+                    }
                     _ => json!({ "toast": format!("{name} has no password") }),
                 },
                 Err(error) => json!({ "toast": error.to_string() }),
@@ -5769,7 +5811,7 @@ fn merge(mut base: Value, extra: Value) -> Value {
 /// into the surface — that is the whole point of `eval`: the app computes the
 /// credential host-side, and the GUI only injects it. It never lands in
 /// yggterm's state, a schema, or the OSC stream.
-fn js_string(value: &str) -> String {
+pub(crate) fn js_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
     for ch in value.chars() {
@@ -5821,7 +5863,7 @@ fn js_string(value: &str) -> String {
 /// which fields were filled and never what went into them (`fill-card` already
 /// answers a length, and this must not widen that). A length separates a wrong
 /// write from a right one without reconstructing the secret.
-const SET_FIELD: &str = r#"
+pub(crate) const SET_FIELD: &str = r#"
 function ychromeSet(el, value) {
   const want = typeof value === 'string' ? value.length : -1;
   if (!el) return { present: false, ok: false, want: want, got: -1 };
@@ -5905,55 +5947,19 @@ pub(crate) fn vault_fill_script(name: &str, user: Option<&str>) -> Result<String
 /// that does not name itself, this fills only the first and reports
 /// `present-but-unnamed`, so the caller can see the thing it was left to decide
 /// rather than discovering it at submit time.
-fn fill_script(username: &str, password: &str) -> String {
+pub(crate) fn fill_script(username: &str, password: &str) -> String {
+    // The field-picking and readback body has ONE owner
+    // ([`crate::autofill::fill_script_body`]) — the armed plan script runs the
+    // same lines on the user's first gesture, and the two can never drift.
     format!(
         r#"(function() {{
 {SET_FIELD}
-  const secrets = Array.from(document.querySelectorAll('input[type=password]:not([disabled])'));
-  const pw = secrets[0] || null;
-  let user = null;
-  if (pw) {{
-    const form = pw.form || document;
-    const candidates = Array.from(form.querySelectorAll('input'));
-    const pwIndex = candidates.indexOf(pw);
-    user = candidates.slice(0, pwIndex < 0 ? candidates.length : pwIndex).reverse().find((el) =>
-      ['text', 'email', 'tel', ''].includes((el.type || '').toLowerCase()) && !el.disabled);
-  }}
-  if (!user) {{
-    user = document.querySelector('input[autocomplete=username], input[name*=user i], input[type=email]');
-  }}
-  const CONFIRM = /confirm|retype|re-type|repeat|verify|again/i;
-  const describes = (el) => [el.getAttribute('name'), el.getAttribute('id'),
-    el.getAttribute('placeholder'), el.getAttribute('aria-label'),
-    el.getAttribute('autocomplete')].filter(Boolean).join(' ');
-  const twin = secrets.slice(1).find((el) => CONFIRM.test(describes(el))) || null;
-  const fields = [];
-  const record = (label, el, verdict) => {{
-    fields.push(Object.assign({{ field: label, target: ychromeField(el) }}, verdict));
-    return verdict;
-  }};
-  const userVerdict = {username} ? record('username', user, ychromeSet(user, {username})) : null;
-  const pwVerdict = record('secret', pw, ychromeSet(pw, {password}));
-  const twinVerdict = twin ? record('secret-confirm', twin, ychromeSet(twin, {password})) : null;
-  if (pw) {{ pw.focus(); }}
-  let filled = pwVerdict.present
-    ? 'filled'
-    : ((userVerdict && userVerdict.present) ? 'user-only' : 'no-fields');
-  // ⛔ THE READBACK OUTRANKS THE ASSIGNMENT. A caller reads 'filled' as "the
-  // form is ready to submit"; if any field we wrote is not holding what we
-  // wrote, that sentence is false and the honest answer is that this run was
-  // not verified.
-  if (fields.some((f) => f.present && !f.ok)) {{ filled = 'unverified'; }}
-  return {{
-    filled: filled,
-    fields: fields,
-    secret_field_count: secrets.length,
-    confirm: twin ? (twinVerdict.ok ? 'filled' : 'unverified')
-                  : (secrets.length > 1 ? 'present-but-unnamed' : 'absent'),
-  }};
+  return (function() {{
+{body}
+  }})();
 }})()"#,
-        username = js_string(username),
-        password = js_string(password),
+        SET_FIELD = SET_FIELD,
+        body = crate::autofill::fill_script_body(Some(username), password),
     )
 }
 

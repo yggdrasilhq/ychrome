@@ -4163,6 +4163,7 @@ dependencies = [
  "gtk",
  "javascriptcore-rs",
  "libc",
+ "serde",
  "serde_json",
  "sha2",
  "soup3",

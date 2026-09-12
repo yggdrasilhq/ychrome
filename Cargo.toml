@@ -44,6 +44,7 @@ javascriptcore-rs = "1.1"
 # `_exit` only: the engine must end the process without libc's exit handlers,
 # because WebKit's runs after the main loop is gone. See engine::exit_now.
 libc = "0.2"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The vault agent's client transport — crypto-free, so the browser stays lean.
 # The sidebar's vault pane and the passkey signer speak the agent socket through
