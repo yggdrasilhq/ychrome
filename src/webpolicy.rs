@@ -226,12 +226,6 @@ pub fn policy(profile: &str) -> Policy {
         userscripts.insert(0, crate::sponsorblock::config_userscript());
     }
 
-    // THE LEARNED-AUTOFILL CAPTURE SHIM, on every page of every profile,
-    // ahead of everything else (see crate::autofill::capture_userscript for
-    // why it is compiled-in rather than a file the user could delete and
-    // then silently lose the plane).
-    userscripts.insert(0, crate::autofill::capture_userscript());
-
     Policy {
         adblock_rules,
         userscripts,

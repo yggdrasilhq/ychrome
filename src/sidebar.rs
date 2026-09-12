@@ -1296,6 +1296,14 @@ pub(crate) fn dispatch(
         ("GET", "/policy") => {
             let profile = state.pane.lock().unwrap().profile.clone();
             let mut policy = crate::webpolicy::policy(&profile);
+            // THE LEARNED-AUTOFILL CAPTURE SHIM, on every page of the profile,
+            // ahead of everything else, carrying the PAGE credential (the
+            // signer token — the same one /fido2 pages hold) so its flush
+            // authenticates. Compiled-in rather than a deletable file: a user
+            // removing it should be a decision, not an accident of cleanup.
+            policy
+                .userscripts
+                .insert(0, crate::autofill::capture_userscript(state.signer.token()));
             // ⛔ THE SHIM IS SCOPED TO THE HOSTS A PASSKEY ACTUALLY EXISTS FOR.
             //
             // It used to be installed on EVERY page, unconditionally. On a page

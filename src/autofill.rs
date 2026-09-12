@@ -594,7 +594,7 @@ mod tests {
 /// field the human already typed into is never overwritten. The plan's SECRET
 /// script does NOT ride through here — the host evaluates it separately, so
 /// a strict-CSP page cannot break the arming with `Function`.
-pub(crate) fn capture_userscript() -> crate::userscript::Userscript {
+pub(crate) fn capture_userscript(token: &str) -> crate::userscript::Userscript {
     let body = r#"// ==UserScript==
 // @match      *://*/*
 // @run-at     document-start
@@ -637,15 +637,21 @@ pub(crate) fn capture_userscript() -> crate::userscript::Userscript {
     if (!stash[id]) stashCount += 1;
     stash[id] = { identity: id, kind: (el.getAttribute('type') || 'text').toLowerCase(), value: v };
   };
+  var TOKEN = '{token}';
   var flush = function () {
     if (!stashCount) return;
     var fields = Object.keys(stash).map(function (k) { return stash[k]; });
     stash = {}; stashCount = 0;
-    try {
-      window.webkit.messageHandlers.yggtermSurface.postMessage(JSON.stringify({
-        type: 'autofill-learn', origin: location.host || '', fields: fields
-      }));
-    } catch (e) { /* no host channel (standalone window): nothing to learn into */ }
+    // The page credential (the signer token, the same one /fido2 uses) rides
+    // the yggterm-appctl bridge, which forwards it as the signer header. A
+    // page may learn for its own origin; the PLAN half of this plane stays
+    // GUI-only, because the plan resolves vault references into ready fill
+    // scripts — the learn gate buys quietness, not secrecy.
+    fetch('yggterm-appctl://signer/autofill/learn', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json', 'X-Ychrome-Fido2': TOKEN }},
+      body: JSON.stringify({{ origin: location.host || '', fields: fields }})
+    }}).catch(function () {{ /* standalone window: no bridge, nothing to learn into */ }});
   };
   document.addEventListener('change', function (e) { capture(e.target); }, true);
   document.addEventListener('pointerdown', function (e) {

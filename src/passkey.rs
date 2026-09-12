@@ -108,6 +108,12 @@ impl Signer {
         shim_js(self.port, &self.token)
     }
 
+    /// The token, for shims that carry it (the capture shim posts learned
+    /// values through the same page credential /fido2 uses).
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+
     /// Bearer-token check for every `/fido2/*` route. A request without the
     /// exact token is refused before it can touch the vault or the GUI.
     pub fn authorized(&self, header_token: Option<&str>) -> bool {
