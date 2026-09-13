@@ -1283,6 +1283,11 @@ pub(crate) fn dispatch(
         // GUI-only (the default in `route_access`): a page must never be able to
         // read — let alone write — what the human decided about its camera.
         ("GET", "/media-permission") => (200, media_permission_query(query)),
+        // The agent/daemon grant path: under --daemon the presence OSC is
+        // written to /dev/null, so the GUI dialog cannot fire. A control-plane
+        // reader discovers the pending ceremony here and answers with
+        // POST /fido2/grant — same request_id capability the GUI dialog uses.
+        ("GET", "/fido2/pending") => (200, state.signer.pending_snapshot()),
         ("POST", "/media-permission") => {
             if req.body.is_null() {
                 return (400, json!({ "error": "bad request" }));

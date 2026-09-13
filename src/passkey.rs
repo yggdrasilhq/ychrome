@@ -70,6 +70,13 @@ enum Outcome {
 #[derive(Default)]
 struct Ceremony {
     outcome: Option<Outcome>,
+    /// What the presence request asks about, mirrored here so a control-plane
+    /// reader can decide a grant without the GUI dialog (the OSC channel is
+    /// /dev/null under `--daemon`).
+    kind: String,
+    rp_id: String,
+    origin: String,
+    accounts: serde_json::Value,
 }
 
 /// The browser-side passkey signer. One per surface control server.
@@ -206,7 +213,16 @@ impl Signer {
             })
             .collect();
         let request_id = hex_token(16);
-        self.register(&request_id);
+        self.register(
+            &request_id,
+            Ceremony {
+                kind: "get".into(),
+                rp_id: rp_id.into(),
+                origin: origin.into(),
+                accounts: serde_json::json!(accounts),
+                ..Ceremony::default()
+            },
+        );
         emit_fido2_request(&self.session, &request_id, rp_id, &accounts, "get", origin);
         let outcome = self.wait_for_outcome(&request_id);
 
@@ -335,7 +351,16 @@ impl Signer {
             display_name
         };
         let accounts = vec![json!({ "label": label })];
-        self.register(&request_id);
+        self.register(
+            &request_id,
+            Ceremony {
+                kind: "create".into(),
+                rp_id: rp_id.into(),
+                origin: origin.into(),
+                accounts: serde_json::json!(accounts),
+                ..Ceremony::default()
+            },
+        );
         emit_fido2_request(
             &self.session,
             &request_id,
@@ -426,11 +451,37 @@ impl Signer {
         }
     }
 
-    fn register(&self, request_id: &str) {
+    fn register(&self, request_id: &str, ceremony: Ceremony) {
         self.pending
             .lock()
             .unwrap()
-            .insert(request_id.to_string(), Ceremony::default());
+            .insert(request_id.to_string(), ceremony);
+    }
+
+    /// The outstanding ceremonies, secret-free. This is the agent answer to
+    /// the OSC-on-stdout channel: under `--daemon` the emitting process's
+    /// stdout is /dev/null, so no dialog can fire — a control-plane reader
+    /// (GET /fido2/pending) discovers the request and grants it deliberately,
+    /// exactly as the GUI dialog would.
+    pub fn pending_snapshot(&self) -> serde_json::Value {
+        let pending = self.pending.lock().unwrap();
+        serde_json::json!({
+            "pending": pending
+                .iter()
+                .filter(|(_, c)| c.outcome.is_none())
+                .map(
+                    |(id, c)| {
+                        serde_json::json!({
+                            "request_id": id,
+                            "kind": c.kind,
+                            "rp_id": c.rp_id,
+                            "origin": c.origin,
+                            "accounts": c.accounts,
+                        })
+                    },
+                )
+                .collect::<Vec<_>>(),
+        })
     }
 
     /// Park until the ceremony has an outcome or the timeout fires, then consume
@@ -803,7 +854,16 @@ mod tests {
     #[test]
     fn a_grant_wakes_a_parked_ceremony_and_is_consumed() {
         let signer = Signer::new(1234, "sess".into());
-        signer.register("req-1");
+        signer.register(
+            "req-1",
+            Ceremony {
+                kind: "get".into(),
+                rp_id: "example.com".into(),
+                origin: "https://example.com".into(),
+                accounts: serde_json::json!([]),
+                ..Ceremony::default()
+            },
+        );
 
         // Grant for a live ceremony succeeds, carrying the chosen account, and
         // is idempotent on repeat.
