@@ -267,7 +267,7 @@ fn serde_json_string(value: &str) -> String {
 
 /// Thin-client mode: drive the yggterm viewport via OSC and block in the
 /// foreground like a proper CLI program. The heartbeat keeps the surface
-/// alive (the GUI expires surfaces after ~15s without one, so a SIGKILLed
+/// alive (the GUI's surface staleness window is 45s, so a SIGKILLed
 /// ychrome never leaks a full-screen overlay) and re-heals the surface
 /// after a GUI-side terminal remount.
 fn run_thin_client(session: &str, url: &str, title: &str, profile: &str) -> Result<()> {
@@ -357,9 +357,9 @@ fn print_site_lore(url: &str) {
 /// action 403'd until the next declare corrected it.
 ///
 /// A missed declare is cheap: it is the contribution's ~4s liveness signal
-/// against the GUI's 15s expiry, so one skipped tick costs nothing, and the
-/// honest silence lets a contribution expire rather than pinning the rail to an
-/// endpoint nobody serves.
+/// against the GUI's 45s surface expiry, so one skipped tick costs nothing,
+/// and the honest silence lets a contribution expire rather than pinning the
+/// rail to an endpoint nobody serves.
 fn declare_current(session: &str, profile: &str) -> bool {
     let Some(endpoint) = daemon::register_supervised(session, profile) else {
         return false;

@@ -2,6 +2,54 @@
 
 Entries are removed in the same commit as their verified fix. Newest first.
 
+## ⛔ WebKitGUI (compositing ON, hardware GL) drops thin glyph bars at specific ppem — math "=" reads as "−" (found 2026-09-12, zcode seat, via a lesson-page app)
+
+**Status:** OPEN · measured 2026-09-12 on two fleet hosts; web-exposed defect reported by the
+owner while reading lesson pages of an internal exam app in his ychrome row.
+
+On a MathJax v4 CHTML lesson page (NewCM woff2 webfonts), the **display-math equals sign
+renders as a single bar** — the top bar falls to near-invisible alpha — so an equation like
+"payoff = price − strike" reads as "payoff — price − strike". Inline math at smaller ppem
+renders both bars correctly **in the same window**. A Chromium build on the same host and
+page is correct.
+
+**The decisive A/B — same binary (ychrome 0.2.2), same libwebkit2gtk 2.52.6, same fonts,
+same DOM (`<mjx-c class="mjx-c3D">=</mjx-c>`, font stack `MJX-NCM-ZERO, MJX-NCM-N`), dpr=1
+on both paths:**
+
+| surface | env | display `=` |
+|---|---|---|
+| GUI ychrome row | `GDK_BACKEND=wayland`, `YGGTERM_ENABLE_WEBKIT_COMPOSITING=1`, `YGGTERM_WEBKIT_GL_POLICY=hardware_gl_forced` | **BROKEN** (top bar faint) |
+| ychrome engine (headless), two hosts | `GDK_BACKEND=x11`, `WEBKIT_DISABLE_COMPOSITING_MODE=1`, Xvfb | correct |
+
+Not the cause (all falsified this sitting): fontconfig deltas (none), stale font caches
+(surface caches empty), version skew (identical), device scale (title glyph heights
+identical at dpr=1), app DOM/CSS (verified byte-clean).
+
+**Mechanism (best fit):** WebKitGTK ≥2.44's Skia GPU text pipeline rasterizes webfont
+glyphs into the compositor's glyph atlas; thin horizontal features at specific ppem hit the
+atlas subpixel/alpha quantization cliff (top bar of NewCM `=` at ~19.5px CSS). The software
+path rasterizes without atlas quantization and is correct. No web-level CSS reaches it
+(consult verdict: text-rendering/text-stroke/translateZ do not change atlas behavior).
+
+**Mitigation shipped on the content side** (the app now serves MathJax **tex-svg.js** to
+WebKit-family engines — vector paths, no glyph atlas, defect cannot fire; Blink/WebView
+keep CHTML). That makes the app correct on ychrome but at SVG's unhinted softness — the
+owner's crispness ruling (soft math judged unacceptable twice) still loses in his main
+browser until THIS defect is fixed.
+
+**Candidate fixes here (one of):**
+1. Per-origin/site-lore compositing override (affected origin → software) — coarse; watch
+   the substrate.rs finding that compositing OFF crashed 7/7 with YouTube playback on
+   Xvfb (GUI Wayland unmeasured).
+2. `YGGTERM_WEBKIT_GL_POLICY` default away from `hardware_gl_forced` for WebKit surfaces —
+   needs the same video-stability re-measurement.
+3. Upstream WebKitGTK bug (Skia glyph atlas, thin-bar alpha loss, GL compositing) with the
+   A/B above as the repro matrix — then bump libwebkit2gtk when the fix lands.
+
+Minimal repro: any MathJax v4 CHTML page with a display `=...` at ~19.5px CSS in NewCM;
+capture at dpr=1 on both compositing paths and compare the top bar alpha.
+
 > **This file is the ONE answer to "what is open" for ychrome.** Open items
 > only; an entry is deleted in the same commit as its verified fix and git
 > remembers it. The law, the owner table for every other question, and how to
