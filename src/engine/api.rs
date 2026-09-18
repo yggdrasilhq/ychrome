@@ -338,6 +338,24 @@ fn route(verb: &str, request: &ParsedRequest) -> Reply {
             else {
                 return Reply::bad(400, "eval needs a page_id and js");
             };
+            // `await=true`: the caller's code may return a promise — run it as
+            // an async function body and reply with the SETTLED value. Plain
+            // eval cannot: WebKitGTK refuses a promise result outright
+            // ("Unsupported result type", measured 2026-09-18), which is why
+            // callers were hand-rolling capture-into-a-global-then-poll-sync.
+            if request.body.get("await").and_then(Value::as_bool).unwrap_or(false) {
+                let timeout = std::time::Duration::from_millis(
+                    request
+                        .body
+                        .get("await_timeout_ms")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(10_000),
+                );
+                return match engine.eval_await(&id, js, timeout) {
+                    Ok(value) => Reply::Json(200, json!({ "ok": true, "value": value })),
+                    Err(error) => Reply::bad(400, error.to_string()),
+                };
+            }
             match engine.eval(&id, js) {
                 Ok(value) => Reply::Json(200, json!({ "ok": true, "value": value })),
                 Err(error) => Reply::bad(400, error.to_string()),
