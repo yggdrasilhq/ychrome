@@ -21,6 +21,8 @@ repository = "https://github.com/yggdrasilhq/ychrome"
 
 [dependencies]
 anyhow = "1"
+once_cell = "1"
+ytrace = { git = "https://github.com/yggdrasilhq/ytrace", branch = "main" }
 base64 = "0.22"
 # The agent engine's substrate (docs/agent-engine.md §9.1). These are the
 # gir-generated bindings wry already links against — same versions, resolved by

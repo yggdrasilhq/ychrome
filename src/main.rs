@@ -20,6 +20,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use ytrace::{Provider, Clock, Sample};
+
+static YTRACE: once_cell::sync::Lazy<Provider> = once_cell::sync::Lazy::new(|| {
+    let provider = Provider::new("ychrome", env!("CARGO_PKG_VERSION"));
+    provider.register("viewport/mount", Clock::Wall, Sample::always());
+    provider.register("web/policy", Clock::Wall, Sample::always());
+    provider.register("web/fetch", Clock::Wall, Sample::always());
+    provider.register("render/gui", Clock::Cpu, Sample::always());
+    provider.register("daemon_request/provide", Clock::Wall, Sample::always());
+    provider
+});
 
 mod abp;
 mod adblock;

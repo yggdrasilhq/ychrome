@@ -4163,6 +4163,7 @@ dependencies = [
  "gtk",
  "javascriptcore-rs",
  "libc",
+ "once_cell",
  "serde_json",
  "sha2",
  "soup3",
@@ -4171,6 +4172,7 @@ dependencies = [
  "webkit2gtk",
  "wry",
  "ychrome-vault-proto",
+ "ytrace",
 ]
 
 [[package]]
@@ -4234,6 +4236,18 @@ dependencies = [
  "quote",
  "syn 2.0.118",
  "synstructure",
+]
+
+[[package]]
+name = "ytrace"
+version = "0.1.0"
+source = "git+https://github.com/yggdrasilhq/ytrace?branch=main#358b864ad86f3a4d65b94028aa2633c7350e83d8"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs 5.0.1",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
