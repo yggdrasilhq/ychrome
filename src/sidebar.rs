@@ -7486,14 +7486,37 @@ mod tests {
         assert_eq!(widget("edit_card_exp_month")["value"], "3");
         assert_eq!(widget("edit_card_exp_year")["value"], "2031");
         // The two secrets are declared, declared SECRET, and declared EMPTY —
-        // the same rule the password box keeps. This form can write them and
-        // cannot read them.
-        for id in ["edit_card_number", "edit_card_code"] {
+        // the same rule the password box keeps — and since reveal parity
+        // (e4da218) each carries the on-field eye/copy/remove trio, so the
+        // operator can verify WHICH card they are editing. Only the eye, one
+        // audited `card-secret` per press, ever reads a value.
+        let trio = |id: &str, spec: &str| -> Vec<String> {
             let box_ = widget(id);
             assert_eq!(box_["secret"], true, "{id} is not marked secret");
             assert_eq!(box_["value"], "", "{id} pre-filled something");
-            assert!(box_["actions"].is_null(), "{id} offers an eye it cannot satisfy");
-        }
+            box_["actions"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{id} lost its on-field actions"))
+                .iter()
+                .filter_map(|action| action["action"].as_str())
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(
+            trio("edit_card_number", "card-number"),
+            vec![
+                "edit-reveal:card-number".to_string(),
+                "edit-copy:card-number".to_string(),
+                "edit-remove-field:card-number".to_string(),
+            ],
+            "the stored number does not offer eye/copy/remove in order",
+        );
+        // …and a code the item does NOT store is offered no eye at all — the
+        // no-reveal-for-nothing rule, unchanged.
+        assert!(
+            trio("edit_card_code", "card-code").is_empty(),
+            "edit_card_code offered verbs for a value that is not there",
+        );
         // A login form grows none of it.
         let login = json!(edit_tab_widgets(&EditDraft::default(), None)).to_string();
         assert!(!login.contains("edit_card_number"), "{login}");
@@ -7819,7 +7842,9 @@ mod tests {
                 "Autofill options",
                 "Additional options",
                 "Custom fields",
-                "Remove a value",
+                // "Remove a value" is GONE since e028078: the delete lives ON
+                // each stored field (the trash in its action trio), not in a
+                // far section with toggles.
             ],
         );
         // …and a form group is a CARD, which is what stops the pane reading as
@@ -7854,7 +7879,13 @@ mod tests {
             let box_ = one_widget(&widgets, id);
             assert_eq!(box_["value"], "", "{id} carries a value");
             assert_eq!(box_["stored"], true, "{id} does not say it holds anything");
-            assert_eq!(box_["placeholder"], "", "{id} declined yggterm's mask");
+            assert!(
+                box_["placeholder"]
+                    .as_str()
+                    .is_some_and(|hint| hint.contains("eye to reveal")),
+                "{id} does not name its affordance (the mask is a placeholder,                  never a value): {:?}",
+                box_["placeholder"],
+            );
         }
         // Notes are prose, so they name their own placeholder and get no dots —
         // and they are still display-only, so a reveal cannot be re-sent.
@@ -8088,6 +8119,10 @@ mod tests {
             StoredField::Notes,
             StoredField::Custom("API Key".into()),
             StoredField::Custom("odd:name: with colons".into()),
+            // Card secrets ride the same wire since the reveal-parity pass
+            // (e4da218): parse-able, spec-able, audited through `card-secret`.
+            StoredField::CardNumber,
+            StoredField::CardCode,
         ] {
             assert_eq!(
                 StoredField::parse(&field.spec()),
@@ -8096,11 +8131,6 @@ mod tests {
             );
             assert!(!field.label().is_empty());
         }
-        assert_eq!(
-            StoredField::parse("card-number"),
-            None,
-            "cards have no reveal"
-        );
         assert_eq!(
             StoredField::parse("field:"),
             None,
@@ -8673,7 +8703,7 @@ mod tests {
             .iter()
             .map(|tab| tab["label"].as_str().unwrap())
             .collect();
-        assert_eq!(offered, vec!["Login", "Note", "Card"]);
+        assert_eq!(offered, vec!["Login", "Note", "Card", "Identity"]);
         assert_eq!(picker["active"], "1", "the picker must show the live type");
 
         // A LOGIN keeps everything it had.
