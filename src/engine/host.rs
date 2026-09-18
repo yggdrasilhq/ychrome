@@ -731,6 +731,95 @@ impl Engine {
         serde_json::from_str(&raw).with_context(|| format!("engine eval returned non-JSON: {raw}"))
     }
 
+    /// The kick script for [`Self::eval_await`]: the caller's code becomes the
+    /// body of an async function whose outcome lands in `window.__ychromeEval`.
+    /// The script's OWN completion value is `'started'` — a plain string, the
+    /// one result kind evaluate_javascript always classifies — while the async
+    /// work floats free of it. Kept a pure function so tests can pin its shape.
+    fn await_kick_script(js: &str) -> String {
+        format!(
+            "(async () => {{ \
+                try {{ \
+                    window.__ychromeEval = {{ state: 'ok', result: await (async () => {{\n{js}\n}})() }}; \
+                }} catch (e) {{ \
+                    window.__ychromeEval = {{ state: 'err', result: (e && e.message) ? e.message : String(e) }}; \
+                }} \
+            }})(); 'started'"
+        )
+    }
+
+    /// Evaluate JS that may return a PROMISE, and reply with its settled value.
+    ///
+    /// Plain `eval` cannot do this: WebKitGTK's evaluate_javascript refuses to
+    /// classify a promise result and answers "Unsupported result type"
+    /// (measured 2026-09-18 — a resolved, a rejected and a delayed promise all
+    /// bounce in ~50ms), so a caller cannot simply eval
+    /// `idb.count().then(...)`. Opt-in via `await=true`: the caller's code runs
+    /// as the BODY of an async function (write `return …` to answer), the
+    /// engine polls the result slot until it settles, and the settled value is
+    /// replied as JSON. Bounded by `timeout`; the slot is per-call and
+    /// overwritten at every kick, so a stale slot from an earlier await cannot
+    /// be read twice.
+    pub fn eval_await(&self, id: &str, js: &str, timeout: std::time::Duration) -> Result<Value> {
+        let kick = Self::await_kick_script(js);
+        let started = self.eval(id, &kick)?;
+        if started.as_str() != Some("started") {
+            return Err(anyhow::anyhow!(
+                "eval await: the kick script did not start cleanly (got {started}); \
+                 the page may be mid-navigation"
+            ));
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if std::time::Instant::now() > deadline {
+                return Err(anyhow::anyhow!(
+                    "eval await timed out after {}ms — the script never settled \
+                     (the page may be busy, closed, or the promise never resolves)",
+                    timeout.as_millis()
+                ));
+            }
+            let state = self.eval(
+                id,
+                "(() => { const s = window.__ychromeEval; \
+                 return s && (s.state === 'ok' || s.state === 'err') ? s.state : 'running'; })()",
+            )?;
+            match state.as_str() {
+                Some("running") => continue,
+                Some("err") => {
+                    let message = self.eval(
+                        id,
+                        "(() => { const s = window.__ychromeEval; \
+                         return s && s.state === 'err' ? JSON.stringify(s.result) : 'null'; })()",
+                    )?;
+                    let message = message.as_str().unwrap_or("null");
+                    let message = serde_json::from_str::<String>(message)
+                        .unwrap_or_else(|_| message.to_string());
+                    // Consume the slot so nothing reads this error twice.
+                    let _ = self.eval(id, "window.__ychromeEval = undefined; 'cleared'");
+                    return Err(anyhow::anyhow!("eval await: page threw: {message}"));
+                }
+                Some("ok") => {
+                    let raw = self.eval(
+                        id,
+                        "(() => { const s = window.__ychromeEval; \
+                         return s && s.state === 'ok' ? JSON.stringify(s.result === undefined ? null : s.result) : 'null'; })()",
+                    )?;
+                    let raw = raw.as_str().unwrap_or("null");
+                    // Consume the slot before parsing: the value is ours now.
+                    let _ = self.eval(id, "window.__ychromeEval = undefined; 'cleared'");
+                    return serde_json::from_str(raw)
+                        .with_context(|| format!("eval await returned non-JSON: {raw}"));
+                }
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "eval await: unexpected slot state {other:?} — aborting rather than polling forever"
+                    ));
+                }
+            }
+        }
+    }
+
     /// Snapshot the visible viewport. The default capture, and the one every
     /// caller before regions existed was asking for.
     pub fn shot(&self, id: &str) -> Result<Shot> {
@@ -1918,5 +2007,27 @@ mod tests {
         // Out-of-bounds rects clamp rather than panic: a selector can report a
         // rect that runs past the viewport and that must not kill the engine.
         assert_eq!(shot.dark_pixels(-8, -8, 64, 64, 128), 16);
+    }
+
+    // The await-eval kick (2026-09-18): the caller's code rides as an async
+    // function body, the script's own completion value stays a plain string
+    // (the only result kind evaluate_javascript classifies), and errors land
+    // in the slot rather than rejecting the kick.
+    #[test]
+    fn the_await_kick_answers_started_and_carries_the_body() {
+        let kick = super::Engine::await_kick_script("return 1 + 1;");
+        assert!(kick.ends_with("; 'started'"), "completion value must be the plain string 'started': {kick}");
+        assert!(kick.contains("window.__ychromeEval"), "the result slot is the contract");
+        assert!(kick.contains("\nreturn 1 + 1;\n"), "the caller's code rides as the async body");
+        assert!(kick.contains("state: 'ok'"), "success lands in the slot, not the completion value");
+        assert!(kick.contains("state: 'err'"), "a rejecting body is captured, not thrown past the slot");
+    }
+
+    #[test]
+    fn the_await_kick_survives_braces_in_the_body() {
+        // The caller's code is interpolated into a format! string: an object
+        // literal in it must not read as a format placeholder.
+        let kick = super::Engine::await_kick_script("return { a: 1 };");
+        assert!(kick.contains("return { a: 1 };"), "body braces must reach the page verbatim: {kick}");
     }
 }
