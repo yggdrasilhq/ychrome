@@ -9,9 +9,13 @@ ychrome is a **libyggterm app**. An app owns its content, its crate, and its
 state. yggterm provides only a generic surface interface and persists none of an
 app's data.
 
-- **Host-resident state.** Config, profiles, credentials and the unlocked-vault
-  session live on the host ychrome RUNS on — over ssh, the remote one, not the
-  GUI's host. `~/.yggterm/web-profiles/<name>/`, `~/.yggterm/vault/`.
+- **App-owned state; mode-specific placement.** App policy/config and the
+  vault peer belong to the invoking host. Standalone/headless profile jars
+  use that host's `~/.yggterm/web-profiles/<name>/`; a thin-client native
+  web context can instead store its jar on the rendering GUI host. Egress
+  still follows the invoking host. Read the mode/owner matrix in
+  `docs/architecture.md` before migrating or synchronizing data. Logical
+  fleet profile sharing is a new architecture target, not a current guarantee.
 - **No app chrome in yggterm.** If a change wants `RightPanelMode::Vault` or an
   ychrome icon inside `yggterm-shell`, it is in the wrong repo. Contribute the
   surface instead.

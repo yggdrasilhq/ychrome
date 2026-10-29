@@ -6,7 +6,7 @@
 ychrome <url>
    │
    ├── yggterm session detected (YGGTERM_SESSION_ID + daemon socket env)
-   │      → thin-client mode: ask the host daemon for a web surface,
+   │      → thin-client mode: declare a web surface over OSC 7717,
    │        block until it closes. Rendering happens in the yggterm GUI.
    │
    └── no yggterm
@@ -19,8 +19,8 @@ Participants:
 
 - **ychrome (CLI)** — runs on whatever machine the user's terminal session is
   on. Resolves the session identity from environment variables exported by the
-  yggterm daemon into every PTY it owns (the `TMUX`-variable pattern). Sends
-  `web-surface open` over the daemon's local socket; stays in the foreground;
+  yggterm daemon into every PTY it owns (the `TMUX`-variable pattern). Emits
+  `web-surface open` over the terminal's OSC 7717 stream; stays in the foreground;
   Ctrl+C or daemon notification of surface close terminates it.
 - **yggterm host daemon** — relays the request to attached GUI clients,
   tagged with the session id. Owns lifecycle truth: if the CLI dies, the
@@ -53,17 +53,45 @@ resolves.
 
 ## Standalone mode
 
-`src/main.rs` today: tao event loop + wry WebViewBuilder on a WebContext whose
-data directory is `~/.local/share/ychrome/profiles/<profile>`. `--via <host>`
+`src/main.rs`: tao event loop + wry WebViewBuilder on a WebContext whose
+data directory comes from `profile_dir`, currently
+`~/.yggterm/web-profiles/<profile>`. `--via <host>`
 is the same egress rule with plain ssh as the carrier: borrow that host's
 entire network identity for the window via a dynamic SOCKS forward
-(`ssh -N -D`), with the web context's proxy pointed at the local end. (The
-current implementation still uses a single-port `-L` rewrite; migrating it to
-`-D` + per-context proxy is the open v0 task, tracked below.) The forward dies
-with the window.
+(`ssh -N -D`), with the web context's proxy pointed at the local end. This
+dynamic SOCKS route is implemented in `main.rs`; it is not the earlier
+single-port URL rewrite. The forward dies with the window.
 
 Standalone mode is also the degradation story required of every libyggterm
 app: in a bare xterm the command still does something sensible.
+
+## State ownership and actual placement
+
+Ychrome is a libyggterm app, not Chromium. Logical profile identity, physical
+storage, rendering, invoking-host egress and control authority are separate.
+The present implementation does not provide automatic fleet profile sync.
+
+| Concern | Current owner / placement |
+| --- | --- |
+| Standalone and headless-engine profile jar | `main.rs::profile_dir` on the app host; the temporary profile is ephemeral |
+| Thin-client native web context | Created by the rendering GUI; its jar can be GUI-host-local even while policy and egress are remote |
+| Profile metadata and normalization | The shared yggterm-core profile contract; unknown metadata keys must survive updates |
+| Policy, user-agent settings, zoom and bundled assets | Ychrome app owners on the invoking host |
+| Headless engine data/cache | `engine/identity.rs`, with both WebKit base directories in the profile jar |
+| Vault | Separate native vault peer; local unlocked state and presence grants are not profile files |
+| Daemon socket, lock and live registry | Host-local runtime state, not transferable profile authority |
+
+The surface context key includes jar, egress/SOCKS endpoint and
+control/signer endpoint. Profile-name equality alone cannot merge contexts
+without changing network or control authority. Engine cookie-import exists
+because editing a persistent jar does not update every live network-process
+store. Import acknowledgement alone does not prove full website-state sync.
+
+Future shared logical profiles need a common catalog, typed app-owned data
+exports and explicit consistency/activation rules. Preserve invoking-host
+`localhost` resolution; classify WebKitCache, HSTS, CacheStorage, IndexedDB,
+cookies and private settings separately. Do not recursively mirror a mixed
+profile/runtime directory or imply that every byte named cache is disposable.
 
 ## What lands where (extraction discipline)
 

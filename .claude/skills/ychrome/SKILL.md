@@ -17,8 +17,12 @@ Two things live in this repo, and they share one rule.
 **The rule both obey:** an app OWNS its content, its crate, and its state;
 yggterm provides only a generic surface interface. Never add ychrome-specific
 chrome to yggterm. Full contract: `yggterm/.agents/skills/libyggterm-surfaces/SKILL.md`.
-State is **host-resident** — it lives on the host the app RUNS on (over ssh, the
-remote one), never on the GUI host.
+State is **app-owned**, with mode-specific physical placement. App policy and
+the vault peer live on the invoking host. Standalone/headless profile jars use
+that host; thin-client native web contexts can store their jars on the GUI
+host while keeping invoking-host egress. The matrix in `docs/architecture.md`
+is the migration door. Shared fleet profile identity is a new target, not a
+claim that current host-local files or live contexts already synchronize.
 
 ## Repo map
 
